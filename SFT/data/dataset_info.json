@@ -1,0 +1,121 @@
+{
+  "new_fvqa_agent_sft": {
+    "file_name": "new_fvqa/fvqa_llama_factory_clean.json",
+    "formatting": "sharegpt",
+    "columns": {
+      "messages": "conversations",
+      "images": "images",
+      "system": "system",
+      "tools": "tools"
+    },
+    "tags": {
+      "role_tag": "from",
+      "content_tag": "value",
+      "user_tag": "human",
+      "assistant_tag": "gpt",
+      "observation_tag": "observation"
+    }
+  },
+  "palace_agent_sft": {
+    "file_name": "palace/palace_llama_factory_filtered.json",
+    "formatting": "sharegpt",
+    "columns": {
+      "messages": "conversations",
+      "images": "images",
+      "system": "system",
+      "tools": "tools"
+    },
+    "tags": {
+      "role_tag": "from",
+      "content_tag": "value",
+      "user_tag": "human",
+      "assistant_tag": "gpt",
+      "observation_tag": "observation"
+    }
+  },
+  "webqa_agent_sft": {
+    "file_name": "WebQA/webqa_llama_factory_filtered.json",
+    "formatting": "sharegpt",
+    "columns": {
+      "messages": "conversations",
+      "images": "images",
+      "system": "system",
+      "tools": "tools"
+    },
+    "tags": {
+      "role_tag": "from",
+      "content_tag": "value",
+      "user_tag": "human",
+      "assistant_tag": "gpt",
+      "observation_tag": "observation"
+    }
+  },
+  "livevqa_agent_sft": {
+    "file_name": "new_livevqa/livevqa_llama_factory_filtered.json",
+    "formatting": "sharegpt",
+    "columns": {
+      "messages": "conversations",
+      "images": "images",
+      "system": "system",
+      "tools": "tools"
+    },
+    "tags": {
+      "role_tag": "from",
+      "content_tag": "value",
+      "user_tag": "human",
+      "assistant_tag": "gpt",
+      "observation_tag": "observation"
+    }
+  },
+  "wikiart_agent_sft": {
+    "file_name": "wikiart/wikiart_llama_factory_filtered.json",
+    "formatting": "sharegpt",
+    "columns": {
+      "messages": "conversations",
+      "images": "images",
+      "system": "system",
+      "tools": "tools"
+    },
+    "tags": {
+      "role_tag": "from",
+      "content_tag": "value",
+      "user_tag": "human",
+      "assistant_tag": "gpt",
+      "observation_tag": "observation"
+    }
+  },
+  "wiki_en_agent_sft": {
+    "file_name": "wiki_en/wiki_en_llama_factory_filtered.json",
+    "formatting": "sharegpt",
+    "columns": {
+      "messages": "conversations",
+      "images": "images",
+      "system": "system",
+      "tools": "tools"
+    },
+    "tags": {
+      "role_tag": "from",
+      "content_tag": "value",
+      "user_tag": "human",
+      "assistant_tag": "gpt",
+      "observation_tag": "observation"
+    }
+  },
+  "wiki_zh_agent_sft": {
+    "file_name": "wiki_zh/wiki_zh_llama_factory_filtered.json",
+    "formatting": "sharegpt",
+    "columns": {
+      "messages": "conversations",
+      "images": "images",
+      "system": "system",
+      "tools": "tools"
+    },
+    "tags": {
+      "role_tag": "from",
+      "content_tag": "value",
+      "user_tag": "human",
+      "assistant_tag": "gpt",
+      "observation_tag": "observation"
+    }
+  }
+}

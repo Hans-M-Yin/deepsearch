@@ -1,0 +1,82 @@
+### model
+model_name_or_path: Qwen/Qwen3-VL-8B-Instruct
+image_max_pixels: 262144
+video_max_pixels: 16384
+trust_remote_code: true
+
+### method
+stage: sft
+do_train: true
+finetuning_type: full
+freeze_vision_tower: false
+freeze_multi_modal_projector: false
+deepspeed: examples/deepspeed/ds_z3_config.json
+
+### dataset
+dataset: new_fvqa_agent_sft,palace_agent_sft,webqa_agent_sft,livevqa_agent_sft,wikiart_agent_sft,wiki_zh_agent_sft,wiki_en_agent_sft
+dataset_dir: data
+template: qwen3_vl
+cutoff_len: 32000
+# max_samples: 1000
+overwrite_cache: true
+preprocessing_num_workers: 16
+dataloader_num_workers: 4
+
+### output
+output_dir: saves/qwen3_vl_8b/full/sft_data_v1
+logging_steps: 5
+save_steps: 400
+plot_loss: true
+overwrite_output_dir: true
+save_only_model: false
+report_to: tensorboard
+
+### ray (128 GPU = 16 nodes × 8 GPUs)
+ray_run_name: qwen3_vl_8b_full_sft_agent_v1
+ray_storage_path: saves
+ray_num_workers: 256
+placement_strategy: PACK
+resources_per_worker:
+  GPU: 1
+ray_init_kwargs:
+  runtime_env:
+    env_vars:
+      NCCL_IB_DISABLE: "0"
+      NCCL_IB_GID_INDEX: "3"
+      NCCL_IB_SL: "3"
+      NCCL_DEBUG: "INFO"
+      NCCL_SOCKET_IFNAME: "bond1"
+      GLOO_SOCKET_IFNAME: "bond1"
+      TP_SOCKET_IFNAME: "bond1"
+      UCX_NET_DEVICES: "bond1"
+      NCCL_IB_HCA: "mlx5_bond*"
+      NCCL_NET_GDR_LEVEL: "1"
+      NCCL_IB_TC: "106"
+      NCCL_IB_QPS_PER_CONNECTION: "4"
+      NCCL_LL_THRESHOLD: "32768"
+      NCCL_P2P_DISABLE: "0"
+      NCCL_CHECK_DISABLE: "1"
+      NCCL_PXN_DISABLE: "0"
+      NCCL_COLLNET_ENABLE: "0"
+      SHARP_COLL_ENABLE_SAT: "0"
+      TOKENIZERS_PARALLELISM: "false"
+      HF_DATASETS_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+
+### train
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 1
+gradient_checkpointing: true
+learning_rate: 2.0e-5
+num_train_epochs: 8.0
+lr_scheduler_type: cosine
+warmup_ratio: 0.1
+bf16: true
+ddp_timeout: 600
+resume_from_checkpoint: true
+
+### eval
+# val_size: 0.1
+# per_device_eval_batch_size: 1
+# eval_strategy: steps
+# eval_steps: 500
