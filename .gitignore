@@ -1,0 +1,62 @@
+# --- macOS / editor cruft ---
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+.eggs/
+build/
+dist/
+wheels/
+pip-wheel-metadata/
+.Python
+
+# --- Virtual envs ---
+.env
+.env.local
+.env.*.local
+.venv/
+venv/
+env/
+ENV/
+
+# --- Test / type checking caches ---
+.pytest_cache/
+.mypy_cache/
+.pyre/
+.ruff_cache/
+.tox/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# --- Jupyter ---
+.ipynb_checkpoints/
+
+# --- Local data / model artifacts (do NOT ship into the repo) ---
+checkpoints/
+ckpts/
+runs/
+wandb/
+outputs/
+logs/
+*.log
+*.pt
+*.bin
+*.safetensors
+*.ckpt
+
+# --- IDE / OS ---
+*.bak
+*.tmp
+*.orig
