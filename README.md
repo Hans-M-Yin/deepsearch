@@ -1,6 +1,6 @@
 <div align="center">
 
-  <img src="./images/logo.png" alt="OpenSearch-VL" width="160">
+  <img src="./images/logo.png" alt="OpenSearch-VL" width="220">
 
   <h1 style="margin: 0; font-size: 1.8em;">
     An Open Recipe for Frontier Multimodal Search Agents
@@ -37,17 +37,17 @@
 
 ## 📖 Introduction
 
-This work presents **OpenSearch-VL**, a fully open-source recipe for training frontier **multimodal deep-research agents** with **agentic reinforcement learning**. Unlike conventional VLMs that answer in a single forward pass, OpenSearch-VL iteratively *looks at images*, *crops / enhances* them, *issues web and image searches*, *visits pages*, and *writes a final answer grounded in the retrieved evidence*.
+**OpenSearch-VL** is a fully open recipe for training frontier multimodal deep-research agents with agentic reinforcement learning. In contrast to standard VLMs that answer in a single forward pass, the agent operates as a closed loop: it inspects the image, crops or enhances the regions of interest, issues web and image searches, visits the retrieved pages, and only then writes an answer grounded in the gathered evidence.
 
-The strongest multimodal search agents today remain difficult to reproduce because their training data, trajectory-synthesis pipelines, and detailed training recipes are kept proprietary. OpenSearch-VL closes this gap by releasing **everything needed to reproduce the paper end-to-end**: data, code, and models.
+Reproducing top-tier multimodal search agents has so far been difficult because the underlying training data, trajectory-synthesis pipelines, and training recipes remain proprietary. This release aims to close that gap: we open-source the **data, code, and model checkpoints** required to reproduce the paper end-to-end.
 
-Our recipe addresses three orthogonal challenges in one stack:
+The recipe addresses three challenges that we found to be largely independent in practice:
 
-1. **Data** — A dedicated curation pipeline that builds high-quality, image-grounded multi-hop VQA from the Wikipedia hyperlink graph, using *fuzzy entity rewriting* and *source-anchored visual grounding* to suppress single-hop retrieval shortcuts. This yields **SearchVL-SFT-36k** for SFT and **SearchVL-RL-8k** for RL.
-2. **Tools** — A unified visual + retrieval tool environment (`crop`, `layout_parsing`, `text_search`, `image_search`, `web_search`, `visit`, `perspective_correct`, `super_resolution`, `sharpen`, `python_interpreter`) shared by SFT data generation, RL rollout, and inference, so the agent can both *repair imperfect visual evidence* and *acquire external knowledge*.
-3. **Algorithm** — A **multi-turn fatal-aware GRPO** that handles cascading tool failures by masking post-failure tokens and applying *one-sided advantage clamping* so that valid pre-failure reasoning is preserved rather than penalised.
+- **Data.** A curation pipeline built on top of the Wikipedia hyperlink graph synthesizes image-grounded multi-hop VQA. *Fuzzy entity rewriting* and *source-anchored visual grounding* are used to suppress shortcut solutions in which a single retrieval step is sufficient. The pipeline yields two open datasets: **SearchVL-SFT-36k** for supervised fine-tuning and **SearchVL-RL-8k** for reinforcement learning.
+- **Tools.** A unified visual and retrieval tool environment (`crop`, `layout_parsing`, `text_search`, `image_search`, `web_search`, `visit`, `perspective_correct`, `super_resolution`, `sharpen`, `python_interpreter`) is shared across SFT data generation, RL rollout, and inference. This allows the agent both to recover from imperfect visual inputs and to acquire external knowledge through a consistent interface.
+- **Algorithm.** A multi-turn **fatal-aware GRPO** algorithm explicitly handles cascading tool failures during long rollouts. Tokens that follow a fatal step are masked out of the policy gradient, while *one-sided advantage clamping* preserves the credit assigned to valid pre-failure reasoning rather than penalizing the entire trajectory.
 
-Built on this recipe, **OpenSearch-VL delivers an average gain of more than 10 points across 7 benchmarks** (SimpleVQA, VDR, MMSearch, LiveVQA, BrowseComp-VL, FVQA, InfoSeek) and reaches results **comparable to proprietary commercial models** at the 30B / 32B scale.
+Across seven knowledge-intensive multimodal benchmarks—SimpleVQA, VDR, MMSearch, LiveVQA, BrowseComp-VL, FVQA, and InfoSeek—OpenSearch-VL improves the average score by more than **10 points** over the corresponding agentic baselines, and at the 30B / 32B scale matches the accuracy of strong proprietary systems.
 
 ---
 
