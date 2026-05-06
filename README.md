@@ -16,6 +16,23 @@
 
 </div>
 
+## 📑 Table of Contents
+
+- [📖 Introduction](#-introduction)
+- [🗺️ Overview](#%EF%B8%8F-overview)
+- [🍭 Method Overview](#-method-overview)
+- [📊 Main Results](#-main-results)
+- [🔎 Case Study](#-case-study)
+- [📁 Repository Layout](#-repository-layout)
+- [🛠️ Prerequisites](#%EF%B8%8F-prerequisites)
+- [🏋️ Agentic SFT · `code/SFT`](#%EF%B8%8F-agentic-sft--codesft)
+- [🚀 Agentic RL · `code/RL`](#-agentic-rl--coderl)
+- [📊 Inference & Evaluation · `code/infer`](#-inference--evaluation--codeinfer)
+- [🚧 TODO](#-todo)
+- [🙌 Acknowledgements](#-acknowledgements)
+
+---
+
 ## 📖 Introduction
 
 This work presents **OpenSearch-VL**, a fully open-source recipe for training frontier **multimodal deep-research agents** with **agentic reinforcement learning**. Unlike conventional VLMs that answer in a single forward pass, OpenSearch-VL iteratively *looks at images*, *crops / enhances* them, *issues web and image searches*, *visits pages*, and *writes a final answer grounded in the retrieved evidence*.
@@ -41,8 +58,8 @@ This repository provides everything needed to **reproduce, fine-tune, and evalua
 | **SFT Training** | [`SFT/`](SFT/) | Agentic cold-start with LLaMA-Factory + Ray + ZeRO-3 (full-parameter fine-tune of LLM + ViT + projector) |
 | **RL Training** | [`RL/`](RL/) | Asynchronous agentic RLOO/GRPO on top of SFT, built on rLLM + verl + Megatron-LM + sglang |
 | **Inference & Evaluation** | [`infer/`](infer/) | Unified `run_infer.py --model {8b,30b-a3b,32b,claude}` rollout + GPT-4o judge for BrowseComp-VL, HLE, VDR-Bench |
-| **Models** | [🤗 OpenSearch-VL](https://huggingface.co/OpenSearch-VL) | OpenSearch-VL-{8B, 30B-A3B, 32B} checkpoints |
-| **Datasets** | [🤗 OpenSearch-VL](https://huggingface.co/OpenSearch-VL) | SearchVL-SFT-36k (cold-start) and SearchVL-RL-8k (RL) |
+| **Models** | [OpenSearch-VL](https://huggingface.co/OpenSearch-VL) | OpenSearch-VL-{8B, 30B-A3B, 32B} checkpoints |
+| **Datasets** | [OpenSearch-VL](https://huggingface.co/OpenSearch-VL) | SearchVL-SFT-36k (cold-start) and SearchVL-RL-8k (RL) |
 
 ### Workflow at a Glance
 
@@ -110,6 +127,24 @@ Vanilla search-augmented GRPO improves SFT 64.6 → 67.6 Avg; the hard-masking b
 </div>
 
 Fatal-aware GRPO sustains a **higher number of tool-use turns *and* a higher batch accuracy** than vanilla GRPO and the Hard-Mask baseline — encouraging productive exploration rather than prematurely suppressing difficult rollouts.
+
+---
+
+## 🔎 Case Study
+
+The example below illustrates a representative OpenSearch-VL trajectory on a knowledge-intensive visual question: **“In what year did this bridge open?”** The answer cannot be read directly from the image or reliably produced by parametric knowledge alone. Instead, the agent progressively grounds the query through tool use.
+
+<div align="center">
+  <img src="./images/case_study.png" width="88%" alt="OpenSearch-VL case study">
+</div>
+
+**Tool-use flow.**
+1. **Visual inspection** — The agent identifies the roadside sign as the most useful visual clue.
+2. **Crop** — It zooms into the sign to obtain a cleaner local view.
+3. **Image search** — The cropped region helps identify the structure as the **Kessock Bridge**.
+4. **Text search / verification** — A targeted search verifies the official opening year as **1982**.
+
+This case highlights the core behavior encouraged by OpenSearch-VL: the agent does not guess from a single model pass, but chains visual perception, image retrieval, and textual evidence acquisition until the answer is grounded.
 
 ---
 
