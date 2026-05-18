@@ -298,6 +298,45 @@ def _search_via_serper(query: str, lang: str, top_k: int) -> List[dict]:
     data = response.json()
     return data.get("organic", []) or []
 
+def _image_search_via_serper(image_url: str) -> object:
+    """Run reverse-image search against Serper's Google Lens endpoint."""
+
+    if not config.SERPER_API_KEY:
+        raise RuntimeError(
+            "Serper Lens is not configured. Set SERPER_API_KEY "
+            "to enable built-in image_search."
+        )
+
+    headers = {
+        "X-API-KEY": config.SERPER_API_KEY,
+        "Content-Type": "application/json",
+    }
+    response = requests.post(
+        config.SERPER_LENS_URL,
+        headers=headers,
+        json={"url": image_url},
+        timeout=60,
+    )
+    response.raise_for_status()
+    data = response.json()
+    organic = data.get("organic", []) or []
+    if not organic:
+        return data
+
+    results = []
+    for item in organic[:3]:
+        result = {
+            "title": item.get("title", ""),
+            "source": item.get("source", "") or item.get("link", ""),
+            "url": item.get("link", ""),
+            "image_url": item.get("imageUrl", ""),
+            "thumbnail_url": item.get("thumbnailUrl", ""),
+            "snippet": item.get("snippet", ""),
+        }
+        results.append(result)
+    return results
+
+
 
 def _read_via_gateway(url: str) -> str:
     headers = {
@@ -400,12 +439,13 @@ def image_search(
     """Run an external visual lookup against ``image_url`` and summarise it."""
 
     if not visual_lookup:
-        return (
-            "Tool execution error:\n"
-            "image_search requires a visual lookup callable. Configure one via "
-            "the runner (e.g. an external lens / similar-image API) before "
-            "invoking image_search."
-        )
+        # return (
+        #     "Tool execution error:\n"
+        #     "image_search requires a visual lookup callable. Configure one via "
+        #     "the runner (e.g. an external lens / similar-image API) before "
+        #     "invoking image_search."
+        # )
+        visual_lookup = _image_search_via_serper
 
     last_error: Optional[Exception] = None
     for attempt in range(1, max_retries + 1):

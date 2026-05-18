@@ -54,6 +54,9 @@ SERPER_API_KEY: str = os.environ.get("SERPER_API_KEY", "")
 SERPER_SEARCH_URL: str = os.environ.get(
     "SERPER_SEARCH_URL", "https://google.serper.dev/search"
 )
+SERPER_LENS_URL: str = os.environ.get(
+    "SERPER_LENS_URL", "https://google.serper.dev/lens"
+)
 JINA_API_KEY: str = os.environ.get("JINA_API_KEY", "")
 JINA_READER_URL: str = os.environ.get("JINA_READER_URL", "https://r.jina.ai/")
 
