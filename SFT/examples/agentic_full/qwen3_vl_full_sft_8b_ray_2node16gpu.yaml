@@ -1,5 +1,5 @@
 ### model
-model_name_or_path: /mnt/hdfs/byte_ai_sales/user/user/yinzhihan/data/models/qwen3-vl-8b
+model_name_or_path: /mnt/hdfs/byte_ai_sales/user/user/yinzhihan/models/qwen3-vl-8b
 image_max_pixels: 262144
 video_max_pixels: 16384
 trust_remote_code: true
