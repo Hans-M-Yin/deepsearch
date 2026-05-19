@@ -10,7 +10,7 @@ do_train: true
 finetuning_type: full
 freeze_vision_tower: false
 freeze_multi_modal_projector: false
-deepspeed: examples/deepspeed/ds_z3_config.json
+deepspeed: /mnt/hdfs/byte_ai_sales/user/user/yinzhihan/agent/OpenSearch-VL/SFT/examples/deepspeed/ds_z3_config.json
 
 ### dataset
 dataset: new_fvqa_agent_sft,palace_agent_sft,webqa_agent_sft,livevqa_agent_sft,wikiart_agent_sft,wiki_zh_agent_sft,wiki_en_agent_sft
