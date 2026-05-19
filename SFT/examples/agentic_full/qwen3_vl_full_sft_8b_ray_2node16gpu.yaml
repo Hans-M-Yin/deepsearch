@@ -31,14 +31,8 @@ overwrite_output_dir: true
 save_only_model: false
 report_to: tensorboard
 
-### ray (16 workers, 9 CPU per worker)
-ray_run_name: qwen3_vl_8b_full_sft_agent_v1_2node16gpu
-ray_storage_path: saves
+### ray
 ray_num_workers: 16
-placement_strategy: PACK
-resources_per_worker:
-  CPU: 9
-  GPU: 1
 ray_init_kwargs:
   runtime_env:
     env_vars:
