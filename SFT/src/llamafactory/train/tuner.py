@@ -337,10 +337,14 @@ def _ray_training_function(ray_args: "RayArguments", config: dict[str, Any]) -> 
 
     # create placementgroup for resource management
     pg, bundle = get_placement_group(num_workers)
-    logger.info(
-        "Creating placement group for %s workers with bundle=%s. cluster_resources=%s available_resources=%s",
+    requested_resources = {k: v * num_workers for k, v in bundle.items()}
+    logger.warning(
+        "Before waiting for placement group: num_workers=%s total_devices=%s bundle=%s "
+        "requested_resources=%s cluster_resources=%s available_resources=%s",
         num_workers,
+        total_devices,
         bundle,
+        requested_resources,
         ray.cluster_resources(),
         ray.available_resources(),
     )
