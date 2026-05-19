@@ -1,5 +1,5 @@
 ### model
-model_name_or_path: Qwen/Qwen3-VL-8B-Instruct
+model_name_or_path: /mnt/hdfs/byte_ai_sales/user/user/yinzhihan/data/models/qwen3-vl-8b
 image_max_pixels: 262144
 video_max_pixels: 16384
 trust_remote_code: true
@@ -17,7 +17,7 @@ dataset: new_fvqa_agent_sft,palace_agent_sft,webqa_agent_sft,livevqa_agent_sft,w
 dataset_dir: /mnt/hdfs/byte_ai_sales/user/user/yinzhihan/data/OpenSearch-VL-SFT-36K
 template: qwen3_vl
 cutoff_len: 32000
-# max_samples: 1000
+max_samples: 1000
 overwrite_cache: true
 preprocessing_num_workers: 16
 dataloader_num_workers: 4
