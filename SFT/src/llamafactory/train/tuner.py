@@ -14,6 +14,7 @@
 
 import os
 import shutil
+import time
 from typing import TYPE_CHECKING, Any, Optional
 
 import torch
@@ -50,6 +51,7 @@ from .trainer_utils import (
 
 if is_ray_available():
     import ray
+    from ray.util.placement_group import placement_group_table
 
 
 if TYPE_CHECKING:
@@ -57,6 +59,47 @@ if TYPE_CHECKING:
 
 
 logger = logging.get_logger(__name__)
+
+
+def _wait_for_placement_group(pg: "Any", num_workers: int, bundle: dict[str, Any], timeout_s: int = 600) -> None:
+    r"""Wait for placement group readiness with periodic diagnostics."""
+    ready_ref = pg.ready()
+    start_time = time.time()
+    last_log_time = 0.0
+
+    while True:
+        elapsed = time.time() - start_time
+        done, _ = ray.wait([ready_ref], timeout=10)
+        if done:
+            ray.get(done[0])
+            logger.info(f"Placement group is ready after {elapsed:.1f}s for {num_workers} workers: {bundle}")
+            return
+
+        now = time.time()
+        if now - last_log_time >= 10:
+            last_log_time = now
+            try:
+                pg_state = placement_group_table(pg)
+            except Exception as exc:
+                pg_state = {"error": f"failed to fetch placement group table: {exc}"}
+
+            logger.warning(
+                "Still waiting for placement group after %.1fs. requested_workers=%s bundle=%s "
+                "cluster_resources=%s available_resources=%s placement_group_state=%s",
+                elapsed,
+                num_workers,
+                bundle,
+                ray.cluster_resources(),
+                ray.available_resources(),
+                pg_state,
+            )
+
+        if elapsed >= timeout_s:
+            raise TimeoutError(
+                f"Timed out after {timeout_s}s waiting for placement group. "
+                f"requested_workers={num_workers}, bundle={bundle}, "
+                f"cluster_resources={ray.cluster_resources()}, available_resources={ray.available_resources()}"
+            )
 
 
 def _training_function(config: dict[str, Any]) -> None:
@@ -294,7 +337,14 @@ def _ray_training_function(ray_args: "RayArguments", config: dict[str, Any]) -> 
 
     # create placementgroup for resource management
     pg, bundle = get_placement_group(num_workers)
-    ray.get(pg.ready())
+    logger.info(
+        "Creating placement group for %s workers with bundle=%s. cluster_resources=%s available_resources=%s",
+        num_workers,
+        bundle,
+        ray.cluster_resources(),
+        ray.available_resources(),
+    )
+    _wait_for_placement_group(pg, num_workers, bundle)
     logger.info(f"Create placement group with {num_workers} bundles: {bundle}")
 
     # get sorted_bundle_indices
