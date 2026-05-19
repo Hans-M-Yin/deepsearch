@@ -293,7 +293,7 @@ def _ray_training_function(ray_args: "RayArguments", config: dict[str, Any]) -> 
             raise ValueError(f"The `master_addr` ({master_addr}) is not in Ray cluster or not alive ")
 
     # create placementgroup for resource management
-    pg, bundle = get_placement_group(total_devices)
+    pg, bundle = get_placement_group(num_workers)
     ray.get(pg.ready())
     logger.info(f"Create placement group with {num_workers} bundles: {bundle}")
 
