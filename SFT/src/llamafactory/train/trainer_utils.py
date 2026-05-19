@@ -893,7 +893,7 @@ def get_swanlab_callback(finetuning_args: "FinetuningArguments") -> "TrainerCall
 
 def get_placement_group(num_workers: int) -> tuple["PlacementGroup", dict[str, int]]:
     r"""Get the Ray placement group for distributed training."""
-    bundle = {"CPU": 1}
+    bundle = {"CPU": 9}
     device_name = get_device_name().upper()
     if device_name != "CPU":
         bundle[device_name] = 1
@@ -928,7 +928,7 @@ def get_ray_remote_config_for_worker(
             placement_group_bundle_index=bundle_idx,
         ),
         "runtime_env": {"env_vars": env},
-        "num_cpus": 1,
+        "num_cpus": 9,
     }
 
     device_name = get_device_name()
