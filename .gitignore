@@ -62,3 +62,4 @@ logs/
 *.orig
 opensearch_vl/vdr_testmini_for_opensearch.parquet
 opensearch_vl/.env.example
+SFT/data

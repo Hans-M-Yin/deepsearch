@@ -321,6 +321,7 @@ def _ray_training_function(ray_args: "RayArguments", config: dict[str, Any]) -> 
     # verify resources
     device_name = get_device_name().upper()
     total_devices = int(ray.cluster_resources().get(device_name, 0))
+    print("这不是324吗？")
     if num_workers > total_devices:
         raise ValueError(
             f"The number of devices in the Ray cluster ({total_devices}) should be greater than num_workers ({num_workers})."

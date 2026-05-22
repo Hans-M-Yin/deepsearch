@@ -1,3 +1,4 @@
+# WANDB_DISABLED=true USE_RAY=1 python -m llamafactory.cli train examples/agentic_full/qwen3_vl_full_sft_8b_ray_2node16gpu.yaml
 ### model
 model_name_or_path: /mnt/hdfs/byte_ai_sales/user/user/yinzhihan/models/qwen3-vl-8b
 image_max_pixels: 262144
@@ -16,11 +17,13 @@ deepspeed: /mnt/hdfs/byte_ai_sales/user/user/yinzhihan/agent/OpenSearch-VL/SFT/e
 dataset: new_fvqa_agent_sft,palace_agent_sft,webqa_agent_sft,livevqa_agent_sft,wikiart_agent_sft,wiki_zh_agent_sft,wiki_en_agent_sft
 dataset_dir: /mnt/hdfs/byte_ai_sales/user/user/yinzhihan/data/OpenSearch-VL-SFT-36K
 template: qwen3_vl
-cutoff_len: 32000
+cutoff_len: 28672
 max_samples: 1000
 overwrite_cache: true
 preprocessing_num_workers: 16
 dataloader_num_workers: 4
+tokenized_path: /mnt/hdfs/byte_ai_sales/user/user/yinzhihan/cache/opensearch_sft_tokenized_8b
+data_shared_file_system: true
 
 ### output
 output_dir: saves/qwen3_vl_8b/full/sft_data_v1_2node16gpu
@@ -29,7 +32,7 @@ save_steps: 400
 plot_loss: true
 overwrite_output_dir: true
 save_only_model: false
-report_to: tensorboard
+report_to: none
 
 ### ray
 ray_num_workers: 16
@@ -63,12 +66,12 @@ per_device_train_batch_size: 1
 gradient_accumulation_steps: 16
 gradient_checkpointing: true
 learning_rate: 2.0e-5
-num_train_epochs: 8.0
+num_train_epochs: 2.0
 lr_scheduler_type: cosine
 warmup_ratio: 0.1
 bf16: true
 ddp_timeout: 1800
-resume_from_checkpoint: true
+resume_from_checkpoint: false
 
 ### eval
 # val_size: 0.1
