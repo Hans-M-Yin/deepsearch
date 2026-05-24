@@ -16,7 +16,8 @@ else
   MODEL_PATH="${MODEL_PATH:-/mnt/hdfs/byte_ai_sales/user/user/yinzhihan/models/qwen3-32b}"
   SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-qwen3-32b}"
 fi
-
+echo $SERVED_MODEL_NAME
+echo $PORT
 vllm serve "${MODEL_PATH}" \
   --served-model-name "${SERVED_MODEL_NAME}" \
   --tensor-parallel-size "${TENSOR_PARALLEL_SIZE}" \

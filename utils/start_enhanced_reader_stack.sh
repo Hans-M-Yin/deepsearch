@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
-
+# Check log
+#tail -f /workspace/reader/reader_log
+ #tail -f /mnt/hdfs/byte_ai_sales/user/user/yinzhihan/agent/OpenSearch-VL/vllm_reader_lm_log
+ #tail -f /mnt/hdfs/byte_ai_sales/user/user/yinzhihan/agent/OpenSearch-VL/enhanced_reader_log
 # Paths can be overridden by exporting env vars before running this script.
 READER_DIR="${READER_DIR:-/workspace/reader}"
 PROJECT_DIR="${PROJECT_DIR:-/mnt/hdfs/byte_ai_sales/user/user/yinzhihan/agent/OpenSearch-VL}"
