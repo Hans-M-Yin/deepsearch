@@ -7,7 +7,7 @@ import io
 import logging
 import os
 import urllib.parse
-from typing import Any, Dict, Iterable, List
+from typing import Any, Dict, Iterable, List, Optional
 
 from PIL import Image
 
@@ -112,3 +112,50 @@ def to_qwen3vl_messages(contents: Iterable[Dict[str, Any]]) -> List[Dict[str, An
             qwen_role = "assistant" if role == "model" else role
             messages.append({"role": qwen_role, "content": block})
     return messages
+
+
+def to_openai_messages(
+    contents: Iterable[Dict[str, Any]],
+    system_instruction: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Convert Gemini-style ``contents`` to OpenAI chat-completions messages.
+
+    This is intentionally lossless for text and image payloads so the same
+    agent loop can target Claude gateways, local HF models, or vLLM/OpenAI-
+    compatible servers without changing benchmark data fields.
+    """
+
+    openai_messages: List[Dict[str, Any]] = []
+    if system_instruction:
+        openai_messages.append({"role": "system", "content": system_instruction})
+
+    for item in contents:
+        role = item.get("role", "user")
+        parts = item.get("parts", []) or []
+        block: List[Dict[str, Any]] = []
+        for part in parts:
+            if "image_url" in part:
+                value = part["image_url"]
+                url = value.get("url", "") if isinstance(value, dict) else str(value)
+                if url:
+                    block.append(
+                        {"type": "image_url", "image_url": {"url": url}}
+                    )
+            elif "inline_data" in part:
+                data = part["inline_data"]
+                payload = data.get("data", "")
+                if payload:
+                    mime = data.get("mime_type", "") or image_io.detect_image_format(
+                        payload
+                    )
+                    if not payload.startswith("data:"):
+                        payload = f"data:{mime};base64,{payload}"
+                    block.append(
+                        {"type": "image_url", "image_url": {"url": payload}}
+                    )
+            elif "text" in part:
+                block.append({"type": "text", "text": str(part["text"])})
+        if block:
+            openai_role = "assistant" if role == "model" else role
+            openai_messages.append({"role": openai_role, "content": block})
+    return openai_messages

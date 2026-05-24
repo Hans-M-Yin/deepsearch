@@ -66,6 +66,10 @@ def _strip_base64_payloads(obj: Any, image_urls: Dict[str, str]) -> Any:
                     continue
             out[k] = _strip_base64_payloads(v, image_urls)
         return out
+    try:
+        json.dumps(obj)
+    except TypeError:
+        return str(obj)
     return obj
 
 
@@ -181,6 +185,40 @@ def _bootstrap_images(
     return image_paths_dict, initial_parts
 
 
+def _row_to_dict(row: Any) -> Dict[str, Any]:
+    if hasattr(row, "to_dict"):
+        return row.to_dict()
+    if isinstance(row, dict):
+        return dict(row)
+    return {}
+
+
+def _first_present(
+    row: Dict[str, Any], keys: Iterable[str], default: Any = None
+) -> Any:
+    for key in keys:
+        value = row.get(key)
+        if value is not None:
+            return value
+    return default
+
+
+def _prompt_from_row(row: Dict[str, Any]) -> tuple[List[Dict[str, Any]], str]:
+    prompt_list = row.get("prompt", [])
+    if isinstance(prompt_list, list) and prompt_list:
+        first = prompt_list[0]
+        prompt_text = (
+            first.get("content", "") if isinstance(first, dict) else str(first)
+        )
+        return prompt_list, prompt_text
+
+    question = row.get("question") or row.get("query") or ""
+    prompt_text = str(question) if question is not None else ""
+    if prompt_text:
+        return [{"role": "user", "content": prompt_text}], prompt_text
+    return [], ""
+
+
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
@@ -199,17 +237,21 @@ def process_single_case(
     """Drive one benchmark example through the agent."""
 
     filename_prefix = "fvqa_test" if dataset_type == "test" else "fvqa_train"
+    row_dict = _row_to_dict(row)
 
-    if hasattr(row, "get"):
-        case_id = row.get("data_id", f"case_{case_idx}")
-        category = row.get("category", "unknown")
-        data_source = row.get("data_source", "unknown")
-        prompt_list = row.get("prompt", [])
+    if row_dict:
+        case_id = _first_present(
+            row_dict, ("data_id", "id", "idx", "_id"), f"case_{case_idx}"
+        )
+        category = row_dict.get("category", "unknown")
+        data_source = row_dict.get("data_source", row_dict.get("source", "unknown"))
+        prompt_list, prompt_text = _prompt_from_row(row_dict)
     else:
         case_id = f"case_{case_idx}"
         category = "unknown"
         data_source = "unknown"
-        prompt_list = []
+        prompt_list, prompt_text = [], ""
+    case_id = str(case_id)
 
     logger.info(
         "Processing case %d (%s, category=%s, source=%s)",
@@ -218,14 +260,6 @@ def process_single_case(
         category,
         data_source,
     )
-
-    if isinstance(prompt_list, list) and prompt_list:
-        first = prompt_list[0]
-        prompt_text = (
-            first.get("content", "") if isinstance(first, dict) else str(first)
-        )
-    else:
-        prompt_text = str(prompt_list) if prompt_list else ""
 
     image_paths_dict, initial_parts = _bootstrap_images(
         row, case_id, case_idx, filename_prefix, image_urls_dict
@@ -244,6 +278,7 @@ def process_single_case(
         "category": category,
         "data_source": data_source,
         "prompt": prompt_list,
+        "original_data": row_dict,
         "turns": [],
         "timestamp": datetime.now().isoformat(),
     }

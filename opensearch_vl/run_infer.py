@@ -31,16 +31,14 @@ to open-source.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import logging
 import os
 import sys
 import traceback
 from typing import Optional
 
-import pandas as pd
-
-from opensearch_infer import config, pipeline
-from opensearch_infer.runners import InferenceConfig, build_runner
+from opensearch_infer import config
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
@@ -82,6 +80,37 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default="bfloat16",
         choices=["bfloat16", "float16", "float32"],
         help="Floating point dtype for Qwen3-VL weights.",
+    )
+    parser.add_argument(
+        "--backend",
+        type=str,
+        default="local",
+        choices=["local", "api"],
+        help=(
+            "Inference backend. 'local' loads HF weights in-process; 'api' calls "
+            "an OpenAI-compatible endpoint such as vLLM serve."
+        ),
+    )
+    parser.add_argument(
+        "--base-url",
+        type=str,
+        default=None,
+        help="OpenAI-compatible base URL for --backend api, e.g. http://localhost:8001/v1.",
+    )
+    parser.add_argument(
+        "--api-key",
+        type=str,
+        default=None,
+        help="API key for --backend api. Defaults to AGENT_API_KEY or EMPTY.",
+    )
+    parser.add_argument(
+        "--served-model-name",
+        type=str,
+        default=None,
+        help=(
+            "Model name sent to the API server. Defaults to --checkpoint, then "
+            "the registry display name."
+        ),
     )
     parser.add_argument(
         "--data-path",
@@ -130,6 +159,27 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Per-turn generation cap.",
     )
     parser.add_argument(
+        "--parallel-workers",
+        type=int,
+        default=1,
+        help=(
+            "Number of benchmark examples to run concurrently. Each trajectory "
+            "remains turn-by-turn serial."
+        ),
+    )
+    parser.add_argument(
+        "--api-timeout",
+        type=int,
+        default=600,
+        help="HTTP timeout in seconds for --backend api.",
+    )
+    parser.add_argument(
+        "--api-max-retries",
+        type=int,
+        default=3,
+        help="HTTP retry count for --backend api.",
+    )
+    parser.add_argument(
         "--temperature",
         type=float,
         default=0.0,
@@ -159,13 +209,22 @@ def main(argv: Optional[list[str]] = None) -> int:
     _configure_logging(args.log_level)
     logger = logging.getLogger("run_infer")
 
+    from opensearch_infer import pipeline
+    from opensearch_infer.runners import InferenceConfig, build_runner
+
     runner = build_runner(
         model_name=args.model,
         checkpoint=args.checkpoint,
         gpus=args.gpus,
         dtype=args.dtype,
+        backend=args.backend,
+        base_url=args.base_url,
+        api_key=args.api_key,
+        served_model_name=args.served_model_name,
+        timeout=args.api_timeout,
+        max_retries=args.api_max_retries,
     )
-    logger.info("Model: %s", runner.display_name)
+    logger.info("Model: %s (backend=%s)", runner.display_name, args.backend)
 
     try:
         runner.load()
@@ -176,6 +235,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     if not os.path.exists(args.data_path):
         logger.error("Data file not found: %s", args.data_path)
         return 1
+
+    import pandas as pd
 
     df = pd.read_parquet(args.data_path)
     logger.info("Loaded %d rows from %s", len(df), args.data_path)
@@ -200,8 +261,15 @@ def main(argv: Optional[list[str]] = None) -> int:
         max_tokens=args.max_tokens,
     )
 
-    success, failure = 0, 0
-    for idx in range(start, end):
+    workers = max(1, int(args.parallel_workers))
+    if args.backend == "local" and workers > 1:
+        logger.warning(
+            "--parallel-workers=%d with --backend local shares one in-process model; "
+            "API/vLLM backend is recommended for parallel evaluation.",
+            workers,
+        )
+
+    def _run_one(idx: int) -> tuple[int, bool, Optional[str]]:
         try:
             row = df.iloc[idx]
             pipeline.process_single_case(
@@ -212,13 +280,48 @@ def main(argv: Optional[list[str]] = None) -> int:
                 dataset_type=args.dataset,
                 inference_cfg=inference_cfg,
             )
-            success += 1
+            return idx, True, None
         except Exception as exc:
-            failure += 1
             logger.error("Case %d failed: %s", idx, exc)
             traceback.print_exc()
+            return idx, False, str(exc)
 
-    logger.info("Done. success=%d failure=%d output=%s", success, failure, args.output_dir)
+    success, failure = 0, 0
+    indices = list(range(start, end))
+    if workers == 1:
+        for idx in indices:
+            _, ok, _ = _run_one(idx)
+            success += int(ok)
+            failure += int(not ok)
+    else:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {executor.submit(_run_one, idx): idx for idx in indices}
+            for future in concurrent.futures.as_completed(futures):
+                idx, ok, error = future.result()
+                success += int(ok)
+                failure += int(not ok)
+                if ok:
+                    logger.info(
+                        "Case %d completed (%d/%d)",
+                        idx,
+                        success + failure,
+                        len(indices),
+                    )
+                else:
+                    logger.error(
+                        "Case %d failed (%d/%d): %s",
+                        idx,
+                        success + failure,
+                        len(indices),
+                        error,
+                    )
+
+    logger.info(
+        "Done. success=%d failure=%d output=%s",
+        success,
+        failure,
+        args.output_dir,
+    )
     return 0
 
 

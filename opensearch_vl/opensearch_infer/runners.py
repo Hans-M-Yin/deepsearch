@@ -25,10 +25,13 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+import requests
 
 from . import auth, config, messages
 from .config import ModelSpec
@@ -194,6 +197,102 @@ class ClaudeRunner(BaseRunner):
             "modelVersion": self.display_name,
             "raw_response": response_json,
         }
+
+
+# ---------------------------------------------------------------------------
+# OpenAI-compatible HTTP API (vLLM / SGLang / hosted APIs)
+# ---------------------------------------------------------------------------
+
+
+class OpenAICompatibleRunner(BaseRunner):
+    """Drives any OpenAI chat-completions compatible endpoint.
+
+    vLLM ``serve`` exposes this API, so the same runner can be used for
+    OpenSearch-VL-8B / 32B / 30B-A3B served behind HTTP and for closed models
+    that already expose an OpenAI-compatible gateway.
+    """
+
+    def __init__(
+        self,
+        spec: ModelSpec,
+        model: str,
+        base_url: str,
+        api_key: str = "EMPTY",
+        timeout: int = 600,
+        max_retries: int = 3,
+    ) -> None:
+        super().__init__(spec)
+        self.model = model
+        self.base_url = base_url.rstrip("/")
+        self.api_key = api_key
+        self.timeout = timeout
+        self.max_retries = max(1, max_retries)
+
+    @property
+    def display_name(self) -> str:
+        return self.model or self.spec.display_name
+
+    def infer(
+        self,
+        contents: Iterable[Dict[str, Any]],
+        system_instruction: Optional[str] = None,
+        cfg: Optional[InferenceConfig] = None,
+    ) -> Dict[str, Any]:
+        cfg = cfg or InferenceConfig()
+        payload: Dict[str, Any] = {
+            "model": self.model,
+            "messages": messages.to_openai_messages(contents, system_instruction),
+            "temperature": cfg.temperature,
+            "max_tokens": cfg.max_tokens,
+        }
+        if cfg.temperature > 0:
+            payload["top_p"] = 0.8
+
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+
+        url = f"{self.base_url}/chat/completions"
+        last_error: Optional[Exception] = None
+        for attempt in range(1, self.max_retries + 1):
+            try:
+                response = requests.post(
+                    url,
+                    json=payload,
+                    headers=headers,
+                    timeout=self.timeout,
+                )
+                response.raise_for_status()
+                response_json = response.json()
+                choice = (response_json.get("choices") or [{}])[0]
+                message = choice.get("message") or {}
+                text = message.get("content") or ""
+                usage = response_json.get("usage") or {}
+                return {
+                    "candidates": [
+                        {
+                            "content": {
+                                "role": "model",
+                                "parts": [{"text": text}],
+                            },
+                            "finishReason": choice.get("finish_reason", "STOP"),
+                        }
+                    ],
+                    "usageMetadata": {
+                        "promptTokenCount": usage.get("prompt_tokens", 0),
+                        "candidatesTokenCount": usage.get("completion_tokens", 0),
+                        "totalTokenCount": usage.get("total_tokens", 0),
+                    },
+                    "modelVersion": self.display_name,
+                    "raw_response": response_json,
+                }
+            except Exception as exc:
+                last_error = exc
+                if attempt < self.max_retries:
+                    time.sleep(min(2 ** (attempt - 1), 8))
+
+        logger.error("OpenAI-compatible inference failed: %s", last_error)
+        return _empty_response(self.display_name, str(last_error))
 
 
 # ---------------------------------------------------------------------------
@@ -632,12 +731,37 @@ def build_runner(
     checkpoint: Optional[str] = None,
     gpus: str = "0",
     dtype: str = "bfloat16",
+    backend: str = "local",
+    base_url: Optional[str] = None,
+    api_key: Optional[str] = None,
+    served_model_name: Optional[str] = None,
+    timeout: int = 600,
+    max_retries: int = 3,
 ) -> BaseRunner:
     if model_name not in config.MODEL_REGISTRY:
         raise KeyError(
             f"Unknown model {model_name!r}. Choose one of: {config.list_model_names()}"
         )
     spec = config.MODEL_REGISTRY[model_name]
+    if backend == "api":
+        model = served_model_name or checkpoint or spec.display_name
+        if not base_url:
+            base_url = (
+                os.environ.get("AGENT_BASE_URL")
+                or os.environ.get("OPENAI_BASE_URL", "")
+            )
+        if not base_url:
+            raise RuntimeError(
+                "--base-url is required when --backend api is used."
+            )
+        return OpenAICompatibleRunner(
+            spec,
+            model=model,
+            base_url=base_url,
+            api_key=api_key or os.environ.get("AGENT_API_KEY", "EMPTY"),
+            timeout=timeout,
+            max_retries=max_retries,
+        )
     if spec.family == "claude":
         return ClaudeRunner(spec)
     return Qwen3VLRunner(

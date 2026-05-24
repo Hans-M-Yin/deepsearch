@@ -12,6 +12,8 @@ specific model is selected via a single `--model` flag.
 opensearch_vl/
 |-- run_infer.py              # Unified entrypoint (--model 8b|32b|30b-a3b|claude)
 |-- run_infer.sh              # Convenience wrapper that reads env variables
+|-- run_eval_set.py           # Directory/file evaluation-set runner for API backends
+|-- run_eval_set.sh           # Env-driven evaluation-set wrapper
 |-- run_eval.sh               # Judge harness for BC-VL / HLE / VDR-Bench
 |-- eval_with_gpt4o.py        # GPT-4o judge implementation
 |-- .env.example              # Environment variables consumed by everything below
@@ -89,6 +91,33 @@ opensearch_vl/
    python run_infer.py --model claude \
        --data-path /data/fvqa_test.parquet \
        --output-dir ./outputs/fvqa_test_claude
+
+   # API-served OpenSearch-VL via vLLM (recommended for evaluation concurrency)
+   python run_infer.py --model 30b-a3b --backend api \
+       --base-url http://localhost:8001/v1 \
+       --served-model-name Qwen3-VL-30B-A3B-Instruct \
+       --data-path /data/bcvl_level1_199.parquet \
+       --output-dir ./outputs/bcvl_level1_30b_a3b \
+       --parallel-workers 10
+   ```
+
+   `--parallel-workers` runs multiple benchmark examples concurrently.
+   The trajectory for each individual example is still generated
+   turn-by-turn because each tool observation conditions the next model
+   call. For the 8B / 32B / 30B-A3B checkpoints, serving them with
+   `vllm serve` and using `--backend api` is the most uniform setup with
+   closed-model APIs and lets vLLM schedule requests efficiently.
+
+   To mirror the Vision-DeepResearch evaluation-set wrapper, point
+   `run_eval_set.py` at either one parquet or a directory of parquets:
+
+   ```bash
+   export AGENT_BASE_URL=http://localhost:8001/v1
+   export AGENT_MODEL_NAME=Qwen3-VL-30B-A3B-Instruct
+   python run_eval_set.py \
+       --data-path /data/eval_ready \
+       --output-dir ./outputs/eval_set_30b_a3b \
+       --parallel-tasks 10
    ```
 
    `run_infer.sh` is a thin wrapper that sources environment variables
