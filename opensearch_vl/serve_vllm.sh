@@ -63,5 +63,4 @@ vllm serve "${MODEL_PATH}" \
   --max-num-seqs "${MAX_NUM_SEQS}" \
   --max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS}" \
   --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION}" \
-  --limit-mm-per-prompt image=10 \
   --trust-remote-code
