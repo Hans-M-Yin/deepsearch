@@ -81,6 +81,11 @@ def create_prompt(
     return f"{instruction}\n```html\n{html}\n```"
 
 
+def strip_outer_markdown_fence(text: str) -> str:
+    match = re.fullmatch(r"\s*```(?:markdown|md)?\s*\n(.*?)\n```\s*", text, flags=re.DOTALL | re.IGNORECASE)
+    return match.group(1).strip() if match else text.strip()
+
+
 async def fetch_html(client: httpx.AsyncClient, url: str) -> str:
     response = await client.get(
         f"{RAW_READER_URL.rstrip('/')}/{url}",
@@ -115,7 +120,7 @@ async def convert_html_to_markdown(client: httpx.AsyncClient, html: str) -> str:
     )
     response.raise_for_status()
     data: dict[str, Any] = response.json()
-    return data["choices"][0]["message"]["content"].strip()
+    return strip_outer_markdown_fence(data["choices"][0]["message"]["content"])
 
 
 @app.get("/{target_url:path}")
