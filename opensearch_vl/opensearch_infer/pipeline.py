@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 
 
 def _strip_base64_payloads(obj: Any, image_urls: Dict[str, str]) -> Any:
-    """Replace large base64 image blobs with their public URLs."""
+    """Remove image payloads before writing trajectories to JSON."""
 
     if isinstance(obj, np.ndarray):
         return obj.tolist()
@@ -34,35 +34,34 @@ def _strip_base64_payloads(obj: Any, image_urls: Dict[str, str]) -> Any:
         return int(obj)
     if isinstance(obj, np.floating):
         return float(obj)
-    if isinstance(obj, bytes):
-        return f"<bytes: {len(obj)} bytes>"
+    if isinstance(obj, (bytes, bytearray, memoryview)):
+        return f"<image bytes omitted: {len(obj)} bytes>"
     if isinstance(obj, list):
         return [_strip_base64_payloads(item, image_urls) for item in obj]
     if isinstance(obj, dict):
         replacement_url = next(iter(image_urls.values()), None)
         if "source" in obj and isinstance(obj["source"], dict):
             data = obj["source"].get("data", "")
-            if isinstance(data, str) and len(data) > 100 and replacement_url:
-                return {
-                    "type": "image_url",
-                    "image_url": {"url": replacement_url},
-                }
+            if isinstance(data, str) and len(data) > 100:
+                if replacement_url:
+                    return {"type": "image_url", "image_url": {"url": replacement_url}}
+                return {"type": "image", "source": "<image payload omitted>"}
         if "inline_data" in obj and isinstance(obj["inline_data"], dict):
             data = obj["inline_data"].get("data", "")
-            if isinstance(data, str) and len(data) > 100 and replacement_url:
+            if isinstance(data, str) and len(data) > 100:
+                if replacement_url:
+                    return {"type": "image_url", "image_url": {"url": replacement_url}}
                 return {
-                    "type": "image_url",
-                    "image_url": {"url": replacement_url},
+                    "inline_data": {
+                        "mime_type": obj["inline_data"].get("mime_type", "image/*"),
+                        "data": f"<image payload omitted: {len(data)} chars>",
+                    }
                 }
         out: Dict[str, Any] = {}
         for k, v in obj.items():
             if k == "data" and isinstance(v, str) and len(v) > 1000:
                 if any(key in obj for key in ("type", "media_type", "mime_type")):
-                    out[k] = (
-                        replacement_url
-                        if replacement_url
-                        else f"<base64_image_data: {len(v)} chars>"
-                    )
+                    out[k] = f"<image payload omitted: {len(v)} chars>"
                     continue
             out[k] = _strip_base64_payloads(v, image_urls)
         return out
@@ -427,6 +426,6 @@ def process_single_case(
     os.makedirs(output_dir, exist_ok=True)
     out_path = os.path.join(output_dir, f"{case_id}_trajectory.json")
     with open(out_path, "w", encoding="utf-8") as fh:
-        json.dump(serialised, fh, ensure_ascii=False, indent=2)
+        json.dump(serialised, fh, ensure_ascii=False, indent=2, default=str)
     logger.info("Trajectory saved to %s", out_path)
     return trajectory
