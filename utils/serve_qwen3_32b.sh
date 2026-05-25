@@ -5,7 +5,7 @@ set -euo pipefail
 # Set USE_VL=true for Qwen3-VL-32B; set USE_VL=false for text-only Qwen3-32B.
 # Usage:
 #   bash utils/serve_qwen3_32b.sh 2 true
-PORT="${PORT:-6658}"
+PORT=6658
 TENSOR_PARALLEL_SIZE="${1:-${TENSOR_PARALLEL_SIZE:-8}}"
 USE_VL="${2:-${USE_VL:-false}}"
 

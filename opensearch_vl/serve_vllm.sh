@@ -6,7 +6,7 @@ set -euo pipefail
 CHECKPOINT="${CHECKPOINT:-OpenSearch-VL-8B}"
 TP_SIZE="${TP_SIZE:-2}"
 
-PORT="${PORT:-6657}"
+PORT=6657
 HOST="${HOST:-0.0.0.0}"
 DTYPE="${DTYPE:-bfloat16}"
 
