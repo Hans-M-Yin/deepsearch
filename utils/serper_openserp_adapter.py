@@ -28,6 +28,7 @@ OPENSERP_USE_MEGA = os.environ.get("OPENSERP_USE_MEGA", "").lower() in {
     "yes",
 }
 OPENSERP_MEGA_ENGINES = os.environ.get("OPENSERP_MEGA_ENGINES", "google,bing")
+OPENSERP_MAX_REQUEST_LIMIT = int(os.environ.get("OPENSERP_MAX_REQUEST_LIMIT", "5"))
 ADAPTER_TIMEOUT = float(os.environ.get("SERPER_ADAPTER_TIMEOUT", "60"))
 
 SERPER_FALLBACK_API_KEY = os.environ.get("SERPER_FALLBACK_API_KEY", "")
@@ -111,6 +112,13 @@ def _organic_item(item: dict[str, Any], fallback_position: int) -> dict[str, Any
     }
 
 
+def _is_search_result(item: dict[str, Any]) -> bool:
+    item_type = item.get("type")
+    if item_type in {"image", "ad", "advertisement"}:
+        return False
+    return bool(item.get("url") or item.get("link"))
+
+
 def _image_url(item: dict[str, Any]) -> str:
     image = item.get("image")
     if isinstance(image, dict):
@@ -146,7 +154,7 @@ def _image_item(item: dict[str, Any], fallback_position: int) -> dict[str, Any]:
 def _serper_search_response(body: dict[str, Any], data: dict[str, Any]) -> dict[str, Any]:
     organic = []
     for idx, item in enumerate(data.get("results", []) or [], start=1):
-        if item.get("type") not in (None, "organic", "answer"):
+        if not _is_search_result(item):
             continue
         organic.append(_organic_item(item, idx))
 
@@ -203,12 +211,17 @@ def _openserp_endpoint(kind: str) -> str:
     return f"{OPENSERP_BASE.rstrip('/')}/{engine}/{kind}"
 
 
-def _openserp_params(body: dict[str, Any]) -> dict[str, Any]:
-    limit = _limit(body.get("num") or body.get("limit"))
+def _openserp_params(
+    body: dict[str, Any],
+    *,
+    limit_override: int | None = None,
+    start_override: int | None = None,
+) -> dict[str, Any]:
+    limit = limit_override or _limit(body.get("num") or body.get("limit"))
     params: dict[str, Any] = {
         "text": body.get("q") or body.get("query") or "",
         "limit": limit,
-        "start": _start(body, limit),
+        "start": _start(body, limit) if start_override is None else start_override,
     }
 
     lang = _normalize_lang(body.get("hl") or body.get("lang"))
@@ -231,6 +244,23 @@ def _openserp_params(body: dict[str, Any]) -> dict[str, Any]:
     return params
 
 
+def _extract_error_detail(response: httpx.Response) -> str:
+    try:
+        data = response.json()
+    except ValueError:
+        text = response.text.strip()
+        return text[:1000] if text else response.reason_phrase
+
+    if isinstance(data, dict):
+        return (
+            data.get("message")
+            or data.get("detail")
+            or data.get("error")
+            or str(data)
+        )
+    return str(data)
+
+
 async def _post_fallback(url: str, body: dict[str, Any]) -> dict[str, Any]:
     if not SERPER_FALLBACK_API_KEY:
         raise HTTPException(
@@ -246,18 +276,108 @@ async def _post_fallback(url: str, body: dict[str, Any]) -> dict[str, Any]:
             },
             json=body,
         )
-    response.raise_for_status()
-    return response.json()
+    try:
+        response.raise_for_status()
+        return response.json()
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(
+            status_code=exc.response.status_code,
+            detail=f"Serper fallback error: {_extract_error_detail(exc.response)}",
+        ) from exc
+    except httpx.TimeoutException as exc:
+        raise HTTPException(status_code=504, detail=f"Serper fallback timed out: {exc}") from exc
+    except httpx.RequestError as exc:
+        raise HTTPException(status_code=502, detail=f"Serper fallback request error: {exc}") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=502, detail=f"Serper fallback returned invalid JSON: {exc}") from exc
 
 
-async def _request_openserp(kind: str, body: dict[str, Any]) -> dict[str, Any]:
-    async with httpx.AsyncClient(timeout=ADAPTER_TIMEOUT) as client:
-        response = await client.get(_openserp_endpoint(kind), params=_openserp_params(body))
-    response.raise_for_status()
-    data = response.json()
+async def _request_openserp_once(
+    client: httpx.AsyncClient,
+    kind: str,
+    body: dict[str, Any],
+    *,
+    limit: int,
+    start: int,
+) -> dict[str, Any]:
+    response = await client.get(
+        _openserp_endpoint(kind),
+        params=_openserp_params(body, limit_override=limit, start_override=start),
+    )
+    try:
+        response.raise_for_status()
+        data = response.json()
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(
+            status_code=exc.response.status_code,
+            detail=f"OpenSERP upstream error: {_extract_error_detail(exc.response)}",
+        ) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=502, detail=f"OpenSERP returned invalid JSON: {exc}") from exc
+
     if not isinstance(data, dict):
         raise HTTPException(status_code=502, detail="OpenSERP returned a non-object response.")
     return data
+
+
+async def _request_openserp(kind: str, body: dict[str, Any]) -> dict[str, Any]:
+    requested_limit = _limit(body.get("num") or body.get("limit"))
+    max_request_limit = max(1, min(OPENSERP_MAX_REQUEST_LIMIT, requested_limit))
+    start = _start(body, requested_limit)
+
+    async with httpx.AsyncClient(timeout=ADAPTER_TIMEOUT) as client:
+        collected: list[dict[str, Any]] = []
+        envelope: dict[str, Any] | None = None
+        offset = start
+        remaining = requested_limit
+
+        while remaining > 0:
+            chunk_limit = min(max_request_limit, remaining)
+            try:
+                data = await _request_openserp_once(
+                    client,
+                    kind,
+                    body,
+                    limit=chunk_limit,
+                    start=offset,
+                )
+            except HTTPException:
+                if collected:
+                    break
+                raise
+            except httpx.TimeoutException as exc:
+                if collected:
+                    break
+                raise HTTPException(status_code=504, detail=f"OpenSERP timed out: {exc}") from exc
+            except httpx.RequestError as exc:
+                if collected:
+                    break
+                raise HTTPException(status_code=502, detail=f"OpenSERP request error: {exc}") from exc
+
+            if envelope is None:
+                envelope = data
+            chunk_results = data.get("results", []) or []
+            if not chunk_results:
+                break
+            collected.extend(item for item in chunk_results if isinstance(item, dict))
+            if len(chunk_results) < chunk_limit:
+                break
+            offset += chunk_limit
+            remaining -= chunk_limit
+
+    if envelope is None:
+        raise HTTPException(status_code=502, detail="OpenSERP returned no response envelope.")
+
+    seen_urls: set[str] = set()
+    deduped = []
+    for item in collected:
+        key = item.get("url") or item.get("link") or item.get("id") or str(item)
+        if key in seen_urls:
+            continue
+        seen_urls.add(key)
+        deduped.append(item)
+    envelope["results"] = deduped
+    return envelope
 
 
 async def _json_body(request: Request) -> dict[str, Any]:

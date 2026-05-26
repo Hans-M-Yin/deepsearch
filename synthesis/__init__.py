@@ -29,7 +29,9 @@ from .evidence import (
 )
 from .store import JsonlGraphStore
 from .model_worker import (
+    LLM_WORKER,
     ModelMessage,
+    ModelRouterWorkerClient,
     OpenAIModelWorkerClient,
     ModelRequest,
     ModelResponse,
@@ -75,7 +77,9 @@ __all__ = [
     "SearchEngine",
     "SearchSnapshot",
     "JsonlGraphStore",
+    "LLM_WORKER",
     "ModelMessage",
+    "ModelRouterWorkerClient",
     "OpenAIModelWorkerClient",
     "ModelRequest",
     "ModelResponse",

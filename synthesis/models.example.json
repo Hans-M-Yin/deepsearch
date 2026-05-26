@@ -1,0 +1,16 @@
+{
+  "models": {
+    "target_planner": {
+      "served_model": "Qwen3-VL-32B",
+      "base_url": "http://127.0.0.1:8000/v1",
+      "api_key": "EMPTY",
+      "timeout_s": 120
+    },
+    "image_validator": {
+      "served_model": "Qwen3-VL-235B",
+      "base_url": "http://127.0.0.1:8001/v1",
+      "api_key": "EMPTY",
+      "timeout_s": 180
+    }
+  }
+}

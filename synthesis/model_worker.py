@@ -11,6 +11,7 @@ from dataclasses import asdict, dataclass, field
 from enum import Enum
 import json
 import os
+from pathlib import Path
 from typing import Any, Protocol
 
 
@@ -145,3 +146,116 @@ class OpenAIModelWorkerClient:
         if not isinstance(parsed, dict):
             raise ValueError("Model JSON response must be an object.")
         return parsed
+
+
+class ModelRouterWorkerClient:
+    """Config-driven router for OpenAI-compatible model endpoints."""
+
+    def __init__(self, config_path: str | Path | None = None) -> None:
+        self.config_path = Path(config_path) if config_path else None
+        self._configs: dict[str, dict[str, Any]] = {}
+        self._clients: dict[str, OpenAIModelWorkerClient] = {}
+        if self.config_path is not None and self.config_path.exists():
+            self.load_config(self.config_path)
+
+    @classmethod
+    def from_env(cls) -> "ModelRouterWorkerClient":
+        config_path = os.environ.get("SYNTHESIS_MODEL_CONFIG")
+        if config_path:
+            return cls(config_path)
+        default_path = Path(__file__).with_name("models.json")
+        return cls(default_path if default_path.exists() else None)
+
+    def load_config(self, config_path: str | Path | None = None) -> None:
+        if config_path is not None:
+            self.config_path = Path(config_path)
+        if self.config_path is None:
+            raise ValueError("No model config path is set.")
+
+        with self.config_path.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        models = payload.get("models", payload)
+        if not isinstance(models, dict):
+            raise ValueError("Model config must contain an object at key 'models'.")
+
+        normalized: dict[str, dict[str, Any]] = {}
+        for alias, config in models.items():
+            if not isinstance(config, dict):
+                raise ValueError(f"Model config for {alias!r} must be an object.")
+            if not config.get("served_model"):
+                raise ValueError(f"Model config for {alias!r} is missing 'served_model'.")
+            normalized[alias] = dict(config)
+
+        self._configs = normalized
+        self._clients.clear()
+
+    def reload(self) -> None:
+        self.load_config(self.config_path)
+
+    def get_model(self, alias: str) -> dict[str, Any] | None:
+        config = self._configs.get(alias)
+        return dict(config) if config is not None else None
+
+    def list_models(self) -> dict[str, dict[str, Any]]:
+        return {alias: dict(config) for alias, config in self._configs.items()}
+
+    def clear(self) -> None:
+        self._configs.clear()
+        self._clients.clear()
+
+    def generate(self, request: ModelRequest) -> ModelResponse:
+        alias = request.model
+        if not alias:
+            if len(self._configs) == 1:
+                alias = next(iter(self._configs))
+            else:
+                raise ValueError("ModelRequest.model must be a registered alias.")
+
+        config = self._configs.get(alias)
+        if config is None:
+            raise KeyError(f"Model alias is not registered: {alias}")
+
+        client = self._client_for(alias, config)
+        routed_request = ModelRequest(
+            messages=request.messages,
+            model=config["served_model"],
+            temperature=request.temperature,
+            max_tokens=request.max_tokens,
+            response_format=request.response_format,
+            metadata=request.metadata,
+        )
+        response = client.generate(routed_request)
+        response.metadata.update(
+            {
+                "model_alias": alias,
+                "served_model": config["served_model"],
+                "base_url": config.get("base_url"),
+            }
+        )
+        return response
+
+    def generate_json(self, request: ModelRequest) -> dict[str, Any]:
+        response = self.generate(request)
+        try:
+            parsed = json.loads(response.content)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Model response is not valid JSON: {response.content[:500]}") from exc
+        if not isinstance(parsed, dict):
+            raise ValueError("Model JSON response must be an object.")
+        return parsed
+
+    def _client_for(self, alias: str, config: dict[str, Any]) -> OpenAIModelWorkerClient:
+        client = self._clients.get(alias)
+        if client is None:
+            client = OpenAIModelWorkerClient(
+                model=config["served_model"],
+                api_key=config.get("api_key"),
+                base_url=config.get("base_url"),
+                timeout_s=config.get("timeout_s"),
+                default_headers=config.get("default_headers"),
+            )
+            self._clients[alias] = client
+        return client
+
+
+LLM_WORKER = ModelRouterWorkerClient.from_env()
