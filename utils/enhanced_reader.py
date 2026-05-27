@@ -11,10 +11,13 @@ cleaned HTML to an OpenAI-compatible ReaderLM-v2 endpoint and returns Markdown.
 from __future__ import annotations
 
 import asyncio
+from html import escape
+from html.parser import HTMLParser
 import os
 import re
 import time
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 from fastapi import FastAPI, Request, Response
@@ -47,12 +50,195 @@ A_OPEN_PATTERN = r"<a\b[^>]*>"
 A_CLOSE_PATTERN = r"</a\s*>"
 URL_ATTR_PATTERN = r"""\s(?:href|src|srcset|data-src|data-original|poster|action)=("[^"]*"|'[^']*'|[^\s>]+)"""
 BARE_URL_PATTERN = r"https?://[^\s<>'\"]+"
+WIKI_MAIN_CLASSES = ("mw-parser-output",)
+WIKI_MAIN_IDS = ("mw-content-text",)
+WIKI_DROP_CLASS_TOKENS = (
+    "ambox",
+    "authority-control",
+    "catlinks",
+    "metadata",
+    "mwe-math-fallback-image-inline",
+    "mw-editsection",
+    "navbox",
+    "navbox-styles",
+    "noprint",
+    "printfooter",
+    "reference",
+    "references",
+    "refbegin",
+    "refend",
+    "reflist",
+    "mw-references-wrap",
+    "sistersitebox",
+    "vertical-navbox",
+)
+WIKI_DROP_IDS = {
+    "References",
+    "Notes",
+    "Footnotes",
+    "Citations",
+    "Notes_and_references",
+    "References_and_notes",
+    "External_links",
+    "Further_reading",
+    "Bibliography",
+    "Sources",
+    "See_also",
+    "Authority_control",
+}
+WIKI_VOID_TAGS = {
+    "area",
+    "base",
+    "br",
+    "col",
+    "embed",
+    "hr",
+    "img",
+    "input",
+    "link",
+    "meta",
+    "source",
+    "track",
+    "wbr",
+}
 
 
 def normalize_url(target_url: str) -> str:
     if target_url.startswith(("http://", "https://")):
         return target_url
     return "https://" + target_url
+
+
+def is_wikipedia_url(url: str | None) -> bool:
+    if not url:
+        return False
+    return urlparse(url).netloc.endswith("wikipedia.org")
+
+
+class WikipediaMainHTMLExtractor(HTMLParser):
+    """Extract Wikipedia article content without page chrome or reference blocks."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=False)
+        self.parts: list[str] = []
+        self.capture_depth: int | None = None
+        self.drop_depth = 0
+        self.found_main = False
+        self.stop_capture = False
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        attrs_dict = {key.lower(): value or "" for key, value in attrs}
+        tag_lower = tag.lower()
+
+        if self.drop_depth:
+            if tag_lower not in WIKI_VOID_TAGS:
+                self.drop_depth += 1
+            return
+
+        if self.capture_depth is None:
+            if self._is_main_container(attrs_dict):
+                self.capture_depth = 1
+                self.found_main = True
+                self._append_starttag(tag_lower, attrs)
+            return
+
+        if self.stop_capture:
+            return
+
+        if attrs_dict.get("id") in WIKI_DROP_IDS:
+            self.stop_capture = True
+            return
+        if self._should_stop_at_heading(tag_lower, attrs_dict):
+            self.stop_capture = True
+            return
+        if self._should_drop_element(attrs_dict):
+            if tag_lower not in WIKI_VOID_TAGS:
+                self.drop_depth = 1
+            return
+
+        self._append_starttag(tag_lower, attrs)
+        if tag_lower not in WIKI_VOID_TAGS:
+            self.capture_depth += 1
+
+    def handle_endtag(self, tag: str) -> None:
+        tag_lower = tag.lower()
+        if self.drop_depth:
+            if tag_lower not in WIKI_VOID_TAGS:
+                self.drop_depth -= 1
+            return
+        if self.capture_depth is None or self.stop_capture:
+            return
+        self.parts.append(f"</{tag_lower}>")
+        if tag_lower not in WIKI_VOID_TAGS:
+            self.capture_depth -= 1
+            if self.capture_depth <= 0:
+                self.capture_depth = None
+
+    def handle_data(self, data: str) -> None:
+        if self.capture_depth is not None and not self.drop_depth and not self.stop_capture:
+            self.parts.append(data)
+
+    def handle_entityref(self, name: str) -> None:
+        if self.capture_depth is not None and not self.drop_depth and not self.stop_capture:
+            self.parts.append(f"&{name};")
+
+    def handle_charref(self, name: str) -> None:
+        if self.capture_depth is not None and not self.drop_depth and not self.stop_capture:
+            self.parts.append(f"&#{name};")
+
+    def result(self) -> str:
+        return "".join(self.parts).strip()
+
+    @staticmethod
+    def _class_tokens(attrs_dict: dict[str, str]) -> set[str]:
+        return set(re.split(r"\s+", attrs_dict.get("class", "").strip())) if attrs_dict.get("class") else set()
+
+    def _is_main_container(self, attrs_dict: dict[str, str]) -> bool:
+        if attrs_dict.get("id") in WIKI_MAIN_IDS:
+            return True
+        classes = self._class_tokens(attrs_dict)
+        return any(class_name in classes for class_name in WIKI_MAIN_CLASSES)
+
+    def _should_drop_element(self, attrs_dict: dict[str, str]) -> bool:
+        if attrs_dict.get("id") in WIKI_DROP_IDS:
+            return True
+        classes = self._class_tokens(attrs_dict)
+        return any(token in classes for token in WIKI_DROP_CLASS_TOKENS)
+
+    @staticmethod
+    def _should_stop_at_heading(tag: str, attrs_dict: dict[str, str]) -> bool:
+        if tag not in {"h2", "h3"}:
+            return False
+        heading_id = attrs_dict.get("id", "")
+        return heading_id in WIKI_DROP_IDS or heading_id.replace(" ", "_") in WIKI_DROP_IDS
+
+    @staticmethod
+    def _append_attrs(attrs: list[tuple[str, str | None]]) -> str:
+        safe_attrs = []
+        for key, value in attrs:
+            if value is None:
+                safe_attrs.append(escape(key, quote=True))
+            else:
+                safe_attrs.append(f'{escape(key, quote=True)}="{escape(value, quote=True)}"')
+        return (" " + " ".join(safe_attrs)) if safe_attrs else ""
+
+    def _append_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag in WIKI_VOID_TAGS:
+            self.parts.append(f"<{tag}{self._append_attrs(attrs)}>")
+        else:
+            self.parts.append(f"<{tag}{self._append_attrs(attrs)}>")
+
+
+def extract_wikipedia_main_html(html: str) -> tuple[str, bool]:
+    extractor = WikipediaMainHTMLExtractor()
+    try:
+        extractor.feed(html)
+        extracted = extractor.result()
+    except Exception:
+        return html, False
+    if not extractor.found_main or len(extracted) < 500:
+        return html, False
+    return extracted, True
 
 
 def replace_svg(html: str, new_content: str = "this is a placeholder") -> str:
@@ -96,8 +282,25 @@ def strip_url_noise(html: str) -> str:
     return re.sub(BARE_URL_PATTERN, "", html, flags=re.IGNORECASE)
 
 
-def clean_html(html: str, clean_svg: bool = True, clean_base64: bool = True) -> str:
+def clean_html(
+    html: str,
+    *,
+    source_url: str | None = None,
+    debug_timing: dict[str, Any] | None = None,
+    clean_svg: bool = True,
+    clean_base64: bool = True,
+) -> str:
     """Pre-clean HTML following the ReaderLM-v2 model-card guidance."""
+
+    if is_wikipedia_url(source_url):
+        before_chars = len(html)
+        html, extracted = extract_wikipedia_main_html(html)
+        if debug_timing is not None:
+            debug_timing["wiki_main_extracted"] = extracted
+            debug_timing["wiki_html_chars_before_main_extract"] = before_chars
+            debug_timing["wiki_html_chars_after_main_extract"] = len(html)
+    elif debug_timing is not None:
+        debug_timing["wiki_main_extracted"] = False
 
     html = re.sub(SCRIPT_PATTERN, "", html, flags=re.IGNORECASE | re.MULTILINE | re.DOTALL)
     html = re.sub(STYLE_PATTERN, "", html, flags=re.IGNORECASE | re.MULTILINE | re.DOTALL)
@@ -183,10 +386,11 @@ async def convert_html_to_markdown(
     client: httpx.AsyncClient,
     html: str,
     *,
+    source_url: str | None = None,
     debug_timing: dict[str, Any] | None = None,
 ) -> str:
     started = time.perf_counter()
-    cleaned_html = clean_html(html)
+    cleaned_html = clean_html(html, source_url=source_url, debug_timing=debug_timing)
     if debug_timing is not None:
         debug_timing["clean_html_s"] = time.perf_counter() - started
         debug_timing["raw_html_chars"] = len(html)
@@ -247,7 +451,7 @@ async def read(target_url: str, request: Request):
             debug_timing["fetch_markdown_html_parallel_s"] = fetch_done - fetch_started
             html = html_response
             readerlm_started = time.perf_counter()
-            markdown = await convert_html_to_markdown(client, html, debug_timing=debug_timing)
+            markdown = await convert_html_to_markdown(client, html, source_url=url, debug_timing=debug_timing)
             debug_timing["readerlm_s"] = time.perf_counter() - readerlm_started
         except Exception as exc:
             debug_timing["total_s"] = time.perf_counter() - total_started
