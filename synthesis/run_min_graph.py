@@ -67,7 +67,7 @@ def check_reader_service(
     base_url: str,
     *,
     test_url: str,
-    timeout_s: float = 20.0,
+    timeout_s: float = 60.0,
 ) -> tuple[bool, str]:
     """Check that the Enhanced Reader can read an actual target URL."""
 
@@ -103,6 +103,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed-url", default=DEFAULT_SEED_URL, help="Seed Wikipedia URL.")
     parser.add_argument("--store-dir", default=str(DEFAULT_STORE_DIR), help="Output JSONL graph store directory.")
     parser.add_argument("--reader-base-url", default="http://127.0.0.1:8004", help="Enhanced Reader base URL.")
+    parser.add_argument("--reader-check-timeout", type=float, default=60.0, help="Enhanced Reader preflight timeout in seconds.")
     parser.add_argument("--skip-reader-check", action="store_true", help="Skip preflight reader reachability check.")
     parser.add_argument("--max-steps", type=int, default=5, help="Maximum text pages to expand.")
     parser.add_argument("--max-nodes", type=int, default=10, help="Stop after this many graph nodes.")
@@ -142,7 +143,11 @@ def main(argv: list[str] | None = None) -> int:
     from synthesis.wiki_text_builder import EnhancedReaderClient, WikiTextBuilder
 
     if not args.skip_reader_check:
-        ok, message = check_reader_service(args.reader_base_url, test_url=args.seed_url)
+        ok, message = check_reader_service(
+            args.reader_base_url,
+            test_url=args.seed_url,
+            timeout_s=args.reader_check_timeout,
+        )
         if not ok:
             print(f"[preflight] Enhanced Reader is unavailable at {args.reader_base_url}: {message}", file=sys.stderr)
             print("[preflight] Start the reader stack or rerun with --skip-reader-check.", file=sys.stderr)
