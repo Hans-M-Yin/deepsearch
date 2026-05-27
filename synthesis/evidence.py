@@ -54,7 +54,10 @@ class AssetType(str, Enum):
 class SearchEngine(str, Enum):
     SERPER_TEXT = "serper_text"
     SERPER_IMAGE = "serper_image"
+    SERPAPI_TEXT = "serpapi_text"
+    SERPAPI_IMAGE = "serpapi_image"
     JINA_READER = "jina_reader"
+    WIKIMEDIA_COMMONS = "wikimedia_commons"
     WIKIDATA = "wikidata"
     WIKIPEDIA = "wikipedia"
     LOCAL_INDEX = "local_index"
@@ -246,3 +249,33 @@ class SearchSnapshot:
             metadata=metadata or {},
             status=status,
         )
+
+
+def _smoke_test() -> None:
+    asset = Asset.create(
+        AssetType.IMAGE_ORIGINAL,
+        "https://example.com/image.jpg",
+        content_type="image/jpeg",
+    )
+    evidence = Evidence.create(
+        EvidenceType.IMAGE,
+        content="Example image evidence",
+        asset_ids=[asset.asset_id],
+        url=asset.uri,
+    )
+    snapshot = SearchSnapshot.create(
+        SearchEngine.WIKIMEDIA_COMMONS,
+        query="Example",
+        request={"limit": 1},
+        result_count=1,
+        status_code=200,
+    )
+    assert asset.to_dict()["asset_type"] == "image_original"
+    assert evidence.asset_ids == [asset.asset_id]
+    assert snapshot.to_dict()["engine"] == "wikimedia_commons"
+    assert SearchSnapshot.make_id(SearchEngine.WIKIMEDIA_COMMONS, "Example", {"limit": 1}) == snapshot.snapshot_id
+    print("evidence smoke test passed")
+
+
+if __name__ == "__main__":
+    _smoke_test()

@@ -193,3 +193,25 @@ def allowed_edge_types(src_node_type: str, dst_node_type: str) -> set[EdgeType]:
         },
     }
     return mapping.get(pair, {EdgeType.DERIVED})
+
+
+def _smoke_test() -> None:
+    edge = Edge.create(
+        "text_a",
+        "image_b",
+        edge_type=EdgeType.SEARCH_RETRIEVED,
+        relation="retrieved_image_for_visual_target",
+        src_node_type="text",
+        dst_node_type="image",
+        evidence_refs=[EvidenceRef(evidence_id="evidence_1", quote="query hit")],
+    )
+    record = edge.to_dict()
+    assert record["edge_type"] == "search_retrieved"
+    assert record["evidence_refs"][0]["evidence_id"] == "evidence_1"
+    assert EdgeType.SEARCH_RETRIEVED in allowed_edge_types("text", "image")
+    assert allowed_edge_types("unknown", "unknown") == {EdgeType.DERIVED}
+    print("edges smoke test passed")
+
+
+if __name__ == "__main__":
+    _smoke_test()

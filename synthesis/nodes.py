@@ -247,3 +247,34 @@ class RegionNode(Node):
                 builder="image_grounding_builder",
             ),
         )
+
+
+def _smoke_test() -> None:
+    text = TextNode.from_wiki_entity(
+        "Q123",
+        "Example Entity",
+        description="An entity used for a node smoke test.",
+        aliases=["Example"],
+        attributes={"type": "test"},
+    )
+    image = ImageNode.from_url(
+        "https://example.com/image.jpg",
+        source_page_url="https://example.com/page",
+        caption="Example image",
+    )
+    region = RegionNode.from_bbox(
+        image.node_id,
+        (0.1, 0.2, 0.3, 0.4),
+        caption="Example region",
+    )
+
+    assert text.to_dict()["node_type"] == "text"
+    assert text.canonical_id == "wikidata:Q123"
+    assert image.to_dict()["node_type"] == "image"
+    assert region.parent_image_id == image.node_id
+    assert TextNode.make_id("wiki_entity", "Q123") == text.node_id
+    print("nodes smoke test passed")
+
+
+if __name__ == "__main__":
+    _smoke_test()

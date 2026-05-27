@@ -5,7 +5,12 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import sys
 from typing import Any, Callable, Iterable
+
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    __package__ = "synthesis"
 
 from .edges import Edge
 from .evidence import Asset, Evidence, SearchSnapshot
@@ -173,3 +178,31 @@ class JsonlGraphStore:
                 json.dump(records[record_id], handle, ensure_ascii=False, sort_keys=True)
                 handle.write("\n")
         os.replace(tmp_path, path)
+
+
+def _smoke_test() -> None:
+    import tempfile
+
+    from .edges import Edge, EdgeType
+    from .evidence import Evidence, EvidenceType
+    from .nodes import TextNode
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = JsonlGraphStore(tmpdir)
+        node = TextNode.from_webpage("https://example.com/a", title="A")
+        evidence = Evidence.create(EvidenceType.WEB_TEXT, content="hello", node_ids=[node.node_id])
+        edge = Edge.create(node.node_id, node.node_id, edge_type=EdgeType.DERIVED, relation="self")
+        store.upsert_node(node)
+        store.upsert_evidence(evidence)
+        store.upsert_edge(edge)
+        store.flush()
+
+        reloaded = JsonlGraphStore(tmpdir)
+        assert reloaded.get_node(node.node_id)["title"] == "A"
+        assert reloaded.get_evidence(evidence.evidence_id)["content"] == "hello"
+        assert reloaded.stats()["edges"] == 1
+    print("store smoke test passed")
+
+
+if __name__ == "__main__":
+    _smoke_test()

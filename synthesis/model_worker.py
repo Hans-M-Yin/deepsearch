@@ -12,6 +12,7 @@ from enum import Enum
 import json
 import os
 from pathlib import Path
+import tempfile
 from typing import Any, Protocol
 
 
@@ -28,7 +29,7 @@ def _jsonify(value: Any) -> Any:
 @dataclass(slots=True)
 class ModelMessage:
     role: str
-    content: str
+    content: Any
 
     def to_dict(self) -> dict[str, Any]:
         return _jsonify(asdict(self))
@@ -259,3 +260,37 @@ class ModelRouterWorkerClient:
 
 
 LLM_WORKER = ModelRouterWorkerClient.from_env()
+
+
+def _smoke_test() -> None:
+    request = ModelRequest(
+        model="text_process",
+        messages=[ModelMessage(role="user", content="hello")],
+        temperature=0.0,
+    )
+    assert request.to_dict()["messages"][0]["content"] == "hello"
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        config_path = Path(tmpdir) / "models.json"
+        config_path.write_text(
+            json.dumps(
+                {
+                    "models": {
+                        "text_process": {
+                            "served_model": "dummy-model",
+                            "base_url": "http://127.0.0.1:8000/v1",
+                            "api_key": "EMPTY",
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        router = ModelRouterWorkerClient(config_path)
+        assert router.get_model("text_process")["served_model"] == "dummy-model"
+        assert "text_process" in router.list_models()
+    print("model_worker smoke test passed")
+
+
+if __name__ == "__main__":
+    _smoke_test()

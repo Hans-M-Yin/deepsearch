@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import re
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 from typing import Any, Protocol
@@ -337,6 +339,341 @@ class SerperAdapterSearchClient:
         return json.loads(response_payload)
 
 
+class SerpApiSearchClient:
+    """Client for SerpApi-compatible Google Search and Google Images APIs.
+
+    It supports both the public SerpApi endpoint and ByteDance's AIDP SERP
+    proxy. The public endpoint uses `api_key`; the AIDP proxy uses `ak`.
+    """
+
+    def __init__(
+        self,
+        *,
+        api_key: str | None = None,
+        base_url: str | None = None,
+        auth_param: str | None = None,
+        timeout_s: float = 60.0,
+        text_engine: str = "google",
+        image_engine: str = "google_images",
+    ) -> None:
+        self.base_url = base_url or os.environ.get("SERPAPI_BASE_URL") or "https://serpapi.com/search.json"
+        self.auth_param = auth_param or os.environ.get("SERPAPI_AUTH_PARAM") or self._default_auth_param(self.base_url)
+        self.api_key = (
+            api_key
+            or os.environ.get("SERPAPI_AK")
+            or os.environ.get("AIDP_SERP_AK")
+            or os.environ.get("SERPAPI_API_KEY")
+            or os.environ.get("SERP_API_KEY")
+        )
+        self.timeout_s = timeout_s
+        self.text_engine = text_engine
+        self.image_engine = image_engine
+
+    def search_text(self, query: str, *, limit: int = 10, **kwargs: Any) -> SearchResponse:
+        raw, status_code = self._get_json(
+            self._serpapi_params(query, limit, kwargs, engine=self.text_engine)
+        )
+        return SearchResponse(
+            query=query,
+            engine=f"serpapi:{self.text_engine}",
+            results=self._parse_text_results(raw),
+            raw_response=raw,
+            status_code=status_code,
+        )
+
+    def search_image(self, query: str, *, limit: int = 10, **kwargs: Any) -> SearchResponse:
+        raw, status_code = self._get_json(
+            self._serpapi_params(query, limit, kwargs, engine=self.image_engine)
+        )
+        return SearchResponse(
+            query=query,
+            engine=f"serpapi:{self.image_engine}",
+            results=self._parse_image_results(raw),
+            raw_response=raw,
+            status_code=status_code,
+        )
+
+    def _serpapi_params(
+        self,
+        query: str,
+        limit: int,
+        params: dict[str, Any],
+        *,
+        engine: str,
+    ) -> dict[str, Any]:
+        if not self.api_key:
+            raise ValueError(
+                "SerpApi credential is required. Set SERPAPI_AK/AIDP_SERP_AK for the "
+                "AIDP proxy, or SERPAPI_API_KEY for public SerpApi."
+            )
+
+        request_params: dict[str, Any] = {
+            "engine": engine,
+            "q": query,
+            self.auth_param: self.api_key,
+            "num": max(1, min(int(limit), 100)),
+        }
+        self._apply_default_params(request_params)
+        for key in (
+            "hl",
+            "gl",
+            "location",
+            "google_domain",
+            "safe",
+            "device",
+            "tbs",
+            "tbm",
+            "ijn",
+            "start",
+        ):
+            if params.get(key) is not None:
+                request_params[key] = params[key]
+
+        if params.get("lang") is not None and "hl" not in request_params:
+            request_params["hl"] = params["lang"]
+        if params.get("region") is not None and "gl" not in request_params:
+            request_params["gl"] = params["region"]
+        if params.get("page") is not None:
+            page = self._int_or_default(params["page"], 1)
+            if engine == self.image_engine and "ijn" not in request_params:
+                request_params["ijn"] = max(0, page - 1)
+            elif "start" not in request_params:
+                request_params["start"] = max(0, page - 1) * max(1, int(limit))
+        return request_params
+
+    @staticmethod
+    def _default_auth_param(base_url: str) -> str:
+        if "aidp-i18ntt" in base_url:
+            return "ak"
+        return "api_key"
+
+    @staticmethod
+    def _apply_default_params(request_params: dict[str, Any]) -> None:
+        defaults = {
+            "location": os.environ.get("SERPAPI_LOCATION"),
+            "google_domain": os.environ.get("SERPAPI_GOOGLE_DOMAIN"),
+            "hl": os.environ.get("SERPAPI_HL"),
+            "gl": os.environ.get("SERPAPI_GL"),
+        }
+        for key, value in defaults.items():
+            if value and request_params.get(key) is None:
+                request_params[key] = value
+
+    def _get_json(self, params: dict[str, Any]) -> tuple[dict[str, Any], int]:
+        url = f"{self.base_url}?{urlencode(params, doseq=True)}"
+        request = Request(url, headers={"Accept": "application/json"})
+        with urlopen(request, timeout=self.timeout_s) as response:
+            payload = response.read().decode("utf-8")
+            status_code = response.getcode()
+        return json.loads(payload), status_code
+
+    @staticmethod
+    def _parse_text_results(raw: dict[str, Any]) -> list[TextSearchResult]:
+        results: list[TextSearchResult] = []
+        organic = raw.get("organic_results") or []
+        if not isinstance(organic, list):
+            return results
+        for rank, item in enumerate(organic, start=1):
+            if not isinstance(item, dict):
+                continue
+            results.append(
+                TextSearchResult(
+                    title=item.get("title"),
+                    url=item.get("link") or item.get("redirect_link"),
+                    snippet=item.get("snippet") or item.get("snippet_highlighted_words"),
+                    source=item.get("source") or item.get("displayed_link"),
+                    rank=SerpApiSearchClient._position(item, rank),
+                    raw=item,
+                )
+            )
+        return results
+
+    @staticmethod
+    def _parse_image_results(raw: dict[str, Any]) -> list[ImageSearchResult]:
+        results: list[ImageSearchResult] = []
+        images = raw.get("images_results") or []
+        if not isinstance(images, list):
+            return results
+        for rank, item in enumerate(images, start=1):
+            if not isinstance(item, dict):
+                continue
+            results.append(
+                ImageSearchResult(
+                    title=item.get("title"),
+                    image_url=item.get("original") or item.get("image") or item.get("link"),
+                    source_page_url=item.get("link") or item.get("source_link"),
+                    thumbnail_url=item.get("thumbnail"),
+                    snippet=item.get("snippet"),
+                    source=item.get("source"),
+                    width=item.get("original_width") or item.get("width"),
+                    height=item.get("original_height") or item.get("height"),
+                    rank=SerpApiSearchClient._position(item, rank),
+                    raw=item,
+                )
+            )
+        return results
+
+    @staticmethod
+    def _position(item: dict[str, Any], fallback: int) -> int:
+        return SerpApiSearchClient._int_or_default(
+            item.get("position") or item.get("block_position"),
+            fallback,
+        )
+
+    @staticmethod
+    def _int_or_default(value: Any, default: int) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+
+class CommonsImageSearchClient:
+    """Image search client backed by Wikimedia Commons.
+
+    It uses the structured MediaWiki API instead of scraping Special:MediaSearch
+    pages. This is more stable while returning the same core information needed
+    by the graph pipeline: file title, original image URL, thumbnail URL, and
+    Commons file page URL.
+    """
+
+    def __init__(
+        self,
+        *,
+        api_url: str = "https://commons.wikimedia.org/w/api.php",
+        timeout_s: float = 30.0,
+        thumb_width: int = 320,
+    ) -> None:
+        self.api_url = api_url
+        self.timeout_s = timeout_s
+        self.thumb_width = thumb_width
+
+    def search_text(self, query: str, *, limit: int = 10, **kwargs: Any) -> SearchResponse:
+        del kwargs
+        return SearchResponse(
+            query=query,
+            engine="commons:text_unsupported",
+            results=[],
+            metadata={"reason": "Wikimedia Commons client only supports image search."},
+        )
+
+    def search_image(self, query: str, *, limit: int = 10, **kwargs: Any) -> SearchResponse:
+        request_params = {
+            "action": "query",
+            "format": "json",
+            "generator": "search",
+            "gsrsearch": query,
+            "gsrnamespace": 6,
+            "gsrlimit": max(1, min(int(limit), 50)),
+            "prop": "info|imageinfo",
+            "inprop": "url",
+            "iiprop": "url|mime|size|extmetadata",
+            "iiurlwidth": kwargs.get("thumb_width", self.thumb_width),
+        }
+        url = f"{self.api_url}?{urlencode(request_params, doseq=True)}"
+        request = Request(
+            url,
+            headers={
+                "Accept": "application/json",
+                "User-Agent": "deepsearch-synthesis/0.1",
+            },
+        )
+        with urlopen(request, timeout=self.timeout_s) as response:
+            payload = response.read().decode("utf-8")
+        raw = json.loads(payload)
+        return SearchResponse(
+            query=query,
+            engine="commons:image",
+            results=self._parse_commons_results(raw),
+            raw_response=raw,
+            status_code=200,
+        )
+
+    @classmethod
+    def _parse_commons_results(cls, raw: dict[str, Any]) -> list[ImageSearchResult]:
+        pages = raw.get("query", {}).get("pages", {})
+        if not isinstance(pages, dict):
+            return []
+
+        results: list[ImageSearchResult] = []
+        sorted_pages = sorted(
+            pages.values(),
+            key=lambda page: page.get("index", page.get("pageid", 0)),
+        )
+        for rank, page in enumerate(sorted_pages, start=1):
+            imageinfo = page.get("imageinfo") or []
+            info = imageinfo[0] if imageinfo else {}
+            extmetadata = info.get("extmetadata") or {}
+            title = page.get("title")
+            results.append(
+                ImageSearchResult(
+                    title=title,
+                    image_url=info.get("url"),
+                    source_page_url=page.get("fullurl") or cls._commons_file_url(title),
+                    thumbnail_url=info.get("thumburl"),
+                    snippet=cls._metadata_text(extmetadata),
+                    source="wikimedia_commons",
+                    width=info.get("width"),
+                    height=info.get("height"),
+                    rank=rank,
+                    raw=page,
+                )
+            )
+        return results
+
+    @staticmethod
+    def _commons_file_url(title: str | None) -> str | None:
+        if not title:
+            return None
+        return "https://commons.wikimedia.org/wiki/" + title.replace(" ", "_")
+
+    @classmethod
+    def _metadata_text(cls, extmetadata: dict[str, Any]) -> str | None:
+        for key in ("ImageDescription", "ObjectName", "Credit", "Artist"):
+            value = extmetadata.get(key, {})
+            if isinstance(value, dict) and value.get("value"):
+                return cls._strip_html(str(value["value"]))
+        return None
+
+    @staticmethod
+    def _strip_html(text: str) -> str:
+        return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", text)).strip()
+
+
+class FallbackImageSearchClient:
+    """Try one image search client first and fall back if too few results appear."""
+
+    def __init__(
+        self,
+        primary: SearchClient,
+        fallback: SearchClient,
+        *,
+        min_primary_results: int = 1,
+    ) -> None:
+        self.primary = primary
+        self.fallback = fallback
+        self.min_primary_results = min_primary_results
+
+    def search_text(self, query: str, *, limit: int = 10, **kwargs: Any) -> SearchResponse:
+        return self.fallback.search_text(query, limit=limit, **kwargs)
+
+    def search_image(self, query: str, *, limit: int = 10, **kwargs: Any) -> SearchResponse:
+        primary_response = self.primary.search_image(query, limit=limit, **kwargs)
+        if len(primary_response.results) >= self.min_primary_results:
+            primary_response.metadata["fallback_used"] = False
+            return primary_response
+
+        fallback_response = self.fallback.search_image(query, limit=limit, **kwargs)
+        fallback_response.metadata.update(
+            {
+                "fallback_used": True,
+                "primary_engine": primary_response.engine,
+                "primary_result_count": len(primary_response.results),
+            }
+        )
+        return fallback_response
+
+
 class MockSearchClient:
     """Deterministic search client for tests and offline development."""
 
@@ -356,3 +693,64 @@ class MockSearchClient:
     def search_image(self, query: str, *, limit: int = 10, **kwargs: Any) -> SearchResponse:
         results = self.image_results.get(query, [])[:limit]
         return SearchResponse(query=query, engine="mock:image", results=results)
+
+
+def _smoke_test() -> None:
+    mock = MockSearchClient(
+        text_results={
+            "coffee": [TextSearchResult(title="Coffee", url="https://example.com/coffee")]
+        },
+        image_results={
+            "coffee": [
+                ImageSearchResult(
+                    title="Coffee image",
+                    image_url="https://example.com/coffee.jpg",
+                    width=320,
+                    height=240,
+                )
+            ]
+        },
+    )
+    assert mock.search_text("coffee").results[0].title == "Coffee"
+    assert mock.search_image("coffee").results[0].image_url.endswith(".jpg")
+
+    serp = SerpApiSearchClient(
+        api_key="dummy",
+        base_url="https://aidp-i18ntt-sg.byteintl.net/api/modelhub/online/v2/crawl/serp",
+    )
+    params = serp._serpapi_params(
+        "Coffee",
+        10,
+        {"location": "Austin, Texas, United States", "hl": "en", "gl": "us"},
+        engine="google",
+    )
+    assert params["ak"] == "dummy"
+    assert params["q"] == "Coffee"
+
+    raw_commons = {
+        "query": {
+            "pages": {
+                "1": {
+                    "title": "File:Coffee.jpg",
+                    "fullurl": "https://commons.wikimedia.org/wiki/File:Coffee.jpg",
+                    "imageinfo": [
+                        {
+                            "url": "https://upload.wikimedia.org/coffee.jpg",
+                            "thumburl": "https://upload.wikimedia.org/thumb/coffee.jpg",
+                            "width": 640,
+                            "height": 480,
+                            "extmetadata": {"ImageDescription": {"value": "<p>Coffee cup</p>"}},
+                        }
+                    ],
+                }
+            }
+        }
+    }
+    parsed = CommonsImageSearchClient._parse_commons_results(raw_commons)
+    assert parsed[0].title == "File:Coffee.jpg"
+    assert parsed[0].snippet == "Coffee cup"
+    print("search_client smoke test passed")
+
+
+if __name__ == "__main__":
+    _smoke_test()

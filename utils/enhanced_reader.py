@@ -10,6 +10,7 @@ cleaned HTML to an OpenAI-compatible ReaderLM-v2 endpoint and returns Markdown.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import re
 from typing import Any
@@ -100,6 +101,16 @@ async def fetch_html(client: httpx.AsyncClient, url: str) -> str:
     return response.text
 
 
+async def fetch_markdown(client: httpx.AsyncClient, url: str) -> str:
+    response = await client.get(
+        f"{RAW_READER_URL.rstrip('/')}/{url}",
+        headers={"Accept": "text/plain"},
+        timeout=READER_TIMEOUT,
+    )
+    response.raise_for_status()
+    return response.text
+
+
 async def convert_html_to_markdown(client: httpx.AsyncClient, html: str) -> str:
     cleaned_html = clean_html(html)[:READERLM_MAX_HTML_CHARS]
     headers = {"Content-Type": "application/json"}
@@ -130,7 +141,11 @@ async def read(target_url: str, request: Request):
 
     async with httpx.AsyncClient() as client:
         try:
-            html = await fetch_html(client, url)
+            markdown_response, html_response = await asyncio.gather(
+                fetch_markdown(client, url),
+                fetch_html(client, url),
+            )
+            html = html_response
             markdown = await convert_html_to_markdown(client, html)
         except Exception as exc:
             message = f"Enhanced Reader error for {url}: {exc}"
@@ -147,6 +162,7 @@ async def read(target_url: str, request: Request):
                 "title": "",
                 "url": url,
                 "content": markdown,
+                "raw_markdown": markdown_response,
             },
             "code": 200,
             "status": 200,
