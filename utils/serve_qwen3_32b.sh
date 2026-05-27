@@ -11,7 +11,7 @@ USE_VL="${2:-${USE_VL:-false}}"
 
 if [[ "${USE_VL}" == "true" ]]; then
   MODEL_PATH="${MODEL_PATH:-/mnt/hdfs/byte_ai_sales/user/user/yinzhihan/models/qwen3-vl-32b}"
-  SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-qwen3-vl-32b}"
+  SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-Qwen3-VL-32B}"
 else
   MODEL_PATH="${MODEL_PATH:-/mnt/hdfs/byte_ai_sales/user/user/yinzhihan/models/qwen3-32b}"
   SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-qwen3-32b}"

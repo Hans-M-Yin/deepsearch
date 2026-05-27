@@ -1,7 +1,7 @@
 # Graph Construction without image fetch
 python run_min_graph.py \
   --seed-url https://en.wikipedia.org/wiki/Kobe_Bryant \
-  --store-dir runs/kobe_text_only_20_100_depth_9 \
+  --store-dir runs/kobe_text_only_20_100_depth_15 \
   --reader-base-url http://10.124.138.16:8004 \
   --fresh \
   --no-images \
