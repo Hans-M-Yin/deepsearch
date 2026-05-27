@@ -28,16 +28,51 @@ targets include major events, iconic appearances, posters, figures, artworks,
 logos, maps, screenshots, documents, products, object details, group photos,
 or images that can reveal a clue for a later text search.
 
+Critical requirement: each target must be visually unique and unambiguous.
+The target should point to one specific entity, event, artifact, version,
+scene, document, object, or appearance. Different acceptable images may vary
+by camera angle, crop, or resolution, but they should depict the same visual
+fact. This is required because the image node will become an intermediate
+multi-hop graph node; if many different images could satisfy the target, the
+downstream question may become impossible to answer reliably.
+
 Choose targets that are:
 - Explicitly supported by the node content.
 - Likely searchable on Wikimedia Commons or Google image search.
 - Useful for multimodal multi-hop data construction.
 - Specific enough to avoid generic queries like "photo of the person".
+- Visually anchored by discriminative details such as year, event name,
+  award ceremony, film/work title, poster/cover version, named landmark,
+  named product, official logo, map, chart, document, uniform/outfit,
+  on-stage moment, or another concrete visual constraint.
+- Searchable with queries that should return near-equivalent evidence images,
+  not many unrelated images that merely share the same broad topic.
 
 Avoid:
 - Private or unlikely-to-exist images.
 - Targets that are too broad, such as only the subject name.
 - Pure text facts that do not benefit from image search.
+- Generic portraits, generic building photos, generic team photos, broad
+  object categories, or vague scenes where many visually different images
+  would all satisfy the description.
+- Targets whose visual identity is not uniquely determined by the node
+  content.
+
+Good target examples:
+- A specific film's official poster, because the poster is a unique artifact.
+- A named album cover, book cover, scientific figure, product model, logo,
+  map, or document page.
+- A named person receiving a named award at a specific ceremony, where
+  acceptable photos show the same person, outfit, and event moment even if
+  angles differ.
+- A named landmark or object detail tied to a distinctive attribute.
+
+Bad target examples:
+- "photo of Justin Bieber" because many unrelated images satisfy it.
+- "Los Angeles Lakers game photo" because many games and moments qualify.
+- "cat image" or "basketball image" because these are broad categories.
+- "South Korea city skyline" unless the text specifies a unique skyline,
+  landmark, date, or event.
 
 Output at most 3 targets. Each target must contain 2 to 4 queries.
 Do not output markdown, JSON, explanations, or extra text.
@@ -47,8 +82,8 @@ Output format:
 description: concrete visual evidence goal
 type: event_photo|poster|figure|artwork|product|logo|map|document|group_photo|object_detail|screenshot|other
 use: answer_evidence|routing_clue|grounding|distractor
-reason: short reason this target is useful
-expected_visual: what the image should visibly contain
+reason: short reason this target is useful and visually unambiguous
+expected_visual: what the image should visibly contain, including uniqueness constraints
 query: image search query 1
 query: image search query 2
 </target>
