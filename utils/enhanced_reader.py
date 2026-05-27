@@ -41,6 +41,8 @@ COMMENT_PATTERN = r"<[ ]*!--.*?--[ ]*>"
 LINK_PATTERN = r"<[ ]*link.*?>"
 BASE64_IMG_PATTERN = r'<img[^>]+src="data:image/[^;]+;base64,[^"]+"[^>]*>'
 SVG_PATTERN = r"(<svg[^>]*>)(.*?)(</svg>)"
+A_OPEN_PATTERN = r"<a\b[^>]*>"
+A_CLOSE_PATTERN = r"</a\s*>"
 
 
 def normalize_url(target_url: str) -> str:
@@ -62,6 +64,13 @@ def replace_base64_images(html: str, new_image_src: str = "#") -> str:
     return re.sub(BASE64_IMG_PATTERN, f'<img src="{new_image_src}"/>', html)
 
 
+def strip_anchor_links(html: str) -> str:
+    """Remove hyperlink tags while keeping their visible anchor text."""
+
+    html = re.sub(A_OPEN_PATTERN, "", html, flags=re.IGNORECASE | re.MULTILINE | re.DOTALL)
+    return re.sub(A_CLOSE_PATTERN, "", html, flags=re.IGNORECASE | re.MULTILINE)
+
+
 def clean_html(html: str, clean_svg: bool = True, clean_base64: bool = True) -> str:
     """Pre-clean HTML following the ReaderLM-v2 model-card guidance."""
 
@@ -70,6 +79,7 @@ def clean_html(html: str, clean_svg: bool = True, clean_base64: bool = True) -> 
     html = re.sub(META_PATTERN, "", html, flags=re.IGNORECASE | re.MULTILINE | re.DOTALL)
     html = re.sub(COMMENT_PATTERN, "", html, flags=re.IGNORECASE | re.MULTILINE | re.DOTALL)
     html = re.sub(LINK_PATTERN, "", html, flags=re.IGNORECASE | re.MULTILINE | re.DOTALL)
+    html = strip_anchor_links(html)
     if clean_svg:
         html = replace_svg(html)
     if clean_base64:
@@ -154,6 +164,7 @@ async def convert_html_to_markdown(
         debug_timing["clean_html_s"] = time.perf_counter() - started
         debug_timing["raw_html_chars"] = len(html)
         debug_timing["cleaned_html_chars"] = len(cleaned_html)
+        debug_timing["html_link_tags_removed"] = len(re.findall(A_OPEN_PATTERN, html, flags=re.IGNORECASE))
 
     started = time.perf_counter()
     readerlm_input = truncate_safely(cleaned_html, READERLM_MAX_HTML_CHARS)
