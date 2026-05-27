@@ -127,6 +127,26 @@ def format_duration(seconds: float) -> str:
     return f"{int(hours)}h {int(minutes)}m {remainder:.2f}s"
 
 
+def print_timing_summary(summary: dict[str, Any]) -> None:
+    metrics = summary.get("metrics") if isinstance(summary, dict) else None
+    if not isinstance(metrics, dict) or not metrics:
+        return
+    print("timing_summary:")
+    print(f"  steps_with_timing: {summary.get('steps_with_timing')}")
+    for key in sorted(metrics):
+        item = metrics[key]
+        if not isinstance(item, dict):
+            continue
+        print(
+            "  "
+            f"{key}: "
+            f"total={item.get('total_s', 0.0):.2f}s "
+            f"avg={item.get('avg_s', 0.0):.2f}s "
+            f"p50={item.get('p50_s', 0.0):.2f}s "
+            f"max={item.get('max_s', 0.0):.2f}s"
+        )
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--env-file", default=str(DEFAULT_ENV_PATH), help="Path to synthesis env file.")
@@ -277,6 +297,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"elapsed: {format_duration(elapsed_s)}")
     print(f"store_size_bytes: {store_size}")
     print(f"store_size: {format_bytes(store_size)}")
+    print_timing_summary(result.timing_summary)
     if result.last_error:
         print(f"last_error: {result.last_error}")
     return 0 if result.failed_count == 0 else 1

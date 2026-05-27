@@ -7,6 +7,7 @@ from dataclasses import asdict, dataclass, field
 from enum import Enum
 from pathlib import Path
 import sys
+import time
 from typing import Any
 
 if __package__ in (None, ""):
@@ -99,6 +100,7 @@ class NodeExpansionResult:
     materialized_edges: list[Edge] = field(default_factory=list)
     queued_tasks: list[ExpansionTask] = field(default_factory=list)
     error: str | None = None
+    timing: dict[str, float] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -111,6 +113,7 @@ class NodeExpansionResult:
             "materialized_edges": [edge.to_dict() for edge in self.materialized_edges],
             "queued_tasks": [task.to_dict() for task in self.queued_tasks],
             "error": self.error,
+            "timing": self.timing,
         }
 
 
@@ -179,29 +182,46 @@ class GraphExpansionStrategy:
         *,
         run_id: str | None = None,
     ) -> NodeExpansionResult:
+        total_started = time.perf_counter()
+        timing: dict[str, float] = {}
         try:
+            started = time.perf_counter()
             text_result = self.wiki_builder.build_from_url(
                 task.url,
                 title=task.title,
                 run_id=run_id,
                 persist=self.config.persist,
             )
+            timing["text_build_s"] = time.perf_counter() - started
+
+            started = time.perf_counter()
             materialized_edges = self._materialize_pending_parent_links(
                 task,
                 target_result=text_result,
                 run_id=run_id,
             )
+            timing["materialize_parent_edges_s"] = time.perf_counter() - started
+
+            started = time.perf_counter()
             attribute_evidence, attribute_error = self._extract_attributes(
                 text_result,
                 run_id=run_id,
             )
+            timing["attribute_s"] = time.perf_counter() - started
+
+            started = time.perf_counter()
             queued_tasks, existing_target_edges = self._process_text_neighbors(
                 text_result,
                 depth=task.depth + 1,
                 run_id=run_id,
             )
             materialized_edges.extend(existing_target_edges)
+            timing["queue_neighbors_s"] = time.perf_counter() - started
+
+            started = time.perf_counter()
             visual_plans, image_results = self._expand_images(text_result, run_id=run_id)
+            timing["image_expansion_s"] = time.perf_counter() - started
+            timing["total_s"] = time.perf_counter() - total_started
             task.status = ExpansionTaskStatus.DONE
             return NodeExpansionResult(
                 task=task,
@@ -212,10 +232,16 @@ class GraphExpansionStrategy:
                 image_results=image_results,
                 materialized_edges=materialized_edges,
                 queued_tasks=queued_tasks,
+                timing=timing,
             )
         except Exception as exc:
             task.status = ExpansionTaskStatus.FAILED
-            return NodeExpansionResult(task=task, error=f"{exc.__class__.__name__}: {exc}")
+            timing["total_s"] = time.perf_counter() - total_started
+            return NodeExpansionResult(
+                task=task,
+                error=f"{exc.__class__.__name__}: {exc}",
+                timing=timing,
+            )
 
     def _extract_attributes(
         self,

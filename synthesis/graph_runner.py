@@ -99,6 +99,7 @@ class GraphRunnerResult:
     completed_count: int
     failed_count: int
     store_stats: dict[str, int]
+    timing_summary: dict[str, Any] = field(default_factory=dict)
     last_error: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
@@ -180,6 +181,7 @@ class GraphRunner:
             completed_count=len(self.state.completed_tasks),
             failed_count=len(self.state.failed_tasks),
             store_stats=self.store.stats(),
+            timing_summary=self._timing_summary(),
             last_error=last_error,
         )
 
@@ -223,6 +225,7 @@ class GraphRunner:
             "materialized_edge_count": len(result.materialized_edges),
             "visual_plan_count": len(result.visual_plans),
             "image_result_count": len(result.image_results),
+            "timing": result.timing,
         }
         if result.error:
             self.state.failed_tasks.append(record)
@@ -239,6 +242,35 @@ class GraphRunner:
         if self.config.max_nodes is not None and self.store.stats().get("nodes", 0) >= self.config.max_nodes:
             return False
         return True
+
+    def _timing_summary(self) -> dict[str, Any]:
+        records = self.state.completed_tasks + self.state.failed_tasks
+        timing_records = [
+            record.get("timing")
+            for record in records
+            if isinstance(record.get("timing"), dict)
+        ]
+        if not timing_records:
+            return {}
+
+        keys = sorted({key for timing in timing_records for key in timing})
+        metrics: dict[str, dict[str, float]] = {}
+        for key in keys:
+            values = [float(timing[key]) for timing in timing_records if timing.get(key) is not None]
+            if not values:
+                continue
+            values_sorted = sorted(values)
+            metrics[key] = {
+                "total_s": sum(values),
+                "avg_s": sum(values) / len(values),
+                "min_s": values_sorted[0],
+                "max_s": values_sorted[-1],
+                "p50_s": values_sorted[len(values_sorted) // 2],
+            }
+        return {
+            "steps_with_timing": len(timing_records),
+            "metrics": metrics,
+        }
 
     @staticmethod
     def _task_from_record(record: dict[str, Any]) -> ExpansionTask:
