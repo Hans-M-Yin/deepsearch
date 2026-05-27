@@ -193,6 +193,8 @@ class GraphExpansionStrategy:
                 persist=self.config.persist,
             )
             timing["text_build_s"] = time.perf_counter() - started
+            for key, value in text_result.timing.items():
+                timing[f"text_{key}"] = value
 
             started = time.perf_counter()
             materialized_edges = self._materialize_pending_parent_links(

@@ -9,6 +9,7 @@ from dataclasses import asdict, dataclass, field
 from enum import Enum
 from pathlib import Path
 import sys
+import time
 from typing import Any, Protocol
 from urllib.parse import quote, unquote, urlparse
 from urllib.request import Request, urlopen
@@ -230,6 +231,7 @@ class WikiTextBuildResult:
     linked_entities: list[WikiLinkCandidate] = field(default_factory=list)
     edges: list[Edge] = field(default_factory=list)
     from_cache: bool = False
+    timing: dict[str, float] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -239,6 +241,7 @@ class WikiTextBuildResult:
             "linked_entities": [entity.to_dict() for entity in self.linked_entities],
             "edges": [edge.to_dict() for edge in self.edges],
             "from_cache": self.from_cache,
+            "timing": self.timing,
         }
 
 
@@ -283,16 +286,28 @@ class WikiTextBuilder:
         persist: bool = True,
         force: bool = False,
     ) -> WikiTextBuildResult:
+        total_started = time.perf_counter()
+        timing: dict[str, float] = {}
         input_url = self._normalize_wikipedia_url(url)
+        started = time.perf_counter()
         cached = None if force else self._cached_build_result(input_url)
+        timing["cache_lookup_input_s"] = time.perf_counter() - started
         if cached is not None:
+            cached.timing = {**cached.timing, **timing, "total_s": time.perf_counter() - total_started}
             return cached
 
+        started = time.perf_counter()
         document = self.reader.read(url)
+        timing["reader_read_s"] = time.perf_counter() - started
         page_url = self._normalize_wikipedia_url(document.url or url)
+        started = time.perf_counter()
         cached = None if force else self._cached_build_result(page_url)
+        timing["cache_lookup_page_s"] = time.perf_counter() - started
         if cached is not None:
+            cached.timing = {**cached.timing, **timing, "total_s": time.perf_counter() - total_started}
             return cached
+
+        started = time.perf_counter()
         page_title = title or document.title or self._title_from_url(page_url)
         link_markdown = document.raw_markdown or document.content
 
@@ -335,8 +350,11 @@ class WikiTextBuilder:
             extractor=self.builder_name,
             evidence_key=f"wiki_text:{page_url}",
         )
+        timing["node_evidence_create_s"] = time.perf_counter() - started
 
+        started = time.perf_counter()
         linked_entities = self.extract_wiki_links(link_markdown, source_url=page_url)
+        timing["link_extract_s"] = time.perf_counter() - started
 
         result = WikiTextBuildResult(
             node=node,
@@ -346,7 +364,13 @@ class WikiTextBuilder:
             edges=[],
         )
         if persist:
+            started = time.perf_counter()
             self._persist_result(result)
+            timing["persist_s"] = time.perf_counter() - started
+        else:
+            timing["persist_s"] = 0.0
+        timing["total_s"] = time.perf_counter() - total_started
+        result.timing = timing
         return result
 
     def _cached_build_result(self, page_url: str) -> WikiTextBuildResult | None:
