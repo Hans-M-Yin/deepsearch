@@ -16,6 +16,7 @@ import os
 from pathlib import Path
 import shlex
 import sys
+import time
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -94,6 +95,36 @@ def has_serpapi_credentials() -> bool:
         or os.environ.get("SERPAPI_API_KEY")
         or os.environ.get("SERP_API_KEY")
     )
+
+
+def directory_size_bytes(path: Path) -> int:
+    if not path.exists():
+        return 0
+    total = 0
+    for item in path.rglob("*"):
+        if item.is_file():
+            total += item.stat().st_size
+    return total
+
+
+def format_bytes(size: int) -> str:
+    units = ("B", "KB", "MB", "GB", "TB")
+    value = float(size)
+    for unit in units:
+        if value < 1024 or unit == units[-1]:
+            return f"{value:.2f} {unit}" if unit != "B" else f"{int(value)} B"
+        value /= 1024
+    return f"{size} B"
+
+
+def format_duration(seconds: float) -> str:
+    if seconds < 60:
+        return f"{seconds:.2f}s"
+    minutes, remainder = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{int(minutes)}m {remainder:.2f}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{int(hours)}h {int(minutes)}m {remainder:.2f}s"
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -228,7 +259,10 @@ def main(argv: list[str] | None = None) -> int:
     if runner.strategy.queue_size() == 0:
         runner.add_seed(args.seed_url)
 
+    started_at = time.perf_counter()
     result = runner.run()
+    elapsed_s = time.perf_counter() - started_at
+    store_size = directory_size_bytes(store_dir)
     print("=== min graph run ===")
     print(f"env_file: {env_path} ({len(loaded_env)} vars loaded)")
     print(f"store_dir: {store_dir}")
@@ -239,6 +273,10 @@ def main(argv: list[str] | None = None) -> int:
     print(f"completed: {result.completed_count}")
     print(f"failed: {result.failed_count}")
     print(f"store_stats: {result.store_stats}")
+    print(f"elapsed_s: {elapsed_s:.2f}")
+    print(f"elapsed: {format_duration(elapsed_s)}")
+    print(f"store_size_bytes: {store_size}")
+    print(f"store_size: {format_bytes(store_size)}")
     if result.last_error:
         print(f"last_error: {result.last_error}")
     return 0 if result.failed_count == 0 else 1
