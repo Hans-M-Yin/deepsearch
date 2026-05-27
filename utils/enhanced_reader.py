@@ -40,6 +40,8 @@ META_PATTERN = r"<[ ]*meta.*?>"
 COMMENT_PATTERN = r"<[ ]*!--.*?--[ ]*>"
 LINK_PATTERN = r"<[ ]*link.*?>"
 BASE64_IMG_PATTERN = r'<img[^>]+src="data:image/[^;]+;base64,[^"]+"[^>]*>'
+IMG_PATTERN = r"<img\b[^>]*>"
+ALT_ATTR_PATTERN = r"""\salt=("[^"]*"|'[^']*'|[^\s>]+)"""
 SVG_PATTERN = r"(<svg[^>]*>)(.*?)(</svg>)"
 A_OPEN_PATTERN = r"<a\b[^>]*>"
 A_CLOSE_PATTERN = r"</a\s*>"
@@ -64,6 +66,20 @@ def replace_svg(html: str, new_content: str = "this is a placeholder") -> str:
 
 def replace_base64_images(html: str, new_image_src: str = "#") -> str:
     return re.sub(BASE64_IMG_PATTERN, f'<img src="{new_image_src}"/>', html)
+
+
+def replace_images_with_alt_text(html: str) -> str:
+    """Remove image tags, keeping alt text when available."""
+
+    def replace(match: re.Match[str]) -> str:
+        tag = match.group(0)
+        alt_match = re.search(ALT_ATTR_PATTERN, tag, flags=re.IGNORECASE | re.DOTALL)
+        if not alt_match:
+            return ""
+        alt = alt_match.group(1).strip("\"'")
+        return f" {alt} " if alt else ""
+
+    return re.sub(IMG_PATTERN, replace, html, flags=re.IGNORECASE | re.MULTILINE | re.DOTALL)
 
 
 def strip_anchor_links(html: str) -> str:
@@ -91,6 +107,7 @@ def clean_html(html: str, clean_svg: bool = True, clean_base64: bool = True) -> 
     html = strip_anchor_links(html)
     if clean_base64:
         html = replace_base64_images(html)
+    html = replace_images_with_alt_text(html)
     html = strip_url_noise(html)
     if clean_svg:
         html = replace_svg(html)
