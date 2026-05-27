@@ -1,0 +1,81 @@
+time="2026-05-26T03:14:04Z" level=warning msg="cannot read config: Config File \"config\" Not Found in \"[/mnt/hdfs/byte_ai_sales/user/user/yinzhihan/agent/OpenSearch-VL]\""
+[2026-05-26 03:14:04][info]["Resilient search enabled: retry + circuit breaker"]
+[2026-05-26 03:14:04][info][cache_max_size=1000][cache_ttl=5m0s]["Response cache enabled"]
+
+ ┌───────────────────────────────────────────────────┐ 
+ │                   Fiber v2.52.9                   │ 
+ │               http://127.0.0.1:7000               │ 
+ │       (bound on host 0.0.0.0 and port 7000)       │ 
+ │                                                   │ 
+ │ Handlers ............ 58  Processes ........... 1 │ 
+ │ Prefork ....... Disabled  PID .............. 3619 │ 
+ └───────────────────────────────────────────────────┘ 
+
+Failed to write to log, write ./logs.txt: operation not supported
+Failed to write to log, write ./logs.txt: operation not supported
+Failed to write to log, write ./logs.txt: operation not supported
+Failed to write to log, write ./logs.txt: operation not supported
+Failed to write to log, write ./logs.txt: operation not supported
+Failed to write to log, write ./logs.txt: operation not supported
+Failed to write to log, write ./logs.txt: operation not supported
+Failed to write to log, write ./logs.txt: operation not supported
+Failed to write to log, write ./logs.txt: operation not supported
+Failed to write to log, write ./logs.txt: operation not supported
+Failed to write to log, write ./logs.txt: operation not supported
+Failed to write to log, write ./logs.txt: operation not supported
+Failed to write to log, write ./logs.txt: operation not supported
+Failed to write to log, write ./logs.txt: operation not supported
+Failed to write to log, write ./logs.txt: operation not supported
+Failed to write to log, write ./logs.txt: operation not supported
+Failed to write to log, write ./logs.txt: operation not supported
+Failed to write to log, write ./logs.txt: operation not supported
+Failed to write to log, write ./logs.txt: operation not supported
+Failed to write to log, write ./logs.txt: operation not supported
+Failed to write to log, write ./logs.txt: operation not supported
+Failed to write to log, write ./logs.txt: operation not supported
+Failed to write to log, write ./logs.txt: operation not supported
+Failed to write to log, write ./logs.txt: operation not supported
+Failed to write to log, write ./logs.txt: operation not supported
+Failed to write to log, write ./logs.txt: operation not supported
+Failed to write to log, write ./logs.txt: operation not supported
+Failed to write to log, write ./logs.txt: operation not supported
+Failed to write to log, write ./logs.txt: operation not supported
+Failed to write to log, write ./logs.txt: operation not supported
+Failed to write to log, write ./logs.txt: operation not supported
+Failed to write to log, write ./logs.txt: operation not supported
+Failed to write to log, write ./logs.txt: operation not supported
+Failed to write to log, write ./logs.txt: operation not supported
+Failed to write to log, write ./logs.txt: operation not supported
+Failed to write to log, write ./logs.txt: operation not supported
+Failed to write to log, write ./logs.txt: operation not supported
+Failed to write to log, write ./logs.txt: operation not supported
+Failed to write to log, write ./logs.txt: operation not supported
+Failed to write to log, write ./logs.txt: operation not supported
+Failed to write to log, write ./logs.txt: operation not supported
+Failed to write to log, write ./logs.txt: operation not supported
+Failed to write to log, write ./logs.txt: operation not supported
+Failed to write to log, write ./logs.txt: operation not supported
+Failed to write to log, write ./logs.txt: operation not supported
+Failed to write to log, write ./logs.txt: operation not supported
+Failed to write to log, write ./logs.txt: operation not supported
+Failed to write to log, write ./logs.txt: operation not supported
+Failed to write to log, write ./logs.txt: operation not supported
+Failed to write to log, write ./logs.txt: operation not supported
+Failed to write to log, write ./logs.txt: operation not supported
+Failed to write to log, write ./logs.txt: operation not supported
+[2026-05-26 03:34:59][info][engine=google][request_id=6ca5eebc][query_hash=6aa7bd163f7b]["Recovery timeout elapsed, moving to half-open"]
+[2026-05-26 03:34:59][info][engine=google][request_id=6ca5eebc][query_hash=6aa7bd163f7b][browser_profile_id=chrome-linux-swiftshader][lane_id=google:us][minimal_profile=true]["Browser profile selected"]
+[2026-05-26 03:35:01][error][engine=google][request_id=6ca5eebc][query_hash=6aa7bd163f7b]["Captcha detected: https://www.google.com/search?gl=us&hl=en&ie=UTF-8&lr=lang_en&nfpr=1&num=4&oq=The+main+character+of+video+game+Final+Fantasy+VII&pws=0&q=The+main+character+of+video+game+Final+Fantasy+VII&sourceid=chrome"]
+[2026-05-26 03:35:01][warning][engine=google][request_id=6ca5eebc][query_hash=6aa7bd163f7b]["CAPTCHA detected, skipping retries"]
+[2026-05-26 03:35:01][warning][engine=google][request_id=6ca5eebc][query_hash=6aa7bd163f7b][browser_profile_id=chrome-linux-swiftshader]["Failed during half-open, circuit re-opened"]
+[2026-05-26 03:35:01][error][engine=google][request_id=6ca5eebc][query_hash=6aa7bd163f7b][action=search][browser_profile_id=chrome-linux-swiftshader][error="captcha detected"]["Search failed"]
+[2026-05-26 03:35:01][warning][engine=google][request_id=6ca5eebc][query_hash=9714414c1681][browser_profile_id=chrome-linux-swiftshader][ip=127.0.0.1][latency_ms=2544][method=GET][path=/google/search][status=429]["request error"]
+[2026-05-26 03:36:41][info][request_id=3306b279][ip=127.0.0.1][latency_ms=0][method=GET][path=/health][status=200]["request completed"]
+Failed to write to log, write ./logs.txt: operation not supported
+Failed to write to log, write ./logs.txt: operation not supported
+Failed to write to log, write ./logs.txt: operation not supported
+Failed to write to log, write ./logs.txt: operation not supported
+Failed to write to log, write ./logs.txt: operation not supported
+Failed to write to log, write ./logs.txt: operation not supported
+Failed to write to log, write ./logs.txt: operation not supported
+Failed to write to log, write ./logs.txt: operation not supported
