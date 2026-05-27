@@ -7,6 +7,7 @@ from dataclasses import asdict, dataclass, field
 from enum import Enum
 from pathlib import Path
 import sys
+from threading import RLock
 import time
 from typing import Any
 
@@ -148,6 +149,8 @@ class GraphExpansionStrategy:
         self.config = config or GraphExpansionConfig()
         self._queue: deque[ExpansionTask] = deque()
         self._seen_urls: set[str] = set()
+        self._pending_parent_links_by_url: dict[str, list[dict[str, Any]]] = {}
+        self._lock = RLock()
 
     def add_seed(
         self,
@@ -161,20 +164,53 @@ class GraphExpansionStrategy:
         return task
 
     def enqueue(self, task: ExpansionTask) -> bool:
-        if task.url in self._seen_urls:
-            return False
-        self._seen_urls.add(task.url)
-        self._queue.append(task)
-        return True
+        with self._lock:
+            if task.url in self._seen_urls:
+                return False
+            self._seen_urls.add(task.url)
+            pending_links = self._pending_parent_links_by_url.pop(task.url, [])
+            if pending_links:
+                links = list(task.metadata.get("pending_parent_links") or [])
+                links.extend(pending_links)
+                task.metadata["pending_parent_links"] = links
+            self._queue.append(task)
+            return True
 
     def queue_size(self) -> int:
-        return len(self._queue)
+        with self._lock:
+            return len(self._queue)
 
     def expand_next(self, *, run_id: str | None = None) -> NodeExpansionResult | None:
-        if not self._queue:
+        task = self.pop_next_task()
+        if task is None:
             return None
-        task = self._queue.popleft()
         return self.expand_task(task, run_id=run_id)
+
+    def pop_next_task(self) -> ExpansionTask | None:
+        with self._lock:
+            if not self._queue:
+                return None
+            return self._queue.popleft()
+
+    def pop_next_batch(self, batch_size: int) -> list[ExpansionTask]:
+        with self._lock:
+            tasks: list[ExpansionTask] = []
+            limit = max(1, int(batch_size))
+            while self._queue and len(tasks) < limit:
+                tasks.append(self._queue.popleft())
+            return tasks
+
+    def queue_records(self) -> list[dict[str, Any]]:
+        with self._lock:
+            return [task.to_dict() for task in self._queue]
+
+    def seen_urls(self) -> list[str]:
+        with self._lock:
+            return sorted(self._seen_urls)
+
+    def add_seen_urls(self, urls: list[str]) -> None:
+        with self._lock:
+            self._seen_urls.update(urls)
 
     def expand_task(
         self,
@@ -321,6 +357,8 @@ class GraphExpansionStrategy:
         run_id: str | None,
     ) -> list[Edge]:
         pending_links = list(task.metadata.get("pending_parent_links") or [])
+        with self._lock:
+            pending_links.extend(self._pending_parent_links_by_url.pop(task.url, []))
         materialized: list[Edge] = []
         for pending in pending_links:
             edge = self._materialize_pending_parent_link(
@@ -400,10 +438,28 @@ class GraphExpansionStrategy:
         url: str,
         pending_link: dict[str, Any],
     ) -> bool:
-        for task in self._queue:
-            if task.url != url:
-                continue
-            links = list(task.metadata.get("pending_parent_links") or [])
+        with self._lock:
+            for task in self._queue:
+                if task.url != url:
+                    continue
+                links = list(task.metadata.get("pending_parent_links") or [])
+                key = (
+                    pending_link.get("parent_node_id"),
+                    pending_link.get("source_evidence_id"),
+                    (pending_link.get("candidate") or {}).get("url"),
+                )
+                for existing in links:
+                    existing_key = (
+                        existing.get("parent_node_id"),
+                        existing.get("source_evidence_id"),
+                        (existing.get("candidate") or {}).get("url"),
+                    )
+                    if existing_key == key:
+                        return False
+                links.append(pending_link)
+                task.metadata["pending_parent_links"] = links
+                return True
+            links = self._pending_parent_links_by_url.setdefault(url, [])
             key = (
                 pending_link.get("parent_node_id"),
                 pending_link.get("source_evidence_id"),
@@ -418,9 +474,7 @@ class GraphExpansionStrategy:
                 if existing_key == key:
                     return False
             links.append(pending_link)
-            task.metadata["pending_parent_links"] = links
             return True
-        return False
 
     @staticmethod
     def _candidate_from_record(record: dict[str, Any]) -> WikiLinkCandidate:

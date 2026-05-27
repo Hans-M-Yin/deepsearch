@@ -127,6 +127,21 @@ def format_duration(seconds: float) -> str:
     return f"{int(hours)}h {int(minutes)}m {remainder:.2f}s"
 
 
+def graph_density_metrics(store_stats: dict[str, int]) -> dict[str, float | int]:
+    node_count = int(store_stats.get("nodes", 0))
+    edge_count = int(store_stats.get("edges", 0))
+    directed_possible_edges = node_count * (node_count - 1)
+    undirected_possible_edges = node_count * (node_count - 1) / 2
+    return {
+        "nodes": node_count,
+        "edges": edge_count,
+        "avg_out_degree": edge_count / node_count if node_count else 0.0,
+        "avg_total_degree": (2 * edge_count) / node_count if node_count else 0.0,
+        "directed_density": edge_count / directed_possible_edges if directed_possible_edges else 0.0,
+        "undirected_density_upper_bound": edge_count / undirected_possible_edges if undirected_possible_edges else 0.0,
+    }
+
+
 def print_timing_summary(summary: dict[str, Any]) -> None:
     metrics = summary.get("metrics") if isinstance(summary, dict) else None
     if not isinstance(metrics, dict) or not metrics:
@@ -158,6 +173,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--skip-reader-check", action="store_true", help="Skip preflight reader reachability check.")
     parser.add_argument("--max-steps", type=int, default=5, help="Maximum text pages to expand.")
     parser.add_argument("--max-nodes", type=int, default=10, help="Stop after this many graph nodes.")
+    parser.add_argument("--parallel-workers", type=int, default=1, help="Number of text-node expansion workers.")
+    parser.add_argument("--batch-size", type=int, default=None, help="Tasks popped from the queue per parallel expansion round.")
     parser.add_argument("--max-depth", type=int, default=1, help="Maximum text-neighbor BFS depth.")
     parser.add_argument("--max-neighbors", type=int, default=2, help="Text neighbors queued per text node.")
     parser.add_argument("--max-links", type=int, default=20, help="Wiki links extracted per page before queue slicing.")
@@ -272,6 +289,8 @@ def main(argv: list[str] | None = None) -> int:
             max_nodes=args.max_nodes,
             checkpoint_every=1,
             stop_on_error=False,
+            parallel_workers=args.parallel_workers,
+            batch_size=args.batch_size,
         ),
         run_id=args.run_id,
         resume=not args.fresh,
@@ -293,6 +312,14 @@ def main(argv: list[str] | None = None) -> int:
     print(f"completed: {result.completed_count}")
     print(f"failed: {result.failed_count}")
     print(f"store_stats: {result.store_stats}")
+    graph_metrics = graph_density_metrics(result.store_stats)
+    print(
+        "graph_density: "
+        f"directed={graph_metrics['directed_density']:.6f} "
+        f"undirected_upper_bound={graph_metrics['undirected_density_upper_bound']:.6f} "
+        f"avg_out_degree={graph_metrics['avg_out_degree']:.2f} "
+        f"avg_total_degree={graph_metrics['avg_total_degree']:.2f}"
+    )
     print(f"elapsed_s: {elapsed_s:.2f}")
     print(f"elapsed: {format_duration(elapsed_s)}")
     print(f"store_size_bytes: {store_size}")

@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import sys
+from threading import RLock
 from typing import Any, Callable, Iterable
 
 if __package__ in (None, ""):
@@ -53,17 +54,20 @@ class JsonlGraphStore:
             table: {} for table in self.TABLE_FILES
         }
         self._dirty: set[str] = set()
+        self._lock = RLock()
         self.load()
 
     def load(self) -> None:
-        for table, file_name in self.TABLE_FILES.items():
-            self._tables[table] = self._read_table(table, self.root_dir / file_name)
-        self._dirty.clear()
+        with self._lock:
+            for table, file_name in self.TABLE_FILES.items():
+                self._tables[table] = self._read_table(table, self.root_dir / file_name)
+            self._dirty.clear()
 
     def flush(self) -> None:
-        for table in list(self._dirty):
-            self._write_table(table, self.root_dir / self.TABLE_FILES[table])
-        self._dirty.clear()
+        with self._lock:
+            for table in list(self._dirty):
+                self._write_table(table, self.root_dir / self.TABLE_FILES[table])
+            self._dirty.clear()
 
     def upsert_node(self, node: Node | JsonRecord) -> JsonRecord:
         return self._upsert("nodes", node)
@@ -81,40 +85,55 @@ class JsonlGraphStore:
         return self._upsert("search_snapshots", snapshot)
 
     def get_node(self, node_id: str) -> JsonRecord | None:
-        return self._tables["nodes"].get(node_id)
+        with self._lock:
+            record = self._tables["nodes"].get(node_id)
+            return dict(record) if record is not None else None
 
     def get_edge(self, edge_id: str) -> JsonRecord | None:
-        return self._tables["edges"].get(edge_id)
+        with self._lock:
+            record = self._tables["edges"].get(edge_id)
+            return dict(record) if record is not None else None
 
     def get_asset(self, asset_id: str) -> JsonRecord | None:
-        return self._tables["assets"].get(asset_id)
+        with self._lock:
+            record = self._tables["assets"].get(asset_id)
+            return dict(record) if record is not None else None
 
     def get_evidence(self, evidence_id: str) -> JsonRecord | None:
-        return self._tables["evidence"].get(evidence_id)
+        with self._lock:
+            record = self._tables["evidence"].get(evidence_id)
+            return dict(record) if record is not None else None
 
     def get_search_snapshot(self, snapshot_id: str) -> JsonRecord | None:
-        return self._tables["search_snapshots"].get(snapshot_id)
+        with self._lock:
+            record = self._tables["search_snapshots"].get(snapshot_id)
+            return dict(record) if record is not None else None
 
     def list_nodes(self) -> list[JsonRecord]:
-        return list(self._tables["nodes"].values())
+        with self._lock:
+            return [dict(record) for record in self._tables["nodes"].values()]
 
     def list_edges(self) -> list[JsonRecord]:
-        return list(self._tables["edges"].values())
+        with self._lock:
+            return [dict(record) for record in self._tables["edges"].values()]
 
     def list_assets(self) -> list[JsonRecord]:
-        return list(self._tables["assets"].values())
+        with self._lock:
+            return [dict(record) for record in self._tables["assets"].values()]
 
     def list_evidence(self) -> list[JsonRecord]:
-        return list(self._tables["evidence"].values())
+        with self._lock:
+            return [dict(record) for record in self._tables["evidence"].values()]
 
     def list_search_snapshots(self) -> list[JsonRecord]:
-        return list(self._tables["search_snapshots"].values())
+        with self._lock:
+            return [dict(record) for record in self._tables["search_snapshots"].values()]
 
     def iter_nodes(self) -> Iterable[JsonRecord]:
-        return iter(self._tables["nodes"].values())
+        return iter(self.list_nodes())
 
     def iter_edges(self) -> Iterable[JsonRecord]:
-        return iter(self._tables["edges"].values())
+        return iter(self.list_edges())
 
     def find_nodes(self, predicate: Callable[[JsonRecord], bool]) -> list[JsonRecord]:
         return [record for record in self.iter_nodes() if predicate(record)]
@@ -129,20 +148,22 @@ class JsonlGraphStore:
         return self.find_edges(lambda edge: edge.get("dst_node_id") == node_id)
 
     def stats(self) -> dict[str, int]:
-        return {table: len(records) for table, records in self._tables.items()}
+        with self._lock:
+            return {table: len(records) for table, records in self._tables.items()}
 
     def _upsert(self, table: str, record_or_obj: Any) -> JsonRecord:
-        record = self._to_record(record_or_obj)
-        key_name = self.TABLE_KEYS[table]
-        record_id = record.get(key_name)
-        if not record_id:
-            raise ValueError(f"Missing required key {key_name!r} for table {table!r}")
+        with self._lock:
+            record = self._to_record(record_or_obj)
+            key_name = self.TABLE_KEYS[table]
+            record_id = record.get(key_name)
+            if not record_id:
+                raise ValueError(f"Missing required key {key_name!r} for table {table!r}")
 
-        self._tables[table][record_id] = record
-        self._dirty.add(table)
-        if self.auto_flush:
-            self.flush()
-        return record
+            self._tables[table][record_id] = record
+            self._dirty.add(table)
+            if self.auto_flush:
+                self.flush()
+            return dict(record)
 
     @staticmethod
     def _to_record(record_or_obj: Any) -> JsonRecord:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
@@ -47,6 +48,8 @@ class GraphRunnerConfig:
     checkpoint_every: int = 1
     stop_on_error: bool = False
     state_file_name: str = "graph_runner_state.json"
+    parallel_workers: int = 1
+    batch_size: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return _jsonify(asdict(self))
@@ -148,20 +151,27 @@ class GraphRunner:
         last_error: str | None = None
 
         while self._should_continue():
-            result = self.strategy.expand_next(run_id=self.state.run_id)
-            if result is None:
+            if self.config.parallel_workers <= 1:
+                results = self._run_one()
+            else:
+                results = self._run_parallel_batch()
+            if not results:
                 self.state.status = "completed"
                 break
 
-            self.state.step += 1
-            self._record_result(result)
-            if result.error:
-                last_error = result.error
-                if self.config.stop_on_error:
-                    self.state.status = "failed"
-                    self._sync_state_from_strategy()
-                    self.save_state()
-                    break
+            for result in results:
+                self.state.step += 1
+                self._record_result(result)
+                if result.error:
+                    last_error = result.error
+                    if self.config.stop_on_error:
+                        self.state.status = "failed"
+                        break
+
+            if self.state.status == "failed":
+                self._sync_state_from_strategy()
+                self.save_state()
+                break
 
             if self.config.checkpoint_every <= 1 or self.state.step % self.config.checkpoint_every == 0:
                 self._sync_state_from_strategy()
@@ -185,6 +195,42 @@ class GraphRunner:
             last_error=last_error,
         )
 
+    def _run_one(self) -> list[NodeExpansionResult]:
+        result = self.strategy.expand_next(run_id=self.state.run_id)
+        return [result] if result is not None else []
+
+    def _run_parallel_batch(self) -> list[NodeExpansionResult]:
+        remaining_steps = self.config.max_steps - self.state.step
+        if remaining_steps <= 0:
+            return []
+        batch_size = self.config.batch_size or self.config.parallel_workers
+        batch_size = max(1, min(int(batch_size), int(self.config.parallel_workers), remaining_steps))
+        tasks = self.strategy.pop_next_batch(batch_size)
+        if not tasks:
+            return []
+
+        results: list[NodeExpansionResult] = []
+        with ThreadPoolExecutor(max_workers=self.config.parallel_workers) as executor:
+            future_to_task = {
+                executor.submit(self.strategy.expand_task, task, run_id=self.state.run_id): task
+                for task in tasks
+            }
+            for future in as_completed(future_to_task):
+                task = future_to_task[future]
+                try:
+                    results.append(future.result())
+                except Exception as exc:
+                    task.status = ExpansionTaskStatus.FAILED
+                    results.append(
+                        NodeExpansionResult(
+                            task=task,
+                            error=f"{exc.__class__.__name__}: {exc}",
+                        )
+                    )
+
+        results.sort(key=lambda result: result.task.priority)
+        return results
+
     def save_state(self) -> None:
         self.state.updated_at = _utc_now()
         self.state.stats = {
@@ -207,11 +253,11 @@ class GraphRunner:
     def _restore_strategy_state(self) -> None:
         for task_record in self.state.queue:
             self.strategy.enqueue(self._task_from_record(task_record))
-        self.strategy._seen_urls.update(self.state.seen_urls)
+        self.strategy.add_seen_urls(self.state.seen_urls)
 
     def _sync_state_from_strategy(self) -> None:
-        self.state.queue = [task.to_dict() for task in self.strategy._queue]
-        self.state.seen_urls = sorted(self.strategy._seen_urls)
+        self.state.queue = self.strategy.queue_records()
+        self.state.seen_urls = self.strategy.seen_urls()
 
     def _record_result(self, result: NodeExpansionResult) -> None:
         record = {
@@ -340,7 +386,7 @@ def _smoke_test() -> None:
         runner = GraphRunner(
             strategy=strategy,
             store=store,
-            config=GraphRunnerConfig(max_steps=1, max_nodes=5),
+            config=GraphRunnerConfig(max_steps=1, max_nodes=5, parallel_workers=2, batch_size=2),
             run_id="run_smoke",
             resume=False,
         )
