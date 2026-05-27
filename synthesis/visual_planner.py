@@ -22,11 +22,11 @@ from .model_worker import LLM_WORKER, ModelMessage, ModelRequest, ModelResponse,
 PROMPT_VISUAL_SEARCH_PLANNER = """You are planning image searches for a multimodal deep-search data synthesis graph.
 
 Task:
-Given a Wikipedia text node, propose visual targets worth searching for. A
-visual target is a concrete image evidence goal, not just a generic photo. Good
-targets include major events, iconic appearances, posters, figures, artworks,
-logos, maps, screenshots, documents, products, object details, group photos,
-or images that can reveal a clue for a later text search.
+Given a Wikipedia text node, analyze the provided information and identify
+textual facts about the subject that can unambiguously point to existing visual
+evidence. Extract or summarize short factual statements from the node content.
+Each statement should correspond to a visually unique and unambiguous target in
+the real world.
 
 Critical requirement: each target must be visually unique and unambiguous.
 The target should point to one specific entity, event, artifact, version,
@@ -59,13 +59,17 @@ Avoid:
   content.
 
 Good target examples:
-- A specific film's official poster, because the poster is a unique artifact.
-- A named album cover, book cover, scientific figure, product model, logo,
-  map, or document page.
+- A singer's debut album cover, because the cover is fixed and unique.
+- A specific film's official theatrical poster, because the poster is a named
+  artifact with a stable visual identity.
+- A named album cover, book cover, scientific figure, product model, official
+  visual identity, map, or document page.
 - A named person receiving a named award at a specific ceremony, where
   acceptable photos show the same person, outfit, and event moment even if
   angles differ.
 - A named landmark or object detail tied to a distinctive attribute.
+- A scanned page of a specific legal document or statute, where the document
+  and its content are uniquely determined.
 
 Bad target examples:
 - "photo of Justin Bieber" because many unrelated images satisfy it.
@@ -73,15 +77,17 @@ Bad target examples:
 - "cat image" or "basketball image" because these are broad categories.
 - "South Korea city skyline" unless the text specifies a unique skyline,
   landmark, date, or event.
+- "2026-27 Los Angeles Lakers team photo" because future or unreleased visual
+  evidence is unstable and may not exist yet.
+- "season-themed Los Angeles Lakers visual identity" because it may refer to
+  official graphics, fan designs, social media banners, or merchandise.
 
 Output at most 3 targets. Each target must contain 2 to 4 queries.
 Do not output markdown, JSON, explanations, or extra text.
 
 Output format:
 <target>
-description: concrete visual evidence goal
-type: event_photo|poster|figure|artwork|product|logo|map|document|group_photo|object_detail|screenshot|other
-use: answer_evidence|routing_clue|grounding|distractor
+description: concrete visual evidence target
 reason: short reason this target is useful and visually unambiguous
 expected_visual: what the image should visibly contain, including uniqueness constraints
 query: image search query 1
