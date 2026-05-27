@@ -337,17 +337,13 @@ class WikiTextBuilder:
         )
 
         linked_entities = self.extract_wiki_links(link_markdown, source_url=page_url)
-        edges = [
-            self._edge_to_linked_entity(node, candidate, text_evidence, run_id=run_id)
-            for candidate in linked_entities
-        ]
 
         result = WikiTextBuildResult(
             node=node,
             text_evidence=text_evidence,
             snapshot=snapshot,
             linked_entities=linked_entities,
-            edges=edges,
+            edges=[],
         )
         if persist:
             self._persist_result(result)
@@ -924,8 +920,6 @@ class WikiTextBuilder:
             self.store.upsert_search_snapshot(result.snapshot)
         self.store.upsert_node(result.node)
         self.store.upsert_evidence(result.text_evidence)
-        for edge in result.edges:
-            self.store.upsert_edge(edge)
         self.store.flush()
 
     @staticmethod

@@ -220,6 +220,7 @@ class GraphRunner:
             "attribute_evidence_id": result.attribute_evidence.evidence_id if result.attribute_evidence else None,
             "attribute_error": result.attribute_error,
             "queued_count": len(result.queued_tasks),
+            "materialized_edge_count": len(result.materialized_edges),
             "visual_plan_count": len(result.visual_plans),
             "image_result_count": len(result.image_results),
         }

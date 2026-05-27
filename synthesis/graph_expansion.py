@@ -14,6 +14,7 @@ if __package__ in (None, ""):
     __package__ = "synthesis"
 
 from .evidence import Evidence
+from .edges import Edge
 from .image_discovery import ImageDiscoveryBuilder, ImageDiscoveryResult
 from .store import JsonlGraphStore
 from .visual_planner import VisualSearchPlan, VisualSearchPlanner
@@ -60,8 +61,14 @@ class ExpansionTask:
         *,
         depth: int,
         parent_node_id: str | None,
+        source_evidence_id: str | None = None,
         parent_edge_id: str | None = None,
     ) -> "ExpansionTask":
+        pending_parent_link = {
+            "parent_node_id": parent_node_id,
+            "source_evidence_id": source_evidence_id,
+            "candidate": candidate.to_dict(),
+        }
         return cls(
             url=candidate.url,
             depth=depth,
@@ -74,6 +81,7 @@ class ExpansionTask:
                 "source_url": candidate.source_url,
                 "context": candidate.context,
                 "rank": candidate.rank,
+                "pending_parent_links": [pending_parent_link],
             },
         )
 
@@ -88,6 +96,7 @@ class NodeExpansionResult:
     attribute_error: str | None = None
     visual_plans: list[VisualSearchPlan] = field(default_factory=list)
     image_results: list[ImageDiscoveryResult] = field(default_factory=list)
+    materialized_edges: list[Edge] = field(default_factory=list)
     queued_tasks: list[ExpansionTask] = field(default_factory=list)
     error: str | None = None
 
@@ -99,6 +108,7 @@ class NodeExpansionResult:
             "attribute_error": self.attribute_error,
             "visual_plans": [plan.to_dict() for plan in self.visual_plans],
             "image_results": [result.to_dict() for result in self.image_results],
+            "materialized_edges": [edge.to_dict() for edge in self.materialized_edges],
             "queued_tasks": [task.to_dict() for task in self.queued_tasks],
             "error": self.error,
         }
@@ -176,11 +186,21 @@ class GraphExpansionStrategy:
                 run_id=run_id,
                 persist=self.config.persist,
             )
+            materialized_edges = self._materialize_pending_parent_links(
+                task,
+                target_result=text_result,
+                run_id=run_id,
+            )
             attribute_evidence, attribute_error = self._extract_attributes(
                 text_result,
                 run_id=run_id,
             )
-            queued_tasks = self._queue_text_neighbors(text_result, depth=task.depth + 1)
+            queued_tasks, existing_target_edges = self._process_text_neighbors(
+                text_result,
+                depth=task.depth + 1,
+                run_id=run_id,
+            )
+            materialized_edges.extend(existing_target_edges)
             visual_plans, image_results = self._expand_images(text_result, run_id=run_id)
             task.status = ExpansionTaskStatus.DONE
             return NodeExpansionResult(
@@ -190,6 +210,7 @@ class GraphExpansionStrategy:
                 attribute_error=attribute_error,
                 visual_plans=visual_plans,
                 image_results=image_results,
+                materialized_edges=materialized_edges,
                 queued_tasks=queued_tasks,
             )
         except Exception as exc:
@@ -222,27 +243,172 @@ class GraphExpansionStrategy:
                 self.store.upsert_node(text_result.node)
             return None, error
 
-    def _queue_text_neighbors(
+    def _process_text_neighbors(
         self,
         text_result: WikiTextBuildResult,
         *,
         depth: int,
-    ) -> list[ExpansionTask]:
+        run_id: str | None,
+    ) -> tuple[list[ExpansionTask], list[Edge]]:
         if depth > self.config.max_depth:
-            return []
+            return [], []
 
         queued: list[ExpansionTask] = []
-        edge_by_dst = {edge.dst_node_id: edge.edge_id for edge in text_result.edges}
+        materialized_edges: list[Edge] = []
         for candidate in text_result.linked_entities[: self.config.max_new_text_neighbors]:
+            if self.store.get_node(candidate.node_id) is not None:
+                edge = self._materialize_edge_to_existing_node(
+                    source_result=text_result,
+                    candidate=candidate,
+                    run_id=run_id,
+                )
+                if edge is not None:
+                    materialized_edges.append(edge)
+                continue
+
             task = ExpansionTask.from_wiki_link(
                 candidate,
                 depth=depth,
                 parent_node_id=text_result.node.node_id,
-                parent_edge_id=edge_by_dst.get(candidate.node_id),
+                source_evidence_id=text_result.text_evidence.evidence_id,
             )
             if self.enqueue(task):
                 queued.append(task)
-        return queued
+            else:
+                self._append_pending_link_to_queued_task(
+                    candidate.url,
+                    {
+                        "parent_node_id": text_result.node.node_id,
+                        "source_evidence_id": text_result.text_evidence.evidence_id,
+                        "candidate": candidate.to_dict(),
+                    },
+                )
+        return queued, materialized_edges
+
+    def _materialize_pending_parent_links(
+        self,
+        task: ExpansionTask,
+        *,
+        target_result: WikiTextBuildResult,
+        run_id: str | None,
+    ) -> list[Edge]:
+        pending_links = list(task.metadata.get("pending_parent_links") or [])
+        materialized: list[Edge] = []
+        for pending in pending_links:
+            edge = self._materialize_pending_parent_link(
+                pending,
+                target_result=target_result,
+                run_id=run_id,
+            )
+            if edge is not None:
+                materialized.append(edge)
+        return materialized
+
+    def _materialize_pending_parent_link(
+        self,
+        pending: dict[str, Any],
+        *,
+        target_result: WikiTextBuildResult,
+        run_id: str | None,
+    ) -> Edge | None:
+        parent_node_id = pending.get("parent_node_id")
+        source_evidence_id = pending.get("source_evidence_id")
+        candidate_record = pending.get("candidate")
+        if not parent_node_id or not source_evidence_id or not isinstance(candidate_record, dict):
+            return None
+
+        source_node_record = self.store.get_node(parent_node_id)
+        source_evidence_record = self.store.get_evidence(source_evidence_id)
+        if source_node_record is None or source_evidence_record is None:
+            return None
+
+        candidate = self._candidate_from_record(candidate_record)
+        if candidate.node_id != target_result.node.node_id:
+            candidate = WikiLinkCandidate(
+                title=target_result.node.title or candidate.title,
+                url=target_result.node.source.url if target_result.node.source and target_result.node.source.url else candidate.url,
+                anchor_text=candidate.anchor_text,
+                source_url=candidate.source_url,
+                context=candidate.context,
+                rank=candidate.rank,
+                start_char=candidate.start_char,
+                end_char=candidate.end_char,
+                window_id=candidate.window_id,
+                score=candidate.score,
+                quality_reasons=list(candidate.quality_reasons),
+            )
+
+        source_node = WikiTextBuilder._text_node_from_record(source_node_record)
+        source_evidence = WikiTextBuilder._evidence_from_record(source_evidence_record)
+        edge = self.wiki_builder._edge_to_linked_entity(
+            source_node,
+            candidate,
+            source_evidence,
+            run_id=run_id,
+        )
+        if self.config.persist:
+            self.store.upsert_edge(edge)
+        return edge
+
+    def _materialize_edge_to_existing_node(
+        self,
+        *,
+        source_result: WikiTextBuildResult,
+        candidate: WikiLinkCandidate,
+        run_id: str | None,
+    ) -> Edge | None:
+        edge = self.wiki_builder._edge_to_linked_entity(
+            source_result.node,
+            candidate,
+            source_result.text_evidence,
+            run_id=run_id,
+        )
+        if self.config.persist:
+            self.store.upsert_edge(edge)
+        return edge
+
+    def _append_pending_link_to_queued_task(
+        self,
+        url: str,
+        pending_link: dict[str, Any],
+    ) -> bool:
+        for task in self._queue:
+            if task.url != url:
+                continue
+            links = list(task.metadata.get("pending_parent_links") or [])
+            key = (
+                pending_link.get("parent_node_id"),
+                pending_link.get("source_evidence_id"),
+                (pending_link.get("candidate") or {}).get("url"),
+            )
+            for existing in links:
+                existing_key = (
+                    existing.get("parent_node_id"),
+                    existing.get("source_evidence_id"),
+                    (existing.get("candidate") or {}).get("url"),
+                )
+                if existing_key == key:
+                    return False
+            links.append(pending_link)
+            task.metadata["pending_parent_links"] = links
+            return True
+        return False
+
+    @staticmethod
+    def _candidate_from_record(record: dict[str, Any]) -> WikiLinkCandidate:
+        return WikiLinkCandidate(
+            title=record["title"],
+            url=record["url"],
+            anchor_text=record.get("anchor_text") or record.get("title") or "",
+            source_url=record.get("source_url") or "",
+            context=record.get("context"),
+            rank=record.get("rank"),
+            start_char=record.get("start_char"),
+            end_char=record.get("end_char"),
+            window_id=record.get("window_id"),
+            score=float(record.get("score") or 0.0),
+            quality_reasons=list(record.get("quality_reasons") or []),
+        )
 
     def _expand_images(
         self,
@@ -291,10 +457,11 @@ def _smoke_test() -> None:
             run_id: str | None = None,
             persist: bool = True,
         ) -> WikiTextBuildResult:
-            node = TextNode.from_webpage(url, title=title or "Seed", description="Seed page")
+            page_title = title or ("Neighbor" if url.endswith("/Neighbor") else "Seed")
+            node = TextNode.from_webpage(url, title=page_title, description=f"{page_title} page")
             evidence = Evidence.create(
                 EvidenceType.WEB_TEXT,
-                content="Seed page",
+                content=f"{page_title} page",
                 node_ids=[node.node_id],
                 url=url,
                 evidence_key=f"text:{url}",
@@ -305,30 +472,43 @@ def _smoke_test() -> None:
                 request={"url": url},
                 run_id=run_id,
             )
-            candidate = WikiLinkCandidate(
-                title="Neighbor",
-                url="https://en.wikipedia.org/wiki/Neighbor",
-                anchor_text="Neighbor",
-                source_url=url,
-                rank=1,
-            )
-            edge = Edge.create(
-                node.node_id,
-                candidate.node_id,
-                edge_type=EdgeType.WIKI_LINK,
-                relation="Neighbor",
-            )
+            linked_entities = []
+            if not url.endswith("/Neighbor"):
+                linked_entities = [
+                    WikiLinkCandidate(
+                        title="Neighbor",
+                        url="https://en.wikipedia.org/wiki/Neighbor",
+                        anchor_text="Neighbor",
+                        source_url=url,
+                        rank=1,
+                    )
+                ]
             if persist:
                 self.store.upsert_node(node)
                 self.store.upsert_evidence(evidence)
                 self.store.upsert_search_snapshot(snapshot)
-                self.store.upsert_edge(edge)
             return WikiTextBuildResult(
                 node=node,
                 text_evidence=evidence,
                 snapshot=snapshot,
-                linked_entities=[candidate],
-                edges=[edge],
+                linked_entities=linked_entities,
+                edges=[],
+            )
+
+        def _edge_to_linked_entity(
+            self,
+            source_node: TextNode,
+            candidate: WikiLinkCandidate,
+            evidence: Evidence,
+            *,
+            run_id: str | None = None,
+        ) -> Edge:
+            del evidence, run_id
+            return Edge.create(
+                source_node.node_id,
+                candidate.node_id,
+                edge_type=EdgeType.WIKI_LINK,
+                relation=candidate.anchor_text,
             )
 
         def extract_attributes(
@@ -360,6 +540,11 @@ def _smoke_test() -> None:
         assert result.attribute_evidence is not None
         assert result.queued_tasks[0].title == "Neighbor"
         assert strategy.queue_size() == 1
+        assert store.stats()["edges"] == 0
+        child_result = strategy.expand_next(run_id="run_smoke")
+        assert child_result is not None
+        assert len(child_result.materialized_edges) == 1
+        assert store.stats()["edges"] == 1
     print("graph_expansion smoke test passed")
 
 
