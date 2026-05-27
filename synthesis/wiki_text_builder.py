@@ -143,6 +143,100 @@ evidence: short quote from context
 """
 
 
+PROMPT_FILTER_WIKI_NEIGHBORS = """You are selecting useful neighboring Wikipedia entities for building a multi-hop research graph.
+
+Given one source entity and candidate outgoing Wikipedia links, decide which candidates should be kept as expansion targets.
+
+The goal is not to keep the closest or most obvious links. Prefer candidates that can become useful intermediate hops for diverse, natural multi-hop questions.
+
+Keep candidates that:
+- are unique, concrete entities or events, not broad classes, generic concepts, dates, list pages, maintenance pages, or ambiguous labels;
+- have a meaningful but not trivial relation to the source entity;
+- can act as a useful bridge for multi-hop questions;
+- are supported by the local hyperlink context.
+
+Reject candidates that:
+- are too close to the source, such as the same entity, aliases, purely self-descriptive links, or repeated administrative editions;
+- are too far or only appear in references/navigation/template noise;
+- are broad categories or common concepts rather than identifiable entities/events;
+- are unlikely to have a stable Wikipedia page representing one specific target.
+
+Relation is open-ended. Use a concise snake_case predicate that best describes the local context.
+Do not force the relation into a fixed taxonomy, and do not overuse a small set of generic predicates.
+If rejecting a candidate, relation can be a short rejection label such as too_generic, too_close, too_far, ambiguous_entity, list_page, reference_noise, or templatic_edition.
+
+Positive examples:
+- Source: Kobe Bryant
+  Candidate: Los Angeles Lakers
+  keep: yes
+  relation: played_for
+  reason: specific team central to career, useful bridge
+
+- Source: Kobe Bryant
+  Candidate: 2008 Summer Olympics
+  keep: yes
+  relation: won_gold_at
+  reason: specific event connected to the source, not merely a broad sports concept
+
+- Source: Parasite
+  Candidate: Bong Joon-ho
+  keep: yes
+  relation: directed_by
+  reason: unique person strongly connected to the work
+
+- Source: South Korea
+  Candidate: Hallasan
+  keep: yes
+  relation: highest_point
+  reason: concrete landmark attribute useful for geographic or visual hops
+
+- Source: Boston Celtics
+  Candidate: TD Garden
+  keep: yes
+  relation: home_arena
+  reason: concrete place connected to the team
+
+Negative examples:
+- Source: Kobe Bryant
+  Candidate: basketball
+  keep: no
+  relation: too_generic
+  reason: broad category, not a unique entity
+
+- Source: NBA Finals
+  Candidate: 1951 NBA Finals
+  keep: no
+  relation: templatic_edition
+  reason: yearly edition pattern is repetitive and too narrow unless local context makes it special
+
+- Source: South Korea
+  Candidate: country
+  keep: no
+  relation: too_generic
+  reason: class label, not a unique entity
+
+- Source: Some company
+  Candidate: References
+  keep: no
+  relation: reference_noise
+  reason: navigation/reference artifact rather than a content entity
+
+- Source: Kobe Bryant
+  Candidate: Kobe Bryant career achievements
+  keep: no
+  relation: too_close
+  reason: likely a self-descriptive or duplicate topic rather than a useful new entity
+
+Return one XML-like item per candidate. Do not output markdown or explanations outside the tags.
+
+Output format:
+<neighbor id="1" keep="yes" score="4.2" relation="played_for" reason="Specific team linked by source career context"/>
+<neighbor id="2" keep="no" score="1.0" relation="too_generic" reason="Broad class, not a unique entity"/>
+
+Scores are 0.0 to 5.0. Use keep="yes" only for candidates with score >= 3.0.
+"""
+
+
 def _jsonify(value: Any) -> Any:
     if isinstance(value, Enum):
         return value.value
@@ -279,6 +373,7 @@ class WikiTextBuilder:
         lead_max_links_per_window: int = 4,
         max_content_chars: int | None = 50000,
         max_link_markdown_chars: int | None = 80000,
+        max_llm_neighbor_candidates: int = 40,
     ) -> None:
         self.reader = reader
         self.store = store
@@ -293,6 +388,7 @@ class WikiTextBuilder:
         self.lead_max_links_per_window = lead_max_links_per_window
         self.max_content_chars = max_content_chars
         self.max_link_markdown_chars = max_link_markdown_chars
+        self.max_llm_neighbor_candidates = max_llm_neighbor_candidates
 
     def build_from_url(
         self,
@@ -713,7 +809,127 @@ class WikiTextBuilder:
             )
             if len(candidates) >= self.max_raw_links:
                 break
+        candidates = self._filter_links_with_llm(source_url=source_url, candidates=candidates)
         return self._select_position_diverse_links(candidates)
+
+    def _filter_links_with_llm(
+        self,
+        *,
+        source_url: str,
+        candidates: list[WikiLinkCandidate],
+    ) -> list[WikiLinkCandidate]:
+        model_alias = os.environ.get("WIKI_NEIGHBOR_MODEL")
+        if not model_alias or not candidates:
+            return candidates
+
+        source_title = self._title_from_url(source_url) or source_url
+        ranked_candidates = sorted(candidates, key=lambda item: (-item.score, item.rank or 10**9))
+        prompt_candidates = ranked_candidates[: max(1, self.max_llm_neighbor_candidates)]
+
+        try:
+            response = self.model_client.generate(
+                ModelRequest(
+                    model=model_alias,
+                    messages=[
+                        ModelMessage(role="system", content=PROMPT_FILTER_WIKI_NEIGHBORS),
+                        ModelMessage(
+                            role="user",
+                            content=self._neighbor_filter_prompt_input(source_title, source_url, prompt_candidates),
+                        ),
+                    ],
+                    temperature=0.0,
+                    max_tokens=2048,
+                )
+            )
+            decisions = self._parse_neighbor_filter_response(response.content)
+        except Exception as exc:
+            for candidate in candidates:
+                candidate.quality_reasons.append(f"llm_neighbor_filter_failed:{exc.__class__.__name__}")
+            return candidates
+
+        kept: list[WikiLinkCandidate] = []
+        for index, candidate in enumerate(prompt_candidates, start=1):
+            decision = decisions.get(index)
+            if decision is None:
+                candidate.quality_reasons.append("llm_neighbor_missing_decision")
+                continue
+            keep = decision.get("keep") == "yes"
+            llm_score = self._parse_neighbor_score(decision.get("score"))
+            relation = decision.get("relation")
+            reason = decision.get("reason")
+            if llm_score is not None:
+                candidate.score = llm_score
+            candidate.quality_reasons.append("llm_neighbor_keep" if keep else "llm_neighbor_reject")
+            if relation:
+                candidate.quality_reasons.append(f"llm_relation:{relation}")
+            if reason:
+                candidate.quality_reasons.append(f"llm_reason:{reason[:120]}")
+            if keep and candidate.score >= 3.0:
+                kept.append(candidate)
+
+        if not kept:
+            for candidate in candidates:
+                candidate.quality_reasons.append("llm_neighbor_filter_empty_fallback")
+            return candidates
+
+        return kept
+
+    @staticmethod
+    def _neighbor_filter_prompt_input(
+        source_title: str,
+        source_url: str,
+        candidates: list[WikiLinkCandidate],
+    ) -> str:
+        lines = [
+            f"Source entity: {source_title}",
+            f"Source URL: {source_url}",
+            "",
+            "Candidates:",
+        ]
+        for index, candidate in enumerate(candidates, start=1):
+            context = re.sub(r"\s+", " ", candidate.context or "").strip()
+            lines.extend(
+                [
+                    f"[{index}]",
+                    f"Title: {candidate.title}",
+                    f"URL: {candidate.url}",
+                    f"Anchor: {candidate.anchor_text}",
+                    f"Rule score: {candidate.score:.2f}",
+                    f"Local context: {context[:500]}",
+                    "",
+                ]
+            )
+        return "\n".join(lines)
+
+    @staticmethod
+    def _parse_neighbor_filter_response(text: str) -> dict[int, dict[str, str]]:
+        decisions: dict[int, dict[str, str]] = {}
+        for match in re.finditer(r"<neighbor\s+([^>]*)/?>", text, flags=re.IGNORECASE | re.DOTALL):
+            attrs: dict[str, str] = {}
+            for key, double_value, single_value in re.findall(r"""(\w+)=(?:"([^"]*)"|'([^']*)')""", match.group(1)):
+                attrs[key.lower()] = double_value or single_value
+            try:
+                candidate_id = int(attrs.get("id", ""))
+            except ValueError:
+                continue
+            keep = attrs.get("keep", "").strip().lower()
+            if keep not in {"yes", "no"}:
+                keep = "no"
+            decisions[candidate_id] = {
+                "keep": keep,
+                "score": attrs.get("score", "0"),
+                "relation": attrs.get("relation", ""),
+                "reason": attrs.get("reason", ""),
+            }
+        return decisions
+
+    @staticmethod
+    def _parse_neighbor_score(value: Any) -> float | None:
+        try:
+            score = float(value)
+        except (TypeError, ValueError):
+            return None
+        return max(0.0, min(5.0, score))
 
     @staticmethod
     def _iter_markdown_links(markdown: str):
@@ -1181,6 +1397,12 @@ def _smoke_test() -> None:
             assert "Los Angeles Lakers" in titles
             assert "Dream Team (basketball)" in titles
             assert all('"' not in link.url for link in result.linked_entities)
+            parsed_neighbors = WikiTextBuilder._parse_neighbor_filter_response(
+                '<neighbor id="1" keep="yes" score="4.2" relation="played_for" reason="Specific team"/>'
+                '<neighbor id="2" keep="no" score="1.0" relation="too_generic" reason="Broad class"/>'
+            )
+            assert parsed_neighbors[1]["keep"] == "yes"
+            assert WikiTextBuilder._parse_neighbor_score(parsed_neighbors[1]["score"]) == 4.2
             nearby_markdown = (
                 "[1950](https://en.wikipedia.org/wiki/1950_NBA_Finals) "
                 "[1951](https://en.wikipedia.org/wiki/1951_NBA_Finals) "

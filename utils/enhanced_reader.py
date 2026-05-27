@@ -13,8 +13,11 @@ from __future__ import annotations
 import asyncio
 from html import escape
 from html.parser import HTMLParser
+import hashlib
 import os
+from pathlib import Path
 import re
+import sys
 import time
 from typing import Any
 from urllib.parse import urlparse
@@ -31,6 +34,8 @@ READERLM_API_KEY = os.environ.get("READERLM_API_KEY", "")
 READERLM_MAX_HTML_CHARS = int(os.environ.get("READERLM_MAX_HTML_CHARS", "120000"))
 READER_TIMEOUT = float(os.environ.get("ENHANCED_READER_TIMEOUT", "180"))
 READERLM_MAX_TOKENS = int(os.environ.get("READERLM_MAX_TOKENS", "8192"))
+DEBUG_READERLM_URL_LEAK = os.environ.get("ENHANCED_READER_DEBUG_URL_LEAK", "1") != "0"
+DEBUG_READERLM_URL_LEAK_DIR = Path(os.environ.get("ENHANCED_READER_DEBUG_URL_LEAK_DIR", "/tmp/enhanced_reader_url_leaks"))
 TRUNCATION_MARKER = "\n<!-- enhanced_reader_truncated -->"
 
 
@@ -358,6 +363,37 @@ def strip_outer_markdown_fence(text: str) -> str:
     return match.group(1).strip() if match else text.strip()
 
 
+def debug_url_leak_after_readerlm(
+    *,
+    source_url: str | None,
+    readerlm_input: str,
+    markdown: str,
+    debug_timing: dict[str, Any] | None = None,
+) -> None:
+    if not DEBUG_READERLM_URL_LEAK or "(http" not in markdown:
+        return
+
+    DEBUG_READERLM_URL_LEAK_DIR.mkdir(parents=True, exist_ok=True)
+    leak_key = hashlib.sha1(f"{source_url or ''}\n{time.time()}".encode("utf-8")).hexdigest()[:12]
+    input_path = DEBUG_READERLM_URL_LEAK_DIR / f"{leak_key}.before_readerlm.html"
+    output_path = DEBUG_READERLM_URL_LEAK_DIR / f"{leak_key}.after_readerlm.md"
+    input_path.write_text(readerlm_input, encoding="utf-8")
+    output_path.write_text(markdown, encoding="utf-8")
+
+    message = (
+        "[enhanced_reader][url_leak] ReaderLM output contains '(http'. "
+        f"url={source_url} input={input_path} output={output_path}"
+    )
+    print(message, file=sys.stderr, flush=True)
+    print("[enhanced_reader][url_leak][before_preview]", readerlm_input[:2000], file=sys.stderr, flush=True)
+    print("[enhanced_reader][url_leak][after_preview]", markdown[:2000], file=sys.stderr, flush=True)
+
+    if debug_timing is not None:
+        debug_timing["readerlm_url_leak_detected"] = True
+        debug_timing["readerlm_url_leak_input_path"] = str(input_path)
+        debug_timing["readerlm_url_leak_output_path"] = str(output_path)
+
+
 async def fetch_html(client: httpx.AsyncClient, url: str) -> str:
     response = await client.get(
         f"{RAW_READER_URL.rstrip('/')}/{url}",
@@ -422,7 +458,14 @@ async def convert_html_to_markdown(
     )
     response.raise_for_status()
     data: dict[str, Any] = response.json()
-    return strip_outer_markdown_fence(data["choices"][0]["message"]["content"])
+    markdown = strip_outer_markdown_fence(data["choices"][0]["message"]["content"])
+    debug_url_leak_after_readerlm(
+        source_url=source_url,
+        readerlm_input=readerlm_input,
+        markdown=markdown,
+        debug_timing=debug_timing,
+    )
+    return markdown
 
 
 async def timed_call(label: str, coro, timing: dict[str, Any]):

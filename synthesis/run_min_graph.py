@@ -185,6 +185,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lead-max-links-per-window", type=int, default=4, help="Maximum selected links per window in the leading page region.")
     parser.add_argument("--max-content-chars", type=int, default=50000, help="Max cleaned markdown chars stored in each text node/evidence. <=0 disables truncation.")
     parser.add_argument("--max-link-markdown-chars", type=int, default=80000, help="Max raw markdown chars used for wiki-link extraction. <=0 disables truncation.")
+    parser.add_argument("--max-llm-neighbor-candidates", type=int, default=40, help="Maximum rule-recalled wiki links sent to WIKI_NEIGHBOR_MODEL per page.")
     parser.add_argument("--per-query-image-limit", type=int, default=3, help="Image search results per visual query.")
     parser.add_argument("--max-images-per-plan", type=int, default=1, help="Accepted images per visual plan.")
     parser.add_argument("--no-images", action="store_true", help="Disable visual planning and image discovery.")
@@ -249,6 +250,7 @@ def main(argv: list[str] | None = None) -> int:
         lead_max_links_per_window=args.lead_max_links_per_window,
         max_content_chars=args.max_content_chars if args.max_content_chars > 0 else None,
         max_link_markdown_chars=args.max_link_markdown_chars if args.max_link_markdown_chars > 0 else None,
+        max_llm_neighbor_candidates=args.max_llm_neighbor_candidates,
     )
 
     visual_planner = None
