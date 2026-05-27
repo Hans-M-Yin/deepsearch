@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+import time
 from typing import Any
 
 import httpx
@@ -134,27 +135,56 @@ async def convert_html_to_markdown(client: httpx.AsyncClient, html: str) -> str:
     return strip_outer_markdown_fence(data["choices"][0]["message"]["content"])
 
 
+async def timed_call(label: str, coro, timing: dict[str, float]):
+    started = time.perf_counter()
+    try:
+        return await coro
+    finally:
+        timing[f"{label}_s"] = time.perf_counter() - started
+
+
 @app.get("/{target_url:path}")
 async def read(target_url: str, request: Request):
+    total_started = time.perf_counter()
     url = normalize_url(target_url)
     wants_json = "application/json" in request.headers.get("accept", "")
+    debug_timing: dict[str, float] = {}
 
     async with httpx.AsyncClient() as client:
         try:
+            fetch_started = time.perf_counter()
             markdown_response, html_response = await asyncio.gather(
-                fetch_markdown(client, url),
-                fetch_html(client, url),
+                timed_call("fetch_markdown", fetch_markdown(client, url), debug_timing),
+                timed_call("fetch_html", fetch_html(client, url), debug_timing),
             )
+            fetch_done = time.perf_counter()
+            debug_timing["fetch_markdown_html_parallel_s"] = fetch_done - fetch_started
             html = html_response
+            readerlm_started = time.perf_counter()
             markdown = await convert_html_to_markdown(client, html)
+            debug_timing["readerlm_s"] = time.perf_counter() - readerlm_started
         except Exception as exc:
+            debug_timing["total_s"] = time.perf_counter() - total_started
             message = f"Enhanced Reader error for {url}: {exc}"
             if wants_json:
                 return JSONResponse(
                     status_code=502,
-                    content={"data": None, "code": 502, "status": 502, "message": message},
+                    content={
+                        "data": None,
+                        "code": 502,
+                        "status": 502,
+                        "message": message,
+                        "debug_timing": debug_timing,
+                    },
                 )
-            return Response(message, status_code=502, media_type="text/plain")
+            return Response(
+                message,
+                status_code=502,
+                media_type="text/plain",
+                headers={"X-Debug-Timing-Total-S": f"{debug_timing['total_s']:.6f}"},
+            )
+
+    debug_timing["total_s"] = time.perf_counter() - total_started
 
     if wants_json:
         return {
@@ -163,10 +193,20 @@ async def read(target_url: str, request: Request):
                 "url": url,
                 "content": markdown,
                 "raw_markdown": markdown_response,
+                "debug_timing": debug_timing,
             },
             "code": 200,
             "status": 200,
+            "debug_timing": debug_timing,
         }
 
     body = f"URL Source: {url}\n\nMarkdown Content:\n{markdown}\n"
-    return Response(body, media_type="text/plain; charset=utf-8")
+    return Response(
+        body,
+        media_type="text/plain; charset=utf-8",
+        headers={
+            "X-Debug-Timing-Fetch-Markdown-Html-Parallel-S": f"{debug_timing['fetch_markdown_html_parallel_s']:.6f}",
+            "X-Debug-Timing-Readerlm-S": f"{debug_timing['readerlm_s']:.6f}",
+            "X-Debug-Timing-Total-S": f"{debug_timing['total_s']:.6f}",
+        },
+    )
