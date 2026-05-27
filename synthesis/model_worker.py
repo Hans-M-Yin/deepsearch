@@ -163,9 +163,25 @@ class ModelRouterWorkerClient:
     def from_env(cls) -> "ModelRouterWorkerClient":
         config_path = os.environ.get("SYNTHESIS_MODEL_CONFIG")
         if config_path:
-            return cls(config_path)
+            return cls(cls._resolve_config_path(config_path))
         default_path = Path(__file__).with_name("models.json")
         return cls(default_path if default_path.exists() else None)
+
+    @staticmethod
+    def _resolve_config_path(config_path: str | Path) -> Path:
+        path = Path(config_path)
+        if path.is_absolute() or path.exists():
+            return path
+
+        project_relative = Path(__file__).resolve().parents[1] / path
+        if project_relative.exists():
+            return project_relative
+
+        synthesis_relative = Path(__file__).resolve().parent / path
+        if synthesis_relative.exists():
+            return synthesis_relative
+
+        return path
 
     def load_config(self, config_path: str | Path | None = None) -> None:
         if config_path is not None:

@@ -69,7 +69,7 @@ Good target examples:
 
 Bad target examples:
 - "photo of Justin Bieber" because many unrelated images satisfy it.
-- "Los Angeles Lakers game photo" because many games and moments qualify.
+- "Los Angeles Lakers game photo" because different games and moments qualify.
 - "cat image" or "basketball image" because these are broad categories.
 - "South Korea city skyline" unless the text specifies a unique skyline,
   landmark, date, or event.
