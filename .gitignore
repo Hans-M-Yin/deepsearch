@@ -71,3 +71,7 @@ serper_openserp_adapter_log
 openserp_log
 openserp.pid
 serper_openserp_adapter.pid
+vllm_reader_lm_log
+vllm_reader_lm.pid
+enhanced_reader_log
+enhanced_reader.pid
