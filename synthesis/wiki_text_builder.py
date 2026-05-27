@@ -255,6 +255,7 @@ class WikiTextBuilder:
         model_client: ModelWorkerClient | None = None,
         max_links: int = 80,
         max_raw_links: int | None = None,
+        persist_snapshots: bool = False,
         diversity_window_size: int = 1200,
         max_links_per_window: int = 2,
         min_link_char_distance: int = 500,
@@ -266,6 +267,7 @@ class WikiTextBuilder:
         self.model_client = model_client or LLM_WORKER
         self.max_links = max_links
         self.max_raw_links = max_raw_links or max(max_links * 5, max_links)
+        self.persist_snapshots = persist_snapshots
         self.diversity_window_size = diversity_window_size
         self.max_links_per_window = max_links_per_window
         self.min_link_char_distance = min_link_char_distance
@@ -329,7 +331,7 @@ class WikiTextBuilder:
             content=document.content,
             node_ids=[node.node_id],
             url=page_url,
-            source_snapshot_id=snapshot.snapshot_id,
+            source_snapshot_id=snapshot.snapshot_id if self.persist_snapshots else None,
             extractor=self.builder_name,
             evidence_key=f"wiki_text:{page_url}",
         )
@@ -918,7 +920,8 @@ class WikiTextBuilder:
     def _persist_result(self, result: WikiTextBuildResult) -> None:
         if self.store is None:
             return
-        self.store.upsert_search_snapshot(result.snapshot)
+        if self.persist_snapshots:
+            self.store.upsert_search_snapshot(result.snapshot)
         self.store.upsert_node(result.node)
         self.store.upsert_evidence(result.text_evidence)
         for edge in result.edges:

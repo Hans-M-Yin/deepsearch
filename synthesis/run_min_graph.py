@@ -120,6 +120,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-images", action="store_true", help="Disable visual planning and image discovery.")
     parser.add_argument("--skip-attributes", action="store_true", help="Do not call LLM attribute extraction.")
     parser.add_argument("--fatal-attribute-errors", action="store_true", help="Fail the task if attribute extraction fails.")
+    parser.add_argument("--persist-snapshots", action="store_true", help="Persist verbose SearchSnapshot records for debugging.")
     parser.add_argument("--no-serp-fallback", action="store_true", help="Do not use SerpApi fallback after Commons.")
     parser.add_argument("--run-id", default=None, help="Optional stable run id.")
     parser.add_argument("--fresh", action="store_true", help="Ignore existing runner checkpoint state.")
@@ -170,6 +171,7 @@ def main(argv: list[str] | None = None) -> int:
         store=store,
         model_client=LLM_WORKER,
         max_links=args.max_links,
+        persist_snapshots=args.persist_snapshots,
         diversity_window_size=args.link_window_size,
         max_links_per_window=args.max_links_per_window,
         min_link_char_distance=args.min_link_char_distance,
@@ -192,6 +194,7 @@ def main(argv: list[str] | None = None) -> int:
             config=ImageDiscoveryConfig(
                 per_query_limit=args.per_query_image_limit,
                 max_images_per_plan=args.max_images_per_plan,
+                persist_search_snapshots=args.persist_snapshots,
             ),
             model_client=LLM_WORKER,
         )

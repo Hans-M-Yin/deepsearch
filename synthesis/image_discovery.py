@@ -96,6 +96,7 @@ class ImageDiscoveryConfig:
 
     per_query_limit: int = 10
     max_images_per_plan: int = 8
+    persist_search_snapshots: bool = False
     min_width: int | None = 120
     min_height: int | None = 120
     allowed_content_types: set[str] | None = None
@@ -352,7 +353,7 @@ class ImageDiscoveryBuilder:
             content=search_result.title or search_result.snippet,
             node_ids=[image_node.node_id],
             url=search_result.source_page_url or search_result.image_url,
-            source_snapshot_id=snapshot.snapshot_id,
+            source_snapshot_id=snapshot.snapshot_id if self.config.persist_search_snapshots else None,
             extractor=self.builder_name,
             confidence=validation.confidence,
             metadata={
@@ -360,6 +361,7 @@ class ImageDiscoveryBuilder:
                 "query": query.query,
                 "rank": search_result.rank,
                 "engine": snapshot.engine.value,
+                "snapshot_id": snapshot.snapshot_id,
                 "used_fallback": used_fallback,
                 "validation": validation.to_dict(),
             },
@@ -371,12 +373,13 @@ class ImageDiscoveryBuilder:
             node_ids=[image_node.node_id],
             asset_ids=asset_ids,
             url=search_result.image_url,
-            source_snapshot_id=snapshot.snapshot_id,
+            source_snapshot_id=snapshot.snapshot_id if self.config.persist_search_snapshots else None,
             extractor=self.builder_name,
             confidence=validation.confidence,
             metadata={
                 "source_page_url": search_result.source_page_url,
                 "thumbnail_url": search_result.thumbnail_url,
+                "snapshot_id": snapshot.snapshot_id,
                 "query_id": query.query_id,
                 "target_evidence_id": plan.target.evidence_id,
                 "validation": validation.to_dict(),
@@ -1021,7 +1024,7 @@ class ImageDiscoveryBuilder:
         )
 
     def _persist_snapshot(self, snapshot: SearchSnapshot) -> None:
-        if self.store is not None:
+        if self.store is not None and self.config.persist_search_snapshots:
             self.store.upsert_search_snapshot(snapshot)
 
     def _persist_records(
