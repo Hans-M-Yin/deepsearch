@@ -183,6 +183,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-link-char-distance", type=int, default=500, help="Minimum character distance between selected wiki links.")
     parser.add_argument("--lead-chars", type=int, default=3000, help="Leading page characters that receive a looser link quota.")
     parser.add_argument("--lead-max-links-per-window", type=int, default=4, help="Maximum selected links per window in the leading page region.")
+    parser.add_argument("--max-content-chars", type=int, default=50000, help="Max cleaned markdown chars stored in each text node/evidence. <=0 disables truncation.")
+    parser.add_argument("--max-link-markdown-chars", type=int, default=80000, help="Max raw markdown chars used for wiki-link extraction. <=0 disables truncation.")
     parser.add_argument("--per-query-image-limit", type=int, default=3, help="Image search results per visual query.")
     parser.add_argument("--max-images-per-plan", type=int, default=1, help="Accepted images per visual plan.")
     parser.add_argument("--no-images", action="store_true", help="Disable visual planning and image discovery.")
@@ -245,6 +247,8 @@ def main(argv: list[str] | None = None) -> int:
         min_link_char_distance=args.min_link_char_distance,
         lead_chars=args.lead_chars,
         lead_max_links_per_window=args.lead_max_links_per_window,
+        max_content_chars=args.max_content_chars if args.max_content_chars > 0 else None,
+        max_link_markdown_chars=args.max_link_markdown_chars if args.max_link_markdown_chars > 0 else None,
     )
 
     visual_planner = None
@@ -311,6 +315,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"queue_size: {result.queue_size}")
     print(f"completed: {result.completed_count}")
     print(f"failed: {result.failed_count}")
+    print(f"skipped: {result.skipped_count}")
     print(f"store_stats: {result.store_stats}")
     graph_metrics = graph_density_metrics(result.store_stats)
     print(

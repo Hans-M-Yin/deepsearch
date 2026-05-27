@@ -28,6 +28,7 @@ READERLM_API_KEY = os.environ.get("READERLM_API_KEY", "")
 READERLM_MAX_HTML_CHARS = int(os.environ.get("READERLM_MAX_HTML_CHARS", "120000"))
 READER_TIMEOUT = float(os.environ.get("ENHANCED_READER_TIMEOUT", "180"))
 READERLM_MAX_TOKENS = int(os.environ.get("READERLM_MAX_TOKENS", "8192"))
+TRUNCATION_MARKER = "\n<!-- enhanced_reader_truncated -->"
 
 
 app = FastAPI(title="Enhanced Reader API")
@@ -76,6 +77,35 @@ def clean_html(html: str, clean_svg: bool = True, clean_base64: bool = True) -> 
     return html
 
 
+def truncate_safely(text: str, max_chars: int, *, marker: str = TRUNCATION_MARKER) -> str:
+    """Truncate near structural boundaries instead of cutting raw HTML mid-token."""
+
+    if max_chars <= 0 or len(text) <= max_chars:
+        return text
+
+    preferred_breaks = (
+        "</section>",
+        "</article>",
+        "</p>",
+        "</div>",
+        "</li>",
+        "\n\n",
+        "\n",
+        ". ",
+        " ",
+    )
+    min_cut = int(max_chars * 0.65)
+    cut_at = -1
+    for needle in preferred_breaks:
+        pos = text.rfind(needle, 0, max_chars)
+        if pos >= min_cut:
+            cut_at = pos + len(needle)
+            break
+    if cut_at < min_cut:
+        cut_at = max_chars
+    return text[:cut_at].rstrip() + marker
+
+
 def create_prompt(
     html: str,
     instruction: str = "Extract the main content from the given HTML and convert it to Markdown format.",
@@ -112,8 +142,26 @@ async def fetch_markdown(client: httpx.AsyncClient, url: str) -> str:
     return response.text
 
 
-async def convert_html_to_markdown(client: httpx.AsyncClient, html: str) -> str:
-    cleaned_html = clean_html(html)[:READERLM_MAX_HTML_CHARS]
+async def convert_html_to_markdown(
+    client: httpx.AsyncClient,
+    html: str,
+    *,
+    debug_timing: dict[str, Any] | None = None,
+) -> str:
+    started = time.perf_counter()
+    cleaned_html = clean_html(html)
+    if debug_timing is not None:
+        debug_timing["clean_html_s"] = time.perf_counter() - started
+        debug_timing["raw_html_chars"] = len(html)
+        debug_timing["cleaned_html_chars"] = len(cleaned_html)
+
+    started = time.perf_counter()
+    readerlm_input = truncate_safely(cleaned_html, READERLM_MAX_HTML_CHARS)
+    if debug_timing is not None:
+        debug_timing["truncate_html_s"] = time.perf_counter() - started
+        debug_timing["readerlm_input_chars"] = len(readerlm_input)
+        debug_timing["readerlm_input_truncated"] = readerlm_input != cleaned_html
+
     headers = {"Content-Type": "application/json"}
     if READERLM_API_KEY:
         headers["Authorization"] = f"Bearer {READERLM_API_KEY}"
@@ -123,7 +171,7 @@ async def convert_html_to_markdown(client: httpx.AsyncClient, html: str) -> str:
         headers=headers,
         json={
             "model": READERLM_MODEL_NAME,
-            "messages": [{"role": "user", "content": create_prompt(cleaned_html)}],
+            "messages": [{"role": "user", "content": create_prompt(readerlm_input)}],
             "temperature": 0,
             "max_tokens": READERLM_MAX_TOKENS,
             "extra_body": {"repetition_penalty": 1.08},
@@ -135,7 +183,7 @@ async def convert_html_to_markdown(client: httpx.AsyncClient, html: str) -> str:
     return strip_outer_markdown_fence(data["choices"][0]["message"]["content"])
 
 
-async def timed_call(label: str, coro, timing: dict[str, float]):
+async def timed_call(label: str, coro, timing: dict[str, Any]):
     started = time.perf_counter()
     try:
         return await coro
@@ -148,7 +196,7 @@ async def read(target_url: str, request: Request):
     total_started = time.perf_counter()
     url = normalize_url(target_url)
     wants_json = "application/json" in request.headers.get("accept", "")
-    debug_timing: dict[str, float] = {}
+    debug_timing: dict[str, Any] = {}
 
     async with httpx.AsyncClient() as client:
         try:
@@ -161,7 +209,7 @@ async def read(target_url: str, request: Request):
             debug_timing["fetch_markdown_html_parallel_s"] = fetch_done - fetch_started
             html = html_response
             readerlm_started = time.perf_counter()
-            markdown = await convert_html_to_markdown(client, html)
+            markdown = await convert_html_to_markdown(client, html, debug_timing=debug_timing)
             debug_timing["readerlm_s"] = time.perf_counter() - readerlm_started
         except Exception as exc:
             debug_timing["total_s"] = time.perf_counter() - total_started

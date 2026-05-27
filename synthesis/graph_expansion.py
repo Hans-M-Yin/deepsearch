@@ -20,7 +20,7 @@ from .edges import Edge
 from .image_discovery import ImageDiscoveryBuilder, ImageDiscoveryResult
 from .store import JsonlGraphStore
 from .visual_planner import VisualSearchPlan, VisualSearchPlanner
-from .wiki_text_builder import WikiLinkCandidate, WikiTextBuilder, WikiTextBuildResult
+from .wiki_text_builder import InvalidWikiPageError, WikiLinkCandidate, WikiTextBuilder, WikiTextBuildResult
 
 
 def _jsonify(value: Any) -> Any:
@@ -271,6 +271,15 @@ class GraphExpansionStrategy:
                 materialized_edges=materialized_edges,
                 queued_tasks=queued_tasks,
                 timing=timing,
+            )
+        except InvalidWikiPageError as exc:
+            task.status = ExpansionTaskStatus.SKIPPED
+            timing["total_s"] = time.perf_counter() - total_started
+            return NodeExpansionResult(
+                task=task,
+                error=None,
+                timing=timing,
+                attribute_error=f"{exc.__class__.__name__}: {exc}",
             )
         except Exception as exc:
             task.status = ExpansionTaskStatus.FAILED

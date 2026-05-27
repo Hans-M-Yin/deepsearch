@@ -26,6 +26,15 @@ from .store import JsonlGraphStore
 
 
 WIKI_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
+MARKDOWN_TRUNCATION_MARKER = "\n\n<!-- wiki_text_builder_truncated -->"
+WIKI_MISSING_PAGE_PATTERNS = (
+    "wikipedia does not have an article with this exact name",
+    "there is currently no text in this page",
+    "you may create the page",
+    "维基百科没有与该名称完全匹配的条目",
+    "没有与该名称完全匹配的条目",
+    "创建新条目",
+)
 WIKI_PAGE_PREFIXES_TO_SKIP = (
     "File:",
     "Category:",
@@ -245,6 +254,10 @@ class WikiTextBuildResult:
         }
 
 
+class InvalidWikiPageError(ValueError):
+    """Raised when a fetched Wikipedia URL is not an actual article page."""
+
+
 class WikiTextBuilder:
     """Build a text node from a Wikipedia page and extract hyperlink neighbors."""
 
@@ -264,6 +277,8 @@ class WikiTextBuilder:
         min_link_char_distance: int = 500,
         lead_chars: int = 3000,
         lead_max_links_per_window: int = 4,
+        max_content_chars: int | None = 50000,
+        max_link_markdown_chars: int | None = 80000,
     ) -> None:
         self.reader = reader
         self.store = store
@@ -276,6 +291,8 @@ class WikiTextBuilder:
         self.min_link_char_distance = min_link_char_distance
         self.lead_chars = lead_chars
         self.lead_max_links_per_window = lead_max_links_per_window
+        self.max_content_chars = max_content_chars
+        self.max_link_markdown_chars = max_link_markdown_chars
 
     def build_from_url(
         self,
@@ -309,17 +326,33 @@ class WikiTextBuilder:
 
         started = time.perf_counter()
         page_title = title or document.title or self._title_from_url(page_url)
-        link_markdown = document.raw_markdown or document.content
+        self._validate_article_page(page_url=page_url, page_title=page_title, content=document.content)
+        content = self._safe_truncate_markdown(document.content, self.max_content_chars)
+        link_markdown = self._safe_truncate_markdown(
+            document.raw_markdown or document.content,
+            self.max_link_markdown_chars,
+        )
+        content_truncated = content != document.content
+        link_markdown_original = document.raw_markdown or document.content
+        link_markdown_truncated = link_markdown != link_markdown_original
 
         snapshot = SearchSnapshot.create(
             SearchEngine.JINA_READER,
             query=page_url,
             request={"url": page_url, "reader": self.reader.__class__.__name__},
-            response_preview=document.content[:2000],
-            result_count=1 if document.content else 0,
+            response_preview=content[:2000],
+            result_count=1 if content else 0,
             status_code=200,
             run_id=run_id,
-            metadata={"raw": document.raw},
+            metadata={
+                "raw": document.raw,
+                "content_original_chars": len(document.content),
+                "content_stored_chars": len(content),
+                "content_truncated": content_truncated,
+                "link_markdown_original_chars": len(link_markdown_original),
+                "link_markdown_used_chars": len(link_markdown),
+                "link_markdown_truncated": link_markdown_truncated,
+            },
         )
         node = TextNode(
             # TODO: alise is not implemented yet.
@@ -327,8 +360,8 @@ class WikiTextBuilder:
             subtype="wiki_page",
             canonical_id=f"wikipedia:{page_title}" if page_title else None,
             title=page_title,
-            summary=self._first_paragraph(document.content),
-            description=document.content,
+            summary=self._first_paragraph(content),
+            description=content,
             source=NodeSource(
                 source_type="wikipedia",
                 url=page_url,
@@ -339,17 +372,23 @@ class WikiTextBuilder:
             metadata={
                 "source_url": page_url,
                 "reader": self.reader.__class__.__name__,
+                "content_original_chars": len(document.content),
+                "content_stored_chars": len(content),
+                "content_truncated": content_truncated,
+                "link_markdown_used_chars": len(link_markdown),
+                "link_markdown_truncated": link_markdown_truncated,
             },
         )
         text_evidence = Evidence.create(
             EvidenceType.WEB_TEXT,
-            content=document.content,
+            content=content,
             node_ids=[node.node_id],
             url=page_url,
             source_snapshot_id=snapshot.snapshot_id if self.persist_snapshots else None,
             extractor=self.builder_name,
             evidence_key=f"wiki_text:{page_url}",
         )
+        timing["validate_and_truncate_s"] = time.perf_counter() - started
         timing["node_evidence_create_s"] = time.perf_counter() - started
 
         started = time.perf_counter()
@@ -640,15 +679,14 @@ class WikiTextBuilder:
     ) -> list[WikiLinkCandidate]:
         seen_urls: set[str] = set()
         candidates: list[WikiLinkCandidate] = []
-        for rank, match in enumerate(WIKI_LINK_RE.finditer(markdown), start=1):
-            anchor_text, href = match.groups()
+        for rank, (anchor_text, href, start, end) in enumerate(self._iter_markdown_links(markdown), start=1):
             url = self._wiki_url_from_href(href, source_url=source_url)
             if not url or url in seen_urls:
                 continue
             title = self._title_from_url(url)
             if not title or title.startswith(WIKI_PAGE_PREFIXES_TO_SKIP):
                 continue
-            context = self._context(markdown, match.start(), match.end())
+            context = self._context(markdown, start, end)
             score, reasons = self._score_link_candidate(
                 title=title,
                 anchor_text=anchor_text,
@@ -666,9 +704,9 @@ class WikiTextBuilder:
                     source_url=source_url,
                     context=context,
                     rank=rank,
-                    start_char=match.start(),
-                    end_char=match.end(),
-                    window_id=self._window_id(match.start()),
+                    start_char=start,
+                    end_char=end,
+                    window_id=self._window_id(start),
                     score=score,
                     quality_reasons=reasons,
                 )
@@ -676,6 +714,46 @@ class WikiTextBuilder:
             if len(candidates) >= self.max_raw_links:
                 break
         return self._select_position_diverse_links(candidates)
+
+    @staticmethod
+    def _iter_markdown_links(markdown: str):
+        """Yield markdown links while tolerating parentheses and optional titles in URLs."""
+
+        pos = 0
+        length = len(markdown)
+        while pos < length:
+            start = markdown.find("[", pos)
+            if start < 0:
+                break
+            if start > 0 and markdown[start - 1] == "!":
+                pos = start + 1
+                continue
+            close = markdown.find("]", start + 1)
+            if close < 0 or close + 1 >= length or markdown[close + 1] != "(":
+                pos = start + 1
+                continue
+
+            href_start = close + 2
+            depth = 1
+            idx = href_start
+            while idx < length:
+                char = markdown[idx]
+                if char == "\\":
+                    idx += 2
+                    continue
+                if char == "(":
+                    depth += 1
+                elif char == ")":
+                    depth -= 1
+                    if depth == 0:
+                        anchor = markdown[start + 1 : close]
+                        href = markdown[href_start:idx]
+                        yield anchor, href, start, idx + 1
+                        pos = idx + 1
+                        break
+                idx += 1
+            else:
+                break
 
     def _select_position_diverse_links(
         self,
@@ -947,8 +1025,61 @@ class WikiTextBuilder:
         self.store.flush()
 
     @staticmethod
-    def _wiki_url_from_href(href: str, *, source_url: str) -> str | None:
+    def _validate_article_page(
+        *,
+        page_url: str,
+        page_title: str | None,
+        content: str,
+    ) -> None:
+        normalized = re.sub(r"\s+", " ", content or "").strip().lower()
+        if not normalized:
+            raise InvalidWikiPageError(f"Empty Wikipedia reader content: {page_url}")
+
+        if any(pattern in normalized for pattern in WIKI_MISSING_PAGE_PATTERNS):
+            raise InvalidWikiPageError(f"Wikipedia page does not exist as an article: {page_url}")
+
+        title = (page_title or "").strip()
+        if title.startswith(WIKI_PAGE_PREFIXES_TO_SKIP):
+            raise InvalidWikiPageError(f"Non-article Wikipedia namespace is not allowed: {page_url}")
+
+    @staticmethod
+    def _safe_truncate_markdown(text: str, max_chars: int | None) -> str:
+        if max_chars is None or max_chars <= 0 or len(text) <= max_chars:
+            return text
+
+        preferred_breaks = ("\n\n", "\n# ", "\n## ", "\n### ", "\n- ", ". ", "。", " ")
+        min_cut = int(max_chars * 0.65)
+        cut_at = -1
+        for needle in preferred_breaks:
+            pos = text.rfind(needle, 0, max_chars)
+            if pos >= min_cut:
+                cut_at = pos + len(needle)
+                break
+        if cut_at < min_cut:
+            cut_at = max_chars
+
+        candidate = text[:cut_at].rstrip()
+        open_bracket = candidate.rfind("[")
+        close_bracket = candidate.rfind("]")
+        open_paren = candidate.rfind("(")
+        close_paren = candidate.rfind(")")
+        if open_bracket > close_bracket or open_paren > close_paren:
+            rollback = max(candidate.rfind("\n\n", 0, open_bracket), candidate.rfind("\n", 0, open_bracket))
+            if rollback >= min_cut:
+                candidate = candidate[:rollback].rstrip()
+        return candidate + MARKDOWN_TRUNCATION_MARKER
+
+    @staticmethod
+    def _clean_markdown_href(href: str) -> str:
         href = href.strip()
+        if href.startswith("<") and ">" in href:
+            return href[1 : href.find(">")].strip()
+        match = re.match(r"""^(\S+)(?:\s+['"].*['"])?\s*$""", href, flags=re.DOTALL)
+        return (match.group(1) if match else href).strip()
+
+    @staticmethod
+    def _wiki_url_from_href(href: str, *, source_url: str) -> str | None:
+        href = WikiTextBuilder._clean_markdown_href(href)
         if href.startswith("#"):
             return None
         parsed_source = urlparse(source_url)
@@ -1010,7 +1141,9 @@ def _smoke_test() -> None:
                 ),
                 raw_markdown=(
                     "Kobe Bryant played for the [Los Angeles Lakers]"
-                    "(https://en.wikipedia.org/wiki/Los_Angeles_Lakers). "
+                    "(https://en.wikipedia.org/wiki/Los_Angeles_Lakers \"Los Angeles Lakers\"). "
+                    "He was selected for the [Dream Team]"
+                    "(https://en.wikipedia.org/wiki/Dream_Team_(basketball)). "
                     "See also [official website](https://example.com). "
                     "Ignore [File:Photo.jpg](https://en.wikipedia.org/wiki/File:Photo.jpg)."
                 ),
@@ -1035,14 +1168,19 @@ def _smoke_test() -> None:
                 model_client=MockModel(),
                 max_links=5,
                 diversity_window_size=120,
-                max_links_per_window=1,
-                min_link_char_distance=80,
+                max_links_per_window=2,
+                min_link_char_distance=0,
                 lead_chars=0,
+                max_content_chars=30,
+                max_link_markdown_chars=500,
             )
             result = builder.build_from_url("https://en.wikipedia.org/wiki/Kobe_Bryant")
             assert result.node.title == "Kobe Bryant"
-            assert len(result.linked_entities) == 1
-            assert result.linked_entities[0].title == "Los Angeles Lakers"
+            assert result.node.metadata["content_truncated"] is True
+            titles = {link.title for link in result.linked_entities}
+            assert "Los Angeles Lakers" in titles
+            assert "Dream Team (basketball)" in titles
+            assert all('"' not in link.url for link in result.linked_entities)
             nearby_markdown = (
                 "[1950](https://en.wikipedia.org/wiki/1950_NBA_Finals) "
                 "[1951](https://en.wikipedia.org/wiki/1951_NBA_Finals) "
@@ -1050,7 +1188,15 @@ def _smoke_test() -> None:
                 + ("x" * 160)
                 + " [Jerry West](https://en.wikipedia.org/wiki/Jerry_West)"
             )
-            diverse_links = builder.extract_wiki_links(
+            diversity_builder = WikiTextBuilder(
+                reader=MockReader(),
+                max_links=5,
+                diversity_window_size=120,
+                max_links_per_window=1,
+                min_link_char_distance=80,
+                lead_chars=0,
+            )
+            diverse_links = diversity_builder.extract_wiki_links(
                 nearby_markdown,
                 source_url="https://en.wikipedia.org/wiki/NBA_Finals",
             )
@@ -1063,6 +1209,18 @@ def _smoke_test() -> None:
             )
             assert result.node.attributes["occupation"] == "basketball player"
             assert evidence.evidence_type == EvidenceType.LLM_OUTPUT
+
+            missing_page = "维基百科没有与该名称完全匹配的条目。请在维基百科中搜索。"
+            try:
+                builder._validate_article_page(
+                    page_url="https://en.wikipedia.org/wiki/United_Nations_%22United_Nations%22",
+                    page_title='United Nations "United Nations"',
+                    content=missing_page,
+                )
+            except InvalidWikiPageError:
+                pass
+            else:
+                raise AssertionError("missing Wikipedia pages should be rejected")
     finally:
         if old_model is None:
             os.environ.pop("TEXT_PROCESS_MODEL", None)

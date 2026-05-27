@@ -102,6 +102,7 @@ class GraphRunnerResult:
     completed_count: int
     failed_count: int
     store_stats: dict[str, int]
+    skipped_count: int = 0
     timing_summary: dict[str, Any] = field(default_factory=dict)
     last_error: str | None = None
 
@@ -190,6 +191,7 @@ class GraphRunner:
             queue_size=self.strategy.queue_size(),
             completed_count=len(self.state.completed_tasks),
             failed_count=len(self.state.failed_tasks),
+            skipped_count=len(self.state.skipped_tasks),
             store_stats=self.store.stats(),
             timing_summary=self._timing_summary(),
             last_error=last_error,
