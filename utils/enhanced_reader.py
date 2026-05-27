@@ -43,6 +43,8 @@ BASE64_IMG_PATTERN = r'<img[^>]+src="data:image/[^;]+;base64,[^"]+"[^>]*>'
 SVG_PATTERN = r"(<svg[^>]*>)(.*?)(</svg>)"
 A_OPEN_PATTERN = r"<a\b[^>]*>"
 A_CLOSE_PATTERN = r"</a\s*>"
+URL_ATTR_PATTERN = r"""\s(?:href|src|srcset|data-src|data-original|poster|action)=("[^"]*"|'[^']*'|[^\s>]+)"""
+BARE_URL_PATTERN = r"https?://[^\s<>'\"]+"
 
 
 def normalize_url(target_url: str) -> str:
@@ -71,6 +73,13 @@ def strip_anchor_links(html: str) -> str:
     return re.sub(A_CLOSE_PATTERN, "", html, flags=re.IGNORECASE | re.MULTILINE)
 
 
+def strip_url_noise(html: str) -> str:
+    """Remove URL-bearing attributes and literal URLs before ReaderLM sees text."""
+
+    html = re.sub(URL_ATTR_PATTERN, "", html, flags=re.IGNORECASE | re.MULTILINE | re.DOTALL)
+    return re.sub(BARE_URL_PATTERN, "", html, flags=re.IGNORECASE)
+
+
 def clean_html(html: str, clean_svg: bool = True, clean_base64: bool = True) -> str:
     """Pre-clean HTML following the ReaderLM-v2 model-card guidance."""
 
@@ -80,10 +89,11 @@ def clean_html(html: str, clean_svg: bool = True, clean_base64: bool = True) -> 
     html = re.sub(COMMENT_PATTERN, "", html, flags=re.IGNORECASE | re.MULTILINE | re.DOTALL)
     html = re.sub(LINK_PATTERN, "", html, flags=re.IGNORECASE | re.MULTILINE | re.DOTALL)
     html = strip_anchor_links(html)
-    if clean_svg:
-        html = replace_svg(html)
     if clean_base64:
         html = replace_base64_images(html)
+    html = strip_url_noise(html)
+    if clean_svg:
+        html = replace_svg(html)
     return html
 
 
