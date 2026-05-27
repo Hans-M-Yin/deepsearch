@@ -28,6 +28,16 @@ READERLM_MAX_HTML_CHARS="${READERLM_MAX_HTML_CHARS:-120000}"
 READERLM_MAX_TOKENS="${READERLM_MAX_TOKENS:-8192}"
 ENHANCED_READER_TIMEOUT="${ENHANCED_READER_TIMEOUT:-180}"
 
+# vLLM throughput knobs for ReaderLM. ReaderLM-v2 is small, so on an H100 80G
+# it is usually better to admit more concurrent sequences than to shard one
+# replica with tensor parallelism. Override these env vars before running this
+# script if the server OOMs or if throughput is still low.
+VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.90}"
+VLLM_MAX_NUM_SEQS="${VLLM_MAX_NUM_SEQS:-16}"
+VLLM_MAX_NUM_BATCHED_TOKENS="${VLLM_MAX_NUM_BATCHED_TOKENS:-65536}"
+VLLM_ENABLE_PREFIX_CACHING="${VLLM_ENABLE_PREFIX_CACHING:-1}"
+VLLM_DISABLE_LOG_REQUESTS="${VLLM_DISABLE_LOG_REQUESTS:-1}"
+
 require_dir() {
   local path="$1"
   local label="$2"
@@ -72,6 +82,11 @@ start_readerlm() {
       --host 0.0.0.0 \
       --port "${READERLM_PORT}" \
       --served-model-name "${READERLM_SERVED_MODEL_NAME}" \
+      --gpu-memory-utilization "${VLLM_GPU_MEMORY_UTILIZATION}" \
+      --max-num-seqs "${VLLM_MAX_NUM_SEQS}" \
+      --max-num-batched-tokens "${VLLM_MAX_NUM_BATCHED_TOKENS}" \
+      $([[ "${VLLM_ENABLE_PREFIX_CACHING}" == "1" ]] && echo "--enable-prefix-caching") \
+      $([[ "${VLLM_DISABLE_LOG_REQUESTS}" == "1" ]] && echo "--disable-log-requests") \
       > "${VLLM_READER_LM_LOG}" 2>&1 &
     echo $! > "${PROJECT_DIR}/vllm_reader_lm.pid"
   )
