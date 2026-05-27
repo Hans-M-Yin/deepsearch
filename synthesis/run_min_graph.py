@@ -63,21 +63,28 @@ def check_python_version() -> None:
         )
 
 
-def check_reader_service(base_url: str, *, timeout_s: float = 5.0) -> tuple[bool, str]:
-    """Check that the Enhanced Reader HTTP service is reachable."""
+def check_reader_service(
+    base_url: str,
+    *,
+    test_url: str,
+    timeout_s: float = 20.0,
+) -> tuple[bool, str]:
+    """Check that the Enhanced Reader can read an actual target URL."""
 
-    request = Request(base_url.rstrip("/") + "/", headers={"Accept": "application/json"})
+    target = test_url if test_url.startswith(("http://", "https://")) else f"https://{test_url}"
+    request_url = f"{base_url.rstrip('/')}/{target}"
+    request = Request(request_url, headers={"Accept": "application/json"})
     try:
         with urlopen(request, timeout=timeout_s) as response:
-            return True, f"reachable, status={response.getcode()}"
+            return True, f"reachable, status={response.getcode()}, test_url={target}"
     except HTTPError as exc:
         if exc.code < 500:
-            return True, f"reachable, status={exc.code}"
-        return False, f"server error, status={exc.code}"
+            return True, f"reachable, status={exc.code}, test_url={target}"
+        return False, f"server error, status={exc.code}, test_url={target}"
     except URLError as exc:
-        return False, f"not reachable: {exc.reason}"
+        return False, f"not reachable: {exc.reason}, test_url={target}"
     except TimeoutError:
-        return False, f"not reachable: timed out after {timeout_s}s"
+        return False, f"not reachable: timed out after {timeout_s}s, test_url={target}"
 
 
 def has_serpapi_credentials() -> bool:
@@ -135,7 +142,7 @@ def main(argv: list[str] | None = None) -> int:
     from synthesis.wiki_text_builder import EnhancedReaderClient, WikiTextBuilder
 
     if not args.skip_reader_check:
-        ok, message = check_reader_service(args.reader_base_url)
+        ok, message = check_reader_service(args.reader_base_url, test_url=args.seed_url)
         if not ok:
             print(f"[preflight] Enhanced Reader is unavailable at {args.reader_base_url}: {message}", file=sys.stderr)
             print("[preflight] Start the reader stack or rerun with --skip-reader-check.", file=sys.stderr)
