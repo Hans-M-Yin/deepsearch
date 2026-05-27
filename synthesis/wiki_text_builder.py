@@ -206,6 +206,9 @@ class WikiLinkCandidate:
     source_url: str
     context: str | None = None
     rank: int | None = None
+    start_char: int | None = None
+    end_char: int | None = None
+    window_id: int | None = None
     score: float = 0.0
     quality_reasons: list[str] = field(default_factory=list)
 
@@ -252,12 +255,22 @@ class WikiTextBuilder:
         model_client: ModelWorkerClient | None = None,
         max_links: int = 80,
         max_raw_links: int | None = None,
+        diversity_window_size: int = 1200,
+        max_links_per_window: int = 2,
+        min_link_char_distance: int = 500,
+        lead_chars: int = 3000,
+        lead_max_links_per_window: int = 4,
     ) -> None:
         self.reader = reader
         self.store = store
         self.model_client = model_client or LLM_WORKER
         self.max_links = max_links
         self.max_raw_links = max_raw_links or max(max_links * 5, max_links)
+        self.diversity_window_size = diversity_window_size
+        self.max_links_per_window = max_links_per_window
+        self.min_link_char_distance = min_link_char_distance
+        self.lead_chars = lead_chars
+        self.lead_max_links_per_window = lead_max_links_per_window
 
     def build_from_url(
         self,
@@ -631,13 +644,72 @@ class WikiTextBuilder:
                     source_url=source_url,
                     context=context,
                     rank=rank,
+                    start_char=match.start(),
+                    end_char=match.end(),
+                    window_id=self._window_id(match.start()),
                     score=score,
                     quality_reasons=reasons,
                 )
             )
             if len(candidates) >= self.max_raw_links:
                 break
-        return sorted(candidates, key=lambda item: (-item.score, item.rank or 10**9))[: self.max_links]
+        return self._select_position_diverse_links(candidates)
+
+    def _select_position_diverse_links(
+        self,
+        candidates: list[WikiLinkCandidate],
+    ) -> list[WikiLinkCandidate]:
+        sorted_candidates = sorted(candidates, key=lambda item: (-item.score, item.rank or 10**9))
+        selected: list[WikiLinkCandidate] = []
+        window_counts: dict[int, int] = {}
+
+        for candidate in sorted_candidates:
+            if len(selected) >= self.max_links:
+                break
+            if not self._passes_position_diversity(candidate, selected, window_counts):
+                continue
+            selected.append(candidate)
+            if candidate.window_id is not None:
+                window_counts[candidate.window_id] = window_counts.get(candidate.window_id, 0) + 1
+            candidate.quality_reasons.append("position_diverse")
+
+        return selected
+
+    def _passes_position_diversity(
+        self,
+        candidate: WikiLinkCandidate,
+        selected: list[WikiLinkCandidate],
+        window_counts: dict[int, int],
+    ) -> bool:
+        start = candidate.start_char
+        if start is None:
+            return True
+
+        window_id = candidate.window_id
+        if window_id is not None:
+            window_limit = self._window_limit(start)
+            if window_counts.get(window_id, 0) >= window_limit:
+                return False
+
+        if self.min_link_char_distance <= 0:
+            return True
+        for picked in selected:
+            picked_start = picked.start_char
+            if picked_start is None:
+                continue
+            if abs(start - picked_start) < self.min_link_char_distance:
+                return False
+        return True
+
+    def _window_id(self, start_char: int) -> int | None:
+        if self.diversity_window_size <= 0:
+            return None
+        return start_char // self.diversity_window_size
+
+    def _window_limit(self, start_char: int) -> int:
+        if self.lead_chars > 0 and start_char < self.lead_chars:
+            return max(1, self.lead_max_links_per_window)
+        return max(1, self.max_links_per_window)
 
     def _edge_to_linked_entity(
         self,
@@ -678,9 +750,19 @@ class WikiTextBuilder:
                 "target_title": candidate.title,
                 "target_url": candidate.url,
                 "rank": candidate.rank,
+                "start_char": candidate.start_char,
+                "end_char": candidate.end_char,
+                "window_id": candidate.window_id,
                 "anchor_text": candidate.anchor_text,
                 "link_score": candidate.score,
                 "quality_reasons": candidate.quality_reasons,
+                "position_diversity": {
+                    "window_size": self.diversity_window_size,
+                    "max_links_per_window": self.max_links_per_window,
+                    "min_char_distance": self.min_link_char_distance,
+                    "lead_chars": self.lead_chars,
+                    "lead_max_links_per_window": self.lead_max_links_per_window,
+                },
                 "relation_info": relation_info,
             },
             evidence_key=f"{evidence.evidence_id}:{candidate.url}",
@@ -931,11 +1013,29 @@ def _smoke_test() -> None:
                 store=store,
                 model_client=MockModel(),
                 max_links=5,
+                diversity_window_size=120,
+                max_links_per_window=1,
+                min_link_char_distance=80,
+                lead_chars=0,
             )
             result = builder.build_from_url("https://en.wikipedia.org/wiki/Kobe_Bryant")
             assert result.node.title == "Kobe Bryant"
             assert len(result.linked_entities) == 1
             assert result.linked_entities[0].title == "Los Angeles Lakers"
+            nearby_markdown = (
+                "[1950](https://en.wikipedia.org/wiki/1950_NBA_Finals) "
+                "[1951](https://en.wikipedia.org/wiki/1951_NBA_Finals) "
+                "[1952](https://en.wikipedia.org/wiki/1952_NBA_Finals) "
+                + ("x" * 160)
+                + " [Jerry West](https://en.wikipedia.org/wiki/Jerry_West)"
+            )
+            diverse_links = builder.extract_wiki_links(
+                nearby_markdown,
+                source_url="https://en.wikipedia.org/wiki/NBA_Finals",
+            )
+            assert len(diverse_links) == 2
+            assert any(link.title == "Jerry West" for link in diverse_links)
+            assert all(link.window_id is not None for link in diverse_links)
             evidence = builder.extract_attributes(
                 result.node,
                 source_evidence_ids=[result.text_evidence.evidence_id],

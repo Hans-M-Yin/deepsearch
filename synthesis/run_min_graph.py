@@ -110,6 +110,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-depth", type=int, default=1, help="Maximum text-neighbor BFS depth.")
     parser.add_argument("--max-neighbors", type=int, default=2, help="Text neighbors queued per text node.")
     parser.add_argument("--max-links", type=int, default=20, help="Wiki links extracted per page before queue slicing.")
+    parser.add_argument("--link-window-size", type=int, default=1200, help="Character window size for wiki-link diversity.")
+    parser.add_argument("--max-links-per-window", type=int, default=2, help="Maximum selected wiki links per character window.")
+    parser.add_argument("--min-link-char-distance", type=int, default=500, help="Minimum character distance between selected wiki links.")
+    parser.add_argument("--lead-chars", type=int, default=3000, help="Leading page characters that receive a looser link quota.")
+    parser.add_argument("--lead-max-links-per-window", type=int, default=4, help="Maximum selected links per window in the leading page region.")
     parser.add_argument("--per-query-image-limit", type=int, default=3, help="Image search results per visual query.")
     parser.add_argument("--max-images-per-plan", type=int, default=1, help="Accepted images per visual plan.")
     parser.add_argument("--no-images", action="store_true", help="Disable visual planning and image discovery.")
@@ -165,6 +170,11 @@ def main(argv: list[str] | None = None) -> int:
         store=store,
         model_client=LLM_WORKER,
         max_links=args.max_links,
+        diversity_window_size=args.link_window_size,
+        max_links_per_window=args.max_links_per_window,
+        min_link_char_distance=args.min_link_char_distance,
+        lead_chars=args.lead_chars,
+        lead_max_links_per_window=args.lead_max_links_per_window,
     )
 
     visual_planner = None
