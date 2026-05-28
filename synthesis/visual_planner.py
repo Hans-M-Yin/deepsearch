@@ -22,73 +22,78 @@ from .model_worker import LLM_WORKER, ModelMessage, ModelRequest, ModelResponse,
 PROMPT_VISUAL_SEARCH_PLANNER = """You are planning image searches for a multimodal deep-search data synthesis graph.
 
 Task:
-Given a Wikipedia text node, analyze the provided information and identify
-textual facts about the subject that can unambiguously point to existing visual
-evidence. Extract or summarize short factual statements from the node content.
-Each statement should correspond to a visually unique and unambiguous target in
-the real world.
+Given a Wikipedia text node split into numbered passages, find textual facts
+inside the passages that can be grounded to visually unique existing evidence.
+Do not brainstorm images from the page title alone. First inspect the passages,
+then extract or lightly summarize only facts that are supported by a specific
+source quote.
 
-Critical requirement: each target must be visually unique and unambiguous.
-The target should point to one specific entity, event, artifact, version,
-scene, document, object, or appearance. Different acceptable images may vary
-by camera angle, crop, or resolution, but they should depict the same visual
-fact. This is required because the image node will become an intermediate
-multi-hop graph node; if many different images could satisfy the target, the
-downstream question may become impossible to answer reliably.
+A valid visual-groundable fact must define one unambiguous visual evidence
+target: a specific event, artifact, version, scene, document, object, named
+place, appearance, cover, figure, official visual identity, or other visual
+fact. Different acceptable images may vary by angle, crop, or resolution, but
+they must depict the same target and let a human decide whether a candidate
+image matches the description.
 
-Choose targets that are:
-- Explicitly supported by the node content.
-- Likely searchable on Wikimedia Commons or Google image search.
-- Useful for multimodal multi-hop data construction.
-- Specific enough to avoid generic queries like "photo of the person".
-- Visually anchored by discriminative details such as year, event name,
-  award ceremony, film/work title, poster/cover version, named landmark,
-  named product, official logo, map, chart, document, uniform/outfit,
-  on-stage moment, or another concrete visual constraint.
-- Searchable with queries that should return near-equivalent evidence images,
-  not many unrelated images that merely share the same broad topic.
+Procedure:
+1. Read the numbered passages, not just the title.
+2. Identify passages that mention a concrete fact with visual evidence.
+3. Reject facts that cannot be tied to an exact source quote.
+4. For each accepted fact, explain why the visual target is unique.
+5. Rewrite the fact into 2 to 4 precise image-search queries.
 
-Avoid:
-- Private or unlikely-to-exist images.
-- Targets that are too broad, such as only the subject name.
-- Pure text facts that do not benefit from image search.
-- Generic portraits, generic building photos, generic team photos, broad
-  object categories, or vague scenes where many visually different images
-  would all satisfy the description.
-- Targets whose visual identity is not uniquely determined by the node
-  content.
+Keep targets that:
+- are explicitly supported by source_quote from the passages;
+- are likely searchable on Wikimedia Commons or image search;
+- have enough constraints such as year, event name, award ceremony, edition,
+  version, title, location, named artifact, named document, product model,
+  landmark, outfit, or moment;
+- can become a reliable intermediate image node in a multi-hop question.
+
+Reject targets if:
+- they are based only on the page title or general knowledge;
+- they are future, unreleased, speculative, or unstable;
+- many visually different images would satisfy the description;
+- the target mixes alternatives using wording like "or", "such as", "logo/banner/screenshot";
+- it is a generic portrait/photo/game/celebration/building/city skyline without
+  a specific event, date, object, version, landmark, or viewpoint;
+- it is a pure text fact with no useful visual search target.
 
 Good target examples:
-- A singer's debut album cover, because the cover is fixed and unique.
-- A specific film's official theatrical poster, because the poster is a named
-  artifact with a stable visual identity.
-- A named album cover, book cover, scientific figure, product model, official
-  visual identity, map, or document page.
-- A named person receiving a named award at a specific ceremony, where
-  acceptable photos show the same person, outfit, and event moment even if
-  angles differ.
-- A named landmark or object detail tied to a distinctive attribute.
-- A scanned page of a specific legal document or statute, where the document
-  and its content are uniquely determined.
+- Source quote mentions a singer's debut album title.
+  Good target: the debut album cover, because the cover is a stable artifact.
+- Source quote mentions an actor appearing at a named award ceremony in a
+  specific year.
+  Good target: that on-stage appearance, because person, event, outfit, and
+  context constrain the image.
+- Source quote mentions a specific film.
+  Good target: the official theatrical poster for that film, if the poster is
+  a stable visual artifact.
+- Source quote mentions a named landmark, product model, scientific figure,
+  legal document, map, official logo, book cover, or document page.
+  Good target: that exact visual artifact/object, if uniquely determined.
 
 Bad target examples:
-- "photo of Justin Bieber" because many unrelated images satisfy it.
-- "Los Angeles Lakers game photo" because different games and moments qualify.
-- "cat image" or "basketball image" because these are broad categories.
-- "South Korea city skyline" unless the text specifies a unique skyline,
-  landmark, date, or event.
-- "2026-27 Los Angeles Lakers team photo" because future or unreleased visual
-  evidence is unstable and may not exist yet.
-- "season-themed Los Angeles Lakers visual identity" because it may refer to
-  official graphics, fan designs, social media banners, or merchandise.
+- "photo of Justin Bieber": too many unrelated images satisfy it.
+- "Messi winning the Champions League": this happened multiple times and is
+  not unique unless the year/match/moment is specified.
+- "Los Angeles Lakers championship celebration": many seasons and moments
+  qualify unless the exact Finals/year/moment is specified.
+- "South Korea city skyline": too broad without city, viewpoint, landmark, or date.
+- "2026-27 Los Angeles Lakers team photo": future/unreleased visual evidence
+  is unstable and may not exist.
 
-Output at most 3 targets. Each target must contain 2 to 4 queries.
+Output at most 3 targets. If no passage supports a suitable target, output nothing.
+Each target must contain 2 to 4 queries.
 Do not output markdown, JSON, explanations, or extra text.
 
 Output format:
 <target>
+source_passage: P3
+source_quote: exact quote or close excerpt from the provided passage
 description: concrete visual evidence target
-reason: short reason this target is useful and visually unambiguous
+uniqueness: why this points to one unambiguous visual target
+reason: short reason this target is useful for multimodal multi-hop data
 expected_visual: what the image should visibly contain, including uniqueness constraints
 query: image search query 1
 query: image search query 2
@@ -271,7 +276,6 @@ class LLMVisualSearchPlanner:
                 temperature=0.0,
             )
         )
-        print(response.content)
         candidates = self._parse_targets(response.content)
         plans: list[VisualSearchPlan] = []
         for candidate in candidates:
@@ -295,8 +299,26 @@ class LLMVisualSearchPlanner:
         return (
             f"Title:\n{title}\n\n"
             f"Attributes:\n{attributes}\n\n"
-            f"Content:\n{page_text}"
+            "Numbered passages:\n"
+            f"{LLMVisualSearchPlanner._numbered_passages(page_text)}"
         )
+
+    @staticmethod
+    def _numbered_passages(page_text: str, *, max_passages: int = 80, max_chars_per_passage: int = 1200) -> str:
+        blocks = [block.strip() for block in re.split(r"\n\s*\n", page_text or "") if block.strip()]
+        passages: list[str] = []
+        for block in blocks:
+            compact = re.sub(r"[ \t]+", " ", block).strip()
+            if not compact:
+                continue
+            if len(compact) > max_chars_per_passage:
+                compact = compact[:max_chars_per_passage].rstrip() + " ..."
+            passages.append(compact)
+            if len(passages) >= max_passages:
+                break
+        if not passages:
+            return "P1: "
+        return "\n\n".join(f"P{index}: {passage}" for index, passage in enumerate(passages, start=1))
 
     @classmethod
     def _parse_targets(cls, text: str) -> list[dict[str, Any]]:
@@ -335,12 +357,14 @@ class LLMVisualSearchPlanner:
         run_id: str | None,
     ) -> VisualSearchPlan | None:
         description = candidate.get("description")
+        source_quote = candidate.get("source_quote")
+        uniqueness = candidate.get("uniqueness")
         queries = self._filter_queries(candidate.get("queries") or [], node_title=node.get("title"))
-        if not description or not queries:
+        if not description or not source_quote or not uniqueness or not queries:
             return None
 
-        target_type = self._target_type(candidate.get("type"))
-        downstream_use = self._downstream_use(candidate.get("use"))
+        target_type = VisualTargetType.OTHER
+        downstream_use = DownstreamUse.ROUTING_CLUE
         source_node_id = node.get("node_id")
         target = Evidence.create(
             EvidenceType.VISUAL_TARGET,
@@ -351,6 +375,9 @@ class LLMVisualSearchPlanner:
             metadata={
                 "target_type": target_type.value,
                 "downstream_use": downstream_use.value,
+                "source_passage": candidate.get("source_passage"),
+                "source_quote": source_quote,
+                "uniqueness": uniqueness,
                 "reason": candidate.get("reason"),
                 "expected_visual": candidate.get("expected_visual"),
                 "source_evidence_ids": source_evidence_ids,
@@ -367,6 +394,9 @@ class LLMVisualSearchPlanner:
                 source=self.planner_name,
                 metadata={
                     "downstream_use": downstream_use.value,
+                    "source_passage": candidate.get("source_passage"),
+                    "source_quote": source_quote,
+                    "uniqueness": uniqueness,
                     "reason": candidate.get("reason"),
                 },
             )
@@ -382,6 +412,9 @@ class LLMVisualSearchPlanner:
                 "raw_model_output_preview": raw_output[:2000],
                 "target_type": target_type.value,
                 "downstream_use": downstream_use.value,
+                "source_passage": candidate.get("source_passage"),
+                "source_quote": source_quote,
+                "uniqueness": uniqueness,
             },
         )
 
@@ -428,8 +461,9 @@ def _smoke_test() -> None:
             return ModelResponse(
                 content="""<target>
 description: Kobe Bryant final game jersey photo
-type: event_photo
-use: routing_clue
+source_passage: P1
+source_quote: Kobe Bryant played his final game in 2016.
+uniqueness: The final NBA game in 2016 is a specific event and uniform appearance.
 reason: iconic visual clue
 expected_visual: Kobe Bryant wearing his final game uniform
 query: Kobe Bryant final game jersey photo
@@ -447,7 +481,14 @@ query: Kobe Bryant 2016 final game uniform
     assert len(plans) == 1
     assert plans[0].source_node_id == "text_1"
     assert len(plans[0].queries) == 2
-    assert plans[0].target.metadata["target_type"] == "event_photo"
+    assert plans[0].target.metadata["source_passage"] == "P1"
+    assert "final game" in plans[0].target.metadata["source_quote"]
+    prompt_input = planner._prompt_input(
+        {"node_id": "text_1", "title": "Kobe Bryant", "attributes": {}},
+        "First paragraph.\n\nSecond paragraph.",
+    )
+    assert "P1: First paragraph." in prompt_input
+    assert "P2: Second paragraph." in prompt_input
     print("visual_planner smoke test passed")
 
 

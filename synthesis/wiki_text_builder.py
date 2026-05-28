@@ -227,11 +227,13 @@ Negative examples:
   relation: too_close
   reason: likely a self-descriptive or duplicate topic rather than a useful new entity
 
-Return one XML-like item per candidate. Do not output markdown or explanations outside the tags.
+Return one XML-like item per candidate. Copy the candidate title exactly into
+the title attribute so debugging output is readable. Do not output markdown or
+explanations outside the tags.
 
 Output format:
-<neighbor id="1" keep="yes" score="4.2" relation="played_for" reason="Specific team linked by source career context"/>
-<neighbor id="2" keep="no" score="1.0" relation="too_generic" reason="Broad class, not a unique entity"/>
+<neighbor id="1" title="Los Angeles Lakers" keep="yes" score="4.2" relation="played_for" reason="Specific team linked by source career context"/>
+<neighbor id="2" title="basketball" keep="no" score="1.0" relation="too_generic" reason="Broad class, not a unique entity"/>
 
 Scores are 0.0 to 5.0. Use keep="yes" only for candidates with score >= 3.0.
 """
@@ -823,8 +825,10 @@ class WikiTextBuilder:
             return candidates
 
         source_title = self._title_from_url(source_url) or source_url
+        debug_enabled = os.environ.get("WIKI_NEIGHBOR_DEBUG", "1") != "0"
         ranked_candidates = sorted(candidates, key=lambda item: (-item.score, item.rank or 10**9))
         prompt_candidates = ranked_candidates[: max(1, self.max_llm_neighbor_candidates)]
+        rule_scores = {candidate.url: candidate.score for candidate in prompt_candidates}
 
         try:
             response = self.model_client.generate(
@@ -842,16 +846,39 @@ class WikiTextBuilder:
                 )
             )
             decisions = self._parse_neighbor_filter_response(response.content)
+            if debug_enabled:
+                self._debug_print_neighbor_filter_raw(
+                    source_title=source_title,
+                    source_url=source_url,
+                    raw_output=response.content,
+                )
         except Exception as exc:
             for candidate in candidates:
                 candidate.quality_reasons.append(f"llm_neighbor_filter_failed:{exc.__class__.__name__}")
+            if debug_enabled:
+                self._debug_print_neighbor_filter_failure(
+                    source_title=source_title,
+                    source_url=source_url,
+                    candidates=prompt_candidates,
+                    error=exc,
+                )
             return candidates
 
         kept: list[WikiLinkCandidate] = []
+        debug_rows: list[dict[str, Any]] = []
         for index, candidate in enumerate(prompt_candidates, start=1):
             decision = decisions.get(index)
             if decision is None:
                 candidate.quality_reasons.append("llm_neighbor_missing_decision")
+                debug_rows.append(
+                    self._neighbor_debug_row(
+                        index=index,
+                        candidate=candidate,
+                        rule_score=rule_scores.get(candidate.url, candidate.score),
+                        decision=None,
+                        final_score=candidate.score,
+                    )
+                )
                 continue
             keep = decision.get("keep") == "yes"
             llm_score = self._parse_neighbor_score(decision.get("score"))
@@ -866,6 +893,24 @@ class WikiTextBuilder:
                 candidate.quality_reasons.append(f"llm_reason:{reason[:120]}")
             if keep and candidate.score >= 3.0:
                 kept.append(candidate)
+            debug_rows.append(
+                self._neighbor_debug_row(
+                    index=index,
+                    candidate=candidate,
+                    rule_score=rule_scores.get(candidate.url, candidate.score),
+                    decision=decision,
+                    final_score=candidate.score,
+                )
+            )
+
+        if debug_enabled:
+            self._debug_print_neighbor_filter(
+                source_title=source_title,
+                source_url=source_url,
+                model_alias=model_alias,
+                rows=debug_rows,
+                kept_urls={candidate.url for candidate in kept},
+            )
 
         if not kept:
             for candidate in candidates:
@@ -873,6 +918,103 @@ class WikiTextBuilder:
             return candidates
 
         return kept
+
+    @staticmethod
+    def _neighbor_debug_row(
+        *,
+        index: int,
+        candidate: WikiLinkCandidate,
+        rule_score: float,
+        decision: dict[str, str] | None,
+        final_score: float,
+    ) -> dict[str, Any]:
+        context = re.sub(r"\s+", " ", candidate.context or "").strip()
+        return {
+            "index": index,
+            "title": candidate.title,
+            "url": candidate.url,
+            "anchor": candidate.anchor_text,
+            "rank": candidate.rank,
+            "rule_score": rule_score,
+            "keep": decision.get("keep") if decision else "missing",
+            "llm_score": decision.get("score") if decision else "",
+            "final_score": final_score,
+            "relation": decision.get("relation") if decision else "",
+            "reason": decision.get("reason") if decision else "missing LLM decision",
+            "context": context[:220],
+        }
+
+    @staticmethod
+    def _debug_print_neighbor_filter(
+        *,
+        source_title: str,
+        source_url: str,
+        model_alias: str,
+        rows: list[dict[str, Any]],
+        kept_urls: set[str],
+    ) -> None:
+        print(
+            f"[wiki_neighbor_filter] source={source_title!r} url={source_url} "
+            f"model={model_alias} candidates={len(rows)} kept={len(kept_urls)}",
+            file=sys.stderr,
+            flush=True,
+        )
+        for row in rows:
+            status = "KEEP" if row["url"] in kept_urls else "DROP"
+            print(
+                "[wiki_neighbor_filter] "
+                f"{status} #{row['index']} title={row['title']!r} anchor={row['anchor']!r} "
+                f"rank={row['rank']} rule={row['rule_score']:.2f} "
+                f"llm_keep={row['keep']} llm_score={row['llm_score']} final={row['final_score']:.2f} "
+                f"relation={row['relation']!r} reason={row['reason']!r} url={row['url']}",
+                file=sys.stderr,
+                flush=True,
+            )
+            if row["context"]:
+                print(
+                    f"[wiki_neighbor_filter]      context={row['context']!r}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+
+    @staticmethod
+    def _debug_print_neighbor_filter_raw(
+        *,
+        source_title: str,
+        source_url: str,
+        raw_output: str,
+    ) -> None:
+        print(
+            f"[wiki_neighbor_filter_raw] source={source_title!r} url={source_url}",
+            file=sys.stderr,
+            flush=True,
+        )
+        for line in raw_output.strip().splitlines():
+            if line.strip():
+                print(f"[wiki_neighbor_filter_raw] {line}", file=sys.stderr, flush=True)
+
+    @staticmethod
+    def _debug_print_neighbor_filter_failure(
+        *,
+        source_title: str,
+        source_url: str,
+        candidates: list[WikiLinkCandidate],
+        error: Exception,
+    ) -> None:
+        print(
+            f"[wiki_neighbor_filter] FAILED source={source_title!r} url={source_url} "
+            f"error={error.__class__.__name__}: {error} candidates={len(candidates)}",
+            file=sys.stderr,
+            flush=True,
+        )
+        for index, candidate in enumerate(candidates, start=1):
+            print(
+                "[wiki_neighbor_filter] "
+                f"FALLBACK #{index} title={candidate.title!r} anchor={candidate.anchor_text!r} "
+                f"rank={candidate.rank} rule={candidate.score:.2f} url={candidate.url}",
+                file=sys.stderr,
+                flush=True,
+            )
 
     @staticmethod
     def _neighbor_filter_prompt_input(
@@ -916,6 +1058,7 @@ class WikiTextBuilder:
             if keep not in {"yes", "no"}:
                 keep = "no"
             decisions[candidate_id] = {
+                "title": attrs.get("title", ""),
                 "keep": keep,
                 "score": attrs.get("score", "0"),
                 "relation": attrs.get("relation", ""),
@@ -1398,10 +1541,11 @@ def _smoke_test() -> None:
             assert "Dream Team (basketball)" in titles
             assert all('"' not in link.url for link in result.linked_entities)
             parsed_neighbors = WikiTextBuilder._parse_neighbor_filter_response(
-                '<neighbor id="1" keep="yes" score="4.2" relation="played_for" reason="Specific team"/>'
-                '<neighbor id="2" keep="no" score="1.0" relation="too_generic" reason="Broad class"/>'
+                '<neighbor id="1" title="Los Angeles Lakers" keep="yes" score="4.2" relation="played_for" reason="Specific team"/>'
+                '<neighbor id="2" title="basketball" keep="no" score="1.0" relation="too_generic" reason="Broad class"/>'
             )
             assert parsed_neighbors[1]["keep"] == "yes"
+            assert parsed_neighbors[1]["title"] == "Los Angeles Lakers"
             assert WikiTextBuilder._parse_neighbor_score(parsed_neighbors[1]["score"]) == 4.2
             nearby_markdown = (
                 "[1950](https://en.wikipedia.org/wiki/1950_NBA_Finals) "
