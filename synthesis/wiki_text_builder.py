@@ -172,6 +172,7 @@ Reject candidates that:
 - are too close to the source, such as the same entity, aliases, purely self-descriptive links, or repeated administrative editions;
 - are too far or only appear in references/navigation/template noise;
 - are broad categories or common concepts rather than identifiable entities/events;
+- are generic geographic or administrative units such as countries, regions, provinces, states, cities, or districts unless the place itself is central to the source entity's identity or needed as a uniquely identifying bridge;
 - would only support a vague relation that is likely to map from the source to many different targets unless the local context clearly provides a stronger distinguishing qualifier;
 - are unlikely to have a stable Wikipedia page representing one specific target.
 
