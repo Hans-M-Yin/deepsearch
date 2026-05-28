@@ -35,12 +35,19 @@ fact. Different acceptable images may vary by angle, crop, or resolution, but
 they must depict the same target and let a human decide whether a candidate
 image matches the description.
 
+Important:
+- Uniqueness is required at two levels: the target itself and every query written for that target.
+- A query is valid only if a human could read the query alone and understand one specific visual target it is trying to retrieve.
+- Do not write queries that merely name an entity plus a broad era, role, matchup, or image genre if many different scenes/photos/posters would still satisfy them.
+- All queries under one target must refer to the same single target, not different plausible instances from the same era or category.
+- If you cannot make the query target unique with constraints explicitly supported by the passage, reject that target.
+
 Procedure:
 1. Read the numbered passages, not just the title.
 2. Identify passages that mention a concrete fact with visual evidence.
 3. Reject facts that cannot be tied to an exact source quote.
 4. For each accepted fact, explain why the visual target is unique.
-5. Rewrite the fact into 2 to 4 precise image-search queries.
+5. Rewrite the fact into 2 to 4 precise image-search queries that all preserve the same unique target.
 
 Keep targets that:
 - are explicitly supported by source_quote from the passages;
@@ -49,6 +56,7 @@ Keep targets that:
   version, title, location, named artifact, named document, product model,
   landmark, outfit, or moment;
 - can become a reliable intermediate image node in a multi-hop question.
+- can be converted into queries that still point to one specific target instead of a family of loosely related images.
 
 Reject targets if:
 - they are based only on the page title or general knowledge;
@@ -57,7 +65,19 @@ Reject targets if:
 - the target mixes alternatives using wording like "or", "such as", "logo/banner/screenshot";
 - it is a generic portrait/photo/game/celebration/building/city skyline without
   a specific event, date, object, version, landmark, or viewpoint;
+- the source quote supports only a broad category of possible images, such as a team in some era, a rivalry across many games, or a promotional image style with many variants;
 - it is a pure text fact with no useful visual search target.
+
+Query-writing rules:
+- Each query must keep the target uniquely pinned down.
+- Queries may vary wording, but must not vary the underlying target instance.
+- Do not use "or", broad alternatives, or mixed visual forms inside a query.
+- Do not write queries like:
+  "1960 Los Angeles Lakers vs Boston Celtics game or matchup image"
+  "Shaquille O'Neal and Kobe Bryant Lakers dynasty-era promotional image"
+  because many distinct images satisfy them.
+- Instead, only keep such cases if the passage supports an exact game, exact ceremony, exact poster/cover/logo, exact season artifact, exact document, or another singular visual target.
+- Good query variants differ lexically, not semantically. They should help retrieval while still pointing to the same image target category.
 
 Good target examples:
 - Source quote mentions a singer's debut album title.
@@ -79,6 +99,10 @@ Bad target examples:
   not unique unless the year/match/moment is specified.
 - "Los Angeles Lakers championship celebration": many seasons and moments
   qualify unless the exact Finals/year/moment is specified.
+- "1960 Los Angeles Lakers vs Boston Celtics game photo": still too broad if
+  multiple games or many photos from the same matchup qualify.
+- "Shaq and Kobe Lakers dynasty-era promotional image": too many posters and
+  promo photos qualify unless one exact campaign, shoot, cover, or event is specified.
 - "South Korea city skyline": too broad without city, viewpoint, landmark, or date.
 - "2026-27 Los Angeles Lakers team photo": future/unreleased visual evidence
   is unstable and may not exist.

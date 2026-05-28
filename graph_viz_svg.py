@@ -47,8 +47,6 @@ def edge_label(edge):
     anchor = meta.get("anchor_text")
     predicate = ((meta.get("relation_info") or {}).get("predicate")) if isinstance(meta.get("relation_info"), dict) else None
     label = relation or anchor or predicate or edge_kind(edge)
-    if edge_kind(edge) == "wiki_link" and label and label != "wiki_link":
-        return f"mentions: {label}"
     return label
 
 

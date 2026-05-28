@@ -124,26 +124,29 @@ Example:
 PROMPT_EXTRACT_RELATION = """You are extracting a semantic relation between two Wikipedia text nodes.
 
 Given a source entity, target entity, anchor text, and local hyperlink context,
-infer the short predicate connecting the source to the target.
+infer the short relation phrase connecting the source to the target.
 
 Rules:
 - Use only the local context.
-- Predicate must be concise snake_case.
-- The predicate is for multi-hop graph reasoning, so it should be strongly target-identifying from the source side.
+- Output a short natural-language relation phrase, not snake_case.
+- The relation is for multi-hop graph reasoning, so it should be strongly target-identifying from the source side.
 - Prefer a relation that would point to this target uniquely, or as close to uniquely as the local context allows.
-- If a generic predicate could apply to multiple targets for the same source, add distinguishing qualifiers directly into the predicate.
+- If a generic relation could apply to multiple targets for the same source, add distinguishing qualifiers directly into the relation phrase.
 - Good qualifiers include time period, role, outcome, ordinal/superlative, event, award, location, work, team, or other locally explicit constraints.
-- Do not use an underspecified generic predicate such as played_for, lived_in, won, member_of, or born_in if that would leave multiple plausible targets for the same source.
-- Example: use club_where_he_won_multiple_champions_league_titles instead of played_for when the generic relation would match several clubs.
-- Example: use won_gold_with_2008_olympic_team instead of member_of if the local context supports that stronger description.
-- If the local context does not support a unique relation, still make the predicate as specific as possible rather than falling back to a broad label.
-- Use related_to only as a last resort when the relation is truly unclear.
+- Do not use an underspecified generic relation such as played for, lived in, won, member of, or born in if that would leave multiple plausible targets for the same source.
+- Prefer relation phrases that read naturally in a graph, such as:
+  source -> club where he won multiple Champions League titles -> target
+  source -> award he received for this work -> target
+  source -> city where he was born -> target
+- The relation phrase can be a short noun phrase or verb phrase, but it should be interpretable without seeing the target name.
+- If the local context does not support a unique relation, still make the relation as specific as possible rather than falling back to a broad label.
+- Use related to only as a last resort when the relation is truly unclear.
 - Keep direction as source_to_target unless the local context clearly says the target acts on the source.
 - Do not output explanations or markdown.
 
 Output exactly:
 <relation>
-predicate: played_for
+predicate: club where he won multiple Champions League titles
 direction: source_to_target
 confidence: 0.0
 evidence: short quote from context
@@ -172,91 +175,64 @@ Reject candidates that:
 - would only support a vague relation that is likely to map from the source to many different targets unless the local context clearly provides a stronger distinguishing qualifier;
 - are unlikely to have a stable Wikipedia page representing one specific target.
 
-Relation is open-ended. Use a concise snake_case predicate that best describes the local context.
+Relation is open-ended.
 Do not force the relation into a fixed taxonomy, and do not overuse a small set of generic predicates.
 The relation should be written from the source to this candidate in a way that is as uniquely target-identifying as possible.
 If a broad predicate would fit multiple candidates for the same source, add qualifiers so the relation becomes more discriminative.
 If rejecting a candidate, relation can be a short rejection label such as too_generic, too_close, too_far, ambiguous_entity, list_page, reference_noise, or templatic_edition.
 
-Positive examples:
-- Source: Kobe Bryant
-  Candidate: Los Angeles Lakers
-  keep: yes
-  relation: played_for
-  reason: specific team central to career, useful bridge
-
-- Source: Kobe Bryant
-  Candidate: 2008 Summer Olympics
-  keep: yes
-  relation: won_gold_at
-  reason: specific event connected to the source, not merely a broad sports concept
-
-- Source: Parasite
-  Candidate: Bong Joon-ho
-  keep: yes
-  relation: directed_by
-  reason: unique person strongly connected to the work
-
-- Source: South Korea
-  Candidate: Hallasan
-  keep: yes
-  relation: highest_point
-  reason: concrete landmark attribute useful for geographic or visual hops
-
-- Source: Boston Celtics
-  Candidate: TD Garden
-  keep: yes
-  relation: home_arena
-  reason: concrete place connected to the team
-
+Examples we should keep:
+ 
 - Source: Lionel Messi
   Candidate: FC Barcelona
   keep: yes
-  relation: club_where_he_won_multiple_champions_league_titles
-  reason: more target-identifying than generic played_for because the source has multiple clubs
+  relation: Messi played for this team and won the UEFA Champions League here
+  reason: Specific team central to career, useful bridge. The Source + relation only leads to the Candidate (FCB).  
+
+- Source: Kobe Bryant
+  Candidate: 2000 NBA Finals
+  keep: no
+  relation: Kobe Bryant won the NBA Finals, and the final game of this year marked the beginning of his first three-peat dynasty.
+  reason: Although Kobe won 5 NBA Finals, but the year represent the begining of the three-peat dynasty is 2000.
+
+- Source: Los Angeles Lakers
+  Candidate: CJ CheilJedang
+  keep: yes
+  relation: This is the only Korean main sponsors of Los Angeles Lakers.
+  reason: CJ CheilJedang is the unique sponsors from Korean of LAL.
+
+Examples we should ignore:
 
 - Source: Lionel Messi
-  Candidate: Paris Saint-Germain
-  keep: yes
-  relation: post_barcelona_club
-  reason: local timeline qualifier makes the relation less ambiguous than generic played_for
+  Candidate: FC Barcelona
+  keep: no
+  relation: Messi once played for this team.
+  reason: Using Source + relation, multiple candidates is suitable for the source + relation (not unique), for instance, FC Bracelona, Saint Paris... and Argentina national football team. 
 
-Negative examples:
 - Source: Kobe Bryant
   Candidate: basketball
   keep: no
-  relation: too_generic
-  reason: broad category, not a unique entity
+  relation: Kobe play this.
+  reason: broad category, not a unique entity. And the realtion is vague (Kobe not only play basketball but also video games.) 
 
 - Source: NBA Finals
   Candidate: 1951 NBA Finals
   keep: no
-  relation: templatic_edition
+  relation: Templatic Edition
   reason: yearly edition pattern is repetitive and too narrow unless local context makes it special
 
-- Source: South Korea
-  Candidate: country
+- Source: Los Angeles Lakers
+  Candidate: CJ CheilJedang
   keep: no
-  relation: too_generic
-  reason: class label, not a unique entity
-
-- Source: Some company
-  Candidate: References
-  keep: no
-  relation: reference_noise
-  reason: navigation/reference artifact rather than a content entity
-
+  relation: This sponsors Lakers.
+  reason: Many companies are sponsors of the Los Angeles Lakers.
+  
 - Source: Kobe Bryant
-  Candidate: Kobe Bryant career achievements
+  Candidate: 2001 NBA Finals
   keep: no
-  relation: too_close
-  reason: likely a self-descriptive or duplicate topic rather than a useful new entity
+  relation: Kobe won NBA Finals this year.
+  reason: Not unique. Given Kobe Bryant and the relation 'kobe won NBA Finals this year', we can infer the candidates including 2000, 2001, 2002...
 
-- Source: Lionel Messi
-  Candidate: Inter Miami CF
-  keep: no
-  relation: played_for
-  reason: generic relation is under-specified because the source has multiple clubs; keep only if local context supports a stronger distinguishing predicate
 
 Return one XML-like item per candidate. Copy the candidate title exactly into
 the title attribute so debugging output is readable. Do not output markdown or
@@ -1323,7 +1299,7 @@ class WikiTextBuilder:
                 continue
             key, value = line.split(":", 1)
             fields[key.strip().lower()] = value.strip()
-        predicate = WikiTextBuilder._normalize_relation_predicate(fields.get("predicate") or "related_to")
+        predicate = WikiTextBuilder._normalize_relation_predicate(fields.get("predicate") or "related to")
         return {
             "predicate": predicate,
             "direction": fields.get("direction") or "source_to_target",
@@ -1333,8 +1309,9 @@ class WikiTextBuilder:
 
     @staticmethod
     def _normalize_relation_predicate(predicate: str) -> str:
-        normalized = re.sub(r"[^0-9a-zA-Z]+", "_", predicate.strip().lower()).strip("_")
-        return normalized or "related_to"
+        text = re.sub(r"\s+", " ", str(predicate or "").strip())
+        text = text.strip("\"'`.,;:()[]{}")
+        return text or "related to"
 
     @staticmethod
     def _parse_confidence(value: Any) -> float | None:
