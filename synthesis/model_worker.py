@@ -120,6 +120,7 @@ class OpenAIModelWorkerClient:
             kwargs["extra_body"] = extra_body
 
         completion = self.client.chat.completions.create(**kwargs)
+        print(completion)
         choice = completion.choices[0]
         content = choice.message.content or ""
 

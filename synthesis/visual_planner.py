@@ -271,6 +271,7 @@ class LLMVisualSearchPlanner:
                 temperature=0.0,
             )
         )
+        print(response.content)
         candidates = self._parse_targets(response.content)
         plans: list[VisualSearchPlan] = []
         for candidate in candidates:
