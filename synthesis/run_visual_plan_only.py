@@ -97,7 +97,7 @@ def plan_to_record(node: dict[str, Any], plan: Any) -> dict[str, Any]:
         "source_quote": target.metadata.get("source_quote"),
         "uniqueness": target.metadata.get("uniqueness"),
         "reason": target.metadata.get("reason"),
-        "expected_visual": target.metadata.get("expected_visual"),
+        "expected_visual": target.metadata.get("expected_visual") or target.metadata.get("query"),
         "queries": [query.query for query in plan.queries],
         "query_specs": [query.to_dict() for query in plan.queries],
         "target": target.to_dict(),
@@ -174,7 +174,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-report", default="visual_plan_report.md", help="Output Markdown report filename inside --run-dir.")
     parser.add_argument("--max-nodes", type=int, default=20, help="Maximum text nodes to plan from.")
     parser.add_argument("--start", type=int, default=0, help="Start offset after filtering text nodes.")
-    parser.add_argument("--max-targets", type=int, default=3, help="Maximum visual targets per node.")
+    parser.add_argument("--max-targets", type=int, default=4, help="Maximum visual targets per node.")
     parser.add_argument("--max-queries-per-target", type=int, default=4, help="Maximum queries per target.")
     parser.add_argument("--max-content-chars", type=int, default=12000, help="Max node description chars sent to planner. <=0 disables truncation.")
     parser.add_argument("--model-alias", default=None, help="Optional model alias overriding VISUAL_PLANNER_MODEL.")
