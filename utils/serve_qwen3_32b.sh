@@ -21,7 +21,7 @@ echo $PORT
 vllm serve "${MODEL_PATH}" \
   --served-model-name "${SERVED_MODEL_NAME}" \
   --tensor-parallel-size "${TENSOR_PARALLEL_SIZE}" \
-  --max-model-len 12000 \
+  --max-model-len 36000 \
   --port "${PORT}" \
-  --gpu-memory-utilization 0.8 \
+  --gpu-memory-utilization 0.9 \
   --trust-remote-code
