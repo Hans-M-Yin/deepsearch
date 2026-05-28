@@ -129,7 +129,15 @@ infer the short predicate connecting the source to the target.
 Rules:
 - Use only the local context.
 - Predicate must be concise snake_case.
-- If the relation is unclear, use related_to.
+- The predicate is for multi-hop graph reasoning, so it should be strongly target-identifying from the source side.
+- Prefer a relation that would point to this target uniquely, or as close to uniquely as the local context allows.
+- If a generic predicate could apply to multiple targets for the same source, add distinguishing qualifiers directly into the predicate.
+- Good qualifiers include time period, role, outcome, ordinal/superlative, event, award, location, work, team, or other locally explicit constraints.
+- Do not use an underspecified generic predicate such as played_for, lived_in, won, member_of, or born_in if that would leave multiple plausible targets for the same source.
+- Example: use club_where_he_won_multiple_champions_league_titles instead of played_for when the generic relation would match several clubs.
+- Example: use won_gold_with_2008_olympic_team instead of member_of if the local context supports that stronger description.
+- If the local context does not support a unique relation, still make the predicate as specific as possible rather than falling back to a broad label.
+- Use related_to only as a last resort when the relation is truly unclear.
 - Keep direction as source_to_target unless the local context clearly says the target acts on the source.
 - Do not output explanations or markdown.
 
@@ -148,10 +156,12 @@ PROMPT_FILTER_WIKI_NEIGHBORS = """You are selecting useful neighboring Wikipedia
 Given one source entity and candidate outgoing Wikipedia links, decide which candidates should be kept as expansion targets.
 
 The goal is not to keep the closest or most obvious links. Prefer candidates that can become useful intermediate hops for diverse, natural multi-hop questions.
+The graph will later rely on source_node + relation -> target_node reasoning, so prefer neighbors whose relation from the source can be phrased in a strong, target-identifying way.
 
 Keep candidates that:
 - are unique, concrete entities or events, not broad classes, generic concepts, dates, list pages, maintenance pages, or ambiguous labels;
 - have a meaningful but not trivial relation to the source entity;
+- admit a relation description that can distinguish this target from other likely neighbors of the same source, possibly by adding explicit qualifiers from context;
 - can act as a useful bridge for multi-hop questions;
 - are supported by the local hyperlink context.
 
@@ -159,10 +169,13 @@ Reject candidates that:
 - are too close to the source, such as the same entity, aliases, purely self-descriptive links, or repeated administrative editions;
 - are too far or only appear in references/navigation/template noise;
 - are broad categories or common concepts rather than identifiable entities/events;
+- would only support a vague relation that is likely to map from the source to many different targets unless the local context clearly provides a stronger distinguishing qualifier;
 - are unlikely to have a stable Wikipedia page representing one specific target.
 
 Relation is open-ended. Use a concise snake_case predicate that best describes the local context.
 Do not force the relation into a fixed taxonomy, and do not overuse a small set of generic predicates.
+The relation should be written from the source to this candidate in a way that is as uniquely target-identifying as possible.
+If a broad predicate would fit multiple candidates for the same source, add qualifiers so the relation becomes more discriminative.
 If rejecting a candidate, relation can be a short rejection label such as too_generic, too_close, too_far, ambiguous_entity, list_page, reference_noise, or templatic_edition.
 
 Positive examples:
@@ -196,6 +209,18 @@ Positive examples:
   relation: home_arena
   reason: concrete place connected to the team
 
+- Source: Lionel Messi
+  Candidate: FC Barcelona
+  keep: yes
+  relation: club_where_he_won_multiple_champions_league_titles
+  reason: more target-identifying than generic played_for because the source has multiple clubs
+
+- Source: Lionel Messi
+  Candidate: Paris Saint-Germain
+  keep: yes
+  relation: post_barcelona_club
+  reason: local timeline qualifier makes the relation less ambiguous than generic played_for
+
 Negative examples:
 - Source: Kobe Bryant
   Candidate: basketball
@@ -226,6 +251,12 @@ Negative examples:
   keep: no
   relation: too_close
   reason: likely a self-descriptive or duplicate topic rather than a useful new entity
+
+- Source: Lionel Messi
+  Candidate: Inter Miami CF
+  keep: no
+  relation: played_for
+  reason: generic relation is under-specified because the source has multiple clubs; keep only if local context supports a stronger distinguishing predicate
 
 Return one XML-like item per candidate. Copy the candidate title exactly into
 the title attribute so debugging output is readable. Do not output markdown or
