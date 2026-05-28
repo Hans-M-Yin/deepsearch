@@ -72,6 +72,7 @@ start_readerlm() {
       --host 0.0.0.0 \
       --port "${READERLM_PORT}" \
       --served-model-name "${READERLM_SERVED_MODEL_NAME}" \
+      --tensor-parallel-size 2 \
       > "${VLLM_READER_LM_LOG}" 2>&1 &
     echo $! > "${PROJECT_DIR}/vllm_reader_lm.pid"
   )
