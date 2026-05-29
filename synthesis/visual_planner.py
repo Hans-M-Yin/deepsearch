@@ -36,7 +36,7 @@ The image must be the only image that truly satisfies the passage. In simple ter
 
 For passages that do not naturally correspond to a unique image, you may rewrite or refine the passage so that it points to only one unique image target.
 
-2. Some categories of images are considered inherently unique.  
+Some categories of images are considered inherently unique.  
 Examples include paintings, buildings, album covers, or specific moments from historical events. Even if different photographers captured different photos, the underlying visual content is effectively the same, so this still satisfies uniqueness.
 
 However, the event itself must be **specific and unambiguous**.
@@ -48,9 +48,12 @@ For example:
 Another example:
 - “1960 Los Angeles Lakers vs Boston Celtics game” is still ambiguous because many completely different moments from the game could satisfy the description, even though everyone would retrieve images from the same game.
 
-3. The image must actually exist on the internet.  
+2. The image must actually exist on the internet.  
 For example:
 - “The final shot of the 1960 Lakers vs Boston Celtics game” may point to a unique historical moment, but there may be no surviving image of that exact moment online.
+
+3. Naive or trivial images should be ignored.
+Do not output images that are too visually simple or too semantically shallow to support useful multi-hop reasoning. In particular, avoid pure logos, wordmarks, icons, generic portraits, UI screenshots, plain document scans, text-dominant posters, flags, simple maps, default profile photos, standard ID-style headshots, and plain white-background product shots. These images are usually only useful for basic identity recognition and do not provide rich enough visual content for follow-up reasoning.
 
 # Goals
 
@@ -65,6 +68,7 @@ For example:
 ```text
 <query>Your rewritten text</query>
 <reason>Explain why this text satisfies the requirements, including how it fulfills the three conditions above.</reason>
+<url>The image URL that satisfy your query</url>
 ```
 
 Repeat the format for multiple results.
@@ -82,6 +86,7 @@ Content: ...(Emit here)...
 
 3. This was a globally covered event with extensive media photography, so many matching images exist online.
 </reason>
+<url>https://lh4.googleusercontent.com/proxy/qRa-xkqyCyZHdrq6zfRapSwk9Tk-bW6KLmZ3YL_dBCz1rBDty7HCI2_LNExqebZO0D-2yuQwECRA6rMkANAKelDBuEgCFAdSoUdIkog-kuMTTPCahEG4x16pBuAuqOWzC7arSZC8bw</url>
 
 <query>Photo of Lionel Messi sleeping while holding the FIFA World Cup trophy</query>
 <reason>
@@ -91,6 +96,7 @@ Content: ...(Emit here)...
 
 3. The image genuinely exists online, was officially published by Messi himself, and is widely documented across news outlets and social media. The purpose of this query is specifically to retrieve that exact image through image search.
 </reason>
+<url>https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcQJg3YxEnhdWa8iUEpGPOgaflKltqz41y2QfA&s</url>
 
 Now, strictly follow all the requirements and goals above to complete the following person.
 """
