@@ -304,10 +304,11 @@ class LLMVisualSearchPlanner:
             "Content:\n"
             f"{LLMVisualSearchPlanner._numbered_passages(page_text)}\n\n"
             "Output requirements:\n"
-            "- Output only repeated <query>...</query> and <reason>...</reason> blocks.\n"
+            "- Output only repeated <query>...</query><reason>...</reason><url></url> blocks.\n"
             "- Do not output markdown fences, bullets, JSON, headings, or any extra text.\n"
             "- Each <query> must be a single rewritten search query.\n"
             "- Each <reason> must explain uniqueness and likely online existence."
+            "- Each <url> must wrap a URL of an image that satisfy the requirement."
         )
 
     @staticmethod
