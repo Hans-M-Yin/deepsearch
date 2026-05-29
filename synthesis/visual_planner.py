@@ -53,8 +53,8 @@ For example:
 - “The final shot of the 1960 Lakers vs Boston Celtics game” may point to a unique historical moment, but there may be no surviving image of that exact moment online.
 
 3. Naive or trivial images should be ignored.
-Do not output images that are too visually simple or too semantically shallow to support useful multi-hop reasoning. In particular, avoid pure logos, wordmarks, icons, generic portraits, UI screenshots, plain document scans, text-dominant posters, flags, simple maps, default profile photos, standard ID-style headshots, and plain white-background product shots. These images are usually only useful for basic identity recognition and do not provide rich enough visual content for follow-up reasoning.
-
+Do not output images that are too visually simple or too semantically shallow to support useful multi-hop reasoning. In particular, avoid pure logos, wordmarks, icons, generic portraits, UI screenshots, plain document scans, text-dominant posters, flags, simple maps, default profile photos, standard ID-style headshots, and plain white-background product shots. These images are usually only useful for basic identity recognition and do not provide rich enough visual content for follow-up reasoning.X
+XXXX
 # Goals
 
 1. You may examine the provided Wikipedia passages one by one, analyze whether the event or object described in each passage is visually unique, and then rewrite the passage into a concise and precise form suitable for image search.
@@ -64,6 +64,8 @@ Do not output images that are too visually simple or too semantically shallow to
 3. The number of unique image materials corresponding to the subject is uncertain. If you believe no suitable image exists, you may output nothing. Otherwise, output at most 4 passages.
 
 4. We will directly use your rewritten text for image search. Please strictly follow the format below:
+
+The query must not contain any explicit URL, domain name, filename, image identifier, or other direct locator of the image. It must contain only semantic information. The query should stand on its own: a user who searches by the query alone, without seeing the URL, should be able to retrieve the same image or an equivalent depiction of the same unique visual target. Do not rely on the URL itself to make the target appear unique.
 
 ```text
 <query>Your rewritten text</query>
