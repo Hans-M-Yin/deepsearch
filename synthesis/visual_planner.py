@@ -48,13 +48,14 @@ For example:
 Another example:
 - “1960 Los Angeles Lakers vs Boston Celtics game” is still ambiguous because many completely different moments from the game could satisfy the description, even though everyone would retrieve images from the same game.
 
-2. The image must actually exist on the internet.  
+2. The image must actually exist on the internet. The supplied URL shoule be existing.
 For example:
 - “The final shot of the 1960 Lakers vs Boston Celtics game” may point to a unique historical moment, but there may be no surviving image of that exact moment online.
 
 3. Naive or trivial images should be ignored.
 Do not output images that are too visually simple or too semantically shallow to support useful multi-hop reasoning. In particular, avoid pure logos, wordmarks, icons, generic portraits, UI screenshots, plain document scans, text-dominant posters, flags, simple maps, default profile photos, standard ID-style headshots, and plain white-background product shots. These images are usually only useful for basic identity recognition and do not provide rich enough visual content for follow-up reasoning.X
-XXXX
+The query must not contain any explicit URL, domain name, filename, image identifier, or other direct locator of the image. It must contain only semantic information. The query should stand on its own: a user who searches by the query alone, without seeing the URL, should be able to retrieve the same image or an equivalent depiction of the same unique visual target. Do not rely on the URL itself to make the target appear unique.
+
 # Goals
 
 1. You may examine the provided Wikipedia passages one by one, analyze whether the event or object described in each passage is visually unique, and then rewrite the passage into a concise and precise form suitable for image search.
@@ -68,9 +69,8 @@ XXXX
 The query must not contain any explicit URL, domain name, filename, image identifier, or other direct locator of the image. It must contain only semantic information. The query should stand on its own: a user who searches by the query alone, without seeing the URL, should be able to retrieve the same image or an equivalent depiction of the same unique visual target. Do not rely on the URL itself to make the target appear unique.
 
 ```text
-<query>Your rewritten text</query>
+<query>Your rewritten text</query><url>The image URL that satisfy your query</url>
 <reason>Explain why this text satisfies the requirements, including how it fulfills the three conditions above.</reason>
-<url>The image URL that satisfy your query</url>
 ```
 
 Repeat the format for multiple results.
@@ -81,24 +81,20 @@ Entity: Lionel Messi
 Content: ...(Emit here)...
 
 <query>Argentina national team lifting the trophy after winning the 2022 FIFA World Cup final</query>
-<reason>
-1. This passage points to one unique historical moment: Argentina winning the 2022 World Cup and lifting the trophy.
-
-2. Even though different photographers may have taken different images, the visual content is fundamentally consistent: the Argentina team on the award stage, with Lionel Messi at the front holding the trophy. Therefore, it satisfies the uniqueness requirement.
-
-3. This was a globally covered event with extensive media photography, so many matching images exist online.
-</reason>
 <url>https://lh4.googleusercontent.com/proxy/qRa-xkqyCyZHdrq6zfRapSwk9Tk-bW6KLmZ3YL_dBCz1rBDty7HCI2_LNExqebZO0D-2yuQwECRA6rMkANAKelDBuEgCFAdSoUdIkog-kuMTTPCahEG4x16pBuAuqOWzC7arSZC8bw</url>
+<reason>
+1. This passage points to one unique historical moment: Argentina winning the 2022 World Cup and lifting the trophy. Even though different photographers may have taken different images, the visual content is fundamentally consistent: the Argentina team on the award stage, with Lionel Messi at the front holding the trophy. Therefore, it satisfies the uniqueness requirement.
+2. This was a globally covered event with extensive media photography, so many matching images exist online. The provided URL is valid and accessible.
+3. This image does not belong to any trivial case.
+</reason>
 
 <query>Photo of Lionel Messi sleeping while holding the FIFA World Cup trophy</query>
-<reason>
-1. Although this query does not explicitly specify a date, internet evidence shows that it clearly refers to the famous photo Messi posted on Instagram after winning the 2022 FIFA World Cup. There are no other widely known or competing images matching the description “Messi sleeping while holding the World Cup trophy.”
-
-2. The only images satisfying this query originate from Messi’s official post, so the visual target is effectively unique. Even if the image is reposted, cropped, or compressed by different media sources, the visual content remains the same.
-
-3. The image genuinely exists online, was officially published by Messi himself, and is widely documented across news outlets and social media. The purpose of this query is specifically to retrieve that exact image through image search.
-</reason>
 <url>https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcQJg3YxEnhdWa8iUEpGPOgaflKltqz41y2QfA&s</url>
+<reason>
+1. Although this query does not explicitly specify a date, internet evidence shows that it clearly refers to the famous photo Messi posted on Instagram after winning the 2022 FIFA World Cup. There are no other widely known or competing images matching the description “Messi sleeping while holding the World Cup trophy.” The only images satisfying this query originate from Messi’s official post, so the visual target is effectively unique. Even if the image is reposted, cropped, or compressed by different media sources, the visual content remains the same.
+2. The image genuinely exists online, was officially published by Messi himself, and is widely documented across news outlets and social media. The purpose of this query is specifically to retrieve that exact image through image search.
+3. The image is quite unique, and does not belong to any trivial case.
+</reason>
 
 Now, strictly follow all the requirements and goals above to complete the following person.
 """
