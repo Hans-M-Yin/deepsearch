@@ -1,6 +1,6 @@
 python run_min_graph.py \
   --seed-url https://en.wikipedia.org/wiki/Kobe_Bryant \
-  --store-dir runs/kobe_with_images_serper_20_100_depth_27 \
+  --store-dir runs/kobe_with_images_serper_20_100_depth_26 \
   --reader-base-url http://10.124.136.6:8004 \
   --fresh \
   --skip-attributes \
