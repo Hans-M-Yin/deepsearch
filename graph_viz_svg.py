@@ -87,6 +87,12 @@ def node_extra_line(node):
     return short(summary, 32) if summary else ""
 
 
+def node_image_href(node):
+    if node.get("node_type") != "image":
+        return None
+    return node.get("image_url") or node.get("thumb_oss_uri") or node.get("oss_uri")
+
+
 def node_type_color(node_type):
     palette = {
         "text": ("#DCEEFF", "#2F6DB5"),
@@ -536,7 +542,8 @@ def render_svg(nodes, edges, positions, component_boxes, width, height):
         subtitle = short(node_subtitle(node), 34)
         extra = node_extra_line(node)
         fill, stroke = node_type_color(node.get("node_type", ""))
-        title_x = x + 48 if node.get("node_type") == "image" else x + 16
+        image_href = node_image_href(node)
+        title_x = x + 74 if node.get("node_type") == "image" else x + 16
 
         svg.append(
             f'<rect x="{x:.1f}" y="{y:.1f}" width="{CARD_W}" height="{CARD_H}" rx="14" ry="14" '
@@ -544,13 +551,23 @@ def render_svg(nodes, edges, positions, component_boxes, width, height):
         )
 
         if node.get("node_type") == "image":
+            thumb_x = x + 14
+            thumb_y = y + 14
+            thumb_w = 48
+            thumb_h = 36
             svg.append(
-                f'<rect x="{x + 14:.1f}" y="{y + 12:.1f}" width="26" height="20" rx="5" ry="5" fill="#FFF7ED" stroke="{stroke}" stroke-width="1.2"/>'
+                f'<rect x="{thumb_x:.1f}" y="{thumb_y:.1f}" width="{thumb_w}" height="{thumb_h}" rx="6" ry="6" fill="#FFF7ED" stroke="{stroke}" stroke-width="1.2"/>'
             )
-            svg.append(
-                f'<circle cx="{x + 23:.1f}" cy="{y + 20:.1f}" r="3" fill="{stroke}"/>'
-                f'<path d="M{x + 18:.1f},{y + 28:.1f} L{x + 24:.1f},{y + 23:.1f} L{x + 31:.1f},{y + 29:.1f}" fill="none" stroke="{stroke}" stroke-width="1.3"/>'
-            )
+            if image_href:
+                svg.append(
+                    f'<image href="{esc(image_href)}" x="{thumb_x + 1:.1f}" y="{thumb_y + 1:.1f}" '
+                    f'width="{thumb_w - 2}" height="{thumb_h - 2}" preserveAspectRatio="xMidYMid slice" />'
+                )
+            else:
+                svg.append(
+                    f'<circle cx="{x + 31:.1f}" cy="{y + 28:.1f}" r="4" fill="{stroke}"/>'
+                    f'<path d="M{x + 22:.1f},{y + 42:.1f} L{x + 31:.1f},{y + 33:.1f} L{x + 42:.1f},{y + 43:.1f}" fill="none" stroke="{stroke}" stroke-width="1.4"/>'
+                )
 
         svg.append(
             f'<text x="{title_x:.1f}" y="{y + 26:.1f}" font-family="Arial, sans-serif" font-size="14" '
