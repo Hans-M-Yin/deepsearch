@@ -164,8 +164,39 @@ class TextNode(Node):
 
 
 @dataclass(slots=True)
+class ImageVariant:
+    """One concrete image returned by a visual search query."""
+
+    variant_id: str
+    image_url: str | None = None
+    source_page_url: str | None = None
+    thumbnail_url: str | None = None
+    title: str | None = None
+    search_caption: str | None = None
+    width: int | None = None
+    height: int | None = None
+    source: str | None = None
+    rank: int | None = None
+    validation_status: str | None = None
+    validation_confidence: float | None = None
+    validation_reason: str | None = None
+    used_fallback: bool = False
+    is_primary: bool = False
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def make_id(
+        cls,
+        image_url: str | None,
+        source_page_url: str | None,
+        title: str | None,
+    ) -> str:
+        return f"image_variant_{_stable_hash(image_url, source_page_url, title)}"
+
+
+@dataclass(slots=True)
 class ImageNode(Node):
-    """Image node with public and OSS references plus lightweight metadata."""
+    """Image node representing one retrieval bundle with a primary image."""
 
     node_type: ClassVar[NodeType] = NodeType.IMAGE
 
@@ -179,6 +210,10 @@ class ImageNode(Node):
     content_type: str | None = None
     phash: str | None = None
     storage_status: str = "url_only"
+    primary_image_id: str | None = None
+    accepted_image_ids: list[str] = field(default_factory=list)
+    rejected_image_ids: list[str] = field(default_factory=list)
+    image_variants: list[ImageVariant] = field(default_factory=list)
 
     @classmethod
     def from_url(
@@ -201,6 +236,47 @@ class ImageNode(Node):
             source=NodeSource(
                 source_type="image_search",
                 url=image_url,
+                run_id=run_id,
+                builder="image_discovery_builder",
+            ),
+            metadata=metadata or {},
+        )
+
+    @classmethod
+    def from_bundle(
+        cls,
+        primary_image_url: str,
+        *,
+        primary_image_id: str,
+        image_variants: list[ImageVariant],
+        source_page_url: str | None = None,
+        caption: str | None = None,
+        title: str | None = None,
+        width: int | None = None,
+        height: int | None = None,
+        content_type: str | None = None,
+        run_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> "ImageNode":
+        accepted_ids = [variant.variant_id for variant in image_variants if variant.validation_status == NodeStatus.ACTIVE.value or variant.validation_status == "accepted"]
+        rejected_ids = [variant.variant_id for variant in image_variants if variant.validation_status == NodeStatus.REJECTED.value or variant.validation_status == "rejected"]
+        return cls(
+            node_id=cls.make_id("image_bundle", primary_image_id, primary_image_url),
+            title=title,
+            summary=caption,
+            image_url=primary_image_url,
+            source_page_url=source_page_url,
+            caption=caption,
+            width=width,
+            height=height,
+            content_type=content_type,
+            primary_image_id=primary_image_id,
+            accepted_image_ids=accepted_ids,
+            rejected_image_ids=rejected_ids,
+            image_variants=image_variants,
+            source=NodeSource(
+                source_type="image_search_bundle",
+                url=primary_image_url,
                 run_id=run_id,
                 builder="image_discovery_builder",
             ),

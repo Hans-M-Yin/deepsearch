@@ -30,10 +30,11 @@ from .evidence import (
     SearchSnapshot,
 )
 from .model_worker import LLM_WORKER, ModelMessage, ModelRequest, ModelResponse, ModelWorkerClient
-from .nodes import ImageNode, NodeType, TextNode
+from .nodes import ImageNode, ImageVariant, NodeType, TextNode
 from .search_client import ImageSearchResult, SearchClient, SearchResponse
 from .store import JsonlGraphStore
 from .visual_planner import SearchQuerySpec, VisualSearchPlan
+from .wiki_entity_resolver import WikiEntityResolver
 
 
 def _jsonify(value: Any) -> Any:
@@ -102,7 +103,23 @@ class ImageDiscoveryConfig:
     allowed_content_types: set[str] | None = None
     rejected_extensions: set[str] = field(default_factory=lambda: {".svg"})
     fallback_if_no_validated: bool = True
-    store_rejected: bool = False
+    store_rejected: bool = True
+    expandable_entity_types: set[str] = field(
+        default_factory=lambda: {
+            "person",
+            "team",
+            "organization",
+            "event",
+            "movie",
+            "book",
+            "album",
+            "brand",
+            "product",
+            "landmark",
+            "document",
+            "artwork",
+        }
+    )
 
 
 @dataclass(slots=True)
@@ -119,32 +136,32 @@ class ImageValidationResult:
 
 
 @dataclass(slots=True)
-class DiscoveredImage:
-    """Graph records created from a single retrieved image."""
+class ImageSearchCandidate:
+    """One retrieved image candidate before/after validation."""
 
-    image_node: ImageNode
-    image_evidence: Evidence
-    search_evidence: Evidence
-    edge: Edge | None
+    candidate_id: str
     source_query: SearchQuerySpec
     source_snapshot: SearchSnapshot
     search_result: ImageSearchResult
     validation: ImageValidationResult
-    grounded_edges: list[Edge] = field(default_factory=list)
     used_fallback: bool = False
+    is_primary: bool = False
+    grounded_entities: list[dict[str, Any]] = field(default_factory=list)
+    grounded_caption: str | None = None
+    visual_facts: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "image_node": self.image_node.to_dict(),
-            "image_evidence": self.image_evidence.to_dict(),
-            "search_evidence": self.search_evidence.to_dict(),
-            "edge": self.edge.to_dict() if self.edge else None,
-            "grounded_edges": [edge.to_dict() for edge in self.grounded_edges],
+            "candidate_id": self.candidate_id,
             "source_query": self.source_query.to_dict(),
             "source_snapshot": self.source_snapshot.to_dict(),
             "search_result": self.search_result.to_dict(),
             "validation": self.validation.to_dict(),
             "used_fallback": self.used_fallback,
+            "is_primary": self.is_primary,
+            "grounded_entities": _jsonify(self.grounded_entities),
+            "grounded_caption": self.grounded_caption,
+            "visual_facts": list(self.visual_facts),
         }
 
 
@@ -153,29 +170,47 @@ class ImageDiscoveryResult:
     """All records produced for one visual search plan."""
 
     plan_id: str
-    images: list[DiscoveredImage] = field(default_factory=list)
+    image_node: ImageNode | None = None
+    edge: Edge | None = None
+    image_evidence: Evidence | None = None
+    search_evidence: Evidence | None = None
+    grounded_edges: list[Edge] = field(default_factory=list)
+    candidates: list[ImageSearchCandidate] = field(default_factory=list)
+    queued_tasks: list[dict[str, Any]] = field(default_factory=list)
     snapshots: list[SearchSnapshot] = field(default_factory=list)
     fallback_used: bool = False
     metadata: dict[str, Any] = field(default_factory=dict)
 
-    def accepted_images(self) -> list[DiscoveredImage]:
+    def accepted_images(self) -> list[ImageSearchCandidate]:
         return [
             image
-            for image in self.images
+            for image in self.candidates
             if image.validation.status == ImageCandidateStatus.ACCEPTED
         ]
 
-    def usable_images(self) -> list[DiscoveredImage]:
+    def usable_images(self) -> list[ImageSearchCandidate]:
         return [
             image
-            for image in self.images
+            for image in self.candidates
             if image.validation.status == ImageCandidateStatus.ACCEPTED
         ]
+
+    def primary_image(self) -> ImageSearchCandidate | None:
+        for image in self.candidates:
+            if image.is_primary:
+                return image
+        return None
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "plan_id": self.plan_id,
-            "images": [image.to_dict() for image in self.images],
+            "image_node": self.image_node.to_dict() if self.image_node else None,
+            "edge": self.edge.to_dict() if self.edge else None,
+            "image_evidence": self.image_evidence.to_dict() if self.image_evidence else None,
+            "search_evidence": self.search_evidence.to_dict() if self.search_evidence else None,
+            "grounded_edges": [edge.to_dict() for edge in self.grounded_edges],
+            "candidates": [image.to_dict() for image in self.candidates],
+            "queued_tasks": _jsonify(self.queued_tasks),
             "snapshots": [snapshot.to_dict() for snapshot in self.snapshots],
             "fallback_used": self.fallback_used,
             "metadata": self.metadata,
@@ -196,6 +231,7 @@ class ImageDiscoveryBuilder:
         config: ImageDiscoveryConfig | None = None,
         model_client: ModelWorkerClient | None = None,
         image_check_model_alias: str | None = None,
+        wiki_resolver: WikiEntityResolver | None = None,
     ) -> None:
         self.store = store
         self.commons_client = commons_client
@@ -203,6 +239,7 @@ class ImageDiscoveryBuilder:
         self.config = config or ImageDiscoveryConfig()
         self.model_client = model_client or LLM_WORKER
         self.image_check_model_alias = image_check_model_alias
+        self.wiki_resolver = wiki_resolver or WikiEntityResolver()
 
     def discover_for_plan(
         self,
@@ -216,7 +253,7 @@ class ImageDiscoveryBuilder:
         result = ImageDiscoveryResult(plan_id=plan.plan_id)
         seen_keys: set[str] = set()
 
-        primary_images = self._discover_with_client(
+        primary_candidates = self._discover_with_client(
             client=self.commons_client,
             plan=plan,
             run_id=run_id,
@@ -225,11 +262,11 @@ class ImageDiscoveryBuilder:
             persist=persist,
             snapshots=result.snapshots,
         )
-        result.images.extend(primary_images)
+        result.candidates.extend(primary_candidates)
 
-        should_fallback = self._should_fallback(primary_images)
+        should_fallback = self._should_fallback(primary_candidates)
         if should_fallback and self.fallback_client is not None:
-            fallback_images = self._discover_with_client(
+            fallback_candidates = self._discover_with_client(
                 client=self.fallback_client,
                 plan=plan,
                 run_id=run_id,
@@ -238,16 +275,26 @@ class ImageDiscoveryBuilder:
                 persist=persist,
                 snapshots=result.snapshots,
             )
-            result.images.extend(fallback_images)
-            result.fallback_used = bool(fallback_images)
+            result.candidates.extend(fallback_candidates)
+            result.fallback_used = bool(fallback_candidates)
 
-        result.images = result.images[: self.config.max_images_per_plan]
+        result.candidates = result.candidates[: self.config.max_images_per_plan]
+        primary_candidate = self._select_primary_candidate(result.candidates)
+        if primary_candidate is not None:
+            self._materialize_primary_candidate(
+                result=result,
+                plan=plan,
+                candidate=primary_candidate,
+                run_id=run_id,
+                persist=persist,
+            )
         result.metadata.update(
             {
                 "query_count": len(plan.queries),
-                "image_count": len(result.images),
+                "image_count": len(result.candidates),
                 "usable_image_count": len(result.usable_images()),
                 "accepted_image_count": len(result.accepted_images()),
+                "queued_task_count": len(result.queued_tasks),
             }
         )
         if persist and self.store is not None:
@@ -264,8 +311,8 @@ class ImageDiscoveryBuilder:
         seen_keys: set[str],
         persist: bool,
         snapshots: list[SearchSnapshot],
-    ) -> list[DiscoveredImage]:
-        discovered: list[DiscoveredImage] = []
+    ) -> list[ImageSearchCandidate]:
+        discovered: list[ImageSearchCandidate] = []
         for query in plan.queries:
             try:
                 response = client.search_image(query.query, limit=self.config.per_query_limit)
@@ -307,101 +354,158 @@ class ImageDiscoveryBuilder:
                     continue
 
                 discovered.append(
-                    self._build_discovered_image(
-                        plan=plan,
-                        query=query,
+                    ImageSearchCandidate(
+                        candidate_id=self._candidate_record_id(search_result),
+                        source_query=query,
+                        source_snapshot=snapshot,
                         search_result=search_result,
-                        snapshot=snapshot,
                         validation=validation,
-                        run_id=run_id,
                         used_fallback=used_fallback,
-                        persist=persist,
                     )
                 )
                 if len(discovered) >= self.config.max_images_per_plan:
                     return discovered
         return discovered
 
-    def _build_discovered_image(
+    @staticmethod
+    def _candidate_record_id(search_result: ImageSearchResult) -> str:
+        return ImageVariant.make_id(
+            search_result.image_url,
+            search_result.source_page_url,
+            search_result.title,
+        )
+
+    @staticmethod
+    def _select_primary_candidate(candidates: list[ImageSearchCandidate]) -> ImageSearchCandidate | None:
+        accepted = [
+            candidate
+            for candidate in candidates
+            if candidate.validation.status == ImageCandidateStatus.ACCEPTED
+        ]
+        if not accepted:
+            return None
+        accepted.sort(
+            key=lambda candidate: (
+                -(candidate.validation.confidence if candidate.validation.confidence is not None else 0.0),
+                candidate.used_fallback,
+                candidate.search_result.rank if candidate.search_result.rank is not None else 10**9,
+            )
+        )
+        primary = accepted[0]
+        primary.is_primary = True
+        return primary
+
+    def _materialize_primary_candidate(
         self,
         *,
+        result: ImageDiscoveryResult,
         plan: VisualSearchPlan,
-        query: SearchQuerySpec,
-        search_result: ImageSearchResult,
-        snapshot: SearchSnapshot,
-        validation: ImageValidationResult,
+        candidate: ImageSearchCandidate,
         run_id: str | None,
-        used_fallback: bool,
         persist: bool,
-    ) -> DiscoveredImage:
-        image_node = self._image_node_from_result(search_result, run_id=run_id)
+    ) -> None:
+        provisional_node = self._image_node_from_result(candidate.search_result, run_id=run_id)
         grounding = self.image_ground(
             plan=plan,
-            search_result=search_result,
-            image_node=image_node,
-            validation=validation,
+            search_result=candidate.search_result,
+            image_node=provisional_node,
+            validation=candidate.validation,
             run_id=run_id,
         )
-        original_asset = self._image_asset(search_result, image_node=image_node)
-        thumb_asset = self._thumbnail_asset(search_result)
+        candidate.grounded_entities = list(grounding.get("grounded_entities", []))
+        candidate.grounded_caption = grounding.get("caption")
+        candidate.visual_facts = list(grounding.get("visual_facts", []))
+
+        variants = [
+            self._variant_from_candidate(
+                item,
+                is_primary=item.candidate_id == candidate.candidate_id,
+            )
+            for item in result.candidates
+        ]
+        source_node_title = self._source_node_title(plan.source_node_id) or plan.target.content
+        primary_caption = candidate.grounded_caption or provisional_node.caption or candidate.search_result.snippet
+        image_node = ImageNode.from_bundle(
+            candidate.search_result.image_url or candidate.search_result.source_page_url or candidate.search_result.title or "",
+            primary_image_id=candidate.candidate_id,
+            image_variants=variants,
+            source_page_url=candidate.search_result.source_page_url,
+            caption=primary_caption,
+            title=candidate.search_result.title,
+            width=candidate.search_result.width,
+            height=candidate.search_result.height,
+            content_type=self._content_type(candidate.search_result),
+            run_id=run_id,
+            metadata={
+                "search_query": candidate.source_query.query,
+                "candidate_count": len(result.candidates),
+                "visual_target": plan.target.content,
+            },
+        )
+        self._apply_grounding_to_image_node(image_node, grounding)
+
+        original_asset = self._image_asset(candidate.search_result, image_node=image_node)
+        thumb_asset = self._thumbnail_asset(candidate.search_result)
         asset_ids = [original_asset.asset_id]
         if thumb_asset:
             asset_ids.append(thumb_asset.asset_id)
 
         search_evidence = Evidence.create(
             EvidenceType.SEARCH_RESULT,
-            content=search_result.title or search_result.snippet,
+            content=candidate.search_result.title or candidate.search_result.snippet,
             node_ids=[image_node.node_id],
-            url=search_result.source_page_url or search_result.image_url,
-            source_snapshot_id=snapshot.snapshot_id if self.config.persist_search_snapshots else None,
+            url=candidate.search_result.source_page_url or candidate.search_result.image_url,
+            source_snapshot_id=candidate.source_snapshot.snapshot_id if self.config.persist_search_snapshots else None,
             extractor=self.builder_name,
-            confidence=validation.confidence,
+            confidence=candidate.validation.confidence,
             metadata={
-                "query_id": query.query_id,
-                "query": query.query,
-                "rank": search_result.rank,
-                "engine": snapshot.engine.value,
-                "snapshot_id": snapshot.snapshot_id,
-                "used_fallback": used_fallback,
-                "validation": validation.to_dict(),
+                "query_id": candidate.source_query.query_id,
+                "query": candidate.source_query.query,
+                "rank": candidate.search_result.rank,
+                "engine": candidate.source_snapshot.engine.value,
+                "snapshot_id": candidate.source_snapshot.snapshot_id,
+                "used_fallback": candidate.used_fallback,
+                "validation": candidate.validation.to_dict(),
             },
-            evidence_key=f"{snapshot.snapshot_id}:{query.query_id}:{self._candidate_key(search_result)}",
+            evidence_key=f"{candidate.source_snapshot.snapshot_id}:{candidate.source_query.query_id}:{self._candidate_key(candidate.search_result)}",
         )
         image_evidence = Evidence.create(
             EvidenceType.IMAGE,
-            content=search_result.snippet or search_result.title,
+            content=primary_caption or candidate.search_result.title,
             node_ids=[image_node.node_id],
             asset_ids=asset_ids,
-            url=search_result.image_url,
-            source_snapshot_id=snapshot.snapshot_id if self.config.persist_search_snapshots else None,
+            url=candidate.search_result.image_url,
+            source_snapshot_id=candidate.source_snapshot.snapshot_id if self.config.persist_search_snapshots else None,
             extractor=self.builder_name,
-            confidence=validation.confidence,
+            confidence=candidate.validation.confidence,
             metadata={
-                "source_page_url": search_result.source_page_url,
-                "thumbnail_url": search_result.thumbnail_url,
-                "snapshot_id": snapshot.snapshot_id,
-                "query_id": query.query_id,
+                "source_page_url": candidate.search_result.source_page_url,
+                "thumbnail_url": candidate.search_result.thumbnail_url,
+                "snapshot_id": candidate.source_snapshot.snapshot_id,
+                "query_id": candidate.source_query.query_id,
                 "target_evidence_id": plan.target.evidence_id,
-                "validation": validation.to_dict(),
+                "validation": candidate.validation.to_dict(),
+                "primary_candidate_id": candidate.candidate_id,
             },
-            evidence_key=f"image:{self._candidate_key(search_result)}",
+            evidence_key=f"image_bundle:{candidate.candidate_id}",
         )
 
         edge = self._edge_from_plan_to_image(
             plan=plan,
-            query=query,
+            query=candidate.source_query,
             image_node=image_node,
             search_evidence=search_evidence,
             image_evidence=image_evidence,
-            search_result=search_result,
+            search_result=candidate.search_result,
             run_id=run_id,
-            used_fallback=used_fallback,
+            used_fallback=candidate.used_fallback,
         )
-        grounded_edges = self._link_grounded_entities(
+        grounded_edges, queued_tasks = self._link_or_queue_grounded_entities(
             image_node=image_node,
-            grounded_entities=grounding.get("grounded_entities", []),
+            grounded_entities=candidate.grounded_entities,
             image_evidence=image_evidence,
             run_id=run_id,
+            source_node_title=source_node_title,
         )
 
         if persist:
@@ -415,17 +519,36 @@ class ImageDiscoveryBuilder:
                 grounded_edges=grounded_edges,
             )
 
-        return DiscoveredImage(
-            image_node=image_node,
-            image_evidence=image_evidence,
-            search_evidence=search_evidence,
-            edge=edge,
-            source_query=query,
-            source_snapshot=snapshot,
-            search_result=search_result,
-            validation=validation,
-            grounded_edges=grounded_edges,
-            used_fallback=used_fallback,
+        result.image_node = image_node
+        result.edge = edge
+        result.image_evidence = image_evidence
+        result.search_evidence = search_evidence
+        result.grounded_edges = grounded_edges
+        result.queued_tasks = queued_tasks
+
+    @staticmethod
+    def _variant_from_candidate(candidate: ImageSearchCandidate, *, is_primary: bool) -> ImageVariant:
+        return ImageVariant(
+            variant_id=candidate.candidate_id,
+            image_url=candidate.search_result.image_url,
+            source_page_url=candidate.search_result.source_page_url,
+            thumbnail_url=candidate.search_result.thumbnail_url,
+            title=candidate.search_result.title,
+            search_caption=candidate.search_result.snippet,
+            width=candidate.search_result.width,
+            height=candidate.search_result.height,
+            source=candidate.search_result.source,
+            rank=candidate.search_result.rank,
+            validation_status=candidate.validation.status.value,
+            validation_confidence=candidate.validation.confidence,
+            validation_reason=candidate.validation.reason,
+            used_fallback=candidate.used_fallback,
+            is_primary=is_primary,
+            metadata={
+                "query": candidate.source_query.query,
+                "snapshot_id": candidate.source_snapshot.snapshot_id,
+                "visual_facts": list(candidate.visual_facts),
+            },
         )
 
     def image_ground(
@@ -711,7 +834,7 @@ class ImageDiscoveryBuilder:
             return None
         return max(0.0, min(1.0, confidence))
 
-    def _should_fallback(self, images: list[DiscoveredImage]) -> bool:
+    def _should_fallback(self, images: list[ImageSearchCandidate]) -> bool:
         if not self.config.fallback_if_no_validated:
             return False
         if not images:
@@ -875,24 +998,53 @@ class ImageDiscoveryBuilder:
             },
         )
 
-    def _link_grounded_entities(
+    def _link_or_queue_grounded_entities(
         self,
         *,
         image_node: ImageNode,
         grounded_entities: list[dict[str, Any]],
         image_evidence: Evidence,
         run_id: str | None,
-    ) -> list[Edge]:
+        source_node_title: str | None,
+    ) -> tuple[list[Edge], list[dict[str, Any]]]:
         if self.store is None or not grounded_entities:
-            return []
+            return [], []
 
         edges: list[Edge] = []
         unresolved: list[dict[str, Any]] = []
+        queued_tasks: list[dict[str, Any]] = []
         for entity in grounded_entities:
+            if not self._should_expand_entity(entity):
+                unresolved.append({**entity, "status": "filtered_out"})
+                continue
             matched_node = self._match_text_node(entity.get("name"))
             if matched_node is None:
-                unresolved.append(entity)
-                continue
+                resolved_target = self._resolve_grounded_entity(
+                    entity,
+                    source_node_title=source_node_title,
+                    image_caption=image_node.caption,
+                )
+                if resolved_target is None:
+                    unresolved.append({**entity, "status": "unresolved"})
+                    continue
+                existing_by_url = self._find_text_node_by_url(resolved_target["url"])
+                if existing_by_url is not None:
+                    matched_node = existing_by_url
+                else:
+                    queued_tasks.append(
+                        {
+                            "url": resolved_target["url"],
+                            "title": resolved_target.get("title") or entity.get("name"),
+                            "pending_link": {
+                                "link_type": "image_entity",
+                                "parent_node_id": image_node.node_id,
+                                "source_evidence_id": image_evidence.evidence_id,
+                                "entity": entity,
+                                "resolved_target": resolved_target,
+                            },
+                        }
+                    )
+                    continue
             relation = entity.get("relation_to_image") or "depicts"
             edge = Edge.create(
                 image_node.node_id,
@@ -905,10 +1057,10 @@ class ImageDiscoveryBuilder:
                     EvidenceRef(
                         evidence_id=image_evidence.evidence_id,
                         quote=entity.get("evidence"),
-                metadata={
-                    "grounded_entity": entity,
-                    "matched_title": matched_node.get("title"),
-                },
+                        metadata={
+                            "grounded_entity": entity,
+                            "matched_title": matched_node.get("title"),
+                        },
                     )
                 ],
                 source=EdgeSource(
@@ -930,7 +1082,56 @@ class ImageDiscoveryBuilder:
         if unresolved:
             image_node.metadata = dict(image_node.metadata or {})
             image_node.metadata["unresolved_grounded_entities"] = unresolved
-        return edges
+        return edges, queued_tasks
+
+    def _resolve_grounded_entity(
+        self,
+        entity: dict[str, Any],
+        *,
+        source_node_title: str | None,
+        image_caption: str | None,
+    ) -> dict[str, Any] | None:
+        label = (entity.get("name") or "").strip()
+        if not label:
+            return None
+        context_parts = [part for part in (entity.get("evidence"), image_caption, source_node_title) if part]
+        resolved = self.wiki_resolver.resolve(
+            label,
+            entity_type=entity.get("type"),
+            source_title=source_node_title,
+            context=" ".join(context_parts),
+        )
+        if resolved is None:
+            return None
+        return resolved.to_dict()
+
+    def _find_text_node_by_url(self, url: str | None) -> dict[str, Any] | None:
+        if self.store is None or not url:
+            return None
+        for node in self.store.list_nodes():
+            if node.get("node_type") != NodeType.TEXT.value:
+                continue
+            source = node.get("source") or {}
+            if isinstance(source, dict) and source.get("url") == url:
+                return dict(node)
+        return None
+
+    def _source_node_title(self, node_id: str | None) -> str | None:
+        if self.store is None or not node_id:
+            return None
+        record = self.store.get_node(node_id)
+        if record is None:
+            return None
+        return record.get("title") or record.get("canonical_id")
+
+    def _should_expand_entity(self, entity: dict[str, Any]) -> bool:
+        label = (entity.get("name") or "").strip()
+        if len(label) < 2:
+            return False
+        entity_type = self._normalize_entity_type(entity.get("type"))
+        if entity_type and entity_type not in self.config.expandable_entity_types:
+            return False
+        return True
 
     def _match_text_node(self, label: str | None) -> dict[str, Any] | None:
         if self.store is None or not label:
@@ -981,6 +1182,11 @@ class ImageDiscoveryBuilder:
         needle_tokens = set(needle.split())
         candidate_tokens = set(candidate.split())
         return needle_tokens.issubset(candidate_tokens)
+
+    @staticmethod
+    def _normalize_entity_type(entity_type: str | None) -> str | None:
+        normalized = re.sub(r"\s+", " ", re.sub(r"[^0-9a-zA-Z]+", " ", (entity_type or "").lower())).strip()
+        return normalized or None
 
     def _edge_from_plan_to_image(
         self,
@@ -1137,10 +1343,12 @@ entity: Kobe | person | depicts | visible player
             )
             result = builder.discover_for_plan(plan, run_id="run_smoke")
             assert len(result.accepted_images()) == 1
-            image = result.accepted_images()[0]
-            assert image.image_node.caption == "Kobe Bryant in his final game"
-            assert image.edge is not None
-            assert image.grounded_edges
+            image = result.primary_image()
+            assert image is not None
+            assert result.image_node is not None
+            assert result.image_node.caption == "Kobe Bryant in his final game"
+            assert result.edge is not None
+            assert result.grounded_edges
             assert store.stats()["nodes"] == 2
     finally:
         if old_check is None:

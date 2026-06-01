@@ -16,7 +16,7 @@ if __package__ in (None, ""):
     __package__ = "synthesis"
 
 from .evidence import Evidence
-from .edges import Edge
+from .edges import Edge, EdgeSource, EdgeType, EvidenceRef
 from .image_discovery import ImageDiscoveryBuilder, ImageDiscoveryResult
 from .store import JsonlGraphStore
 from .visual_planner import VisualSearchPlan, VisualSearchPlanner
@@ -84,6 +84,37 @@ class ExpansionTask:
                 "context": candidate.context,
                 "rank": candidate.rank,
                 "pending_parent_links": [pending_parent_link],
+            },
+        )
+
+    @classmethod
+    def from_image_entity(
+        cls,
+        *,
+        url: str,
+        title: str | None,
+        parent_image_node_id: str,
+        source_evidence_id: str,
+        entity: dict[str, Any],
+    ) -> "ExpansionTask":
+        pending_parent_link = {
+            "link_type": "image_entity",
+            "parent_node_id": parent_image_node_id,
+            "source_evidence_id": source_evidence_id,
+            "entity": entity,
+            "resolved_target": {"url": url, "title": title},
+        }
+        return cls(
+            url=url,
+            depth=0,
+            title=title,
+            parent_node_id=parent_image_node_id,
+            priority=-1.0,
+            metadata={
+                "pending_parent_links": [pending_parent_link],
+                "task_origin": "image_entity",
+                "entity_name": entity.get("name"),
+                "entity_type": entity.get("type"),
             },
         )
 
@@ -257,7 +288,8 @@ class GraphExpansionStrategy:
             timing["queue_neighbors_s"] = time.perf_counter() - started
 
             started = time.perf_counter()
-            visual_plans, image_results = self._expand_images(text_result, run_id=run_id)
+            visual_plans, image_results, image_queued_tasks = self._expand_images(text_result, run_id=run_id)
+            queued_tasks.extend(image_queued_tasks)
             timing["image_expansion_s"] = time.perf_counter() - started
             timing["total_s"] = time.perf_counter() - total_started
             task.status = ExpansionTaskStatus.DONE
@@ -386,6 +418,16 @@ class GraphExpansionStrategy:
         target_result: WikiTextBuildResult,
         run_id: str | None,
     ) -> Edge | None:
+        link_type = pending.get("link_type") or "wiki_link"
+        if link_type == "image_entity":
+            edge = self._materialize_pending_image_entity_link(
+                pending,
+                target_node_record=target_result.node.to_dict(),
+            )
+            if edge is not None and self.config.persist:
+                self.store.upsert_edge(edge)
+            return edge
+
         parent_node_id = pending.get("parent_node_id")
         source_evidence_id = pending.get("source_evidence_id")
         candidate_record = pending.get("candidate")
@@ -425,6 +467,53 @@ class GraphExpansionStrategy:
             self.store.upsert_edge(edge)
         return edge
 
+    def _materialize_pending_image_entity_link(
+        self,
+        pending: dict[str, Any],
+        *,
+        target_node_record: dict[str, Any],
+    ) -> Edge | None:
+        parent_node_id = pending.get("parent_node_id")
+        source_evidence_id = pending.get("source_evidence_id")
+        entity = pending.get("entity")
+        if not parent_node_id or not source_evidence_id or not isinstance(entity, dict):
+            return None
+        source_node_record = self.store.get_node(parent_node_id)
+        source_evidence_record = self.store.get_evidence(source_evidence_id)
+        if source_node_record is None or source_evidence_record is None:
+            return None
+        relation = entity.get("relation_to_image") or "depicts"
+        return Edge.create(
+            parent_node_id,
+            target_node_record["node_id"],
+            edge_type=EdgeType.IMAGE_DEPICTS,
+            relation=relation,
+            src_node_type=source_node_record.get("node_type"),
+            dst_node_type=target_node_record.get("node_type"),
+            evidence_refs=[
+                EvidenceRef(
+                    evidence_id=source_evidence_id,
+                    quote=entity.get("evidence"),
+                    metadata={
+                        "grounded_entity": entity,
+                        "resolved_target": pending.get("resolved_target"),
+                    },
+                )
+            ],
+            source=EdgeSource(
+                source_type="image_grounding_delayed",
+                url=(source_node_record.get("source") or {}).get("url") if isinstance(source_node_record.get("source"), dict) else None,
+                builder="graph_expansion_strategy",
+            ),
+            extractor="graph_expansion_strategy",
+            metadata={
+                "entity_name": entity.get("name"),
+                "entity_type": entity.get("type"),
+                "link_type": "image_entity",
+            },
+            evidence_key=f"{source_evidence_id}:{entity.get('name')}:{target_node_record['node_id']}",
+        )
+
     def _materialize_edge_to_existing_node(
         self,
         *,
@@ -447,39 +536,34 @@ class GraphExpansionStrategy:
         url: str,
         pending_link: dict[str, Any],
     ) -> bool:
+        def _pending_key(record: dict[str, Any]) -> tuple[Any, Any, Any, Any]:
+            candidate = record.get("candidate") or {}
+            resolved_target = record.get("resolved_target") or {}
+            entity = record.get("entity") or {}
+            return (
+                record.get("link_type") or "wiki_link",
+                record.get("parent_node_id"),
+                record.get("source_evidence_id"),
+                candidate.get("url") or resolved_target.get("url") or entity.get("name"),
+            )
+
         with self._lock:
             for task in self._queue:
                 if task.url != url:
                     continue
                 links = list(task.metadata.get("pending_parent_links") or [])
-                key = (
-                    pending_link.get("parent_node_id"),
-                    pending_link.get("source_evidence_id"),
-                    (pending_link.get("candidate") or {}).get("url"),
-                )
+                key = _pending_key(pending_link)
                 for existing in links:
-                    existing_key = (
-                        existing.get("parent_node_id"),
-                        existing.get("source_evidence_id"),
-                        (existing.get("candidate") or {}).get("url"),
-                    )
+                    existing_key = _pending_key(existing)
                     if existing_key == key:
                         return False
                 links.append(pending_link)
                 task.metadata["pending_parent_links"] = links
                 return True
             links = self._pending_parent_links_by_url.setdefault(url, [])
-            key = (
-                pending_link.get("parent_node_id"),
-                pending_link.get("source_evidence_id"),
-                (pending_link.get("candidate") or {}).get("url"),
-            )
+            key = _pending_key(pending_link)
             for existing in links:
-                existing_key = (
-                    existing.get("parent_node_id"),
-                    existing.get("source_evidence_id"),
-                    (existing.get("candidate") or {}).get("url"),
-                )
+                existing_key = _pending_key(existing)
                 if existing_key == key:
                     return False
             links.append(pending_link)
@@ -506,11 +590,11 @@ class GraphExpansionStrategy:
         text_result: WikiTextBuildResult,
         *,
         run_id: str | None,
-    ) -> tuple[list[VisualSearchPlan], list[ImageDiscoveryResult]]:
+    ) -> tuple[list[VisualSearchPlan], list[ImageDiscoveryResult], list[ExpansionTask]]:
         if not self.config.enable_image_expansion:
-            return [], []
+            return [], [], []
         if self.visual_planner is None or self.image_builder is None:
-            return [], []
+            return [], [], []
 
         plans = self.visual_planner.plan(
             node=text_result.node.to_dict(),
@@ -526,7 +610,56 @@ class GraphExpansionStrategy:
             )
             for plan in plans
         ]
-        return plans, image_results
+        queued_tasks: list[ExpansionTask] = []
+        for image_result in image_results:
+            for pending in image_result.queued_tasks:
+                task = self._enqueue_image_entity_task(pending)
+                if task is not None:
+                    queued_tasks.append(task)
+        return plans, image_results, queued_tasks
+
+    def _enqueue_image_entity_task(self, pending: dict[str, Any]) -> ExpansionTask | None:
+        url = pending.get("url")
+        title = pending.get("title")
+        pending_link = pending.get("pending_link")
+        if not url or not isinstance(pending_link, dict):
+            return None
+        parent_image_node_id = pending_link.get("parent_node_id")
+        source_evidence_id = pending_link.get("source_evidence_id")
+        entity = pending_link.get("entity")
+        if not parent_image_node_id or not source_evidence_id or not isinstance(entity, dict):
+            return None
+
+        existing_node = self._find_text_node_by_source_url(url)
+        if existing_node is not None:
+            edge = self._materialize_pending_image_entity_link(
+                pending_link,
+                target_node_record=existing_node,
+            )
+            if edge is not None and self.config.persist:
+                self.store.upsert_edge(edge)
+            return None
+
+        task = ExpansionTask.from_image_entity(
+            url=url,
+            title=title,
+            parent_image_node_id=parent_image_node_id,
+            source_evidence_id=source_evidence_id,
+            entity=entity,
+        )
+        if self.enqueue(task):
+            return task
+        self._append_pending_link_to_queued_task(url, pending_link)
+        return None
+
+    def _find_text_node_by_source_url(self, url: str) -> dict[str, Any] | None:
+        for node in self.store.list_nodes():
+            if node.get("node_type") != "text":
+                continue
+            source = node.get("source") or {}
+            if isinstance(source, dict) and source.get("url") == url:
+                return node
+        return None
 
 
 def _smoke_test() -> None:

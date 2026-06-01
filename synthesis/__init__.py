@@ -10,6 +10,7 @@ if __package__ in (None, ""):
 from .nodes import (
     AssetRef,
     ImageNode,
+    ImageVariant,
     Node,
     NodeSource,
     NodeStatus,
@@ -58,7 +59,7 @@ from .search_client import (
     TextSearchResult,
 )
 from .image_discovery import (
-    DiscoveredImage,
+    ImageSearchCandidate,
     ImageCandidateStatus,
     ImageDiscoveryBuilder,
     ImageDiscoveryConfig,
@@ -67,6 +68,7 @@ from .image_discovery import (
     PROMPT_IMAGE_CHECK,
     PROMPT_IMAGE_GROUND,
 )
+from .wiki_entity_resolver import WikiEntityResolver, WikiEntityCandidate
 from .wiki_text_builder import (
     EnhancedReaderClient,
     PROMPT_EXTRACT_ATTRIBUTE,
@@ -102,6 +104,7 @@ from .visual_planner import (
 __all__ = [
     "AssetRef",
     "ImageNode",
+    "ImageVariant",
     "Node",
     "NodeSource",
     "NodeStatus",
@@ -140,7 +143,7 @@ __all__ = [
     "SerperAdapterSearchClient",
     "SerpApiSearchClient",
     "TextSearchResult",
-    "DiscoveredImage",
+    "ImageSearchCandidate",
     "ImageCandidateStatus",
     "ImageDiscoveryBuilder",
     "ImageDiscoveryConfig",
@@ -148,6 +151,8 @@ __all__ = [
     "ImageValidationResult",
     "PROMPT_IMAGE_CHECK",
     "PROMPT_IMAGE_GROUND",
+    "WikiEntityResolver",
+    "WikiEntityCandidate",
     "EnhancedReaderClient",
     "PROMPT_EXTRACT_ATTRIBUTE",
     "ReaderClient",
