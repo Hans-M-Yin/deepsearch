@@ -112,6 +112,7 @@ class ImageDiscoveryConfig:
     allowed_content_types: set[str] | None = None
     rejected_extensions: set[str] = field(default_factory=lambda: {".svg"})
     store_rejected: bool = True
+    force_accept_images: bool = False
     precheck_image_urls: bool = True
     precheck_timeout_s: float = 15.0
     precheck_max_bytes: int = 262144
@@ -816,16 +817,32 @@ class ImageDiscoveryBuilder:
                 return self._reject(f"content_type_not_allowed:{content_type}")
 
         model_alias = self.image_check_model_alias or os.environ.get("IMAGE_CHECK_MODEL")
+        resolved_asset: ResolvedImageAsset | None = None
+        if self.config.precheck_image_urls:
+            resolved_asset, precheck_error = self._resolve_image_asset(search_result)
+            if precheck_error is not None or resolved_asset is None:
+                self._log_invalid_image_url(search_result.image_url, precheck_error, stage="image_check")
+                return self._reject(
+                    f"image_url_precheck_failed:{precheck_error}",
+                    drop_candidate=True,
+                )
+
+        if self.config.force_accept_images:
+            metadata: dict[str, Any] = {
+                "check": "force_accept_images",
+                "debug_force_accept_images": True,
+            }
+            if resolved_asset is not None:
+                metadata["resolved_image_key"] = resolved_asset.cache_key
+                metadata["resolved_image"] = resolved_asset.to_metadata()
+            return ImageValidationResult(
+                status=ImageCandidateStatus.ACCEPTED,
+                confidence=1.0,
+                reason="force_accept_images",
+                metadata=metadata,
+            )
+
         if model_alias:
-            resolved_asset: ResolvedImageAsset | None = None
-            if self.config.precheck_image_urls:
-                resolved_asset, precheck_error = self._resolve_image_asset(search_result)
-                if precheck_error is not None or resolved_asset is None:
-                    self._log_invalid_image_url(search_result.image_url, precheck_error, stage="image_check")
-                    return self._reject(
-                        f"image_url_precheck_failed:{precheck_error}",
-                        drop_candidate=True,
-                    )
             try:
                 result = self._image_check_with_mllm(
                     plan=plan,

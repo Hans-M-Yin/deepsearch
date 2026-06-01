@@ -207,6 +207,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--per-query-image-limit", type=int, default=3, help="Image search results per visual query.")
     parser.add_argument("--max-images-per-plan", type=int, default=1, help="Accepted images per visual plan.")
     parser.add_argument("--no-images", action="store_true", help="Disable visual planning and image discovery.")
+    parser.add_argument(
+        "--force-accept-images",
+        action="store_true",
+        help="Debug mode: bypass semantic image rejection for every resolvable image candidate.",
+    )
     parser.add_argument("--skip-attributes", action="store_true", help="Do not call LLM attribute extraction.")
     parser.add_argument("--fatal-attribute-errors", action="store_true", help="Fail the task if attribute extraction fails.")
     parser.add_argument("--persist-snapshots", action="store_true", help="Persist verbose SearchSnapshot records for debugging.")
@@ -318,6 +323,7 @@ def main(argv: list[str] | None = None) -> int:
                 per_query_limit=args.per_query_image_limit,
                 max_images_per_plan=args.max_images_per_plan,
                 persist_search_snapshots=args.persist_snapshots,
+                force_accept_images=args.force_accept_images,
             ),
             model_client=LLM_WORKER,
         )
