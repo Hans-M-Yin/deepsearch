@@ -7,14 +7,19 @@ creates graph records, and leaves one image_check hook for future MLLM checks.
 
 from __future__ import annotations
 
+import base64
 from io import BytesIO
 import os
 import re
+import threading
+import time
 from dataclasses import asdict, dataclass, field
 from enum import Enum
+from hashlib import sha256
 from pathlib import Path
 import sys
 from typing import Any
+from urllib.parse import urlparse
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -109,6 +114,11 @@ class ImageDiscoveryConfig:
     precheck_image_urls: bool = True
     precheck_timeout_s: float = 15.0
     precheck_max_bytes: int = 262144
+    precheck_retries: int = 3
+    host_min_interval_s: float = 0.35
+    cache_dir: str | None = None
+    try_source_page_recovery: bool = True
+    source_page_timeout_s: float = 20.0
     expandable_entity_types: set[str] = field(
         default_factory=lambda: {
             "person",
@@ -168,6 +178,35 @@ class ImageSearchCandidate:
             "grounded_entities": _jsonify(self.grounded_entities),
             "grounded_caption": self.grounded_caption,
             "visual_facts": list(self.visual_facts),
+        }
+
+
+@dataclass(slots=True)
+class ResolvedImageAsset:
+    cache_key: str
+    original_url: str | None
+    resolved_url: str | None
+    source_page_url: str | None
+    model_url: str
+    asset_uri: str
+    cache_path: str | None
+    content_type: str | None
+    width: int | None = None
+    height: int | None = None
+    strategy: str = "direct"
+
+    def to_metadata(self) -> dict[str, Any]:
+        return {
+            "cache_key": self.cache_key,
+            "original_url": self.original_url,
+            "resolved_url": self.resolved_url,
+            "source_page_url": self.source_page_url,
+            "asset_uri": self.asset_uri,
+            "cache_path": self.cache_path,
+            "content_type": self.content_type,
+            "width": self.width,
+            "height": self.height,
+            "strategy": self.strategy,
         }
 
 
@@ -244,6 +283,9 @@ class ImageDiscoveryBuilder:
         self.model_client = model_client or LLM_WORKER
         self.image_check_model_alias = image_check_model_alias
         self.wiki_resolver = wiki_resolver or WikiEntityResolver()
+        self._resolved_image_cache: dict[str, ResolvedImageAsset] = {}
+        self._host_not_before: dict[str, float] = {}
+        self._download_lock = threading.Lock()
 
     def discover_for_plan(
         self,
@@ -394,7 +436,12 @@ class ImageDiscoveryBuilder:
         run_id: str | None,
         persist: bool,
     ) -> None:
-        provisional_node = self._image_node_from_result(candidate.search_result, run_id=run_id)
+        resolved_asset = self._resolved_image_from_validation(candidate.validation)
+        provisional_node = self._image_node_from_result(
+            candidate.search_result,
+            run_id=run_id,
+            resolved_asset=resolved_asset,
+        )
         grounding = self.image_ground(
             plan=plan,
             search_result=candidate.search_result,
@@ -415,26 +462,36 @@ class ImageDiscoveryBuilder:
         ]
         source_node_title = self._source_node_title(plan.source_node_id) or plan.target.content
         primary_caption = candidate.grounded_caption or provisional_node.caption or candidate.search_result.snippet
+        primary_image_uri = (
+            resolved_asset.asset_uri
+            if resolved_asset is not None
+            else candidate.search_result.image_url or candidate.search_result.source_page_url or candidate.search_result.title or ""
+        )
         image_node = ImageNode.from_bundle(
-            candidate.search_result.image_url or candidate.search_result.source_page_url or candidate.search_result.title or "",
+            primary_image_uri,
             primary_image_id=candidate.candidate_id,
             image_variants=variants,
             source_page_url=candidate.search_result.source_page_url,
             caption=primary_caption,
             title=candidate.search_result.title,
-            width=candidate.search_result.width,
-            height=candidate.search_result.height,
-            content_type=self._content_type(candidate.search_result),
+            width=resolved_asset.width if resolved_asset is not None and resolved_asset.width is not None else candidate.search_result.width,
+            height=resolved_asset.height if resolved_asset is not None and resolved_asset.height is not None else candidate.search_result.height,
+            content_type=resolved_asset.content_type if resolved_asset is not None else self._content_type(candidate.search_result),
             run_id=run_id,
             metadata={
                 "search_query": candidate.source_query.query,
                 "candidate_count": len(result.candidates),
                 "visual_target": plan.target.content,
+                "resolved_image": resolved_asset.to_metadata() if resolved_asset is not None else None,
             },
         )
         self._apply_grounding_to_image_node(image_node, grounding)
 
-        original_asset = self._image_asset(candidate.search_result, image_node=image_node)
+        original_asset = self._image_asset(
+            candidate.search_result,
+            image_node=image_node,
+            resolved_asset=resolved_asset,
+        )
         thumb_asset = self._thumbnail_asset(candidate.search_result)
         asset_ids = [original_asset.asset_id]
         if thumb_asset:
@@ -538,6 +595,7 @@ class ImageDiscoveryBuilder:
                 "query": candidate.source_query.query,
                 "snapshot_id": candidate.source_snapshot.snapshot_id,
                 "visual_facts": list(candidate.visual_facts),
+                "resolved_image": (candidate.validation.metadata or {}).get("resolved_image"),
             },
         )
 
@@ -564,25 +622,33 @@ class ImageDiscoveryBuilder:
             self._apply_grounding_to_image_node(image_node, grounding)
             return grounding
 
-        if self.config.precheck_image_urls:
-            precheck_error = self._precheck_image_url(search_result.image_url)
-            if precheck_error is not None:
-                self._log_invalid_image_url(search_result.image_url, precheck_error, stage="image_ground")
-                grounding = {
-                    "caption": image_node.caption,
-                    "visual_facts": validation.metadata.get("visual_facts", []),
-                    "ocr_texts": [],
-                    "grounded_entities": [],
-                    "check": "image_url_precheck_failed",
-                    "raw_model_output": None,
-                    "run_id": run_id,
-                }
-                image_node.metadata = dict(image_node.metadata or {})
-                image_node.metadata["image_ground_error"] = precheck_error
-                self._apply_grounding_to_image_node(image_node, grounding)
-                return grounding
+        resolved_asset = self._resolved_image_from_validation(validation)
+        precheck_error: str | None = None
+        if self.config.precheck_image_urls and resolved_asset is None:
+            resolved_asset, precheck_error = self._resolve_image_asset(search_result)
+        if self.config.precheck_image_urls and resolved_asset is None:
+            precheck_error = precheck_error or "missing_resolved_image_asset"
+            self._log_invalid_image_url(search_result.image_url, precheck_error, stage="image_ground")
+            grounding = {
+                "caption": image_node.caption,
+                "visual_facts": validation.metadata.get("visual_facts", []),
+                "ocr_texts": [],
+                "grounded_entities": [],
+                "check": "image_url_precheck_failed",
+                "raw_model_output": None,
+                "run_id": run_id,
+            }
+            image_node.metadata = dict(image_node.metadata or {})
+            image_node.metadata["image_ground_error"] = precheck_error
+            self._apply_grounding_to_image_node(image_node, grounding)
+            return grounding
+
+        if self.config.precheck_image_urls and resolved_asset is not None:
+            image_node.metadata = dict(image_node.metadata or {})
+            image_node.metadata["resolved_image"] = resolved_asset.to_metadata()
 
         try:
+            model_image_url = resolved_asset.model_url if resolved_asset is not None else search_result.image_url
             response = self.model_client.generate(
                 ModelRequest(
                     model=model_alias,
@@ -601,7 +667,7 @@ class ImageDiscoveryBuilder:
                                 },
                                 {
                                     "type": "image_url",
-                                    "image_url": {"url": search_result.image_url},
+                                    "image_url": {"url": model_image_url},
                                 },
                             ],
                         ),
@@ -749,21 +815,28 @@ class ImageDiscoveryBuilder:
 
         model_alias = self.image_check_model_alias or os.environ.get("IMAGE_CHECK_MODEL")
         if model_alias:
+            resolved_asset: ResolvedImageAsset | None = None
             if self.config.precheck_image_urls:
-                precheck_error = self._precheck_image_url(search_result.image_url)
-                if precheck_error is not None:
+                resolved_asset, precheck_error = self._resolve_image_asset(search_result)
+                if precheck_error is not None or resolved_asset is None:
                     self._log_invalid_image_url(search_result.image_url, precheck_error, stage="image_check")
                     return self._reject(
                         f"image_url_precheck_failed:{precheck_error}",
                         drop_candidate=True,
                     )
             try:
-                return self._image_check_with_mllm(
+                result = self._image_check_with_mllm(
                     plan=plan,
                     search_result=search_result,
                     model_alias=model_alias,
                     run_id=run_id,
+                    resolved_asset=resolved_asset,
                 )
+                if resolved_asset is not None:
+                    result.metadata = dict(result.metadata or {})
+                    result.metadata["resolved_image_key"] = resolved_asset.cache_key
+                    result.metadata["resolved_image"] = resolved_asset.to_metadata()
+                return result
             except Exception as exc:
                 error = f"{exc.__class__.__name__}: {exc}"
                 self._log_invalid_image_url(search_result.image_url, error, stage="image_check")
@@ -779,52 +852,306 @@ class ImageDiscoveryBuilder:
             metadata={"check": "basic_url_format_size"},
         )
 
-    def _precheck_image_url(self, image_url: str | None) -> str | None:
-        if not image_url:
-            return "missing_image_url"
+    def _resolve_image_asset(
+        self,
+        search_result: ImageSearchResult,
+    ) -> tuple[ResolvedImageAsset | None, str | None]:
+        image_url = search_result.image_url
+        source_page_url = search_result.source_page_url
+        cache_key = self._resolved_image_cache_key(image_url, source_page_url)
+        cached = self._resolved_image_cache.get(cache_key)
+        if cached is not None:
+            return cached, None
 
-        request = Request(
+        attempted_errors: list[str] = []
+        direct_asset, direct_error = self._download_and_prepare_image_asset(
             image_url,
-            headers={
-                "Accept": "image/*,*/*;q=0.8",
-                "User-Agent": "deepsearch-synthesis/0.1",
-            },
+            source_page_url=source_page_url,
+            strategy="direct",
+            cache_key=cache_key,
         )
-        try:
-            with urlopen(request, timeout=self.config.precheck_timeout_s) as response:
-                content_type = response.headers.get("Content-Type", "")
-                payload = response.read(self.config.precheck_max_bytes)
-        except HTTPError as exc:
-            return f"http_{exc.code}"
-        except URLError as exc:
-            return f"url_error:{exc.reason}"
-        except TimeoutError:
-            return f"timeout_after_{self.config.precheck_timeout_s}s"
-        except Exception as exc:
-            return f"download_error:{exc.__class__.__name__}:{exc}"
+        if direct_asset is not None:
+            self._resolved_image_cache[cache_key] = direct_asset
+            return direct_asset, None
+        if direct_error:
+            attempted_errors.append(direct_error)
 
+        if self.config.try_source_page_recovery and source_page_url:
+            for recovered_url in self._recover_candidate_image_urls(search_result):
+                recovered_asset, recovered_error = self._download_and_prepare_image_asset(
+                    recovered_url,
+                    source_page_url=source_page_url,
+                    strategy="source_page_recovery",
+                    cache_key=cache_key,
+                )
+                if recovered_asset is not None:
+                    self._resolved_image_cache[cache_key] = recovered_asset
+                    self._log_recovered_image_url(
+                        original_url=image_url,
+                        recovered_url=recovered_url,
+                        source_page_url=source_page_url,
+                    )
+                    return recovered_asset, None
+                if recovered_error:
+                    attempted_errors.append(recovered_error)
+
+        return None, " | ".join(attempted_errors) if attempted_errors else "unresolved_image_asset"
+
+    def _download_and_prepare_image_asset(
+        self,
+        image_url: str | None,
+        *,
+        source_page_url: str | None,
+        strategy: str,
+        cache_key: str,
+    ) -> tuple[ResolvedImageAsset | None, str | None]:
+        if not image_url:
+            return None, "missing_image_url"
+
+        download_result = self._download_image_payload(image_url)
+        if isinstance(download_result, str):
+            return None, f"{image_url} -> {download_result}"
+        payload, content_type = download_result
         if not payload:
-            return "empty_response_body"
+            return None, f"{image_url} -> empty_response_body"
 
-        normalized_content_type = content_type.lower()
+        normalized_content_type = (content_type or "").lower()
         if normalized_content_type and not normalized_content_type.startswith("image/"):
-            return f"non_image_content_type:{content_type}"
+            return None, f"{image_url} -> non_image_content_type:{content_type}"
 
         try:
             from PIL import Image
 
             with Image.open(BytesIO(payload)) as image:
+                width, height = image.size
                 image.verify()
         except ImportError:
-            return None
+            width = None
+            height = None
         except Exception as exc:
-            return f"decode_error:{exc.__class__.__name__}:{exc}"
+            return None, f"{image_url} -> decode_error:{exc.__class__.__name__}:{exc}"
+
+        content_type = content_type or self._sniff_content_type(payload) or "image/jpeg"
+        cache_path = self._write_image_cache_file(cache_key, payload, content_type)
+        asset_uri = self._maybe_upload_cached_image(cache_path, cache_key) or cache_path
+        model_url = self._data_url(content_type, payload)
+        return (
+            ResolvedImageAsset(
+                cache_key=cache_key,
+                original_url=image_url,
+                resolved_url=image_url,
+                source_page_url=source_page_url,
+                model_url=model_url,
+                asset_uri=asset_uri,
+                cache_path=cache_path,
+                content_type=content_type,
+                width=width,
+                height=height,
+                strategy=strategy,
+            ),
+            None,
+        )
+
+    def _download_image_payload(self, image_url: str) -> tuple[bytes, str | None] | str:
+        host = urlparse(image_url).netloc.lower()
+        last_error: str | None = None
+        for attempt in range(1, max(1, self.config.precheck_retries) + 1):
+            self._wait_for_host_slot(host)
+            request = Request(
+                image_url,
+                headers={
+                    "Accept": "image/*,*/*;q=0.8",
+                    "User-Agent": "deepsearch-synthesis/0.1",
+                },
+            )
+            try:
+                with urlopen(request, timeout=self.config.precheck_timeout_s) as response:
+                    content_type = response.headers.get("Content-Type", "")
+                    payload = response.read(self.config.precheck_max_bytes)
+                self._mark_host_slot(host, success=True)
+                return payload, content_type
+            except HTTPError as exc:
+                retry_after = self._retry_after_seconds(exc)
+                if exc.code == 429 and attempt < self.config.precheck_retries:
+                    self._mark_host_slot(host, retry_after=retry_after or (attempt * 2.0))
+                    time.sleep(retry_after or (attempt * 2.0))
+                    last_error = "http_429"
+                    continue
+                return f"http_{exc.code}"
+            except URLError as exc:
+                last_error = f"url_error:{exc.reason}"
+            except TimeoutError:
+                last_error = f"timeout_after_{self.config.precheck_timeout_s}s"
+            except Exception as exc:
+                last_error = f"download_error:{exc.__class__.__name__}:{exc}"
+            if attempt < self.config.precheck_retries:
+                time.sleep(min(6.0, attempt * 1.5))
+        return last_error or "download_failed"
+
+    def _recover_candidate_image_urls(self, search_result: ImageSearchResult) -> list[str]:
+        source_page_url = search_result.source_page_url
+        if not source_page_url:
+            return []
+        html_text = self._fetch_source_page_html(source_page_url)
+        if html_text is None:
+            return []
+
+        patterns = [
+            r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']',
+            r'<meta[^>]+name=["\']twitter:image["\'][^>]+content=["\']([^"\']+)["\']',
+            r'"display_url"\s*:\s*"([^"]+)"',
+            r'"image_url"\s*:\s*"([^"]+)"',
+        ]
+        candidates: list[str] = []
+        seen = set()
+        for pattern in patterns:
+            for match in re.findall(pattern, html_text, flags=re.IGNORECASE):
+                candidate = match.replace("\\u0026", "&").replace("\\/", "/").strip()
+                if not candidate.startswith(("http://", "https://")) or candidate in seen:
+                    continue
+                seen.add(candidate)
+                candidates.append(candidate)
+        return candidates
+
+    def _fetch_source_page_html(self, source_page_url: str) -> str | None:
+        request = Request(
+            source_page_url,
+            headers={
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "User-Agent": "deepsearch-synthesis/0.1",
+            },
+        )
+        try:
+            with urlopen(request, timeout=self.config.source_page_timeout_s) as response:
+                payload = response.read(min(self.config.precheck_max_bytes * 4, 1048576))
+            return payload.decode("utf-8", errors="ignore")
+        except Exception:
+            return None
+
+    def _resolved_image_from_validation(
+        self,
+        validation: ImageValidationResult,
+    ) -> ResolvedImageAsset | None:
+        key = (validation.metadata or {}).get("resolved_image_key")
+        if not key:
+            return None
+        return self._resolved_image_cache.get(key)
+
+    @staticmethod
+    def _resolved_image_cache_key(image_url: str | None, source_page_url: str | None) -> str:
+        payload = f"{image_url or ''}||{source_page_url or ''}"
+        return sha256(payload.encode("utf-8")).hexdigest()[:24]
+
+    def _write_image_cache_file(self, cache_key: str, payload: bytes, content_type: str) -> str:
+        cache_dir = self._cache_dir()
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        path = cache_dir / f"{cache_key}{self._suffix_for_content_type(content_type)}"
+        if not path.exists():
+            path.write_bytes(payload)
+        return str(path.resolve())
+
+    def _cache_dir(self) -> Path:
+        configured = self.config.cache_dir
+        if configured:
+            return Path(configured)
+        return Path(__file__).resolve().parent / ".image_cache"
+
+    @staticmethod
+    def _suffix_for_content_type(content_type: str | None) -> str:
+        mapping = {
+            "image/jpeg": ".jpg",
+            "image/png": ".png",
+            "image/webp": ".webp",
+            "image/gif": ".gif",
+            "image/bmp": ".bmp",
+            "image/avif": ".avif",
+        }
+        return mapping.get((content_type or "").lower(), ".img")
+
+    @staticmethod
+    def _data_url(content_type: str, payload: bytes) -> str:
+        return f"data:{content_type};base64,{base64.b64encode(payload).decode('ascii')}"
+
+    @staticmethod
+    def _sniff_content_type(payload: bytes) -> str | None:
+        if payload.startswith(b"\x89PNG\r\n\x1a\n"):
+            return "image/png"
+        if payload.startswith(b"\xff\xd8\xff"):
+            return "image/jpeg"
+        if payload[:6] in (b"GIF87a", b"GIF89a"):
+            return "image/gif"
+        if payload.startswith(b"RIFF") and payload[8:12] == b"WEBP":
+            return "image/webp"
         return None
+
+    def _maybe_upload_cached_image(self, cache_path: str, cache_key: str) -> str | None:
+        try:
+            from PIL import Image
+            from opensearch_vl.opensearch_infer import cos_upload
+        except Exception:
+            return None
+        if not cos_upload.upload_available():
+            return None
+        try:
+            with Image.open(cache_path) as pil_image:
+                pil_copy = pil_image.copy()
+        except Exception:
+            return None
+        return cos_upload.upload_pil_image(
+            pil_copy,
+            filename_prefix="synthesis",
+            case_idx=0,
+            turn_num=0,
+            tool_name=f"image_cache_{cache_key}",
+        )
+
+    def _wait_for_host_slot(self, host: str) -> None:
+        if not host:
+            return
+        with self._download_lock:
+            not_before = self._host_not_before.get(host, 0.0)
+        now = time.time()
+        if not_before > now:
+            time.sleep(not_before - now)
+
+    def _mark_host_slot(self, host: str, retry_after: float | None = None, *, success: bool = False) -> None:
+        if not host:
+            return
+        with self._download_lock:
+            delay = self.config.host_min_interval_s if success else max(
+                self.config.host_min_interval_s,
+                retry_after or self.config.host_min_interval_s,
+            )
+            self._host_not_before[host] = time.time() + delay
+
+    @staticmethod
+    def _retry_after_seconds(error: HTTPError) -> float | None:
+        value = error.headers.get("Retry-After") if error.headers else None
+        if not value:
+            return None
+        try:
+            return max(0.0, float(value))
+        except ValueError:
+            return None
 
     @staticmethod
     def _log_invalid_image_url(image_url: str | None, reason: str, *, stage: str) -> None:
         print(
             f"[image-url-check][{stage}] invalid image URL: {image_url or '<missing>'} | reason: {reason}",
+            file=sys.stderr,
+        )
+
+    @staticmethod
+    def _log_recovered_image_url(
+        *,
+        original_url: str | None,
+        recovered_url: str,
+        source_page_url: str | None,
+    ) -> None:
+        print(
+            "[image-url-recover] recovered image URL "
+            f"from original={original_url or '<missing>'} "
+            f"via source_page={source_page_url or '<missing>'} -> {recovered_url}",
             file=sys.stderr,
         )
 
@@ -835,9 +1162,11 @@ class ImageDiscoveryBuilder:
         search_result: ImageSearchResult,
         model_alias: str,
         run_id: str | None,
+        resolved_asset: ResolvedImageAsset | None = None,
     ) -> ImageValidationResult:
         if not search_result.image_url:
             return self._reject("missing_image_url_for_mllm_check")
+        image_for_model = resolved_asset.model_url if resolved_asset is not None else search_result.image_url
         response = self.model_client.generate(
             ModelRequest(
                 model=model_alias,
@@ -855,7 +1184,7 @@ class ImageDiscoveryBuilder:
                             },
                             {
                                 "type": "image_url",
-                                "image_url": {"url": search_result.image_url},
+                                "image_url": {"url": image_for_model},
                             },
                         ],
                     ),
@@ -1034,6 +1363,7 @@ class ImageDiscoveryBuilder:
         result: ImageSearchResult,
         *,
         run_id: str | None,
+        resolved_asset: ResolvedImageAsset | None = None,
     ) -> ImageNode:
         metadata = {
             "search_source": result.source,
@@ -1041,8 +1371,14 @@ class ImageDiscoveryBuilder:
             "rank": result.rank,
             "raw": result.raw,
         }
+        if resolved_asset is not None:
+            metadata["resolved_image"] = resolved_asset.to_metadata()
         return ImageNode.from_url(
-            result.image_url or result.source_page_url or result.title or "",
+            (
+                resolved_asset.asset_uri
+                if resolved_asset is not None
+                else result.image_url or result.source_page_url or result.title or ""
+            ),
             source_page_url=result.source_page_url,
             caption=result.snippet,
             title=result.title,
@@ -1051,18 +1387,30 @@ class ImageDiscoveryBuilder:
         )
 
     @staticmethod
-    def _image_asset(result: ImageSearchResult, *, image_node: ImageNode) -> Asset:
-        uri = result.image_url or image_node.image_url or image_node.node_id
+    def _image_asset(
+        result: ImageSearchResult,
+        *,
+        image_node: ImageNode,
+        resolved_asset: ResolvedImageAsset | None = None,
+    ) -> Asset:
+        uri = (
+            resolved_asset.asset_uri
+            if resolved_asset is not None
+            else result.image_url or image_node.image_url or image_node.node_id
+        )
         return Asset.create(
             AssetType.IMAGE_ORIGINAL,
             uri,
             original_url=result.image_url,
-            content_type=ImageDiscoveryBuilder._content_type(result),
+            content_type=resolved_asset.content_type if resolved_asset is not None else ImageDiscoveryBuilder._content_type(result),
             metadata={
                 "source_page_url": result.source_page_url,
                 "width": result.width,
                 "height": result.height,
                 "storage_status": image_node.storage_status,
+                "resolved_url": resolved_asset.resolved_url if resolved_asset is not None else None,
+                "cache_path": resolved_asset.cache_path if resolved_asset is not None else None,
+                "resolution_strategy": resolved_asset.strategy if resolved_asset is not None else None,
             },
         )
 
