@@ -66,10 +66,11 @@ The query must not contain any explicit URL, domain name, filename, image identi
 
 4. We will directly use your rewritten text for image search. Please strictly follow the format below:
 
-The query must not contain any explicit URL, domain name, filename, image identifier, or other direct locator of the image. It must contain only semantic information. The query should stand on its own: a user who searches by the query alone, without seeing the URL, should be able to retrieve the same image or an equivalent depiction of the same unique visual target. Do not rely on the URL itself to make the target appear unique.
+The query must not contain any explicit URL, domain name, filename, image identifier, or other direct locator of the image. It must contain only semantic information. The query should stand on its own: a user who searches by the query alone, without seeing the URL, should be able to retrieve the same image or an equivalent depiction of the same unique visual target. 
+You can validate your query as follows: for photographs of a specific event, check whether the event's date or time is included; for photographs of a specific object or entity, check whether the object or entity is unique in the world.
 
 ```text
-<query>Your rewritten text</query><url>The image URL that satisfy your query</url>
+<query>Your rewritten text</query>
 <reason>Explain why this text satisfies the requirements, including how it fulfills the three conditions above.</reason>
 ```
 
@@ -81,7 +82,6 @@ Entity: Lionel Messi
 Content: ...(Emit here)...
 
 <query>Argentina national team lifting the trophy after winning the 2022 FIFA World Cup final</query>
-<url>https://lh4.googleusercontent.com/proxy/qRa-xkqyCyZHdrq6zfRapSwk9Tk-bW6KLmZ3YL_dBCz1rBDty7HCI2_LNExqebZO0D-2yuQwECRA6rMkANAKelDBuEgCFAdSoUdIkog-kuMTTPCahEG4x16pBuAuqOWzC7arSZC8bw</url>
 <reason>
 1. This passage points to one unique historical moment: Argentina winning the 2022 World Cup and lifting the trophy. Even though different photographers may have taken different images, the visual content is fundamentally consistent: the Argentina team on the award stage, with Lionel Messi at the front holding the trophy. Therefore, it satisfies the uniqueness requirement.
 2. This was a globally covered event with extensive media photography, so many matching images exist online. The provided URL is valid and accessible.
@@ -89,7 +89,6 @@ Content: ...(Emit here)...
 </reason>
 
 <query>Photo of Lionel Messi sleeping while holding the FIFA World Cup trophy</query>
-<url>https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcQJg3YxEnhdWa8iUEpGPOgaflKltqz41y2QfA&s</url>
 <reason>
 1. Although this query does not explicitly specify a date, internet evidence shows that it clearly refers to the famous photo Messi posted on Instagram after winning the 2022 FIFA World Cup. There are no other widely known or competing images matching the description “Messi sleeping while holding the World Cup trophy.” The only images satisfying this query originate from Messi’s official post, so the visual target is effectively unique. Even if the image is reposted, cropped, or compressed by different media sources, the visual content remains the same.
 2. The image genuinely exists online, was officially published by Messi himself, and is widely documented across news outlets and social media. The purpose of this query is specifically to retrieve that exact image through image search.
@@ -302,11 +301,10 @@ class LLMVisualSearchPlanner:
             "Content:\n"
             f"{LLMVisualSearchPlanner._numbered_passages(page_text)}\n\n"
             "Output requirements:\n"
-            "- Output only repeated <query>...</query><reason>...</reason><url></url> blocks.\n"
+            "- Output only repeated <query>...</query><reason>...</reason> blocks.\n"
             "- Do not output markdown fences, bullets, JSON, headings, or any extra text.\n"
             "- Each <query> must be a single rewritten search query.\n"
             "- Each <reason> must explain uniqueness and likely online existence."
-            "- Each <url> must wrap a URL of an image that satisfy the requirement."
         )
 
     @staticmethod
