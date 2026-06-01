@@ -8,6 +8,7 @@ creates graph records, and leaves one image_check hook for future MLLM checks.
 from __future__ import annotations
 
 import base64
+import html
 from io import BytesIO
 import os
 import re
@@ -1015,7 +1016,7 @@ class ImageDiscoveryBuilder:
         seen = set()
         for pattern in patterns:
             for match in re.findall(pattern, html_text, flags=re.IGNORECASE):
-                candidate = match.replace("\\u0026", "&").replace("\\/", "/").strip()
+                candidate = html.unescape(match).replace("\\u0026", "&").replace("\\/", "/").strip()
                 if not candidate.startswith(("http://", "https://")) or candidate in seen:
                     continue
                 seen.add(candidate)
