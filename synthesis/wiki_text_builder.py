@@ -970,6 +970,7 @@ class WikiTextBuilder:
         rows: list[dict[str, Any]],
         kept_urls: set[str],
     ) -> None:
+        return
         print(
             f"[wiki_neighbor_filter] source={source_title!r} url={source_url} "
             f"model={model_alias} candidates={len(rows)} kept={len(kept_urls)}",
@@ -1008,7 +1009,8 @@ class WikiTextBuilder:
         )
         for line in raw_output.strip().splitlines():
             if line.strip():
-                print(f"[wiki_neighbor_filter_raw] {line}", file=sys.stderr, flush=True)
+                # print(f"[wiki_neighbor_filter_raw] {line}", file=sys.stderr, flush=True)
+                continue
 
     @staticmethod
     def _debug_print_neighbor_filter_failure(
