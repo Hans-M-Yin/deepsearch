@@ -114,6 +114,7 @@ class ImageDiscoveryConfig:
     precheck_image_urls: bool = True
     precheck_timeout_s: float = 15.0
     precheck_max_bytes: int = 262144
+    model_image_max_bytes: int | None = None
     precheck_retries: int = 3
     host_min_interval_s: float = 0.35
     cache_dir: str | None = None
@@ -908,7 +909,10 @@ class ImageDiscoveryBuilder:
         if not image_url:
             return None, "missing_image_url"
 
-        download_result = self._download_image_payload(image_url)
+        download_result = self._download_image_payload(
+            image_url,
+            max_bytes=self.config.model_image_max_bytes,
+        )
         if isinstance(download_result, str):
             return None, f"{image_url} -> {download_result}"
         payload, content_type = download_result
@@ -952,7 +956,12 @@ class ImageDiscoveryBuilder:
             None,
         )
 
-    def _download_image_payload(self, image_url: str) -> tuple[bytes, str | None] | str:
+    def _download_image_payload(
+        self,
+        image_url: str,
+        *,
+        max_bytes: int | None,
+    ) -> tuple[bytes, str | None] | str:
         host = urlparse(image_url).netloc.lower()
         last_error: str | None = None
         for attempt in range(1, max(1, self.config.precheck_retries) + 1):
@@ -967,7 +976,7 @@ class ImageDiscoveryBuilder:
             try:
                 with urlopen(request, timeout=self.config.precheck_timeout_s) as response:
                     content_type = response.headers.get("Content-Type", "")
-                    payload = response.read(self.config.precheck_max_bytes)
+                    payload = response.read() if not max_bytes or max_bytes <= 0 else response.read(max_bytes)
                 self._mark_host_slot(host, success=True)
                 return payload, content_type
             except HTTPError as exc:
