@@ -1024,14 +1024,24 @@ class WikiTextBuilder:
             file=sys.stderr,
             flush=True,
         )
+        failure_reason = f"llm_neighbor_filter_failed:{error.__class__.__name__}: {error}"
         for index, candidate in enumerate(candidates, start=1):
             print(
                 "[wiki_neighbor_filter] "
                 f"FALLBACK #{index} title={candidate.title!r} anchor={candidate.anchor_text!r} "
-                f"rank={candidate.rank} rule={candidate.score:.2f} url={candidate.url}",
+                f"rank={candidate.rank} rule={candidate.score:.2f} "
+                f"fallback_reason={failure_reason!r} url={candidate.url}",
                 file=sys.stderr,
                 flush=True,
             )
+            if candidate.context:
+                context = re.sub(r"\s+", " ", candidate.context).strip()
+                if context:
+                    print(
+                        f"[wiki_neighbor_filter]      context={context[:220]!r}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
 
     @staticmethod
     def _debug_print_neighbor_empty_fallback(
@@ -1056,7 +1066,8 @@ class WikiTextBuilder:
                 f"FALLBACK #{row['index']} title={row['title']!r} anchor={row['anchor']!r} "
                 f"rank={row['rank']} rule={row['rule_score']:.2f} "
                 f"llm_keep={row['keep']} llm_score={row['llm_score']} final={row['final_score']:.2f} "
-                f"relation={row['relation']!r} reason={row['reason']!r} url={row['url']}",
+                f"relation={row['relation']!r} llm_reason={row['reason']!r} "
+                f"fallback_reason='llm_kept_none' url={row['url']}",
                 file=sys.stderr,
                 flush=True,
             )
