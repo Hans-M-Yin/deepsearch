@@ -75,3 +75,4 @@ vllm_reader_lm_log
 vllm_reader_lm.pid
 enhanced_reader_log
 enhanced_reader.pid
+synthesis/.image_cache
