@@ -339,6 +339,136 @@ class SerperAdapterSearchClient:
         return json.loads(response_payload)
 
 
+class SerperSearchClient:
+    """Direct client for the official Serper.dev API."""
+
+    def __init__(
+        self,
+        *,
+        api_key: str | None = None,
+        search_url: str | None = None,
+        images_url: str | None = None,
+        timeout_s: float = 60.0,
+    ) -> None:
+        self.api_key = api_key or os.environ.get("SERPER_API_KEY")
+        self.search_url = search_url or os.environ.get("SERPER_SEARCH_URL") or "https://google.serper.dev/search"
+        self.images_url = images_url or os.environ.get("SERPER_IMAGES_URL") or "https://google.serper.dev/images"
+        self.timeout_s = timeout_s
+
+    def search_text(self, query: str, *, limit: int = 10, **kwargs: Any) -> SearchResponse:
+        raw, status_code = self._post_json(self.search_url, self._serper_body(query, limit, kwargs))
+        return SearchResponse(
+            query=query,
+            engine="serper:search",
+            results=self._parse_text_results(raw),
+            raw_response=raw,
+            status_code=status_code,
+        )
+
+    def search_image(self, query: str, *, limit: int = 10, **kwargs: Any) -> SearchResponse:
+        raw, status_code = self._post_json(self.images_url, self._serper_body(query, limit, kwargs))
+        return SearchResponse(
+            query=query,
+            engine="serper:images",
+            results=self._parse_image_results(raw),
+            raw_response=raw,
+            status_code=status_code,
+        )
+
+    def _post_json(self, url: str, body: dict[str, Any]) -> tuple[dict[str, Any], int]:
+        if not self.api_key:
+            raise ValueError("Serper API key is required. Set SERPER_API_KEY or pass api_key explicitly.")
+
+        payload = json.dumps(body).encode("utf-8")
+        request = Request(
+            url,
+            data=payload,
+            headers={
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+                "X-API-KEY": self.api_key,
+            },
+            method="POST",
+        )
+        with urlopen(request, timeout=self.timeout_s) as response:
+            response_payload = response.read().decode("utf-8")
+            status_code = response.getcode()
+        return json.loads(response_payload), status_code
+
+    @staticmethod
+    def _serper_body(query: str, limit: int, params: dict[str, Any]) -> dict[str, Any]:
+        body = {"q": query, "num": max(1, min(int(limit), 100))}
+        for src_key, dst_key in (
+            ("hl", "hl"),
+            ("lang", "hl"),
+            ("gl", "gl"),
+            ("region", "gl"),
+            ("location", "location"),
+            ("page", "page"),
+            ("num", "num"),
+            ("autocorrect", "autocorrect"),
+            ("safe", "safe"),
+            ("tbs", "tbs"),
+            ("type", "type"),
+        ):
+            if params.get(src_key) is not None:
+                body[dst_key] = params[src_key]
+        return body
+
+    @staticmethod
+    def _parse_text_results(raw: dict[str, Any]) -> list[TextSearchResult]:
+        results: list[TextSearchResult] = []
+        organic = raw.get("organic") or []
+        if not isinstance(organic, list):
+            return results
+        for rank, item in enumerate(organic, start=1):
+            if not isinstance(item, dict):
+                continue
+            results.append(
+                TextSearchResult(
+                    title=item.get("title"),
+                    url=item.get("link"),
+                    snippet=item.get("snippet"),
+                    source=item.get("source") or item.get("domain"),
+                    rank=SerperSearchClient._position(item, rank),
+                    raw=item,
+                )
+            )
+        return results
+
+    @staticmethod
+    def _parse_image_results(raw: dict[str, Any]) -> list[ImageSearchResult]:
+        results: list[ImageSearchResult] = []
+        images = raw.get("images") or []
+        if not isinstance(images, list):
+            return results
+        for rank, item in enumerate(images, start=1):
+            if not isinstance(item, dict):
+                continue
+            results.append(
+                ImageSearchResult(
+                    title=item.get("title"),
+                    image_url=item.get("imageUrl"),
+                    source_page_url=item.get("link"),
+                    thumbnail_url=item.get("thumbnailUrl"),
+                    snippet=item.get("snippet"),
+                    source=item.get("source") or item.get("domain"),
+                    width=item.get("imageWidth"),
+                    height=item.get("imageHeight"),
+                    rank=SerperSearchClient._position(item, rank),
+                    raw=item,
+                )
+            )
+        return results
+
+    @staticmethod
+    def _position(item: dict[str, Any], fallback: int) -> int:
+        try:
+            return int(item.get("position"))
+        except (TypeError, ValueError):
+            return fallback
+
+
 class SerpApiSearchClient:
     """Client for SerpApi-compatible Google Search and Google Images APIs.
 
@@ -726,6 +856,35 @@ def _smoke_test() -> None:
     )
     assert params["ak"] == "dummy"
     assert params["q"] == "Coffee"
+
+    serper_body = SerperSearchClient._serper_body(
+        "Coffee",
+        5,
+        {"hl": "en", "gl": "us", "location": "Austin, Texas, United States"},
+    )
+    assert serper_body["q"] == "Coffee"
+    assert serper_body["num"] == 5
+    assert serper_body["hl"] == "en"
+    assert serper_body["gl"] == "us"
+
+    raw_serper_images = {
+        "images": [
+            {
+                "title": "Coffee cup",
+                "imageUrl": "https://example.com/coffee.jpg",
+                "imageWidth": 640,
+                "imageHeight": 480,
+                "thumbnailUrl": "https://example.com/thumb.jpg",
+                "source": "Example",
+                "domain": "example.com",
+                "link": "https://example.com/page",
+                "position": 1,
+            }
+        ]
+    }
+    parsed_serper = SerperSearchClient._parse_image_results(raw_serper_images)
+    assert parsed_serper[0].image_url == "https://example.com/coffee.jpg"
+    assert parsed_serper[0].source_page_url == "https://example.com/page"
 
     raw_commons = {
         "query": {
