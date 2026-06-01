@@ -97,6 +97,10 @@ def has_serpapi_credentials() -> bool:
     )
 
 
+def has_serper_credentials() -> bool:
+    return bool(os.environ.get("SERPER_API_KEY"))
+
+
 def directory_size_bytes(path: Path) -> int:
     if not path.exists():
         return 0
@@ -192,7 +196,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--skip-attributes", action="store_true", help="Do not call LLM attribute extraction.")
     parser.add_argument("--fatal-attribute-errors", action="store_true", help="Fail the task if attribute extraction fails.")
     parser.add_argument("--persist-snapshots", action="store_true", help="Persist verbose SearchSnapshot records for debugging.")
-    parser.add_argument("--no-serp-fallback", action="store_true", help="Do not use SerpApi fallback after Commons.")
+    parser.add_argument(
+        "--image-backend",
+        choices=("commons", "serpapi", "serper", "openserp", "serper_adapter", "commons_serpapi"),
+        default="commons_serpapi",
+        help="Image search backend.",
+    )
     parser.add_argument("--run-id", default=None, help="Optional stable run id.")
     parser.add_argument("--fresh", action="store_true", help="Ignore existing runner checkpoint state.")
     return parser
@@ -214,7 +223,14 @@ def main(argv: list[str] | None = None) -> int:
     from synthesis.graph_runner import GraphRunner, GraphRunnerConfig
     from synthesis.image_discovery import ImageDiscoveryBuilder, ImageDiscoveryConfig
     from synthesis.model_worker import LLM_WORKER
-    from synthesis.search_client import CommonsImageSearchClient, SerpApiSearchClient
+    from synthesis.search_client import (
+        CommonsImageSearchClient,
+        CommonsSerpApiSearchClient,
+        OpenSerpSearchClient,
+        SerperAdapterSearchClient,
+        SerperSearchClient,
+        SerpApiSearchClient,
+    )
     from synthesis.store import JsonlGraphStore
     from synthesis.visual_planner import LLMVisualSearchPlanner
     from synthesis.wiki_text_builder import EnhancedReaderClient, WikiTextBuilder
@@ -257,14 +273,33 @@ def main(argv: list[str] | None = None) -> int:
     image_builder = None
     if not args.no_images:
         visual_planner = LLMVisualSearchPlanner(model_client=LLM_WORKER)
-        commons_client = CommonsImageSearchClient()
-        fallback_client = None
-        if not args.no_serp_fallback and has_serpapi_credentials():
-            fallback_client = SerpApiSearchClient()
+        backend_builders = {
+            "commons": CommonsImageSearchClient,
+            "commons_serpapi": CommonsSerpApiSearchClient,
+            "serpapi": SerpApiSearchClient,
+            "serper": SerperSearchClient,
+            "openserp": OpenSerpSearchClient,
+            "serper_adapter": SerperAdapterSearchClient,
+        }
+        credential_checks = {
+            "commons": lambda: True,
+            "commons_serpapi": has_serpapi_credentials,
+            "serpapi": has_serpapi_credentials,
+            "serper": has_serper_credentials,
+            "openserp": lambda: True,
+            "serper_adapter": lambda: True,
+        }
+
+        def build_backend(name: str):
+            if not credential_checks[name]():
+                raise ValueError(
+                    f"Image backend {name!r} is selected but required credentials/service configuration is missing."
+                )
+            return backend_builders[name]()
+
         image_builder = ImageDiscoveryBuilder(
             store=store,
-            commons_client=commons_client,
-            fallback_client=fallback_client,
+            search_client=build_backend(args.image_backend),
             config=ImageDiscoveryConfig(
                 per_query_limit=args.per_query_image_limit,
                 max_images_per_plan=args.max_images_per_plan,

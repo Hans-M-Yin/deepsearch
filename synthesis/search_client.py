@@ -770,6 +770,52 @@ class CommonsImageSearchClient:
         return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", text)).strip()
 
 
+class CommonsSerpApiSearchClient:
+    """Single backend that tries Wikimedia Commons first, then SerpApi.
+
+    This keeps the caller-facing API to one backend choice while preserving the
+    pragmatic "Commons first, web fallback second" retrieval behavior.
+    """
+
+    def __init__(
+        self,
+        *,
+        commons_client: SearchClient | None = None,
+        serpapi_client: SearchClient | None = None,
+        min_commons_results: int = 1,
+    ) -> None:
+        self.commons_client = commons_client or CommonsImageSearchClient()
+        self.serpapi_client = serpapi_client or SerpApiSearchClient()
+        self.min_commons_results = min_commons_results
+
+    def search_text(self, query: str, *, limit: int = 10, **kwargs: Any) -> SearchResponse:
+        return self.serpapi_client.search_text(query, limit=limit, **kwargs)
+
+    def search_image(self, query: str, *, limit: int = 10, **kwargs: Any) -> SearchResponse:
+        commons_response = self.commons_client.search_image(query, limit=limit, **kwargs)
+        commons_response.metadata.update(
+            {
+                "fallback_used": False,
+                "backend": "commons_serpapi",
+                "attempted_engines": [commons_response.engine],
+            }
+        )
+        if len(commons_response.results) >= self.min_commons_results:
+            return commons_response
+
+        serp_response = self.serpapi_client.search_image(query, limit=limit, **kwargs)
+        serp_response.metadata.update(
+            {
+                "fallback_used": True,
+                "backend": "commons_serpapi",
+                "attempted_engines": [commons_response.engine, serp_response.engine],
+                "primary_engine": commons_response.engine,
+                "primary_result_count": len(commons_response.results),
+            }
+        )
+        return serp_response
+
+
 class FallbackImageSearchClient:
     """Try one image search client first and fall back if too few results appear."""
 
@@ -908,6 +954,27 @@ def _smoke_test() -> None:
     parsed = CommonsImageSearchClient._parse_commons_results(raw_commons)
     assert parsed[0].title == "File:Coffee.jpg"
     assert parsed[0].snippet == "Coffee cup"
+
+    composite = CommonsSerpApiSearchClient(
+        commons_client=MockSearchClient(
+            image_results={
+                "coffee": [],
+            }
+        ),
+        serpapi_client=MockSearchClient(
+            image_results={
+                "coffee": [
+                    ImageSearchResult(
+                        title="Coffee via fallback",
+                        image_url="https://example.com/fallback.jpg",
+                    )
+                ]
+            }
+        ),
+    )
+    composite_response = composite.search_image("coffee")
+    assert composite_response.metadata["fallback_used"] is True
+    assert composite_response.results[0].image_url == "https://example.com/fallback.jpg"
     print("search_client smoke test passed")
 
 

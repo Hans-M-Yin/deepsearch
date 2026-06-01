@@ -102,7 +102,6 @@ class ImageDiscoveryConfig:
     min_height: int | None = 120
     allowed_content_types: set[str] | None = None
     rejected_extensions: set[str] = field(default_factory=lambda: {".svg"})
-    fallback_if_no_validated: bool = True
     store_rejected: bool = True
     expandable_entity_types: set[str] = field(
         default_factory=lambda: {
@@ -226,16 +225,14 @@ class ImageDiscoveryBuilder:
         self,
         *,
         store: JsonlGraphStore | None = None,
-        commons_client: SearchClient,
-        fallback_client: SearchClient | None = None,
+        search_client: SearchClient,
         config: ImageDiscoveryConfig | None = None,
         model_client: ModelWorkerClient | None = None,
         image_check_model_alias: str | None = None,
         wiki_resolver: WikiEntityResolver | None = None,
     ) -> None:
         self.store = store
-        self.commons_client = commons_client
-        self.fallback_client = fallback_client
+        self.search_client = search_client
         self.config = config or ImageDiscoveryConfig()
         self.model_client = model_client or LLM_WORKER
         self.image_check_model_alias = image_check_model_alias
@@ -253,32 +250,16 @@ class ImageDiscoveryBuilder:
         result = ImageDiscoveryResult(plan_id=plan.plan_id)
         seen_keys: set[str] = set()
 
-        primary_candidates = self._discover_with_client(
-            client=self.commons_client,
+        result.candidates = self._discover_with_client(
+            client=self.search_client,
             plan=plan,
             run_id=run_id,
-            used_fallback=False,
             seen_keys=seen_keys,
             persist=persist,
             snapshots=result.snapshots,
         )
-        result.candidates.extend(primary_candidates)
-
-        should_fallback = self._should_fallback(primary_candidates)
-        if should_fallback and self.fallback_client is not None:
-            fallback_candidates = self._discover_with_client(
-                client=self.fallback_client,
-                plan=plan,
-                run_id=run_id,
-                used_fallback=True,
-                seen_keys=seen_keys,
-                persist=persist,
-                snapshots=result.snapshots,
-            )
-            result.candidates.extend(fallback_candidates)
-            result.fallback_used = bool(fallback_candidates)
-
         result.candidates = result.candidates[: self.config.max_images_per_plan]
+        result.fallback_used = any(candidate.used_fallback for candidate in result.candidates)
         primary_candidate = self._select_primary_candidate(result.candidates)
         if primary_candidate is not None:
             self._materialize_primary_candidate(
@@ -307,7 +288,6 @@ class ImageDiscoveryBuilder:
         client: SearchClient,
         plan: VisualSearchPlan,
         run_id: str | None,
-        used_fallback: bool,
         seen_keys: set[str],
         persist: bool,
         snapshots: list[SearchSnapshot],
@@ -332,6 +312,7 @@ class ImageDiscoveryBuilder:
             snapshots.append(snapshot)
             if persist:
                 self._persist_snapshot(snapshot)
+            used_fallback = bool(response.metadata.get("fallback_used"))
 
             for search_result in response.results:
                 if not isinstance(search_result, ImageSearchResult):
@@ -834,16 +815,6 @@ class ImageDiscoveryBuilder:
             return None
         return max(0.0, min(1.0, confidence))
 
-    def _should_fallback(self, images: list[ImageSearchCandidate]) -> bool:
-        if not self.config.fallback_if_no_validated:
-            return False
-        if not images:
-            return True
-        return not any(
-            image.validation.status == ImageCandidateStatus.ACCEPTED
-            for image in images
-        )
-
     @staticmethod
     def _reject(reason: str) -> ImageValidationResult:
         return ImageValidationResult(
@@ -1337,7 +1308,7 @@ entity: Kobe | person | depicts | visible player
             )
             builder = ImageDiscoveryBuilder(
                 store=store,
-                commons_client=MockImageSearchClient(),
+                search_client=MockImageSearchClient(),
                 config=ImageDiscoveryConfig(per_query_limit=1, max_images_per_plan=1),
                 model_client=MockModel(),
             )

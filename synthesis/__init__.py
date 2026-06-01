@@ -47,7 +47,7 @@ from .model_worker import (
 )
 from .search_client import (
     CommonsImageSearchClient,
-    FallbackImageSearchClient,
+    CommonsSerpApiSearchClient,
     ImageSearchResult,
     MockSearchClient,
     OpenSerpSearchClient,
@@ -133,7 +133,7 @@ __all__ = [
     "ModelResponse",
     "ModelWorkerClient",
     "CommonsImageSearchClient",
-    "FallbackImageSearchClient",
+    "CommonsSerpApiSearchClient",
     "ImageSearchResult",
     "MockSearchClient",
     "OpenSerpSearchClient",
