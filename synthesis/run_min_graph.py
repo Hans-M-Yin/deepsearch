@@ -166,6 +166,20 @@ def print_timing_summary(summary: dict[str, Any]) -> None:
         )
 
 
+def load_failed_task_preview(store_dir: Path, *, limit: int = 1) -> list[dict[str, Any]]:
+    state_path = store_dir / "graph_runner_state.json"
+    if not state_path.exists():
+        return []
+    try:
+        payload = json.loads(state_path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    failed = payload.get("failed_tasks")
+    if not isinstance(failed, list):
+        return []
+    return [item for item in failed[-limit:] if isinstance(item, dict)]
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--env-file", default=str(DEFAULT_ENV_PATH), help="Path to synthesis env file.")
@@ -354,6 +368,17 @@ def main(argv: list[str] | None = None) -> int:
     print(f"failed: {result.failed_count}")
     print(f"skipped: {result.skipped_count}")
     print(f"store_stats: {result.store_stats}")
+    if result.last_error:
+        print(f"last_error: {result.last_error}")
+    failed_preview = load_failed_task_preview(store_dir, limit=1)
+    if failed_preview:
+        record = failed_preview[0]
+        task = record.get("task") if isinstance(record.get("task"), dict) else {}
+        print("last_failed_task:")
+        print(f"  url: {task.get('url')}")
+        print(f"  title: {task.get('title')}")
+        print(f"  depth: {task.get('depth')}")
+        print(f"  error: {record.get('error')}")
     graph_metrics = graph_density_metrics(result.store_stats)
     print(
         "graph_density: "
