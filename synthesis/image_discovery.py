@@ -7,6 +7,7 @@ creates graph records, and leaves one image_check hook for future MLLM checks.
 
 from __future__ import annotations
 
+from io import BytesIO
 import os
 import re
 from dataclasses import asdict, dataclass, field
@@ -14,6 +15,8 @@ from enum import Enum
 from pathlib import Path
 import sys
 from typing import Any
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -103,6 +106,9 @@ class ImageDiscoveryConfig:
     allowed_content_types: set[str] | None = None
     rejected_extensions: set[str] = field(default_factory=lambda: {".svg"})
     store_rejected: bool = True
+    precheck_image_urls: bool = True
+    precheck_timeout_s: float = 15.0
+    precheck_max_bytes: int = 262144
     expandable_entity_types: set[str] = field(
         default_factory=lambda: {
             "person",
@@ -128,6 +134,7 @@ class ImageValidationResult:
     status: ImageCandidateStatus
     confidence: float | None = None
     reason: str | None = None
+    drop_candidate: bool = False
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -328,6 +335,8 @@ class ImageDiscoveryBuilder:
                     search_result=search_result,
                     run_id=run_id,
                 )
+                if validation.drop_candidate:
+                    continue
                 if (
                     validation.status == ImageCandidateStatus.REJECTED
                     and not self.config.store_rejected
@@ -555,32 +564,68 @@ class ImageDiscoveryBuilder:
             self._apply_grounding_to_image_node(image_node, grounding)
             return grounding
 
-        response = self.model_client.generate(
-            ModelRequest(
-                model=model_alias,
-                messages=[
-                    ModelMessage(role="system", content=PROMPT_IMAGE_GROUND),
-                    ModelMessage(
-                        role="user",
-                        content=[
-                            {
-                                "type": "text",
-                                "text": self._image_ground_prompt_input(
-                                    plan=plan,
-                                    search_result=search_result,
-                                    validation=validation,
-                                ),
-                            },
-                            {
-                                "type": "image_url",
-                                "image_url": {"url": search_result.image_url},
-                            },
-                        ],
-                    ),
-                ],
-                temperature=0.0,
+        if self.config.precheck_image_urls:
+            precheck_error = self._precheck_image_url(search_result.image_url)
+            if precheck_error is not None:
+                self._log_invalid_image_url(search_result.image_url, precheck_error, stage="image_ground")
+                grounding = {
+                    "caption": image_node.caption,
+                    "visual_facts": validation.metadata.get("visual_facts", []),
+                    "ocr_texts": [],
+                    "grounded_entities": [],
+                    "check": "image_url_precheck_failed",
+                    "raw_model_output": None,
+                    "run_id": run_id,
+                }
+                image_node.metadata = dict(image_node.metadata or {})
+                image_node.metadata["image_ground_error"] = precheck_error
+                self._apply_grounding_to_image_node(image_node, grounding)
+                return grounding
+
+        try:
+            response = self.model_client.generate(
+                ModelRequest(
+                    model=model_alias,
+                    messages=[
+                        ModelMessage(role="system", content=PROMPT_IMAGE_GROUND),
+                        ModelMessage(
+                            role="user",
+                            content=[
+                                {
+                                    "type": "text",
+                                    "text": self._image_ground_prompt_input(
+                                        plan=plan,
+                                        search_result=search_result,
+                                        validation=validation,
+                                    ),
+                                },
+                                {
+                                    "type": "image_url",
+                                    "image_url": {"url": search_result.image_url},
+                                },
+                            ],
+                        ),
+                    ],
+                    temperature=0.0,
+                )
             )
-        )
+        except Exception as exc:
+            error = f"{exc.__class__.__name__}: {exc}"
+            self._log_invalid_image_url(search_result.image_url, error, stage="image_ground")
+            grounding = {
+                "caption": image_node.caption,
+                "visual_facts": validation.metadata.get("visual_facts", []),
+                "ocr_texts": [],
+                "grounded_entities": [],
+                "check": "mllm_grounding_failed",
+                "raw_model_output": error,
+                "run_id": run_id,
+            }
+            image_node.metadata = dict(image_node.metadata or {})
+            image_node.metadata["image_ground_error"] = error
+            self._apply_grounding_to_image_node(image_node, grounding)
+            return grounding
+
         grounding = self._parse_image_ground_response(response.content, run_id=run_id)
         self._apply_grounding_to_image_node(image_node, grounding)
         return grounding
@@ -704,18 +749,83 @@ class ImageDiscoveryBuilder:
 
         model_alias = self.image_check_model_alias or os.environ.get("IMAGE_CHECK_MODEL")
         if model_alias:
-            return self._image_check_with_mllm(
-                plan=plan,
-                search_result=search_result,
-                model_alias=model_alias,
-                run_id=run_id,
-            )
+            if self.config.precheck_image_urls:
+                precheck_error = self._precheck_image_url(search_result.image_url)
+                if precheck_error is not None:
+                    self._log_invalid_image_url(search_result.image_url, precheck_error, stage="image_check")
+                    return self._reject(
+                        f"image_url_precheck_failed:{precheck_error}",
+                        drop_candidate=True,
+                    )
+            try:
+                return self._image_check_with_mllm(
+                    plan=plan,
+                    search_result=search_result,
+                    model_alias=model_alias,
+                    run_id=run_id,
+                )
+            except Exception as exc:
+                error = f"{exc.__class__.__name__}: {exc}"
+                self._log_invalid_image_url(search_result.image_url, error, stage="image_check")
+                return self._reject(
+                    f"image_check_model_error:{error}",
+                    drop_candidate=True,
+                )
 
         del query, run_id
         return ImageValidationResult(
             status=ImageCandidateStatus.ACCEPTED,
             confidence=None,
             metadata={"check": "basic_url_format_size"},
+        )
+
+    def _precheck_image_url(self, image_url: str | None) -> str | None:
+        if not image_url:
+            return "missing_image_url"
+
+        request = Request(
+            image_url,
+            headers={
+                "Accept": "image/*,*/*;q=0.8",
+                "User-Agent": "deepsearch-synthesis/0.1",
+            },
+        )
+        try:
+            with urlopen(request, timeout=self.config.precheck_timeout_s) as response:
+                content_type = response.headers.get("Content-Type", "")
+                payload = response.read(self.config.precheck_max_bytes)
+        except HTTPError as exc:
+            return f"http_{exc.code}"
+        except URLError as exc:
+            return f"url_error:{exc.reason}"
+        except TimeoutError:
+            return f"timeout_after_{self.config.precheck_timeout_s}s"
+        except Exception as exc:
+            return f"download_error:{exc.__class__.__name__}:{exc}"
+
+        if not payload:
+            return "empty_response_body"
+
+        normalized_content_type = content_type.lower()
+        if normalized_content_type and not normalized_content_type.startswith("image/"):
+            return f"non_image_content_type:{content_type}"
+
+        try:
+            from PIL import Image
+
+            with Image.open(BytesIO(payload)) as image:
+                image.verify()
+        except ImportError:
+            return None
+        except Exception as exc:
+            return f"decode_error:{exc.__class__.__name__}:{exc}"
+        return None
+
+    @staticmethod
+    def _log_invalid_image_url(image_url: str | None, reason: str, *, stage: str) -> None:
+        print(
+            f"[image-url-check][{stage}] invalid image URL: {image_url or '<missing>'} | reason: {reason}",
+            file=sys.stderr,
         )
 
     def _image_check_with_mllm(
@@ -816,11 +926,12 @@ class ImageDiscoveryBuilder:
         return max(0.0, min(1.0, confidence))
 
     @staticmethod
-    def _reject(reason: str) -> ImageValidationResult:
+    def _reject(reason: str, *, drop_candidate: bool = False) -> ImageValidationResult:
         return ImageValidationResult(
             status=ImageCandidateStatus.REJECTED,
             confidence=0.0,
             reason=reason,
+            drop_candidate=drop_candidate,
         )
 
     @staticmethod
@@ -1309,7 +1420,11 @@ entity: Kobe | person | depicts | visible player
             builder = ImageDiscoveryBuilder(
                 store=store,
                 search_client=MockImageSearchClient(),
-                config=ImageDiscoveryConfig(per_query_limit=1, max_images_per_plan=1),
+                config=ImageDiscoveryConfig(
+                    per_query_limit=1,
+                    max_images_per_plan=1,
+                    precheck_image_urls=False,
+                ),
                 model_client=MockModel(),
             )
             result = builder.discover_for_plan(plan, run_id="run_smoke")
