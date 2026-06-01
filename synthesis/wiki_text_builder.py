@@ -923,6 +923,15 @@ class WikiTextBuilder:
         if not kept:
             for candidate in candidates:
                 candidate.quality_reasons.append("llm_neighbor_filter_empty_fallback")
+            if debug_enabled:
+                self._debug_print_neighbor_empty_fallback(
+                    source_title=source_title,
+                    source_url=source_url,
+                    model_alias=model_alias,
+                    rows=debug_rows,
+                    total_candidates=len(candidates),
+                    prompt_candidates=len(prompt_candidates),
+                )
             return candidates
 
         return kept
@@ -1023,6 +1032,40 @@ class WikiTextBuilder:
                 file=sys.stderr,
                 flush=True,
             )
+
+    @staticmethod
+    def _debug_print_neighbor_empty_fallback(
+        *,
+        source_title: str,
+        source_url: str,
+        model_alias: str,
+        rows: list[dict[str, Any]],
+        total_candidates: int,
+        prompt_candidates: int,
+    ) -> None:
+        print(
+            f"[wiki_neighbor_filter] EMPTY_FALLBACK source={source_title!r} url={source_url} "
+            f"model={model_alias} prompt_candidates={prompt_candidates} "
+            f"total_candidates={total_candidates} reason='LLM kept no neighbors; falling back to rule-based candidates'",
+            file=sys.stderr,
+            flush=True,
+        )
+        for row in rows:
+            print(
+                "[wiki_neighbor_filter] "
+                f"FALLBACK #{row['index']} title={row['title']!r} anchor={row['anchor']!r} "
+                f"rank={row['rank']} rule={row['rule_score']:.2f} "
+                f"llm_keep={row['keep']} llm_score={row['llm_score']} final={row['final_score']:.2f} "
+                f"relation={row['relation']!r} reason={row['reason']!r} url={row['url']}",
+                file=sys.stderr,
+                flush=True,
+            )
+            if row["context"]:
+                print(
+                    f"[wiki_neighbor_filter]      context={row['context']!r}",
+                    file=sys.stderr,
+                    flush=True,
+                )
 
     @staticmethod
     def _neighbor_filter_prompt_input(
