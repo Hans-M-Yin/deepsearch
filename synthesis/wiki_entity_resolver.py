@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from dataclasses import asdict, dataclass
 from typing import Any
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
@@ -37,10 +39,16 @@ class WikiEntityResolver:
         api_url: str = "https://en.wikipedia.org/w/api.php",
         timeout_s: float = 20.0,
         language: str = "en",
+        retries: int = 3,
+        retry_after_s: float = 10.0,
+        user_agent: str = "DeepSearchBot/0.1 (https://github.com/shawn0728/OpenSearch-VL; Wikipedia entity resolver)",
     ) -> None:
         self.api_url = api_url
         self.timeout_s = timeout_s
         self.language = language
+        self.retries = retries
+        self.retry_after_s = retry_after_s
+        self.user_agent = user_agent
 
     def resolve(
         self,
@@ -58,7 +66,7 @@ class WikiEntityResolver:
         queries = self._build_queries(label, entity_type=entity_type, source_title=source_title, context=context)
         candidates: dict[str, WikiEntityCandidate] = {}
         for query in queries:
-            for candidate in self._search(query, limit=limit):
+            for candidate in self._safe_search(query, limit=limit):
                 existing = candidates.get(candidate.url)
                 if existing is None or candidate.score > existing.score:
                     candidates[candidate.url] = candidate
@@ -120,6 +128,12 @@ class WikiEntityResolver:
         normalized = _normalize_label(entity_type)
         return mapping.get(normalized, entity_type.strip() if entity_type else None)
 
+    def _safe_search(self, query: str, *, limit: int) -> list[WikiEntityCandidate]:
+        try:
+            return self._search(query, limit=limit)
+        except Exception:
+            return []
+
     def _search(self, query: str, *, limit: int) -> list[WikiEntityCandidate]:
         params = {
             "action": "query",
@@ -133,11 +147,10 @@ class WikiEntityResolver:
             f"{self.api_url}?{urlencode(params)}",
             headers={
                 "Accept": "application/json",
-                "User-Agent": "deepsearch-synthesis/0.1",
+                "User-Agent": self.user_agent,
             },
         )
-        with urlopen(request, timeout=self.timeout_s) as response:
-            payload = json.loads(response.read().decode("utf-8"))
+        payload = self._get_json(request)
         search_results = payload.get("query", {}).get("search") or []
         if not isinstance(search_results, list):
             return []
@@ -178,13 +191,47 @@ class WikiEntityResolver:
             f"{self.api_url}?{urlencode(params)}",
             headers={
                 "Accept": "application/json",
-                "User-Agent": "deepsearch-synthesis/0.1",
+                "User-Agent": self.user_agent,
             },
         )
-        with urlopen(request, timeout=self.timeout_s) as response:
-            payload = json.loads(response.read().decode("utf-8"))
+        try:
+            payload = self._get_json(request)
+        except Exception:
+            return {}
         pages = payload.get("query", {}).get("pages") or {}
         return pages if isinstance(pages, dict) else {}
+
+    def _get_json(self, request: Request) -> dict[str, Any]:
+        last_error: Exception | None = None
+        for attempt in range(1, max(1, self.retries) + 1):
+            try:
+                with urlopen(request, timeout=self.timeout_s) as response:
+                    return json.loads(response.read().decode("utf-8"))
+            except HTTPError as exc:
+                last_error = exc
+                if exc.code == 429 and attempt < self.retries:
+                    time.sleep(self._retry_after_seconds(exc) or (self.retry_after_s * attempt))
+                    continue
+                raise
+            except URLError as exc:
+                last_error = exc
+                if attempt < self.retries:
+                    time.sleep(min(6.0, 1.5 * attempt))
+                    continue
+                raise
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("wiki_entity_resolver_get_json_failed")
+
+    @staticmethod
+    def _retry_after_seconds(error: HTTPError) -> float | None:
+        value = error.headers.get("Retry-After") if error.headers else None
+        if not value:
+            return None
+        try:
+            return max(0.0, float(value))
+        except ValueError:
+            return None
 
     @staticmethod
     def _title_to_url(title: str | None) -> str:

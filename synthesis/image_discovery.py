@@ -117,6 +117,7 @@ class ImageDiscoveryConfig:
     precheck_timeout_s: float = 15.0
     precheck_max_bytes: int = 262144
     model_image_max_bytes: int | None = None
+    model_image_max_edge: int | None = 1280
     precheck_retries: int = 3
     host_min_interval_s: float = 0.35
     wikimedia_host_min_interval_s: float = 1.25
@@ -1033,8 +1034,10 @@ class ImageDiscoveryBuilder:
             return None, f"{image_url} -> empty_response_body"
 
         normalized_content_type = (content_type or "").lower()
+        sniffed_content_type = self._sniff_content_type(payload)
         if normalized_content_type and not normalized_content_type.startswith("image/"):
-            return None, f"{image_url} -> non_image_content_type:{content_type}"
+            if not sniffed_content_type:
+                return None, f"{image_url} -> non_image_content_type:{content_type}"
 
         try:
             from PIL import Image
@@ -1048,10 +1051,19 @@ class ImageDiscoveryBuilder:
         except Exception as exc:
             return None, f"{image_url} -> decode_error:{exc.__class__.__name__}:{exc}"
 
-        content_type = content_type or self._sniff_content_type(payload) or "image/jpeg"
+        content_type = (
+            sniffed_content_type
+            if normalized_content_type == "application/octet-stream" and sniffed_content_type
+            else content_type or sniffed_content_type or "image/jpeg"
+        )
         cache_path = self._write_image_cache_file(cache_key, payload, content_type)
         asset_uri = self._maybe_upload_cached_image(cache_path, cache_key) or cache_path
-        model_url = self._data_url(content_type, payload)
+        model_content_type, model_payload = self._prepare_model_payload(
+            payload=payload,
+            content_type=content_type,
+            max_edge=self.config.model_image_max_edge,
+        )
+        model_url = self._data_url(model_content_type, model_payload)
         return (
             ResolvedImageAsset(
                 cache_key=cache_key,
@@ -1245,6 +1257,40 @@ class ImageDiscoveryBuilder:
         if payload.startswith(b"RIFF") and payload[8:12] == b"WEBP":
             return "image/webp"
         return None
+
+    @staticmethod
+    def _prepare_model_payload(
+        *,
+        payload: bytes,
+        content_type: str,
+        max_edge: int | None,
+    ) -> tuple[str, bytes]:
+        if not max_edge or max_edge <= 0:
+            return content_type, payload
+        try:
+            from PIL import Image
+        except ImportError:
+            return content_type, payload
+        try:
+            with Image.open(BytesIO(payload)) as image:
+                image.load()
+                width, height = image.size
+                if max(width, height) <= max_edge:
+                    return content_type, payload
+                resized = image.copy()
+                resized.thumbnail((max_edge, max_edge), Image.Resampling.LANCZOS)
+                has_alpha = resized.mode in ("RGBA", "LA") or (
+                    resized.mode == "P" and "transparency" in resized.info
+                )
+                output = BytesIO()
+                if has_alpha:
+                    resized.save(output, format="PNG", optimize=True)
+                    return "image/png", output.getvalue()
+                resized = resized.convert("RGB")
+                resized.save(output, format="JPEG", quality=90, optimize=True)
+                return "image/jpeg", output.getvalue()
+        except Exception:
+            return content_type, payload
 
     def _maybe_upload_cached_image(self, cache_path: str, cache_key: str) -> str | None:
         try:

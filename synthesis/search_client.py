@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import sys
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 from typing import Any, Protocol
@@ -393,7 +394,31 @@ class SerperSearchClient:
         with urlopen(request, timeout=self.timeout_s) as response:
             response_payload = response.read().decode("utf-8")
             status_code = response.getcode()
-        return json.loads(response_payload), status_code
+        raw = json.loads(response_payload)
+        self._log_raw_response(url=url, body=body, status_code=status_code, raw=raw)
+        return raw, status_code
+
+    @staticmethod
+    def _log_raw_response(
+        *,
+        url: str,
+        body: dict[str, Any],
+        status_code: int,
+        raw: dict[str, Any],
+    ) -> None:
+        print(
+            "[serper-raw] "
+            f"url={url} "
+            f"status={status_code} "
+            f"body={json.dumps(body, ensure_ascii=False, sort_keys=True)}",
+            file=sys.stderr,
+            flush=True,
+        )
+        print(
+            f"[serper-raw] response={json.dumps(raw, ensure_ascii=False, sort_keys=True)}",
+            file=sys.stderr,
+            flush=True,
+        )
 
     @staticmethod
     def _serper_body(query: str, limit: int, params: dict[str, Any]) -> dict[str, Any]:
