@@ -603,14 +603,29 @@ class GraphExpansionStrategy:
             run_id=run_id,
         )
         self._log_image_plan_start(text_result, plans)
-        image_results = [
-            self.image_builder.discover_for_plan(
-                plan,
-                run_id=run_id,
-                persist=self.config.persist,
+        image_results: list[ImageDiscoveryResult] = []
+        for index, plan in enumerate(plans, start=1):
+            self._log_image_plan_execute_start(text_result, plan_index=index, plan=plan)
+            try:
+                image_result = self.image_builder.discover_for_plan(
+                    plan,
+                    run_id=run_id,
+                    persist=self.config.persist,
+                )
+            except Exception as exc:
+                self._log_image_plan_execute_failure(
+                    text_result,
+                    plan_index=index,
+                    plan=plan,
+                    error=exc,
+                )
+                raise
+            image_results.append(image_result)
+            self._log_image_plan_execute_done(
+                text_result,
+                plan_index=index,
+                result=image_result,
             )
-            for plan in plans
-        ]
         self._log_image_plan_results(text_result, plans, image_results)
         queued_tasks: list[ExpansionTask] = []
         for image_result in image_results:
@@ -643,6 +658,62 @@ class GraphExpansionStrategy:
                 f"queries={queries}",
                 file=sys.stderr,
             )
+
+    @staticmethod
+    def _log_image_plan_execute_start(
+        text_result: WikiTextBuildResult,
+        *,
+        plan_index: int,
+        plan: VisualSearchPlan,
+    ) -> None:
+        title = getattr(text_result.node, "title", None) or text_result.node.node_id
+        print(
+            "[image-expand-exec] "
+            f"source_text={title!r} "
+            f"plan_index={plan_index} "
+            f"plan_id={plan.plan_id} "
+            f"status='start'",
+            file=sys.stderr,
+        )
+
+    @staticmethod
+    def _log_image_plan_execute_done(
+        text_result: WikiTextBuildResult,
+        *,
+        plan_index: int,
+        result: ImageDiscoveryResult,
+    ) -> None:
+        title = getattr(text_result.node, "title", None) or text_result.node.node_id
+        print(
+            "[image-expand-exec] "
+            f"source_text={title!r} "
+            f"plan_index={plan_index} "
+            f"plan_id={result.plan_id} "
+            f"status='done' "
+            f"candidates={len(result.candidates)} "
+            f"accepted={len(result.accepted_images())} "
+            f"kept={'yes' if result.image_node is not None else 'no'}",
+            file=sys.stderr,
+        )
+
+    @staticmethod
+    def _log_image_plan_execute_failure(
+        text_result: WikiTextBuildResult,
+        *,
+        plan_index: int,
+        plan: VisualSearchPlan,
+        error: Exception,
+    ) -> None:
+        title = getattr(text_result.node, "title", None) or text_result.node.node_id
+        print(
+            "[image-expand-exec] "
+            f"source_text={title!r} "
+            f"plan_index={plan_index} "
+            f"plan_id={plan.plan_id} "
+            f"status='failed' "
+            f"error={error.__class__.__name__}: {error}",
+            file=sys.stderr,
+        )
 
     @staticmethod
     def _log_image_plan_results(
