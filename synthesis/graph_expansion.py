@@ -745,6 +745,14 @@ class GraphExpansionStrategy:
                 item for item in decision_log
                 if isinstance(item, dict) and item.get("kind") == "candidate_kept"
             ]
+            accepted_records = [
+                item for item in kept_records
+                if str(item.get("status") or "").lower() == "accepted"
+            ]
+            rejected_records = [
+                item for item in kept_records
+                if str(item.get("status") or "").lower() == "rejected"
+            ]
             dropped_records = [
                 item for item in decision_log
                 if isinstance(item, dict) and item.get("kind") in {"candidate_drop", "candidate_skip"}
@@ -766,17 +774,32 @@ class GraphExpansionStrategy:
                 f"primary_url={primary_url}",
                 file=sys.stderr,
             )
-            if kept_records:
+            if accepted_records:
                 added_payload = [
                     {
                         "rank": item.get("rank"),
                         "title": item.get("title"),
                         "reason": item.get("reason"),
                     }
-                    for item in kept_records[:5]
+                    for item in accepted_records[:5]
                 ]
                 print(
                     f"[image-expand-result]      added={added_payload}",
+                    file=sys.stderr,
+                )
+            if rejected_records:
+                rejected_payload = [
+                    {
+                        "rank": item.get("rank"),
+                        "title": item.get("title"),
+                        "reason": item.get("reason"),
+                        "check": item.get("check"),
+                        "raw_model_output": item.get("raw_model_output"),
+                    }
+                    for item in rejected_records[:5]
+                ]
+                print(
+                    f"[image-expand-result]      rejected={rejected_payload}",
                     file=sys.stderr,
                 )
             if dropped_records:
@@ -786,6 +809,8 @@ class GraphExpansionStrategy:
                         "rank": item.get("rank"),
                         "title": item.get("title"),
                         "reason": item.get("reason"),
+                        "check": item.get("check"),
+                        "raw_model_output": item.get("raw_model_output"),
                     }
                     for item in dropped_records[:8]
                 ]

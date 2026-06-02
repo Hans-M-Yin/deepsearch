@@ -426,6 +426,7 @@ class ImageDiscoveryBuilder:
                             query=query.query,
                             search_result=search_result,
                             reason=validation.reason or "drop_candidate",
+                            validation=validation,
                         )
                     )
                     continue
@@ -439,6 +440,7 @@ class ImageDiscoveryBuilder:
                             query=query.query,
                             search_result=search_result,
                             reason=validation.reason or "rejected_not_stored",
+                            validation=validation,
                         )
                     )
                     continue
@@ -461,6 +463,7 @@ class ImageDiscoveryBuilder:
                         reason=validation.reason or validation.status.value,
                         status=validation.status.value,
                         bundle_count=len(discovered),
+                        validation=validation,
                     )
                 )
                 if len(discovered) >= self.config.max_images_per_plan:
@@ -483,6 +486,7 @@ class ImageDiscoveryBuilder:
         reason: str,
         status: str | None = None,
         bundle_count: int | None = None,
+        validation: ImageValidationResult | None = None,
     ) -> dict[str, Any]:
         payload = {
             "kind": kind,
@@ -496,6 +500,14 @@ class ImageDiscoveryBuilder:
             payload["status"] = status
         if bundle_count is not None:
             payload["bundle_count"] = bundle_count
+        if validation is not None:
+            metadata = validation.metadata or {}
+            if metadata.get("check") is not None:
+                payload["check"] = metadata.get("check")
+            if metadata.get("raw_model_output") is not None:
+                payload["raw_model_output"] = metadata.get("raw_model_output")
+            if metadata.get("visual_facts") is not None:
+                payload["visual_facts"] = metadata.get("visual_facts")
         return payload
 
     @staticmethod
