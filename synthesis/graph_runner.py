@@ -104,6 +104,7 @@ class GraphRunnerResult:
     store_stats: dict[str, int]
     skipped_count: int = 0
     timing_summary: dict[str, Any] = field(default_factory=dict)
+    image_summary: dict[str, int] = field(default_factory=dict)
     last_error: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
@@ -194,6 +195,7 @@ class GraphRunner:
             skipped_count=len(self.state.skipped_tasks),
             store_stats=self.store.stats(),
             timing_summary=self._timing_summary(),
+            image_summary=self._image_summary(),
             last_error=last_error,
         )
 
@@ -273,6 +275,7 @@ class GraphRunner:
             "materialized_edge_count": len(result.materialized_edges),
             "visual_plan_count": len(result.visual_plans),
             "image_result_count": len(result.image_results),
+            "image_summary": self._summarize_image_results(result.image_results),
             "timing": result.timing,
         }
         if result.error:
@@ -319,6 +322,71 @@ class GraphRunner:
             "steps_with_timing": len(timing_records),
             "metrics": metrics,
         }
+
+    @staticmethod
+    def _is_fetch_failure_reason(reason: str | None) -> bool:
+        text = str(reason or "").lower()
+        if not text:
+            return False
+        needles = (
+            "image_url_precheck_failed",
+            "http_429",
+            "http_403",
+            "forbidden",
+            "timeout",
+            "connection error",
+            "apiconnectionerror",
+            "apitimeouterror",
+            "non_image_content_type",
+            "url_error",
+            "decode_error",
+            "missing_resolved_image_asset",
+        )
+        return any(needle in text for needle in needles)
+
+    def _summarize_image_results(self, image_results: list[NodeExpansionResult] | list[Any]) -> dict[str, int]:
+        summary = {
+            "returned": 0,
+            "accepted": 0,
+            "rejected": 0,
+            "fetch_failed": 0,
+        }
+        for image_result in image_results or []:
+            metadata = image_result.metadata if hasattr(image_result, "metadata") else {}
+            decision_log = list(metadata.get("candidate_decisions") or [])
+            for item in decision_log:
+                if not isinstance(item, dict):
+                    continue
+                kind = str(item.get("kind") or "")
+                if kind == "query_results":
+                    summary["returned"] += int(item.get("returned") or 0)
+                    continue
+                if kind == "candidate_kept":
+                    status = str(item.get("status") or "").lower()
+                    if status == "accepted":
+                        summary["accepted"] += 1
+                    elif status == "rejected":
+                        summary["rejected"] += 1
+                    continue
+                if kind in {"candidate_drop", "candidate_skip"} and self._is_fetch_failure_reason(item.get("reason")):
+                    summary["fetch_failed"] += 1
+        return summary
+
+    def _image_summary(self) -> dict[str, int]:
+        records = self.state.completed_tasks + self.state.failed_tasks + self.state.skipped_tasks
+        summary = {
+            "returned": 0,
+            "accepted": 0,
+            "rejected": 0,
+            "fetch_failed": 0,
+        }
+        for record in records:
+            item = record.get("image_summary")
+            if not isinstance(item, dict):
+                continue
+            for key in summary:
+                summary[key] += int(item.get(key) or 0)
+        return summary
 
     @staticmethod
     def _task_from_record(record: dict[str, Any]) -> ExpansionTask:

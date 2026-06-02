@@ -406,19 +406,7 @@ class SerperSearchClient:
         status_code: int,
         raw: dict[str, Any],
     ) -> None:
-        print(
-            "[serper-raw] "
-            f"url={url} "
-            f"status={status_code} "
-            f"body={json.dumps(body, ensure_ascii=False, sort_keys=True)}",
-            file=sys.stderr,
-            flush=True,
-        )
-        print(
-            f"[serper-raw] response={json.dumps(raw, ensure_ascii=False, sort_keys=True)}",
-            file=sys.stderr,
-            flush=True,
-        )
+        return
 
     @staticmethod
     def _serper_body(query: str, limit: int, params: dict[str, Any]) -> dict[str, Any]:

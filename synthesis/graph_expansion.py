@@ -640,24 +640,7 @@ class GraphExpansionStrategy:
         text_result: WikiTextBuildResult,
         plans: list[VisualSearchPlan],
     ) -> None:
-        title = getattr(text_result.node, "title", None) or text_result.node.node_id
-        print(
-            "[image-expand] "
-            f"source_text={title!r} "
-            f"source_node_id={text_result.node.node_id} "
-            f"visual_plans={len(plans)}",
-            file=sys.stderr,
-        )
-        for index, plan in enumerate(plans, start=1):
-            queries = [query.query for query in plan.queries]
-            print(
-                "[image-expand-plan] "
-                f"source_text={title!r} "
-                f"plan_index={index} "
-                f"plan_id={plan.plan_id} "
-                f"queries={queries}",
-                file=sys.stderr,
-            )
+        return
 
     @staticmethod
     def _log_image_plan_execute_start(
@@ -666,15 +649,7 @@ class GraphExpansionStrategy:
         plan_index: int,
         plan: VisualSearchPlan,
     ) -> None:
-        title = getattr(text_result.node, "title", None) or text_result.node.node_id
-        print(
-            "[image-expand-exec] "
-            f"source_text={title!r} "
-            f"plan_index={plan_index} "
-            f"plan_id={plan.plan_id} "
-            f"status='start'",
-            file=sys.stderr,
-        )
+        return
 
     @staticmethod
     def _log_image_plan_execute_done(
@@ -683,18 +658,7 @@ class GraphExpansionStrategy:
         plan_index: int,
         result: ImageDiscoveryResult,
     ) -> None:
-        title = getattr(text_result.node, "title", None) or text_result.node.node_id
-        print(
-            "[image-expand-exec] "
-            f"source_text={title!r} "
-            f"plan_index={plan_index} "
-            f"plan_id={result.plan_id} "
-            f"status='done' "
-            f"candidates={len(result.candidates)} "
-            f"accepted={len(result.accepted_images())} "
-            f"kept={'yes' if result.image_node is not None else 'no'}",
-            file=sys.stderr,
-        )
+        return
 
     @staticmethod
     def _log_image_plan_execute_failure(
@@ -704,16 +668,7 @@ class GraphExpansionStrategy:
         plan: VisualSearchPlan,
         error: Exception,
     ) -> None:
-        title = getattr(text_result.node, "title", None) or text_result.node.node_id
-        print(
-            "[image-expand-exec] "
-            f"source_text={title!r} "
-            f"plan_index={plan_index} "
-            f"plan_id={plan.plan_id} "
-            f"status='failed' "
-            f"error={error.__class__.__name__}: {error}",
-            file=sys.stderr,
-        )
+        return
 
     @staticmethod
     def _log_image_plan_results(
@@ -721,141 +676,7 @@ class GraphExpansionStrategy:
         plans: list[VisualSearchPlan],
         image_results: list[ImageDiscoveryResult],
     ) -> None:
-        title = getattr(text_result.node, "title", None) or text_result.node.node_id
-        kept_count = sum(1 for result in image_results if result.image_node is not None)
-        accepted_total = sum(len(result.accepted_images()) for result in image_results)
-        candidate_total = sum(len(result.candidates) for result in image_results)
-        print(
-            "[image-expand-summary] "
-            f"source_text={title!r} "
-            f"source_node_id={text_result.node.node_id} "
-            f"plans={len(plans)} "
-            f"candidates={candidate_total} "
-            f"accepted={accepted_total} "
-            f"kept_image_nodes={kept_count}",
-            file=sys.stderr,
-        )
-        for index, result in enumerate(image_results, start=1):
-            primary = result.primary_image()
-            primary_url = primary.search_result.image_url if primary is not None else None
-            primary_title = primary.search_result.title if primary is not None else None
-            image_node_id = result.image_node.node_id if result.image_node is not None else None
-            decision_log = list(result.metadata.get("candidate_decisions") or [])
-            kept_records = [
-                item for item in decision_log
-                if isinstance(item, dict) and item.get("kind") == "candidate_kept"
-            ]
-            accepted_records = [
-                item for item in kept_records
-                if str(item.get("status") or "").lower() == "accepted"
-            ]
-            rejected_records = [
-                item for item in kept_records
-                if str(item.get("status") or "").lower() == "rejected"
-            ]
-            dropped_records = [
-                item for item in decision_log
-                if isinstance(item, dict) and item.get("kind") in {"candidate_drop", "candidate_skip"}
-            ]
-            query_records = [
-                item for item in decision_log
-                if isinstance(item, dict) and item.get("kind") == "query_results"
-            ]
-            routing_records = [
-                item for item in decision_log
-                if isinstance(item, dict) and item.get("kind") in {"candidate_kept", "candidate_drop", "candidate_skip"}
-            ]
-            print(
-                "[image-expand-result] "
-                f"source_text={title!r} "
-                f"plan_index={index} "
-                f"plan_id={result.plan_id} "
-                f"search_returns={sum(int(item.get('returned') or 0) for item in query_records)} "
-                f"accepted={len(result.accepted_images())} "
-                f"kept={'yes' if result.image_node is not None else 'no'} "
-                f"image_node_id={image_node_id} "
-                f"primary_title={primary_title!r} "
-                f"primary_url={primary_url}",
-                file=sys.stderr,
-            )
-            if routing_records:
-                routing_payload = []
-                for item in routing_records[:12]:
-                    kind = str(item.get("kind") or "")
-                    status = str(item.get("status") or "").lower()
-                    if kind == "candidate_kept" and status == "accepted":
-                        fate = "accepted"
-                    elif kind == "candidate_kept" and status == "rejected":
-                        fate = "rejected"
-                    elif kind == "candidate_drop":
-                        fate = "dropped"
-                    else:
-                        fate = "skipped"
-                    routing_payload.append(
-                        {
-                            "index": item.get("result_index"),
-                            "rank": item.get("rank"),
-                            "fate": fate,
-                            "title": item.get("title"),
-                            "reason": item.get("reason"),
-                        }
-                    )
-                print(
-                    f"[image-expand-result]      routing={routing_payload}",
-                    file=sys.stderr,
-                )
-            if accepted_records:
-                added_payload = [
-                    {
-                        "index": item.get("result_index"),
-                        "rank": item.get("rank"),
-                        "title": item.get("title"),
-                        "reason": item.get("reason"),
-                    }
-                    for item in accepted_records[:5]
-                ]
-                print(
-                    f"[image-expand-result]      added={added_payload}",
-                    file=sys.stderr,
-                )
-            if rejected_records:
-                rejected_payload = [
-                    {
-                        "index": item.get("result_index"),
-                        "rank": item.get("rank"),
-                        "title": item.get("title"),
-                        "reason": item.get("reason"),
-                        "check": item.get("check"),
-                        "raw_model_output": item.get("raw_model_output"),
-                    }
-                    for item in rejected_records[:5]
-                ]
-                print(
-                    f"[image-expand-result]      rejected={rejected_payload}",
-                    file=sys.stderr,
-                )
-            if dropped_records:
-                deleted_payload = [
-                    {
-                        "index": item.get("result_index"),
-                        "kind": item.get("kind"),
-                        "rank": item.get("rank"),
-                        "title": item.get("title"),
-                        "reason": item.get("reason"),
-                        "check": item.get("check"),
-                        "raw_model_output": item.get("raw_model_output"),
-                    }
-                    for item in dropped_records[:8]
-                ]
-                print(
-                    f"[image-expand-result]      deleted={deleted_payload}",
-                    file=sys.stderr,
-                )
-            elif result.image_node is None:
-                print(
-                    "[image-expand-result]      deleted=[{'reason': 'no_primary_candidate_selected'}]",
-                    file=sys.stderr,
-                )
+        return
 
     def _enqueue_image_entity_task(self, pending: dict[str, Any]) -> ExpansionTask | None:
         url = pending.get("url")

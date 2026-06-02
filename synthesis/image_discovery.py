@@ -1462,10 +1462,7 @@ class ImageDiscoveryBuilder:
 
     @staticmethod
     def _log_invalid_image_url(image_url: str | None, reason: str, *, stage: str) -> None:
-        print(
-            f"[image-url-check][{stage}] invalid image URL: {image_url or '<missing>'} | reason: {reason}",
-            file=sys.stderr,
-        )
+        return
 
     @staticmethod
     def _log_image_download(
@@ -1505,12 +1502,7 @@ class ImageDiscoveryBuilder:
         recovered_url: str,
         source_page_url: str | None,
     ) -> None:
-        print(
-            "[image-url-recover] recovered image URL "
-            f"from original={original_url or '<missing>'} "
-            f"via source_page={source_page_url or '<missing>'} -> {recovered_url}",
-            file=sys.stderr,
-        )
+        return
 
     @staticmethod
     def _log_image_result_fate(
@@ -1523,23 +1515,7 @@ class ImageDiscoveryBuilder:
         reason: str,
         raw_model_output: str | None = None,
     ) -> None:
-        title = search_result.title if search_result is not None else None
-        rank = search_result.rank if search_result is not None else None
-        url = search_result.image_url if search_result is not None else None
-        message = (
-            "[image-result-fate] "
-            f"plan_id={plan_id} "
-            f"query={query!r} "
-            f"index={result_index} "
-            f"rank={rank} "
-            f"fate={fate} "
-            f"title={title!r} "
-            f"url={url} "
-            f"reason={reason!r}"
-        )
-        if raw_model_output:
-            message += f" raw_model_output={raw_model_output!r}"
-        print(message, file=sys.stderr, flush=True)
+        return
 
     def _image_check_with_mllm(
         self,
@@ -1608,22 +1584,7 @@ class ImageDiscoveryBuilder:
         model_image_url: str | None,
         model_output: str | None = None,
     ) -> None:
-        if model_image_url and model_image_url.startswith("data:"):
-            image_ref = f"data_url(len={len(model_image_url)})"
-        else:
-            image_ref = model_image_url
-        message = (
-            "[image-model-call] "
-            f"stage={stage} "
-            f"when={when} "
-            f"model={model_alias} "
-            f"plan_id={plan_id} "
-            f"title={search_result.title!r} "
-            f"image_ref={image_ref}"
-        )
-        if model_output is not None:
-            message += f" raw_output={model_output!r}"
-        print(message, file=sys.stderr, flush=True)
+        return
 
     @staticmethod
     def _image_check_prompt_input(

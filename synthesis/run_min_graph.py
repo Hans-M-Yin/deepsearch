@@ -393,6 +393,14 @@ def main(argv: list[str] | None = None) -> int:
         f"avg_out_degree={graph_metrics['avg_out_degree']:.2f} "
         f"avg_total_degree={graph_metrics['avg_total_degree']:.2f}"
     )
+    image_summary = result.image_summary or {}
+    print(
+        "image_summary: "
+        f"returned={int(image_summary.get('returned') or 0)} "
+        f"accepted={int(image_summary.get('accepted') or 0)} "
+        f"rejected={int(image_summary.get('rejected') or 0)} "
+        f"fetch_failed={int(image_summary.get('fetch_failed') or 0)}"
+    )
     print(f"elapsed_s: {elapsed_s:.2f}")
     print(f"elapsed: {format_duration(elapsed_s)}")
     print(f"store_size_bytes: {store_size}")
