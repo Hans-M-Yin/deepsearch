@@ -748,6 +748,14 @@ class ImageDiscoveryBuilder:
 
         try:
             model_image_url = resolved_asset.model_url if resolved_asset is not None else search_result.image_url
+            self._log_image_model_call(
+                stage="image_ground",
+                when="before",
+                model_alias=model_alias,
+                plan_id=plan.plan_id,
+                search_result=search_result,
+                model_image_url=model_image_url,
+            )
             response = self.model_client.generate(
                 ModelRequest(
                     model=model_alias,
@@ -773,6 +781,14 @@ class ImageDiscoveryBuilder:
                     ],
                     temperature=0.0,
                 )
+            )
+            self._log_image_model_call(
+                stage="image_ground",
+                when="after",
+                model_alias=model_alias,
+                plan_id=plan.plan_id,
+                search_result=search_result,
+                model_image_url=model_image_url,
             )
         except Exception as exc:
             error = f"{exc.__class__.__name__}: {exc}"
@@ -1440,6 +1456,14 @@ class ImageDiscoveryBuilder:
         if not search_result.image_url:
             return self._reject("missing_image_url_for_mllm_check")
         image_for_model = resolved_asset.model_url if resolved_asset is not None else search_result.image_url
+        self._log_image_model_call(
+            stage="image_check",
+            when="before",
+            model_alias=model_alias,
+            plan_id=plan.plan_id,
+            search_result=search_result,
+            model_image_url=image_for_model,
+        )
         response = self.model_client.generate(
             ModelRequest(
                 model=model_alias,
@@ -1465,7 +1489,41 @@ class ImageDiscoveryBuilder:
                 temperature=0.0,
             )
         )
+        self._log_image_model_call(
+            stage="image_check",
+            when="after",
+            model_alias=model_alias,
+            plan_id=plan.plan_id,
+            search_result=search_result,
+            model_image_url=image_for_model,
+        )
         return self._parse_image_check_response(response.content, run_id=run_id)
+
+    @staticmethod
+    def _log_image_model_call(
+        *,
+        stage: str,
+        when: str,
+        model_alias: str,
+        plan_id: str,
+        search_result: ImageSearchResult,
+        model_image_url: str | None,
+    ) -> None:
+        if model_image_url and model_image_url.startswith("data:"):
+            image_ref = f"data_url(len={len(model_image_url)})"
+        else:
+            image_ref = model_image_url
+        print(
+            "[image-model-call] "
+            f"stage={stage} "
+            f"when={when} "
+            f"model={model_alias} "
+            f"plan_id={plan_id} "
+            f"title={search_result.title!r} "
+            f"image_ref={image_ref}",
+            file=sys.stderr,
+            flush=True,
+        )
 
     @staticmethod
     def _image_check_prompt_input(
