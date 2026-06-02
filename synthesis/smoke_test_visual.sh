@@ -2,7 +2,7 @@ mkdir -p runs/multi_seed_visual_smoke
 
 python run_min_graph.py \
   --seed-urls-file synthesis/seeds.txt \
-  --store-dir runs/multi_seed_visual_smoke \
+  --store-dir runs/multi_seed_visual_smoke_2 \
   --reader-base-url http://10.124.136.6:8004 \
   --fresh \
   --skip-attributes \
@@ -13,5 +13,5 @@ python run_min_graph.py \
   --parallel-workers 64 \
   --batch-size 64 \
   --image-backend serper \
-  2>&1 | tee runs/multi_seed_visual_smoke/run.log
+  2>&1 | tee runs/multi_seed_visual_smoke_2/run.log
   
