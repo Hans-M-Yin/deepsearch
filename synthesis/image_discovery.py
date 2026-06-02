@@ -305,7 +305,7 @@ class ImageDiscoveryBuilder:
 
         result = ImageDiscoveryResult(plan_id=plan.plan_id)
         seen_keys: set[str] = set()
-        self._log_image_plan_discovery_start(plan)
+        decision_log: list[dict[str, Any]] = []
 
         result.candidates = self._discover_with_client(
             client=self.search_client,
@@ -314,6 +314,7 @@ class ImageDiscoveryBuilder:
             seen_keys=seen_keys,
             persist=persist,
             snapshots=result.snapshots,
+            decision_log=decision_log,
         )
         result.candidates = result.candidates[: self.config.max_images_per_plan]
         result.fallback_used = any(candidate.used_fallback for candidate in result.candidates)
@@ -326,7 +327,6 @@ class ImageDiscoveryBuilder:
                 run_id=run_id,
                 persist=persist,
             )
-        self._log_image_plan_discovery_done(result)
         result.metadata.update(
             {
                 "query_count": len(plan.queries),
@@ -334,6 +334,7 @@ class ImageDiscoveryBuilder:
                 "usable_image_count": len(result.usable_images()),
                 "accepted_image_count": len(result.accepted_images()),
                 "queued_task_count": len(result.queued_tasks),
+                "candidate_decisions": decision_log,
             }
         )
         if persist and self.store is not None:
@@ -349,6 +350,7 @@ class ImageDiscoveryBuilder:
         seen_keys: set[str],
         persist: bool,
         snapshots: list[SearchSnapshot],
+        decision_log: list[dict[str, Any]],
     ) -> list[ImageSearchCandidate]:
         discovered: list[ImageSearchCandidate] = []
         for query in plan.queries:
@@ -364,7 +366,13 @@ class ImageDiscoveryBuilder:
                 snapshots.append(snapshot)
                 if persist:
                     self._persist_snapshot(snapshot)
-                self._log_image_query_error(plan_id=plan.plan_id, query=query.query, error=exc)
+                decision_log.append(
+                    {
+                        "kind": "query_error",
+                        "query": query.query,
+                        "reason": f"{exc.__class__.__name__}: {exc}",
+                    }
+                )
                 continue
 
             snapshot = self._snapshot_from_response(response, run_id=run_id)
@@ -372,29 +380,34 @@ class ImageDiscoveryBuilder:
             if persist:
                 self._persist_snapshot(snapshot)
             used_fallback = bool(response.metadata.get("fallback_used"))
-            self._log_image_query_results(
-                plan_id=plan.plan_id,
-                query=query.query,
-                result_count=len(response.results),
-                used_fallback=used_fallback,
+            decision_log.append(
+                {
+                    "kind": "query_results",
+                    "query": query.query,
+                    "returned": len(response.results),
+                    "fallback_used": used_fallback,
+                }
             )
 
             for search_result in response.results:
                 if not isinstance(search_result, ImageSearchResult):
-                    self._log_image_candidate_skip(
-                        plan_id=plan.plan_id,
-                        query=query.query,
-                        search_result=search_result if isinstance(search_result, ImageSearchResult) else None,
-                        reason="non_image_search_result",
+                    decision_log.append(
+                        {
+                            "kind": "candidate_skip",
+                            "query": query.query,
+                            "reason": "non_image_search_result",
+                        }
                     )
                     continue
                 key = self._candidate_key(search_result)
                 if not key or key in seen_keys:
-                    self._log_image_candidate_skip(
-                        plan_id=plan.plan_id,
-                        query=query.query,
-                        search_result=search_result,
-                        reason="missing_or_duplicate_candidate_key",
+                    decision_log.append(
+                        self._candidate_decision_record(
+                            kind="candidate_skip",
+                            query=query.query,
+                            search_result=search_result,
+                            reason="missing_or_duplicate_candidate_key",
+                        )
                     )
                     continue
                 seen_keys.add(key)
@@ -406,22 +419,26 @@ class ImageDiscoveryBuilder:
                     run_id=run_id,
                 )
                 if validation.drop_candidate:
-                    self._log_image_candidate_skip(
-                        plan_id=plan.plan_id,
-                        query=query.query,
-                        search_result=search_result,
-                        reason=validation.reason or "drop_candidate",
+                    decision_log.append(
+                        self._candidate_decision_record(
+                            kind="candidate_drop",
+                            query=query.query,
+                            search_result=search_result,
+                            reason=validation.reason or "drop_candidate",
+                        )
                     )
                     continue
                 if (
                     validation.status == ImageCandidateStatus.REJECTED
                     and not self.config.store_rejected
                 ):
-                    self._log_image_candidate_skip(
-                        plan_id=plan.plan_id,
-                        query=query.query,
-                        search_result=search_result,
-                        reason=validation.reason or "rejected_not_stored",
+                    decision_log.append(
+                        self._candidate_decision_record(
+                            kind="candidate_skip",
+                            query=query.query,
+                            search_result=search_result,
+                            reason=validation.reason or "rejected_not_stored",
+                        )
                     )
                     continue
 
@@ -435,129 +452,50 @@ class ImageDiscoveryBuilder:
                         used_fallback=used_fallback,
                     )
                 )
-                self._log_image_candidate_kept(
-                    plan_id=plan.plan_id,
-                    query=query.query,
-                    search_result=search_result,
-                    validation=validation,
-                    discovered_count=len(discovered),
+                decision_log.append(
+                    self._candidate_decision_record(
+                        kind="candidate_kept",
+                        query=query.query,
+                        search_result=search_result,
+                        reason=validation.reason or validation.status.value,
+                        status=validation.status.value,
+                        bundle_count=len(discovered),
+                    )
                 )
                 if len(discovered) >= self.config.max_images_per_plan:
-                    self._log_image_query_limit_reached(
-                        plan_id=plan.plan_id,
-                        query=query.query,
-                        limit=self.config.max_images_per_plan,
+                    decision_log.append(
+                        {
+                            "kind": "query_limit_reached",
+                            "query": query.query,
+                            "limit": self.config.max_images_per_plan,
+                        }
                     )
                     return discovered
         return discovered
 
     @staticmethod
-    def _log_image_plan_discovery_start(plan: VisualSearchPlan) -> None:
-        queries = [query.query for query in plan.queries]
-        print(
-            "[image-discovery] "
-            f"plan_id={plan.plan_id} "
-            f"source_node_id={plan.source_node_id} "
-            f"query_count={len(plan.queries)} "
-            f"queries={queries}",
-            file=sys.stderr,
-            flush=True,
-        )
-
-    @staticmethod
-    def _log_image_plan_discovery_done(result: ImageDiscoveryResult) -> None:
-        primary = result.primary_image()
-        print(
-            "[image-discovery] "
-            f"plan_id={result.plan_id} "
-            f"bundle_candidates={len(result.candidates)} "
-            f"accepted={len(result.accepted_images())} "
-            f"kept_image_node={'yes' if result.image_node is not None else 'no'} "
-            f"primary_url={primary.search_result.image_url if primary else None}",
-            file=sys.stderr,
-            flush=True,
-        )
-
-    @staticmethod
-    def _log_image_query_results(
+    def _candidate_decision_record(
         *,
-        plan_id: str,
-        query: str,
-        result_count: int,
-        used_fallback: bool,
-    ) -> None:
-        print(
-            "[image-query] "
-            f"plan_id={plan_id} "
-            f"returned={result_count} "
-            f"fallback_used={'yes' if used_fallback else 'no'} "
-            f"query={query!r}",
-            file=sys.stderr,
-            flush=True,
-        )
-
-    @staticmethod
-    def _log_image_query_error(*, plan_id: str, query: str, error: Exception) -> None:
-        print(
-            "[image-query] "
-            f"plan_id={plan_id} "
-            f"error={error.__class__.__name__}: {error} "
-            f"query={query!r}",
-            file=sys.stderr,
-            flush=True,
-        )
-
-    @staticmethod
-    def _log_image_candidate_skip(
-        *,
-        plan_id: str,
-        query: str,
-        search_result: ImageSearchResult | None,
-        reason: str,
-    ) -> None:
-        print(
-            "[image-candidate-skip] "
-            f"plan_id={plan_id} "
-            f"rank={getattr(search_result, 'rank', None)} "
-            f"title={getattr(search_result, 'title', None)!r} "
-            f"url={getattr(search_result, 'image_url', None)} "
-            f"reason={reason!r} "
-            f"query={query!r}",
-            file=sys.stderr,
-            flush=True,
-        )
-
-    @staticmethod
-    def _log_image_candidate_kept(
-        *,
-        plan_id: str,
+        kind: str,
         query: str,
         search_result: ImageSearchResult,
-        validation: ImageValidationResult,
-        discovered_count: int,
-    ) -> None:
-        print(
-            "[image-candidate-keep] "
-            f"plan_id={plan_id} "
-            f"rank={search_result.rank} "
-            f"title={search_result.title!r} "
-            f"url={search_result.image_url} "
-            f"status={validation.status.value} "
-            f"reason={validation.reason!r} "
-            f"bundle_count={discovered_count} "
-            f"query={query!r}",
-            file=sys.stderr,
-            flush=True,
-        )
-
-    @staticmethod
-    def _log_image_query_limit_reached(*, plan_id: str, query: str, limit: int) -> None:
-        print(
-            "[image-query] "
-            f"plan_id={plan_id} limit_reached={limit} query={query!r}",
-            file=sys.stderr,
-            flush=True,
-        )
+        reason: str,
+        status: str | None = None,
+        bundle_count: int | None = None,
+    ) -> dict[str, Any]:
+        payload = {
+            "kind": kind,
+            "query": query,
+            "rank": search_result.rank,
+            "title": search_result.title,
+            "url": search_result.image_url,
+            "reason": reason,
+        }
+        if status is not None:
+            payload["status"] = status
+        if bundle_count is not None:
+            payload["bundle_count"] = bundle_count
+        return payload
 
     @staticmethod
     def _candidate_record_id(search_result: ImageSearchResult) -> str:
@@ -1409,19 +1347,7 @@ class ImageDiscoveryBuilder:
         attempt: int,
         max_bytes: int | None,
     ) -> None:
-        speed_bps = byte_count / elapsed_s if elapsed_s > 0 else 0.0
-        mode = "full" if not max_bytes or max_bytes <= 0 else f"partial<= {max_bytes}B"
-        print(
-            "[image-download] "
-            f"url={image_url} "
-            f"size={ImageDiscoveryBuilder._format_byte_count(byte_count)} "
-            f"time={elapsed_s:.3f}s "
-            f"speed={ImageDiscoveryBuilder._format_byte_count(int(speed_bps))}/s "
-            f"content_type={content_type or '<missing>'} "
-            f"attempt={attempt} "
-            f"mode={mode}",
-            file=sys.stderr,
-        )
+        return
 
     @staticmethod
     def _log_image_download_failure(
@@ -1431,14 +1357,7 @@ class ImageDiscoveryBuilder:
         elapsed_s: float,
         attempt: int,
     ) -> None:
-        print(
-            "[image-download-fail] "
-            f"url={image_url} "
-            f"time={elapsed_s:.3f}s "
-            f"attempt={attempt} "
-            f"reason={reason}",
-            file=sys.stderr,
-        )
+        return
 
     @staticmethod
     def _format_byte_count(size: int) -> str:

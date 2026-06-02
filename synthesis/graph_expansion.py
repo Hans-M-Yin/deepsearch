@@ -669,28 +669,64 @@ class GraphExpansionStrategy:
             primary_url = primary.search_result.image_url if primary is not None else None
             primary_title = primary.search_result.title if primary is not None else None
             image_node_id = result.image_node.node_id if result.image_node is not None else None
-            failure_reasons = [
-                candidate.validation.reason
-                for candidate in result.candidates
-                if candidate.validation.reason
-                and candidate.validation.status != "accepted"
+            decision_log = list(result.metadata.get("candidate_decisions") or [])
+            kept_records = [
+                item for item in decision_log
+                if isinstance(item, dict) and item.get("kind") == "candidate_kept"
             ]
-            if not failure_reasons and result.image_node is None:
-                failure_reasons = ["no_primary_candidate_selected"]
+            dropped_records = [
+                item for item in decision_log
+                if isinstance(item, dict) and item.get("kind") in {"candidate_drop", "candidate_skip"}
+            ]
+            query_records = [
+                item for item in decision_log
+                if isinstance(item, dict) and item.get("kind") == "query_results"
+            ]
             print(
                 "[image-expand-result] "
                 f"source_text={title!r} "
                 f"plan_index={index} "
                 f"plan_id={result.plan_id} "
-                f"candidates={len(result.candidates)} "
+                f"search_returns={sum(int(item.get('returned') or 0) for item in query_records)} "
                 f"accepted={len(result.accepted_images())} "
                 f"kept={'yes' if result.image_node is not None else 'no'} "
                 f"image_node_id={image_node_id} "
                 f"primary_title={primary_title!r} "
-                f"primary_url={primary_url} "
-                f"failure_reasons={failure_reasons[:3]}",
+                f"primary_url={primary_url}",
                 file=sys.stderr,
             )
+            if kept_records:
+                added_payload = [
+                    {
+                        "rank": item.get("rank"),
+                        "title": item.get("title"),
+                        "reason": item.get("reason"),
+                    }
+                    for item in kept_records[:5]
+                ]
+                print(
+                    f"[image-expand-result]      added={added_payload}",
+                    file=sys.stderr,
+                )
+            if dropped_records:
+                deleted_payload = [
+                    {
+                        "kind": item.get("kind"),
+                        "rank": item.get("rank"),
+                        "title": item.get("title"),
+                        "reason": item.get("reason"),
+                    }
+                    for item in dropped_records[:8]
+                ]
+                print(
+                    f"[image-expand-result]      deleted={deleted_payload}",
+                    file=sys.stderr,
+                )
+            elif result.image_node is None:
+                print(
+                    "[image-expand-result]      deleted=[{'reason': 'no_primary_candidate_selected'}]",
+                    file=sys.stderr,
+                )
 
     def _enqueue_image_entity_task(self, pending: dict[str, Any]) -> ExpansionTask | None:
         url = pending.get("url")
