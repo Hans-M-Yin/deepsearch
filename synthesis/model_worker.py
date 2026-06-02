@@ -12,7 +12,9 @@ from enum import Enum
 import json
 import os
 from pathlib import Path
+import sys
 import tempfile
+import time
 from typing import Any, Protocol
 
 
@@ -67,6 +69,38 @@ class ModelWorkerClient(Protocol):
         """Run one model generation request."""
 
 
+def _trace_timing_enabled() -> bool:
+    return os.environ.get("SYNTHESIS_TRACE_TIMING", "1") != "0"
+
+
+def _trace_model_call(
+    *,
+    phase: str,
+    label: str,
+    model: str,
+    base_url: str | None,
+    elapsed_s: float | None = None,
+    message_count: int | None = None,
+    max_tokens: int | None = None,
+) -> None:
+    if not _trace_timing_enabled():
+        return
+    parts = [
+        "[trace][llm]",
+        f"phase={phase}",
+        f"label={label!r}",
+        f"model={model!r}",
+        f"base_url={base_url!r}",
+    ]
+    if message_count is not None:
+        parts.append(f"messages={message_count}")
+    if max_tokens is not None:
+        parts.append(f"max_tokens={max_tokens}")
+    if elapsed_s is not None:
+        parts.append(f"elapsed_s={elapsed_s:.3f}")
+    print(" ".join(parts), file=sys.stderr, flush=True)
+
+
 class OpenAIModelWorkerClient:
     """OpenAI-compatible model worker.
 
@@ -105,6 +139,16 @@ class OpenAIModelWorkerClient:
         )
 
     def generate(self, request: ModelRequest) -> ModelResponse:
+        label = str(request.metadata.get("trace_label") or request.model or self.model)
+        _trace_model_call(
+            phase="start",
+            label=label,
+            model=request.model or self.model,
+            base_url=self.base_url,
+            message_count=len(request.messages),
+            max_tokens=request.max_tokens,
+        )
+        started_at = time.perf_counter()
         kwargs: dict[str, Any] = {
             "model": request.model or self.model,
             "messages": [message.to_dict() for message in request.messages],
@@ -120,9 +164,19 @@ class OpenAIModelWorkerClient:
             kwargs["extra_body"] = extra_body
 
         completion = self.client.chat.completions.create(**kwargs)
+        elapsed_s = time.perf_counter() - started_at
         # print(completion)
         choice = completion.choices[0]
         content = choice.message.content or ""
+        _trace_model_call(
+            phase="done",
+            label=label,
+            model=getattr(completion, "model", None) or kwargs["model"],
+            base_url=self.base_url,
+            elapsed_s=elapsed_s,
+            message_count=len(request.messages),
+            max_tokens=request.max_tokens,
+        )
 
         raw_response = completion.model_dump() if hasattr(completion, "model_dump") else None
         usage = raw_response.get("usage") if isinstance(raw_response, dict) else None

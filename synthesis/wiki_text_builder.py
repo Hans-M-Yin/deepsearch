@@ -25,6 +25,15 @@ from .nodes import AssetRef, NodeSource, NodeStatus, NodeType, TextNode
 from .store import JsonlGraphStore
 
 
+def _trace_timing_enabled() -> bool:
+    return os.environ.get("SYNTHESIS_TRACE_TIMING", "1") != "0"
+
+
+def _trace_timing(message: str) -> None:
+    if _trace_timing_enabled():
+        print(f"[trace]{message}", file=sys.stderr, flush=True)
+
+
 WIKI_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
 MARKDOWN_TRUNCATION_MARKER = "\n\n<!-- wiki_text_builder_truncated -->"
 WIKI_MISSING_PAGE_PATTERNS = (
@@ -293,12 +302,16 @@ class EnhancedReaderClient:
     def read(self, url: str, **kwargs: Any) -> ReaderDocument:
         del kwargs
         target = url if url.startswith(("http://", "https://")) else f"https://{url}"
+        started_at = time.perf_counter()
+        _trace_timing(f"[reader] phase=start target={target!r} base_url={self.base_url!r}")
         request = Request(
             f"{self.base_url}/{target}",
             headers={"Accept": "application/json"},
         )
         with urlopen(request, timeout=self.timeout_s) as response:
             payload = response.read().decode("utf-8")
+        elapsed_s = time.perf_counter() - started_at
+        _trace_timing(f"[reader] phase=done target={target!r} elapsed_s={elapsed_s:.3f}")
         data = json.loads(payload)
         document = data.get("data") or {}
         return ReaderDocument(
@@ -412,22 +425,32 @@ class WikiTextBuilder:
         total_started = time.perf_counter()
         timing: dict[str, float] = {}
         input_url = self._normalize_wikipedia_url(url)
+        _trace_timing(f"[text-build] phase=start url={input_url!r}")
         started = time.perf_counter()
         cached = None if force else self._cached_build_result(input_url)
         timing["cache_lookup_input_s"] = time.perf_counter() - started
+        _trace_timing(
+            f"[text-build] stage=cache_lookup_input url={input_url!r} elapsed_s={timing['cache_lookup_input_s']:.3f} hit={'yes' if cached is not None else 'no'}"
+        )
         if cached is not None:
             cached.timing = {**cached.timing, **timing, "total_s": time.perf_counter() - total_started}
+            _trace_timing(f"[text-build] phase=done url={input_url!r} elapsed_s={cached.timing['total_s']:.3f} cache_hit=input")
             return cached
 
         started = time.perf_counter()
         document = self.reader.read(url)
         timing["reader_read_s"] = time.perf_counter() - started
+        _trace_timing(f"[text-build] stage=reader_read url={input_url!r} elapsed_s={timing['reader_read_s']:.3f}")
         page_url = self._normalize_wikipedia_url(document.url or url)
         started = time.perf_counter()
         cached = None if force else self._cached_build_result(page_url)
         timing["cache_lookup_page_s"] = time.perf_counter() - started
+        _trace_timing(
+            f"[text-build] stage=cache_lookup_page url={page_url!r} elapsed_s={timing['cache_lookup_page_s']:.3f} hit={'yes' if cached is not None else 'no'}"
+        )
         if cached is not None:
             cached.timing = {**cached.timing, **timing, "total_s": time.perf_counter() - total_started}
+            _trace_timing(f"[text-build] phase=done url={page_url!r} elapsed_s={cached.timing['total_s']:.3f} cache_hit=page")
             return cached
 
         started = time.perf_counter()
@@ -496,10 +519,16 @@ class WikiTextBuilder:
         )
         timing["validate_and_truncate_s"] = time.perf_counter() - started
         timing["node_evidence_create_s"] = time.perf_counter() - started
+        _trace_timing(
+            f"[text-build] stage=node_create url={page_url!r} elapsed_s={timing['node_evidence_create_s']:.3f} title={page_title!r}"
+        )
 
         started = time.perf_counter()
         linked_entities = self.extract_wiki_links(link_markdown, source_url=page_url)
         timing["link_extract_s"] = time.perf_counter() - started
+        _trace_timing(
+            f"[text-build] stage=link_extract url={page_url!r} elapsed_s={timing['link_extract_s']:.3f} links={len(linked_entities)}"
+        )
 
         result = WikiTextBuildResult(
             node=node,
@@ -512,10 +541,12 @@ class WikiTextBuilder:
             started = time.perf_counter()
             self._persist_result(result)
             timing["persist_s"] = time.perf_counter() - started
+            _trace_timing(f"[text-build] stage=persist url={page_url!r} elapsed_s={timing['persist_s']:.3f}")
         else:
             timing["persist_s"] = 0.0
         timing["total_s"] = time.perf_counter() - total_started
         result.timing = timing
+        _trace_timing(f"[text-build] phase=done url={page_url!r} elapsed_s={timing['total_s']:.3f}")
         return result
 
     def _cached_build_result(self, page_url: str) -> WikiTextBuildResult | None:
@@ -723,6 +754,7 @@ class WikiTextBuilder:
                     ModelMessage(role="user", content=self._attribute_prompt_input(node, content)),
                 ],
                 temperature=0.0,
+                metadata={"trace_label": f"attribute_extract:{node.title or node.node_id}"},
             )
         )
         return self._parse_attribute_tags(response.content)
@@ -848,6 +880,7 @@ class WikiTextBuilder:
             )
 
         try:
+            llm_started = time.perf_counter()
             response = self.model_client.generate(
                 ModelRequest(
                     model=model_alias,
@@ -860,7 +893,11 @@ class WikiTextBuilder:
                     ],
                     temperature=0.0,
                     max_tokens=2048,
+                    metadata={"trace_label": f"neighbor_filter:{source_title}"},
                 )
+            )
+            _trace_timing(
+                f"[neighbor-filter] stage=llm_call source={source_title!r} candidates={len(prompt_candidates)} elapsed_s={time.perf_counter() - llm_started:.3f}"
             )
             decisions = self._parse_neighbor_filter_response(response.content)
             if debug_enabled:

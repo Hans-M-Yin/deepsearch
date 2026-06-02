@@ -50,6 +50,7 @@ class GraphRunnerConfig:
     state_file_name: str = "graph_runner_state.json"
     parallel_workers: int = 1
     batch_size: int | None = None
+    show_progress: bool = True
 
     def to_dict(self) -> dict[str, Any]:
         return _jsonify(asdict(self))
@@ -130,6 +131,7 @@ class GraphRunner:
         self.state_path = Path(state_path) if state_path else store.root_dir / self.config.state_file_name
         self.state = self._load_or_create_state(run_id=run_id, resume=resume)
         self._restore_strategy_state()
+        self._progress_width = 0
 
     def add_seed(
         self,
@@ -164,6 +166,7 @@ class GraphRunner:
             for result in results:
                 self.state.step += 1
                 self._record_result(result)
+                self._emit_progress()
                 if result.error:
                     last_error = result.error
                     if self.config.stop_on_error:
@@ -182,6 +185,7 @@ class GraphRunner:
         if self.state.status == "running":
             self.state.status = "completed" if self.strategy.queue_size() == 0 else "paused"
 
+        self._finish_progress()
         self._sync_state_from_strategy()
         self.save_state()
         self.store.flush()
@@ -284,6 +288,39 @@ class GraphRunner:
             self.state.skipped_tasks.append(record)
         else:
             self.state.completed_tasks.append(record)
+
+    def _emit_progress(self) -> None:
+        if not self.config.show_progress:
+            return
+        stats = self.store.stats()
+        queue_size = self.strategy.queue_size()
+        max_steps = self.config.max_steps
+        max_nodes = self.config.max_nodes
+        steps_text = f"{self.state.step}/{max_steps}" if max_steps else str(self.state.step)
+        node_count = int(stats.get("nodes", 0))
+        nodes_text = f"{node_count}/{max_nodes}" if max_nodes is not None else str(node_count)
+        line = (
+            "[progress] "
+            f"steps={steps_text} "
+            f"queue={queue_size} "
+            f"nodes={nodes_text} "
+            f"edges={int(stats.get('edges', 0))} "
+            f"completed={len(self.state.completed_tasks)} "
+            f"failed={len(self.state.failed_tasks)} "
+            f"skipped={len(self.state.skipped_tasks)}"
+        )
+        self._progress_width = max(self._progress_width, len(line))
+        if sys.stderr.isatty():
+            padded = line.ljust(self._progress_width)
+            print(f"\r{padded}", end="", file=sys.stderr, flush=True)
+            return
+        print(line, file=sys.stderr, flush=True)
+
+    def _finish_progress(self) -> None:
+        if not self.config.show_progress:
+            return
+        if sys.stderr.isatty() and self._progress_width > 0:
+            print(file=sys.stderr, flush=True)
 
     def _should_continue(self) -> bool:
         if self.strategy.queue_size() <= 0:

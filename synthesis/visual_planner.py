@@ -9,6 +9,7 @@ from enum import Enum
 from hashlib import sha256
 from pathlib import Path
 import sys
+import time
 from typing import Any, Protocol
 
 if __package__ in (None, ""):
@@ -17,6 +18,15 @@ if __package__ in (None, ""):
 
 from .evidence import Evidence, EvidenceType
 from .model_worker import LLM_WORKER, ModelMessage, ModelRequest, ModelResponse, ModelWorkerClient
+
+
+def _trace_timing_enabled() -> bool:
+    return os.environ.get("SYNTHESIS_TRACE_TIMING", "1") != "0"
+
+
+def _trace_timing(message: str) -> None:
+    if _trace_timing_enabled():
+        print(f"[trace]{message}", file=sys.stderr, flush=True)
 
 
 PROMPT_VISUAL_SEARCH_PLANNER = """You are adding illustrative images to a Wikipedia page.
@@ -264,6 +274,7 @@ class LLMVisualSearchPlanner:
         if not model_alias:
             raise ValueError("VISUAL_PLANNER_MODEL or TEXT_PROCESS_MODEL is required for visual planning.")
 
+        started_at = time.perf_counter()
         response = self.model_client.generate(
             ModelRequest(
                 model=model_alias,
@@ -272,7 +283,11 @@ class LLMVisualSearchPlanner:
                     ModelMessage(role="user", content=self._prompt_input(node, page_text)),
                 ],
                 temperature=0.0,
+                metadata={"trace_label": f"visual_planner:{node.get('title') or node.get('node_id') or ''}"},
             )
+        )
+        _trace_timing(
+            f"[visual-plan] stage=llm_call node={node.get('title') or node.get('node_id')!r} elapsed_s={time.perf_counter() - started_at:.3f}"
         )
         candidates = self._parse_targets(response.content)
         plans: list[VisualSearchPlan] = []

@@ -43,6 +43,15 @@ from .nodes import ImageNode, ImageVariant, NodeType, TextNode
 from .search_client import ImageSearchResult, SearchClient, SearchResponse
 from .store import JsonlGraphStore
 from .visual_planner import SearchQuerySpec, VisualSearchPlan
+
+
+def _trace_timing_enabled() -> bool:
+    return os.environ.get("SYNTHESIS_TRACE_TIMING", "1") != "0"
+
+
+def _trace_timing(message: str) -> None:
+    if _trace_timing_enabled():
+        print(f"[trace]{message}", file=sys.stderr, flush=True)
 from .wiki_entity_resolver import WikiEntityResolver
 
 
@@ -304,10 +313,13 @@ class ImageDiscoveryBuilder:
     ) -> ImageDiscoveryResult:
         """Discover images for one visual plan."""
 
+        total_started = time.perf_counter()
         result = ImageDiscoveryResult(plan_id=plan.plan_id)
         seen_keys: set[str] = set()
         decision_log: list[dict[str, Any]] = []
+        _trace_timing(f"[image-discovery] phase=start plan_id={plan.plan_id} queries={len(plan.queries)}")
 
+        started = time.perf_counter()
         result.candidates = self._discover_with_client(
             client=self.search_client,
             plan=plan,
@@ -317,16 +329,23 @@ class ImageDiscoveryBuilder:
             snapshots=result.snapshots,
             decision_log=decision_log,
         )
+        _trace_timing(
+            f"[image-discovery] stage=search_and_check plan_id={plan.plan_id} elapsed_s={time.perf_counter() - started:.3f} candidates={len(result.candidates)}"
+        )
         result.candidates = result.candidates[: self.config.max_images_per_plan]
         result.fallback_used = any(candidate.used_fallback for candidate in result.candidates)
         primary_candidate = self._select_primary_candidate(result.candidates)
         if primary_candidate is not None:
+            started = time.perf_counter()
             self._materialize_primary_candidate(
                 result=result,
                 plan=plan,
                 candidate=primary_candidate,
                 run_id=run_id,
                 persist=persist,
+            )
+            _trace_timing(
+                f"[image-discovery] stage=materialize_primary plan_id={plan.plan_id} elapsed_s={time.perf_counter() - started:.3f} primary_title={primary_candidate.search_result.title!r}"
             )
         result.metadata.update(
             {
@@ -340,6 +359,9 @@ class ImageDiscoveryBuilder:
         )
         if persist and self.store is not None:
             self.store.flush()
+        _trace_timing(
+            f"[image-discovery] phase=done plan_id={plan.plan_id} elapsed_s={time.perf_counter() - total_started:.3f} accepted={len(result.accepted_images())} kept={'yes' if result.image_node is not None else 'no'}"
+        )
         return result
 
     def _discover_with_client(
@@ -356,7 +378,11 @@ class ImageDiscoveryBuilder:
         discovered: list[ImageSearchCandidate] = []
         for query in plan.queries:
             try:
+                started = time.perf_counter()
                 response = client.search_image(query.query, limit=self.config.per_query_limit)
+                _trace_timing(
+                    f"[image-discovery] stage=search_query plan_id={plan.plan_id} query={query.query!r} elapsed_s={time.perf_counter() - started:.3f} returned={len(response.results)}"
+                )
             except Exception as exc:
                 snapshot = self._snapshot_from_error(
                     client=client,
@@ -847,6 +873,7 @@ class ImageDiscoveryBuilder:
                         ),
                     ],
                     temperature=0.0,
+                    metadata={"trace_label": f"image_ground:{plan.plan_id}:{search_result.title or ''}"},
                 )
             )
             self._log_image_model_call(
@@ -1560,6 +1587,7 @@ class ImageDiscoveryBuilder:
                     ),
                 ],
                 temperature=0.0,
+                metadata={"trace_label": f"image_check:{plan.plan_id}:{search_result.title or ''}"},
             )
         )
         self._log_image_model_call(

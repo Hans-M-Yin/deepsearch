@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import asdict, dataclass, field
 from enum import Enum
+import os
 from pathlib import Path
 import sys
 from threading import RLock
@@ -21,6 +22,15 @@ from .image_discovery import ImageDiscoveryBuilder, ImageDiscoveryResult
 from .store import JsonlGraphStore
 from .visual_planner import VisualSearchPlan, VisualSearchPlanner
 from .wiki_text_builder import InvalidWikiPageError, WikiLinkCandidate, WikiTextBuilder, WikiTextBuildResult
+
+
+def _trace_timing_enabled() -> bool:
+    return os.environ.get("SYNTHESIS_TRACE_TIMING", "1") != "0"
+
+
+def _trace_timing(message: str) -> None:
+    if _trace_timing_enabled():
+        print(f"[trace]{message}", file=sys.stderr, flush=True)
 
 
 def _jsonify(value: Any) -> Any:
@@ -251,6 +261,7 @@ class GraphExpansionStrategy:
     ) -> NodeExpansionResult:
         total_started = time.perf_counter()
         timing: dict[str, float] = {}
+        _trace_timing(f"[expand-task] phase=start url={task.url!r} title={task.title!r} depth={task.depth}")
         try:
             started = time.perf_counter()
             text_result = self.wiki_builder.build_from_url(
@@ -262,6 +273,9 @@ class GraphExpansionStrategy:
             timing["text_build_s"] = time.perf_counter() - started
             for key, value in text_result.timing.items():
                 timing[f"text_{key}"] = value
+            _trace_timing(
+                f"[expand-task] stage=text_build url={task.url!r} elapsed_s={timing['text_build_s']:.3f} node_id={text_result.node.node_id!r}"
+            )
 
             started = time.perf_counter()
             materialized_edges = self._materialize_pending_parent_links(
@@ -270,6 +284,9 @@ class GraphExpansionStrategy:
                 run_id=run_id,
             )
             timing["materialize_parent_edges_s"] = time.perf_counter() - started
+            _trace_timing(
+                f"[expand-task] stage=materialize_parent_edges url={task.url!r} elapsed_s={timing['materialize_parent_edges_s']:.3f} edges={len(materialized_edges)}"
+            )
 
             started = time.perf_counter()
             attribute_evidence, attribute_error = self._extract_attributes(
@@ -277,6 +294,9 @@ class GraphExpansionStrategy:
                 run_id=run_id,
             )
             timing["attribute_s"] = time.perf_counter() - started
+            _trace_timing(
+                f"[expand-task] stage=attribute_extract url={task.url!r} elapsed_s={timing['attribute_s']:.3f} status={'error' if attribute_error else 'ok'}"
+            )
 
             started = time.perf_counter()
             queued_tasks, existing_target_edges = self._process_text_neighbors(
@@ -286,12 +306,19 @@ class GraphExpansionStrategy:
             )
             materialized_edges.extend(existing_target_edges)
             timing["queue_neighbors_s"] = time.perf_counter() - started
+            _trace_timing(
+                f"[expand-task] stage=neighbor_expand url={task.url!r} elapsed_s={timing['queue_neighbors_s']:.3f} queued={len(queued_tasks)} existing_edges={len(existing_target_edges)}"
+            )
 
             started = time.perf_counter()
             visual_plans, image_results, image_queued_tasks = self._expand_images(text_result, run_id=run_id)
             queued_tasks.extend(image_queued_tasks)
             timing["image_expansion_s"] = time.perf_counter() - started
+            _trace_timing(
+                f"[expand-task] stage=image_expand url={task.url!r} elapsed_s={timing['image_expansion_s']:.3f} plans={len(visual_plans)} image_nodes={sum(1 for item in image_results if item.image_node is not None)}"
+            )
             timing["total_s"] = time.perf_counter() - total_started
+            _trace_timing(f"[expand-task] phase=done url={task.url!r} elapsed_s={timing['total_s']:.3f}")
             task.status = ExpansionTaskStatus.DONE
             return NodeExpansionResult(
                 task=task,
@@ -307,6 +334,7 @@ class GraphExpansionStrategy:
         except InvalidWikiPageError as exc:
             task.status = ExpansionTaskStatus.SKIPPED
             timing["total_s"] = time.perf_counter() - total_started
+            _trace_timing(f"[expand-task] phase=skipped url={task.url!r} elapsed_s={timing['total_s']:.3f} error={exc}")
             return NodeExpansionResult(
                 task=task,
                 error=None,
@@ -316,6 +344,7 @@ class GraphExpansionStrategy:
         except Exception as exc:
             task.status = ExpansionTaskStatus.FAILED
             timing["total_s"] = time.perf_counter() - total_started
+            _trace_timing(f"[expand-task] phase=failed url={task.url!r} elapsed_s={timing['total_s']:.3f} error={exc.__class__.__name__}: {exc}")
             return NodeExpansionResult(
                 task=task,
                 error=f"{exc.__class__.__name__}: {exc}",
