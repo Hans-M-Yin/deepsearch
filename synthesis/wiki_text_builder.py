@@ -1009,8 +1009,7 @@ class WikiTextBuilder:
         )
         for line in raw_output.strip().splitlines():
             if line.strip():
-                # print(f"[wiki_neighbor_filter_raw] {line}", file=sys.stderr, flush=True)
-                continue
+                print(f"[wiki_neighbor_filter_raw] {line}", file=sys.stderr, flush=True)
 
     @staticmethod
     def _debug_print_neighbor_filter_failure(
