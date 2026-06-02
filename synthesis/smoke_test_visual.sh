@@ -4,11 +4,11 @@ python run_min_graph.py \
   --reader-base-url http://10.124.136.6:8004 \
   --fresh \
   --skip-attributes \
-  --max-neighbors 0 \
-  --max-steps 32 \
-  --max-nodes 4 \
+  --max-neighbors 4 \
+  --max-steps 12345678 \
+  --max-nodes 512 \
   --max-depth 64 \
-  --parallel-workers 1 \
-  --batch-size 32 \
+  --parallel-workers 64 \
+  --batch-size 64 \
   --image-backend serper
   
