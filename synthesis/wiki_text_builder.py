@@ -837,6 +837,15 @@ class WikiTextBuilder:
         ranked_candidates = sorted(candidates, key=lambda item: (-item.score, item.rank or 10**9))
         prompt_candidates = ranked_candidates[: max(1, self.max_llm_neighbor_candidates)]
         rule_scores = {candidate.url: candidate.score for candidate in prompt_candidates}
+        prompt_input = self._neighbor_filter_prompt_input(source_title, source_url, prompt_candidates)
+        if debug_enabled:
+            self._probe_neighbor_filter_model(model_alias=model_alias, source_title=source_title, source_url=source_url)
+            self._debug_print_neighbor_filter_prompt(
+                source_title=source_title,
+                source_url=source_url,
+                candidate_count=len(prompt_candidates),
+                prompt_text=prompt_input,
+            )
 
         try:
             response = self.model_client.generate(
@@ -846,7 +855,7 @@ class WikiTextBuilder:
                         ModelMessage(role="system", content=PROMPT_FILTER_WIKI_NEIGHBORS),
                         ModelMessage(
                             role="user",
-                            content=self._neighbor_filter_prompt_input(source_title, source_url, prompt_candidates),
+                            content=prompt_input,
                         ),
                     ],
                     temperature=0.0,
@@ -936,6 +945,41 @@ class WikiTextBuilder:
 
         return kept
 
+    def _probe_neighbor_filter_model(
+        self,
+        *,
+        model_alias: str,
+        source_title: str,
+        source_url: str,
+    ) -> None:
+        try:
+            response = self.model_client.generate(
+                ModelRequest(
+                    model=model_alias,
+                    messages=[
+                        ModelMessage(role="system", content="You are a health check. Reply with exactly: OK"),
+                        ModelMessage(role="user", content="Return exactly: OK"),
+                    ],
+                    temperature=0.0,
+                    max_tokens=16,
+                )
+            )
+            content = (response.content or "").strip()
+            healthy = content == "OK"
+            print(
+                f"[wiki_neighbor_probe] source={source_title!r} url={source_url} "
+                f"healthy={'yes' if healthy else 'no'} output={content[:200]!r}",
+                file=sys.stderr,
+                flush=True,
+            )
+        except Exception as exc:
+            print(
+                f"[wiki_neighbor_probe] source={source_title!r} url={source_url} "
+                f"healthy=error error={exc.__class__.__name__}: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+
     @staticmethod
     def _neighbor_debug_row(
         *,
@@ -960,6 +1004,27 @@ class WikiTextBuilder:
             "reason": decision.get("reason") if decision else "missing LLM decision",
             "context": context[:220],
         }
+
+    @staticmethod
+    def _debug_print_neighbor_filter_prompt(
+        *,
+        source_title: str,
+        source_url: str,
+        candidate_count: int,
+        prompt_text: str,
+    ) -> None:
+        compact = re.sub(r"\s+", " ", prompt_text).strip()
+        print(
+            f"[wiki_neighbor_filter_prompt] source={source_title!r} url={source_url} "
+            f"candidate_count={candidate_count} chars={len(prompt_text)}",
+            file=sys.stderr,
+            flush=True,
+        )
+        print(
+            f"[wiki_neighbor_filter_prompt] preview={compact[:600]!r}",
+            file=sys.stderr,
+            flush=True,
+        )
 
     @staticmethod
     def _debug_print_neighbor_filter(
@@ -1002,14 +1067,32 @@ class WikiTextBuilder:
         source_url: str,
         raw_output: str,
     ) -> None:
+        degenerate = WikiTextBuilder._degenerate_neighbor_output_summary(raw_output)
         print(
-            f"[wiki_neighbor_filter_raw] source={source_title!r} url={source_url}",
+            f"[wiki_neighbor_filter_raw] source={source_title!r} url={source_url} "
+            f"chars={len(raw_output)} degenerate={degenerate!r}",
             file=sys.stderr,
             flush=True,
         )
         for line in raw_output.strip().splitlines():
             if line.strip():
                 print(f"[wiki_neighbor_filter_raw] {line}", file=sys.stderr, flush=True)
+
+    @staticmethod
+    def _degenerate_neighbor_output_summary(raw_output: str) -> str:
+        stripped = raw_output.strip()
+        if not stripped:
+            return "empty"
+        if "<neighbor" in raw_output.lower():
+            return "contains_neighbor_tags"
+        counts: dict[str, int] = {}
+        for char in stripped:
+            counts[char] = counts.get(char, 0) + 1
+        dominant_char, dominant_count = max(counts.items(), key=lambda item: item[1])
+        ratio = dominant_count / max(1, len(stripped))
+        if ratio >= 0.8 and dominant_char in {"!", ".", "-", "_", "*", "#", "="}:
+            return f"dominant_char:{dominant_char}:{ratio:.2f}"
+        return "non_xml_no_dominant_char"
 
     @staticmethod
     def _debug_print_neighbor_filter_failure(
