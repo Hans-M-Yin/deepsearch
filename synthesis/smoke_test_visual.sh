@@ -1,6 +1,6 @@
 python run_min_graph.py \
   --seed-url https://en.wikipedia.org/wiki/Kobe_Bryant \
-  --store-dir runs/kobe_with_images_serper_20_100_depth_32 \
+  --store-dir runs/kobe_with_images_serper_20_100_depth_29 \
   --reader-base-url http://10.124.136.6:8004 \
   --fresh \
   --skip-attributes \
@@ -8,6 +8,6 @@ python run_min_graph.py \
   --max-steps 32 \
   --max-nodes 8 \
   --max-depth 64 \
-  --parallel-workers 1 \
+  --parallel-workers 32 \
   --batch-size 32 \
   --image-backend serper
