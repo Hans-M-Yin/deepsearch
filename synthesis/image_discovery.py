@@ -991,13 +991,30 @@ class ImageDiscoveryBuilder:
                     "User-Agent": "deepsearch-synthesis/0.1",
                 },
             )
+            started_at = time.perf_counter()
             try:
                 with urlopen(request, timeout=self.config.precheck_timeout_s) as response:
                     content_type = response.headers.get("Content-Type", "")
                     payload = response.read() if not max_bytes or max_bytes <= 0 else response.read(max_bytes)
+                elapsed_s = time.perf_counter() - started_at
                 self._mark_host_slot(host, success=True)
+                self._log_image_download(
+                    image_url=image_url,
+                    byte_count=len(payload),
+                    elapsed_s=elapsed_s,
+                    content_type=content_type,
+                    attempt=attempt,
+                    max_bytes=max_bytes,
+                )
                 return payload, content_type
             except HTTPError as exc:
+                elapsed_s = time.perf_counter() - started_at
+                self._log_image_download_failure(
+                    image_url=image_url,
+                    reason=f"http_{exc.code}",
+                    elapsed_s=elapsed_s,
+                    attempt=attempt,
+                )
                 retry_after = self._retry_after_seconds(exc)
                 if exc.code == 429 and attempt < self.config.precheck_retries:
                     self._mark_host_slot(host, retry_after=retry_after or (attempt * 2.0))
@@ -1006,10 +1023,31 @@ class ImageDiscoveryBuilder:
                     continue
                 return f"http_{exc.code}"
             except URLError as exc:
+                elapsed_s = time.perf_counter() - started_at
+                self._log_image_download_failure(
+                    image_url=image_url,
+                    reason=f"url_error:{exc.reason}",
+                    elapsed_s=elapsed_s,
+                    attempt=attempt,
+                )
                 last_error = f"url_error:{exc.reason}"
             except TimeoutError:
+                elapsed_s = time.perf_counter() - started_at
+                self._log_image_download_failure(
+                    image_url=image_url,
+                    reason=f"timeout_after_{self.config.precheck_timeout_s}s",
+                    elapsed_s=elapsed_s,
+                    attempt=attempt,
+                )
                 last_error = f"timeout_after_{self.config.precheck_timeout_s}s"
             except Exception as exc:
+                elapsed_s = time.perf_counter() - started_at
+                self._log_image_download_failure(
+                    image_url=image_url,
+                    reason=f"download_error:{exc.__class__.__name__}:{exc}",
+                    elapsed_s=elapsed_s,
+                    attempt=attempt,
+                )
                 last_error = f"download_error:{exc.__class__.__name__}:{exc}"
             if attempt < self.config.precheck_retries:
                 time.sleep(min(6.0, attempt * 1.5))
@@ -1167,6 +1205,56 @@ class ImageDiscoveryBuilder:
             f"[image-url-check][{stage}] invalid image URL: {image_url or '<missing>'} | reason: {reason}",
             file=sys.stderr,
         )
+
+    @staticmethod
+    def _log_image_download(
+        *,
+        image_url: str,
+        byte_count: int,
+        elapsed_s: float,
+        content_type: str | None,
+        attempt: int,
+        max_bytes: int | None,
+    ) -> None:
+        speed_bps = byte_count / elapsed_s if elapsed_s > 0 else 0.0
+        mode = "full" if not max_bytes or max_bytes <= 0 else f"partial<= {max_bytes}B"
+        print(
+            "[image-download] "
+            f"url={image_url} "
+            f"size={ImageDiscoveryBuilder._format_byte_count(byte_count)} "
+            f"time={elapsed_s:.3f}s "
+            f"speed={ImageDiscoveryBuilder._format_byte_count(int(speed_bps))}/s "
+            f"content_type={content_type or '<missing>'} "
+            f"attempt={attempt} "
+            f"mode={mode}",
+            file=sys.stderr,
+        )
+
+    @staticmethod
+    def _log_image_download_failure(
+        *,
+        image_url: str,
+        reason: str,
+        elapsed_s: float,
+        attempt: int,
+    ) -> None:
+        print(
+            "[image-download-fail] "
+            f"url={image_url} "
+            f"time={elapsed_s:.3f}s "
+            f"attempt={attempt} "
+            f"reason={reason}",
+            file=sys.stderr,
+        )
+
+    @staticmethod
+    def _format_byte_count(size: int) -> str:
+        value = float(max(0, size))
+        for unit in ("B", "KB", "MB", "GB"):
+            if value < 1024.0 or unit == "GB":
+                return f"{value:.1f}{unit}" if unit != "B" else f"{int(value)}B"
+            value /= 1024.0
+        return f"{int(value)}B"
 
     @staticmethod
     def _log_recovered_image_url(
