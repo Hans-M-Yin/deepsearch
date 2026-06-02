@@ -98,11 +98,21 @@ Content: ...(Emit here)...
 3. This image does not belong to any trivial case.
 </reason>
 
-<query>Photo of Lionel Messi sleeping while holding the FIFA World Cup trophy</query>
+<query>Photo of Lionel Messi sleeping while holding the FIFA World Cup trophy in 2022</query>
 <reason>
 1. Although this query does not explicitly specify a date, internet evidence shows that it clearly refers to the famous photo Messi posted on Instagram after winning the 2022 FIFA World Cup. There are no other widely known or competing images matching the description “Messi sleeping while holding the World Cup trophy.” The only images satisfying this query originate from Messi’s official post, so the visual target is effectively unique. Even if the image is reposted, cropped, or compressed by different media sources, the visual content remains the same.
 2. The image genuinely exists online, was officially published by Messi himself, and is widely documented across news outlets and social media. The purpose of this query is specifically to retrieve that exact image through image search.
 3. The image is quite unique, and does not belong to any trivial case.
+</reason>
+
+Entity: Justin Bieber
+Content: ...(Emit here)...
+
+<query>The cover of the album "Changes" by Justin Bieber</query>
+<reason>
+1. This query represent a clear and unique cover of a album "Changes" by Justin Bieber.  Because all editions of the album worldwide share the same cover artwork featuring a red-themed side-view portrait of Justin Bieber, the image referenced by this text corresponds to a unique visual target.
+2. The image is quite popular, and there are many copies on the internet.
+3. The cover contains many visual details, including the clothing design, text placement, and typography.
 </reason>
 
 Now, strictly follow all the requirements and goals above to complete the following person.
