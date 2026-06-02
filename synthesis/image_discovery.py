@@ -46,7 +46,7 @@ from .visual_planner import SearchQuerySpec, VisualSearchPlan
 
 
 def _trace_timing_enabled() -> bool:
-    return os.environ.get("SYNTHESIS_TRACE_TIMING", "1") != "0"
+    return os.environ.get("SYNTHESIS_TRACE_TIMING", "0") != "0"
 
 
 def _trace_timing(message: str) -> None:

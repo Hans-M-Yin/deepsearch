@@ -70,7 +70,7 @@ class ModelWorkerClient(Protocol):
 
 
 def _trace_timing_enabled() -> bool:
-    return os.environ.get("SYNTHESIS_TRACE_TIMING", "1") != "0"
+    return os.environ.get("SYNTHESIS_TRACE_TIMING", "0") != "0"
 
 
 def _trace_model_call(

@@ -167,6 +167,7 @@ class GraphRunner:
                 self.state.step += 1
                 self._record_result(result)
                 self._emit_progress()
+                self._emit_warning(result)
                 if result.error:
                     last_error = result.error
                     if self.config.stop_on_error:
@@ -321,6 +322,32 @@ class GraphRunner:
             return
         if sys.stderr.isatty() and self._progress_width > 0:
             print(file=sys.stderr, flush=True)
+
+    @staticmethod
+    def _emit_warning(result: NodeExpansionResult) -> None:
+        if result.error:
+            task = result.task
+            print(
+                "[warning] "
+                f"task_failed url={task.url!r} "
+                f"title={task.title!r} "
+                f"depth={task.depth} "
+                f"error={result.error}",
+                file=sys.stderr,
+                flush=True,
+            )
+            return
+        if result.attribute_error:
+            task = result.task
+            print(
+                "[warning] "
+                f"attribute_extract_failed url={task.url!r} "
+                f"title={task.title!r} "
+                f"depth={task.depth} "
+                f"error={result.attribute_error}",
+                file=sys.stderr,
+                flush=True,
+            )
 
     def _should_continue(self) -> bool:
         if self.strategy.queue_size() <= 0:

@@ -21,7 +21,7 @@ from .model_worker import LLM_WORKER, ModelMessage, ModelRequest, ModelResponse,
 
 
 def _trace_timing_enabled() -> bool:
-    return os.environ.get("SYNTHESIS_TRACE_TIMING", "1") != "0"
+    return os.environ.get("SYNTHESIS_TRACE_TIMING", "0") != "0"
 
 
 def _trace_timing(message: str) -> None:
