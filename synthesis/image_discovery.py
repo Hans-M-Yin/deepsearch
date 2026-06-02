@@ -390,14 +390,23 @@ class ImageDiscoveryBuilder:
                 }
             )
 
-            for search_result in response.results:
+            for result_index, search_result in enumerate(response.results, start=1):
                 if not isinstance(search_result, ImageSearchResult):
                     decision_log.append(
                         {
                             "kind": "candidate_skip",
                             "query": query.query,
+                            "result_index": result_index,
                             "reason": "non_image_search_result",
                         }
+                    )
+                    self._log_image_result_fate(
+                        plan_id=plan.plan_id,
+                        query=query.query,
+                        result_index=result_index,
+                        search_result=None,
+                        fate="skipped",
+                        reason="non_image_search_result",
                     )
                     continue
                 key = self._candidate_key(search_result)
@@ -408,7 +417,16 @@ class ImageDiscoveryBuilder:
                             query=query.query,
                             search_result=search_result,
                             reason="missing_or_duplicate_candidate_key",
+                            result_index=result_index,
                         )
+                    )
+                    self._log_image_result_fate(
+                        plan_id=plan.plan_id,
+                        query=query.query,
+                        result_index=result_index,
+                        search_result=search_result,
+                        fate="skipped",
+                        reason="missing_or_duplicate_candidate_key",
                     )
                     continue
                 seen_keys.add(key)
@@ -426,8 +444,18 @@ class ImageDiscoveryBuilder:
                             query=query.query,
                             search_result=search_result,
                             reason=validation.reason or "drop_candidate",
+                            result_index=result_index,
                             validation=validation,
                         )
+                    )
+                    self._log_image_result_fate(
+                        plan_id=plan.plan_id,
+                        query=query.query,
+                        result_index=result_index,
+                        search_result=search_result,
+                        fate="dropped",
+                        reason=validation.reason or "drop_candidate",
+                        raw_model_output=(validation.metadata or {}).get("raw_model_output"),
                     )
                     continue
                 if (
@@ -440,8 +468,18 @@ class ImageDiscoveryBuilder:
                             query=query.query,
                             search_result=search_result,
                             reason=validation.reason or "rejected_not_stored",
+                            result_index=result_index,
                             validation=validation,
                         )
+                    )
+                    self._log_image_result_fate(
+                        plan_id=plan.plan_id,
+                        query=query.query,
+                        result_index=result_index,
+                        search_result=search_result,
+                        fate="skipped",
+                        reason=validation.reason or "rejected_not_stored",
+                        raw_model_output=(validation.metadata or {}).get("raw_model_output"),
                     )
                     continue
 
@@ -461,10 +499,24 @@ class ImageDiscoveryBuilder:
                         query=query.query,
                         search_result=search_result,
                         reason=validation.reason or validation.status.value,
+                        result_index=result_index,
                         status=validation.status.value,
                         bundle_count=len(discovered),
                         validation=validation,
                     )
+                )
+                self._log_image_result_fate(
+                    plan_id=plan.plan_id,
+                    query=query.query,
+                    result_index=result_index,
+                    search_result=search_result,
+                    fate=(
+                        "accepted"
+                        if validation.status == ImageCandidateStatus.ACCEPTED
+                        else "rejected"
+                    ),
+                    reason=validation.reason or validation.status.value,
+                    raw_model_output=(validation.metadata or {}).get("raw_model_output"),
                 )
                 if len(discovered) >= self.config.max_images_per_plan:
                     decision_log.append(
@@ -484,6 +536,7 @@ class ImageDiscoveryBuilder:
         query: str,
         search_result: ImageSearchResult,
         reason: str,
+        result_index: int | None = None,
         status: str | None = None,
         bundle_count: int | None = None,
         validation: ImageValidationResult | None = None,
@@ -496,6 +549,8 @@ class ImageDiscoveryBuilder:
             "url": search_result.image_url,
             "reason": reason,
         }
+        if result_index is not None:
+            payload["result_index"] = result_index
         if status is not None:
             payload["status"] = status
         if bundle_count is not None:
@@ -801,6 +856,7 @@ class ImageDiscoveryBuilder:
                 plan_id=plan.plan_id,
                 search_result=search_result,
                 model_image_url=model_image_url,
+                model_output=response.content,
             )
         except Exception as exc:
             error = f"{exc.__class__.__name__}: {exc}"
@@ -1456,6 +1512,35 @@ class ImageDiscoveryBuilder:
             file=sys.stderr,
         )
 
+    @staticmethod
+    def _log_image_result_fate(
+        *,
+        plan_id: str,
+        query: str,
+        result_index: int | None,
+        search_result: ImageSearchResult | None,
+        fate: str,
+        reason: str,
+        raw_model_output: str | None = None,
+    ) -> None:
+        title = search_result.title if search_result is not None else None
+        rank = search_result.rank if search_result is not None else None
+        url = search_result.image_url if search_result is not None else None
+        message = (
+            "[image-result-fate] "
+            f"plan_id={plan_id} "
+            f"query={query!r} "
+            f"index={result_index} "
+            f"rank={rank} "
+            f"fate={fate} "
+            f"title={title!r} "
+            f"url={url} "
+            f"reason={reason!r}"
+        )
+        if raw_model_output:
+            message += f" raw_model_output={raw_model_output!r}"
+        print(message, file=sys.stderr, flush=True)
+
     def _image_check_with_mllm(
         self,
         *,
@@ -1508,6 +1593,7 @@ class ImageDiscoveryBuilder:
             plan_id=plan.plan_id,
             search_result=search_result,
             model_image_url=image_for_model,
+            model_output=response.content,
         )
         return self._parse_image_check_response(response.content, run_id=run_id)
 
@@ -1520,22 +1606,24 @@ class ImageDiscoveryBuilder:
         plan_id: str,
         search_result: ImageSearchResult,
         model_image_url: str | None,
+        model_output: str | None = None,
     ) -> None:
         if model_image_url and model_image_url.startswith("data:"):
             image_ref = f"data_url(len={len(model_image_url)})"
         else:
             image_ref = model_image_url
-        print(
+        message = (
             "[image-model-call] "
             f"stage={stage} "
             f"when={when} "
             f"model={model_alias} "
             f"plan_id={plan_id} "
             f"title={search_result.title!r} "
-            f"image_ref={image_ref}",
-            file=sys.stderr,
-            flush=True,
+            f"image_ref={image_ref}"
         )
+        if model_output is not None:
+            message += f" raw_output={model_output!r}"
+        print(message, file=sys.stderr, flush=True)
 
     @staticmethod
     def _image_check_prompt_input(

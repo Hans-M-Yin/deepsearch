@@ -761,6 +761,10 @@ class GraphExpansionStrategy:
                 item for item in decision_log
                 if isinstance(item, dict) and item.get("kind") == "query_results"
             ]
+            routing_records = [
+                item for item in decision_log
+                if isinstance(item, dict) and item.get("kind") in {"candidate_kept", "candidate_drop", "candidate_skip"}
+            ]
             print(
                 "[image-expand-result] "
                 f"source_text={title!r} "
@@ -774,9 +778,36 @@ class GraphExpansionStrategy:
                 f"primary_url={primary_url}",
                 file=sys.stderr,
             )
+            if routing_records:
+                routing_payload = []
+                for item in routing_records[:12]:
+                    kind = str(item.get("kind") or "")
+                    status = str(item.get("status") or "").lower()
+                    if kind == "candidate_kept" and status == "accepted":
+                        fate = "accepted"
+                    elif kind == "candidate_kept" and status == "rejected":
+                        fate = "rejected"
+                    elif kind == "candidate_drop":
+                        fate = "dropped"
+                    else:
+                        fate = "skipped"
+                    routing_payload.append(
+                        {
+                            "index": item.get("result_index"),
+                            "rank": item.get("rank"),
+                            "fate": fate,
+                            "title": item.get("title"),
+                            "reason": item.get("reason"),
+                        }
+                    )
+                print(
+                    f"[image-expand-result]      routing={routing_payload}",
+                    file=sys.stderr,
+                )
             if accepted_records:
                 added_payload = [
                     {
+                        "index": item.get("result_index"),
                         "rank": item.get("rank"),
                         "title": item.get("title"),
                         "reason": item.get("reason"),
@@ -790,6 +821,7 @@ class GraphExpansionStrategy:
             if rejected_records:
                 rejected_payload = [
                     {
+                        "index": item.get("result_index"),
                         "rank": item.get("rank"),
                         "title": item.get("title"),
                         "reason": item.get("reason"),
@@ -805,6 +837,7 @@ class GraphExpansionStrategy:
             if dropped_records:
                 deleted_payload = [
                     {
+                        "index": item.get("result_index"),
                         "kind": item.get("kind"),
                         "rank": item.get("rank"),
                         "title": item.get("title"),
