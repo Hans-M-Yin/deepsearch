@@ -602,6 +602,7 @@ class GraphExpansionStrategy:
             source_evidence_ids=[text_result.text_evidence.evidence_id],
             run_id=run_id,
         )
+        self._log_image_plan_start(text_result, plans)
         image_results = [
             self.image_builder.discover_for_plan(
                 plan,
@@ -610,6 +611,7 @@ class GraphExpansionStrategy:
             )
             for plan in plans
         ]
+        self._log_image_plan_results(text_result, plans, image_results)
         queued_tasks: list[ExpansionTask] = []
         for image_result in image_results:
             for pending in image_result.queued_tasks:
@@ -617,6 +619,78 @@ class GraphExpansionStrategy:
                 if task is not None:
                     queued_tasks.append(task)
         return plans, image_results, queued_tasks
+
+    @staticmethod
+    def _log_image_plan_start(
+        text_result: WikiTextBuildResult,
+        plans: list[VisualSearchPlan],
+    ) -> None:
+        title = getattr(text_result.node, "title", None) or text_result.node.node_id
+        print(
+            "[image-expand] "
+            f"source_text={title!r} "
+            f"source_node_id={text_result.node.node_id} "
+            f"visual_plans={len(plans)}",
+            file=sys.stderr,
+        )
+        for index, plan in enumerate(plans, start=1):
+            queries = [query.query for query in plan.queries]
+            print(
+                "[image-expand-plan] "
+                f"source_text={title!r} "
+                f"plan_index={index} "
+                f"plan_id={plan.plan_id} "
+                f"queries={queries}",
+                file=sys.stderr,
+            )
+
+    @staticmethod
+    def _log_image_plan_results(
+        text_result: WikiTextBuildResult,
+        plans: list[VisualSearchPlan],
+        image_results: list[ImageDiscoveryResult],
+    ) -> None:
+        title = getattr(text_result.node, "title", None) or text_result.node.node_id
+        kept_count = sum(1 for result in image_results if result.image_node is not None)
+        accepted_total = sum(len(result.accepted_images()) for result in image_results)
+        candidate_total = sum(len(result.candidates) for result in image_results)
+        print(
+            "[image-expand-summary] "
+            f"source_text={title!r} "
+            f"source_node_id={text_result.node.node_id} "
+            f"plans={len(plans)} "
+            f"candidates={candidate_total} "
+            f"accepted={accepted_total} "
+            f"kept_image_nodes={kept_count}",
+            file=sys.stderr,
+        )
+        for index, result in enumerate(image_results, start=1):
+            primary = result.primary_image()
+            primary_url = primary.search_result.image_url if primary is not None else None
+            primary_title = primary.search_result.title if primary is not None else None
+            image_node_id = result.image_node.node_id if result.image_node is not None else None
+            failure_reasons = [
+                candidate.validation.reason
+                for candidate in result.candidates
+                if candidate.validation.reason
+                and candidate.validation.status != "accepted"
+            ]
+            if not failure_reasons and result.image_node is None:
+                failure_reasons = ["no_primary_candidate_selected"]
+            print(
+                "[image-expand-result] "
+                f"source_text={title!r} "
+                f"plan_index={index} "
+                f"plan_id={result.plan_id} "
+                f"candidates={len(result.candidates)} "
+                f"accepted={len(result.accepted_images())} "
+                f"kept={'yes' if result.image_node is not None else 'no'} "
+                f"image_node_id={image_node_id} "
+                f"primary_title={primary_title!r} "
+                f"primary_url={primary_url} "
+                f"failure_reasons={failure_reasons[:3]}",
+                file=sys.stderr,
+            )
 
     def _enqueue_image_entity_task(self, pending: dict[str, Any]) -> ExpansionTask | None:
         url = pending.get("url")

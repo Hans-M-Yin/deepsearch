@@ -119,6 +119,9 @@ class ImageDiscoveryConfig:
     model_image_max_bytes: int | None = None
     precheck_retries: int = 3
     host_min_interval_s: float = 0.35
+    wikimedia_host_min_interval_s: float = 1.25
+    wikimedia_429_retry_after_s: float = 15.0
+    user_agent: str | None = None
     cache_dir: str | None = None
     try_source_page_recovery: bool = True
     source_page_timeout_s: float = 20.0
@@ -288,6 +291,7 @@ class ImageDiscoveryBuilder:
         self.wiki_resolver = wiki_resolver or WikiEntityResolver()
         self._resolved_image_cache: dict[str, ResolvedImageAsset] = {}
         self._host_not_before: dict[str, float] = {}
+        self._host_locks: dict[str, threading.Lock] = {}
         self._download_lock = threading.Lock()
 
     def discover_for_plan(
@@ -983,72 +987,74 @@ class ImageDiscoveryBuilder:
         host = urlparse(image_url).netloc.lower()
         last_error: str | None = None
         for attempt in range(1, max(1, self.config.precheck_retries) + 1):
-            self._wait_for_host_slot(host)
-            request = Request(
-                image_url,
-                headers={
-                    "Accept": "image/*,*/*;q=0.8",
-                    "User-Agent": "deepsearch-synthesis/0.1",
-                },
-            )
-            started_at = time.perf_counter()
-            try:
-                with urlopen(request, timeout=self.config.precheck_timeout_s) as response:
-                    content_type = response.headers.get("Content-Type", "")
-                    payload = response.read() if not max_bytes or max_bytes <= 0 else response.read(max_bytes)
-                elapsed_s = time.perf_counter() - started_at
-                self._mark_host_slot(host, success=True)
-                self._log_image_download(
-                    image_url=image_url,
-                    byte_count=len(payload),
-                    elapsed_s=elapsed_s,
-                    content_type=content_type,
-                    attempt=attempt,
-                    max_bytes=max_bytes,
+            host_lock = self._host_lock(host)
+            with host_lock:
+                self._wait_for_host_slot(host)
+                request = Request(
+                    image_url,
+                    headers={
+                        "Accept": "image/*,*/*;q=0.8",
+                        "User-Agent": self._user_agent(),
+                    },
                 )
-                return payload, content_type
-            except HTTPError as exc:
-                elapsed_s = time.perf_counter() - started_at
-                self._log_image_download_failure(
-                    image_url=image_url,
-                    reason=f"http_{exc.code}",
-                    elapsed_s=elapsed_s,
-                    attempt=attempt,
-                )
-                retry_after = self._retry_after_seconds(exc)
-                if exc.code == 429 and attempt < self.config.precheck_retries:
-                    self._mark_host_slot(host, retry_after=retry_after or (attempt * 2.0))
-                    time.sleep(retry_after or (attempt * 2.0))
-                    last_error = "http_429"
-                    continue
-                return f"http_{exc.code}"
-            except URLError as exc:
-                elapsed_s = time.perf_counter() - started_at
-                self._log_image_download_failure(
-                    image_url=image_url,
-                    reason=f"url_error:{exc.reason}",
-                    elapsed_s=elapsed_s,
-                    attempt=attempt,
-                )
-                last_error = f"url_error:{exc.reason}"
-            except TimeoutError:
-                elapsed_s = time.perf_counter() - started_at
-                self._log_image_download_failure(
-                    image_url=image_url,
-                    reason=f"timeout_after_{self.config.precheck_timeout_s}s",
-                    elapsed_s=elapsed_s,
-                    attempt=attempt,
-                )
-                last_error = f"timeout_after_{self.config.precheck_timeout_s}s"
-            except Exception as exc:
-                elapsed_s = time.perf_counter() - started_at
-                self._log_image_download_failure(
-                    image_url=image_url,
-                    reason=f"download_error:{exc.__class__.__name__}:{exc}",
-                    elapsed_s=elapsed_s,
-                    attempt=attempt,
-                )
-                last_error = f"download_error:{exc.__class__.__name__}:{exc}"
+                started_at = time.perf_counter()
+                try:
+                    with urlopen(request, timeout=self.config.precheck_timeout_s) as response:
+                        content_type = response.headers.get("Content-Type", "")
+                        payload = response.read() if not max_bytes or max_bytes <= 0 else response.read(max_bytes)
+                    elapsed_s = time.perf_counter() - started_at
+                    self._mark_host_slot(host, success=True)
+                    self._log_image_download(
+                        image_url=image_url,
+                        byte_count=len(payload),
+                        elapsed_s=elapsed_s,
+                        content_type=content_type,
+                        attempt=attempt,
+                        max_bytes=max_bytes,
+                    )
+                    return payload, content_type
+                except HTTPError as exc:
+                    elapsed_s = time.perf_counter() - started_at
+                    self._log_image_download_failure(
+                        image_url=image_url,
+                        reason=f"http_{exc.code}",
+                        elapsed_s=elapsed_s,
+                        attempt=attempt,
+                    )
+                    retry_after = self._retry_after_seconds(exc)
+                    if exc.code == 429 and attempt < self.config.precheck_retries:
+                        backoff_s = retry_after or self._default_retry_after_seconds(host, attempt)
+                        self._mark_host_slot(host, retry_after=backoff_s)
+                        last_error = "http_429"
+                        continue
+                    return f"http_{exc.code}"
+                except URLError as exc:
+                    elapsed_s = time.perf_counter() - started_at
+                    self._log_image_download_failure(
+                        image_url=image_url,
+                        reason=f"url_error:{exc.reason}",
+                        elapsed_s=elapsed_s,
+                        attempt=attempt,
+                    )
+                    last_error = f"url_error:{exc.reason}"
+                except TimeoutError:
+                    elapsed_s = time.perf_counter() - started_at
+                    self._log_image_download_failure(
+                        image_url=image_url,
+                        reason=f"timeout_after_{self.config.precheck_timeout_s}s",
+                        elapsed_s=elapsed_s,
+                        attempt=attempt,
+                    )
+                    last_error = f"timeout_after_{self.config.precheck_timeout_s}s"
+                except Exception as exc:
+                    elapsed_s = time.perf_counter() - started_at
+                    self._log_image_download_failure(
+                        image_url=image_url,
+                        reason=f"download_error:{exc.__class__.__name__}:{exc}",
+                        elapsed_s=elapsed_s,
+                        attempt=attempt,
+                    )
+                    last_error = f"download_error:{exc.__class__.__name__}:{exc}"
             if attempt < self.config.precheck_retries:
                 time.sleep(min(6.0, attempt * 1.5))
         return last_error or "download_failed"
@@ -1083,7 +1089,7 @@ class ImageDiscoveryBuilder:
             source_page_url,
             headers={
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "User-Agent": "deepsearch-synthesis/0.1",
+                "User-Agent": self._user_agent(),
             },
         )
         try:
@@ -1183,11 +1189,45 @@ class ImageDiscoveryBuilder:
         if not host:
             return
         with self._download_lock:
-            delay = self.config.host_min_interval_s if success else max(
-                self.config.host_min_interval_s,
-                retry_after or self.config.host_min_interval_s,
+            min_interval_s = self._host_min_interval_seconds(host)
+            delay = min_interval_s if success else max(
+                min_interval_s,
+                retry_after or min_interval_s,
             )
             self._host_not_before[host] = time.time() + delay
+
+    def _host_lock(self, host: str) -> threading.Lock:
+        with self._download_lock:
+            lock = self._host_locks.get(host)
+            if lock is None:
+                lock = threading.Lock()
+                self._host_locks[host] = lock
+            return lock
+
+    def _host_min_interval_seconds(self, host: str) -> float:
+        if self._is_wikimedia_host(host):
+            return self.config.wikimedia_host_min_interval_s
+        return self.config.host_min_interval_s
+
+    def _default_retry_after_seconds(self, host: str, attempt: int) -> float:
+        if self._is_wikimedia_host(host):
+            return max(self.config.wikimedia_429_retry_after_s, float(attempt) * self.config.wikimedia_429_retry_after_s)
+        return float(attempt) * 2.0
+
+    @staticmethod
+    def _is_wikimedia_host(host: str) -> bool:
+        normalized = (host or "").lower()
+        return normalized.endswith((".wikimedia.org", ".wikipedia.org", ".mediawiki.org"))
+
+    def _user_agent(self) -> str:
+        configured = (
+            self.config.user_agent
+            or os.environ.get("SYNTHESIS_USER_AGENT")
+            or os.environ.get("WIKIMEDIA_USER_AGENT")
+        )
+        if configured:
+            return configured
+        return "DeepSearchBot/0.1 (https://github.com/shawn0728/OpenSearch-VL; automated research image fetcher)"
 
     @staticmethod
     def _retry_after_seconds(error: HTTPError) -> float | None:
