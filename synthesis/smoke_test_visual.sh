@@ -1,3 +1,5 @@
+mkdir -p runs/multi_seed_visual_smoke
+
 python run_min_graph.py \
   --seed-urls-file synthesis/seeds.txt \
   --store-dir runs/multi_seed_visual_smoke \
@@ -10,5 +12,6 @@ python run_min_graph.py \
   --max-depth 64 \
   --parallel-workers 64 \
   --batch-size 64 \
-  --image-backend serper
+  --image-backend serper \
+  2>&1 | tee runs/multi_seed_visual_smoke/run.log
   
