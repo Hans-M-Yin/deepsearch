@@ -8,6 +8,6 @@ python run_min_graph.py \
   --max-steps 32 \
   --max-nodes 8 \
   --max-depth 64 \
-  --parallel-workers 32 \
+  --parallel-workers 1 \
   --batch-size 32 \
   --image-backend serper
