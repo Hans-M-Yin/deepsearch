@@ -234,13 +234,27 @@ class ModelRouterWorkerClient:
             raise KeyError(f"Model alias is not registered: {alias}")
 
         client = self._client_for(alias, config)
+        sampling_params = dict(config.get("sampling_params") or {})
+        extra_body = dict(request.metadata.get("extra_body") or {})
+        routed_temperature = sampling_params.pop("temperature", request.temperature)
+        routed_max_tokens = request.max_tokens
+        if routed_max_tokens is None:
+            out_seq_length = sampling_params.pop("out_seq_length", None)
+            max_tokens = sampling_params.pop("max_tokens", None)
+            chosen_max_tokens = out_seq_length if out_seq_length is not None else max_tokens
+            if chosen_max_tokens is not None:
+                routed_max_tokens = int(chosen_max_tokens)
+        extra_body = {**sampling_params, **extra_body} if sampling_params or extra_body else {}
+        routed_metadata = dict(request.metadata or {})
+        if extra_body:
+            routed_metadata["extra_body"] = extra_body
         routed_request = ModelRequest(
             messages=request.messages,
             model=config["served_model"],
-            temperature=request.temperature,
-            max_tokens=request.max_tokens,
+            temperature=routed_temperature,
+            max_tokens=routed_max_tokens,
             response_format=request.response_format,
-            metadata=request.metadata,
+            metadata=routed_metadata,
         )
         response = client.generate(routed_request)
         response.metadata.update(
@@ -248,6 +262,7 @@ class ModelRouterWorkerClient:
                 "model_alias": alias,
                 "served_model": config["served_model"],
                 "base_url": config.get("base_url"),
+                "sampling_params": config.get("sampling_params"),
             }
         )
         return response
