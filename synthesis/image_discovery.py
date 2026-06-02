@@ -95,7 +95,7 @@ Describe the image and ground only unique, searchable entities visible in or cle
 
 Keep entities only if they are named or uniquely identifiable, such as a person, landmark, movie, book, album, artwork, product, brand, team, organization, event, document, map, or logo. Do not output generic objects such as person, woman, car, building, crowd, red shirt, tree.
 
-Use candidate metadata only to disambiguate what is visible. Do not invent entities that are not visually supported.
+Use candidate metadata only to disambiguate what is visible. The preferred textual description may help identify a visible person or entity when the image alone is insufficient, but do not invent entities that are not visually supported.
 
 Output exactly one block:
 <ground>
@@ -913,9 +913,11 @@ class ImageDiscoveryBuilder:
         search_result: ImageSearchResult,
         validation: ImageValidationResult,
     ) -> str:
+        preferred_description = ImageDiscoveryBuilder._preferred_search_result_description(search_result)
         return (
             f"Target:\n{plan.target.content or ''}\n\n"
             "Candidate metadata:\n"
+            f"preferred_textual_description: {preferred_description}\n"
             f"title: {search_result.title or ''}\n"
             f"caption/snippet: {search_result.snippet or ''}\n"
             f"source_page_url: {search_result.source_page_url or ''}\n\n"
@@ -923,6 +925,16 @@ class ImageDiscoveryBuilder:
             f"reason: {validation.reason or ''}\n"
             f"visual_facts: {validation.metadata.get('visual_facts', [])}\n"
         )
+
+    @staticmethod
+    def _preferred_search_result_description(search_result: ImageSearchResult) -> str:
+        title = (search_result.title or "").strip()
+        snippet = (search_result.snippet or "").strip()
+        if snippet and len(snippet) >= len(title):
+            return snippet
+        if title:
+            return title
+        return snippet
 
     @staticmethod
     def _parse_image_ground_response(text: str, *, run_id: str | None) -> dict[str, Any]:

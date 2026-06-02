@@ -1,0 +1,31 @@
+# Initial multi-seed set for synthesis.
+# One full Wikipedia URL per line.
+# Mix of head (popular/mainstream) and tail (niche/long-tail) entities.
+
+# ====================
+# Head / mainstream
+# ====================
+
+# Person
+https://en.wikipedia.org/wiki/Kobe_Bryant
+https://en.wikipedia.org/wiki/Taylor_Swift
+https://en.wikipedia.org/wiki/Shou_Chew
+
+# Artifact
+https://en.wikipedia.org/wiki/IPhone_(1st_generation)
+https://en.wikipedia.org/wiki/Mona_Lisa
+https://en.wikipedia.org/wiki/Thriller_(album)
+
+
+# ====================
+# Tail / niche
+# ====================
+
+# Person
+https://en.wikipedia.org/wiki/Ada_Hegerberg
+https://en.wikipedia.org/wiki/Chien-Shiung_Wu
+
+# Artifact
+https://en.wikipedia.org/wiki/Bird_in_Space
+https://en.wikipedia.org/wiki/Book_of_Kells
+https://en.wikipedia.org/wiki/Kinora
