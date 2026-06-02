@@ -1,6 +1,6 @@
 python run_min_graph.py \
-  --seed-url https://en.wikipedia.org/wiki/Jay_Chou \
-  --store-dir runs/kobe_with_images_serper_20_100_depth_33 \
+  --seed-urls-file synthesis/seeds.txt \
+  --store-dir runs/multi_seed_visual_smoke \
   --reader-base-url http://10.124.136.6:8004 \
   --fresh \
   --skip-attributes \
