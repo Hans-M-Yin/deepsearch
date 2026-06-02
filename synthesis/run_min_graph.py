@@ -205,7 +205,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-link-markdown-chars", type=int, default=80000, help="Max raw markdown chars used for wiki-link extraction. <=0 disables truncation.")
     parser.add_argument("--max-llm-neighbor-candidates", type=int, default=40, help="Maximum rule-recalled wiki links sent to WIKI_NEIGHBOR_MODEL per page.")
     parser.add_argument("--per-query-image-limit", type=int, default=3, help="Image search results per visual query.")
-    parser.add_argument("--max-images-per-plan", type=int, default=1, help="Accepted images per visual plan.")
+    parser.add_argument("--max-images-per-plan", type=int, default=5, help="Accepted images per visual plan.")
     parser.add_argument("--no-images", action="store_true", help="Disable visual planning and image discovery.")
     parser.add_argument(
         "--force-accept-images",
