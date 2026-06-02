@@ -204,13 +204,127 @@ class OpenAIModelWorkerClient:
         return parsed
 
 
+class AzureOpenAIModelWorkerClient:
+    """Azure OpenAI-compatible model worker.
+
+    This client is used for endpoints that expect the AzureOpenAI SDK shape,
+    including `azure_endpoint` and `api_version`.
+    """
+
+    def __init__(
+        self,
+        *,
+        model: str,
+        api_key: str | None = None,
+        azure_endpoint: str,
+        api_version: str,
+        timeout_s: float | None = None,
+        default_headers: dict[str, str] | None = None,
+        generate_tt_logid: bool = False,
+    ) -> None:
+        try:
+            from openai import AzureOpenAI
+        except ImportError as exc:
+            raise ImportError(
+                "AzureOpenAIModelWorkerClient requires the `openai` package. "
+                "Install it or use a different ModelWorkerClient implementation."
+            ) from exc
+
+        self.model = model
+        self.azure_endpoint = azure_endpoint
+        self.api_version = api_version
+        self.api_key = api_key or os.environ.get("OPENAI_API_KEY") or "EMPTY"
+        self.timeout_s = timeout_s
+        self.generate_tt_logid = generate_tt_logid
+        self._azure_client_cls = AzureOpenAI
+        self._default_headers = dict(default_headers or {})
+        self.client = self._build_client()
+
+    def _build_headers(self) -> dict[str, str] | None:
+        headers = dict(self._default_headers)
+        if self.generate_tt_logid and "X-TT-LOGID" not in headers:
+            try:
+                import logid as tt_logid
+
+                headers["X-TT-LOGID"] = tt_logid.generate_v2()
+            except Exception:
+                pass
+        return headers or None
+
+    def _build_client(self) -> Any:
+        return self._azure_client_cls(
+            api_key=self.api_key,
+            api_version=self.api_version,
+            azure_endpoint=self.azure_endpoint,
+            timeout=self.timeout_s,
+            default_headers=self._build_headers(),
+        )
+
+    def generate(self, request: ModelRequest) -> ModelResponse:
+        label = str(request.metadata.get("trace_label") or request.model or self.model)
+        _trace_model_call(
+            phase="start",
+            label=label,
+            model=request.model or self.model,
+            base_url=self.azure_endpoint,
+            message_count=len(request.messages),
+            max_tokens=request.max_tokens,
+        )
+        started_at = time.perf_counter()
+        kwargs: dict[str, Any] = {
+            "model": request.model or self.model,
+            "messages": [message.to_dict() for message in request.messages],
+            "temperature": request.temperature,
+            "stream": False,
+        }
+        if request.max_tokens is not None:
+            kwargs["max_tokens"] = request.max_tokens
+        if request.response_format is not None:
+            kwargs["response_format"] = request.response_format
+
+        extra_body = request.metadata.get("extra_body")
+        if isinstance(extra_body, dict):
+            kwargs["extra_body"] = extra_body
+
+        # Rebuild client per request when dynamic TT logid is enabled.
+        if self.generate_tt_logid:
+            self.client = self._build_client()
+        completion = self.client.chat.completions.create(**kwargs)
+        elapsed_s = time.perf_counter() - started_at
+        choice = completion.choices[0]
+        content = choice.message.content or ""
+        _trace_model_call(
+            phase="done",
+            label=label,
+            model=getattr(completion, "model", None) or kwargs["model"],
+            base_url=self.azure_endpoint,
+            elapsed_s=elapsed_s,
+            message_count=len(request.messages),
+            max_tokens=request.max_tokens,
+        )
+
+        raw_response = completion.model_dump() if hasattr(completion, "model_dump") else None
+        usage = raw_response.get("usage") if isinstance(raw_response, dict) else None
+        return ModelResponse(
+            content=content,
+            raw_response=raw_response,
+            model=getattr(completion, "model", None) or kwargs["model"],
+            usage=usage,
+            metadata={
+                "finish_reason": getattr(choice, "finish_reason", None),
+                "base_url": self.azure_endpoint,
+                "api_version": self.api_version,
+            },
+        )
+
+
 class ModelRouterWorkerClient:
-    """Config-driven router for OpenAI-compatible model endpoints."""
+    """Config-driven router for OpenAI-compatible and AzureOpenAI endpoints."""
 
     def __init__(self, config_path: str | Path | None = None) -> None:
         self.config_path = Path(config_path) if config_path else None
         self._configs: dict[str, dict[str, Any]] = {}
-        self._clients: dict[str, OpenAIModelWorkerClient] = {}
+        self._clients: dict[str, Any] = {}
         if self.config_path is not None and self.config_path.exists():
             self.load_config(self.config_path)
 
@@ -256,6 +370,14 @@ class ModelRouterWorkerClient:
                 raise ValueError(f"Model config for {alias!r} must be an object.")
             if not config.get("served_model"):
                 raise ValueError(f"Model config for {alias!r} is missing 'served_model'.")
+            client_type = str(config.get("client_type") or "openai")
+            if client_type not in {"openai", "azure_openai"}:
+                raise ValueError(f"Unsupported client_type for {alias!r}: {client_type}")
+            if client_type == "azure_openai":
+                if not config.get("azure_endpoint"):
+                    raise ValueError(f"Azure model config for {alias!r} is missing 'azure_endpoint'.")
+                if not config.get("api_version"):
+                    raise ValueError(f"Azure model config for {alias!r} is missing 'api_version'.")
             normalized[alias] = dict(config)
 
         self._configs = normalized
@@ -315,7 +437,7 @@ class ModelRouterWorkerClient:
             {
                 "model_alias": alias,
                 "served_model": config["served_model"],
-                "base_url": config.get("base_url"),
+                "base_url": config.get("base_url") or config.get("azure_endpoint"),
                 "sampling_params": config.get("sampling_params"),
             }
         )
@@ -331,16 +453,28 @@ class ModelRouterWorkerClient:
             raise ValueError("Model JSON response must be an object.")
         return parsed
 
-    def _client_for(self, alias: str, config: dict[str, Any]) -> OpenAIModelWorkerClient:
+    def _client_for(self, alias: str, config: dict[str, Any]) -> Any:
         client = self._clients.get(alias)
         if client is None:
-            client = OpenAIModelWorkerClient(
-                model=config["served_model"],
-                api_key=config.get("api_key"),
-                base_url=config.get("base_url"),
-                timeout_s=config.get("timeout_s"),
-                default_headers=config.get("default_headers"),
-            )
+            client_type = str(config.get("client_type") or "openai")
+            if client_type == "azure_openai":
+                client = AzureOpenAIModelWorkerClient(
+                    model=config["served_model"],
+                    api_key=config.get("api_key"),
+                    azure_endpoint=config["azure_endpoint"],
+                    api_version=config["api_version"],
+                    timeout_s=config.get("timeout_s"),
+                    default_headers=config.get("default_headers"),
+                    generate_tt_logid=bool(config.get("generate_tt_logid")),
+                )
+            else:
+                client = OpenAIModelWorkerClient(
+                    model=config["served_model"],
+                    api_key=config.get("api_key"),
+                    base_url=config.get("base_url"),
+                    timeout_s=config.get("timeout_s"),
+                    default_headers=config.get("default_headers"),
+                )
             self._clients[alias] = client
         return client
 

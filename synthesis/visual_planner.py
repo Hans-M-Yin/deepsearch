@@ -262,15 +262,19 @@ class LLMVisualSearchPlanner:
         *,
         model_client: ModelWorkerClient | None = None,
         model_alias: str | None = None,
-        max_targets: int = 4,
+        max_targets: int = 7,
         max_queries_per_target: int = 4,
         min_query_terms: int = 3,
+        target_chars_per_budget: int = 8000,
+        min_content_chars_for_images: int = 2500,
     ) -> None:
         self.model_client = model_client or LLM_WORKER
         self.model_alias = model_alias
         self.max_targets = max_targets
         self.max_queries_per_target = max_queries_per_target
         self.min_query_terms = min_query_terms
+        self.target_chars_per_budget = max(1, target_chars_per_budget)
+        self.min_content_chars_for_images = max(0, min_content_chars_for_images)
 
     def plan(
         self,
@@ -283,6 +287,9 @@ class LLMVisualSearchPlanner:
         model_alias = self.model_alias or os.environ.get("VISUAL_PLANNER_MODEL") or os.environ.get("TEXT_PROCESS_MODEL")
         if not model_alias:
             raise ValueError("VISUAL_PLANNER_MODEL or TEXT_PROCESS_MODEL is required for visual planning.")
+        target_budget = self._compute_target_budget(page_text)
+        if target_budget <= 0:
+            return []
 
         started_at = time.perf_counter()
         response = self.model_client.generate(
@@ -290,7 +297,7 @@ class LLMVisualSearchPlanner:
                 model=model_alias,
                 messages=[
                     ModelMessage(role="system", content=PROMPT_VISUAL_SEARCH_PLANNER),
-                    ModelMessage(role="user", content=self._prompt_input(node, page_text)),
+                    ModelMessage(role="user", content=self._prompt_input(node, page_text, target_budget)),
                 ],
                 temperature=0.0,
                 metadata={"trace_label": f"visual_planner:{node.get('title') or node.get('node_id') or ''}"},
@@ -302,7 +309,7 @@ class LLMVisualSearchPlanner:
         candidates = self._parse_targets(response.content)
         plans: list[VisualSearchPlan] = []
         for candidate in candidates:
-            if len(plans) >= self.max_targets:
+            if len(plans) >= target_budget:
                 break
             plan = self._candidate_to_plan(
                 candidate,
@@ -310,13 +317,22 @@ class LLMVisualSearchPlanner:
                 source_evidence_ids=source_evidence_ids or [],
                 raw_output=response.content,
                 run_id=run_id,
+                target_budget=target_budget,
             )
             if plan is not None:
                 plans.append(plan)
         return plans
 
+    def _compute_target_budget(self, page_text: str) -> int:
+        content_chars = len(page_text or "")
+        if content_chars < self.min_content_chars_for_images:
+            return 0
+        budget = content_chars // self.target_chars_per_budget
+        budget = max(1, budget)
+        return min(self.max_targets, budget)
+
     @staticmethod
-    def _prompt_input(node: dict[str, Any], page_text: str) -> str:
+    def _prompt_input(node: dict[str, Any], page_text: str, target_budget: int) -> str:
         title = node.get("title") or ""
         attributes = node.get("attributes") or {}
         return (
@@ -329,7 +345,8 @@ class LLMVisualSearchPlanner:
             "- Output only repeated <query>...</query><reason>...</reason> blocks.\n"
             "- Do not output markdown fences, bullets, JSON, headings, or any extra text.\n"
             "- Each <query> must be a single rewritten search query.\n"
-            "- Each <reason> must explain uniqueness and likely online existence."
+            "- Each <reason> must explain uniqueness and likely online existence.\n"
+            f"- Output at most {target_budget} results."
         )
 
     @staticmethod
@@ -371,6 +388,7 @@ class LLMVisualSearchPlanner:
         source_evidence_ids: list[str],
         raw_output: str,
         run_id: str | None,
+        target_budget: int,
     ) -> VisualSearchPlan | None:
         query = candidate.get("query")
         reason = candidate.get("reason")
@@ -424,6 +442,7 @@ class LLMVisualSearchPlanner:
                 "downstream_use": downstream_use.value,
                 "query": query,
                 "reason": reason,
+                "target_budget": target_budget,
             },
         )
 

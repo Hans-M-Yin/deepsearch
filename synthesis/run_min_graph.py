@@ -12,9 +12,11 @@ Run it from the repository root:
 from __future__ import annotations
 
 import argparse
+import json
 import os
 from pathlib import Path
 import shlex
+import subprocess
 import sys
 import time
 from typing import Any
@@ -53,6 +55,20 @@ def load_env_file(path: Path, *, override: bool = False) -> dict[str, str]:
             os.environ[key] = env_value
         loaded[key] = env_value
     return loaded
+
+
+def load_seed_urls_file(path: Path) -> list[str]:
+    seeds: list[str] = []
+    if not path.exists():
+        raise FileNotFoundError(f"Seed URL file does not exist: {path}")
+    for line_no, raw_line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if not line.startswith(("http://", "https://")):
+            raise ValueError(f"{path}:{line_no} seed URL must start with http:// or https://: {raw_line!r}")
+        seeds.append(line)
+    return seeds
 
 
 def check_python_version() -> None:
@@ -180,11 +196,60 @@ def load_failed_task_preview(store_dir: Path, *, limit: int = 1) -> list[dict[st
     return [item for item in failed[-limit:] if isinstance(item, dict)]
 
 
+def current_git_metadata(project_root: Path) -> dict[str, Any]:
+    def _run_git(*args: str) -> str | None:
+        try:
+            completed = subprocess.run(
+                ["git", *args],
+                cwd=project_root,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        except Exception:
+            return None
+        return completed.stdout.strip()
+
+    commit = _run_git("rev-parse", "HEAD")
+    branch = _run_git("rev-parse", "--abbrev-ref", "HEAD")
+    status_output = _run_git("status", "--porcelain")
+    dirty = bool(status_output) if status_output is not None else None
+    return {
+        "commit": commit,
+        "branch": branch,
+        "dirty": dirty,
+    }
+
+
+def save_run_config(
+    store_dir: Path,
+    *,
+    args: argparse.Namespace,
+    env_path: Path,
+    loaded_env: dict[str, str],
+    git_metadata: dict[str, Any],
+) -> Path:
+    payload = {
+        "project_root": str(PROJECT_ROOT),
+        "store_dir": str(store_dir),
+        "command": " ".join(shlex.quote(part) for part in sys.argv),
+        "args": vars(args),
+        "env_file": str(env_path),
+        "loaded_env_count": len(loaded_env),
+        "loaded_env_keys": sorted(loaded_env.keys()),
+        "git": git_metadata,
+    }
+    path = store_dir / "run_config.json"
+    path.write_text(json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+    return path
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--env-file", default=str(DEFAULT_ENV_PATH), help="Path to synthesis env file.")
     parser.add_argument("--override-env", action="store_true", help="Let --env-file override existing env vars.")
-    parser.add_argument("--seed-url", default=DEFAULT_SEED_URL, help="Seed Wikipedia URL.")
+    parser.add_argument("--seed-url", default=None, help="Seed Wikipedia URL. If omitted, defaults to Kobe Bryant unless --seed-urls-file is provided.")
+    parser.add_argument("--seed-urls-file", default=None, help="Text file containing one seed Wikipedia URL per line. Blank lines and # comments are ignored.")
     parser.add_argument("--store-dir", default=str(DEFAULT_STORE_DIR), help="Output JSONL graph store directory.")
     parser.add_argument("--reader-base-url", default="http://127.0.0.1:8004", help="Enhanced Reader base URL.")
     parser.add_argument("--reader-check-timeout", type=float, default=60.0, help="Enhanced Reader preflight timeout in seconds.")
@@ -201,11 +266,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-link-char-distance", type=int, default=500, help="Minimum character distance between selected wiki links.")
     parser.add_argument("--lead-chars", type=int, default=3000, help="Leading page characters that receive a looser link quota.")
     parser.add_argument("--lead-max-links-per-window", type=int, default=4, help="Maximum selected links per window in the leading page region.")
-    parser.add_argument("--max-content-chars", type=int, default=50000, help="Max cleaned markdown chars stored in each text node/evidence. <=0 disables truncation.")
-    parser.add_argument("--max-link-markdown-chars", type=int, default=80000, help="Max raw markdown chars used for wiki-link extraction. <=0 disables truncation.")
+    parser.add_argument("--max-content-chars", type=int, default=70000, help="Max cleaned markdown chars stored in each text node/evidence. <=0 disables truncation.")
+    parser.add_argument("--max-link-markdown-chars", type=int, default=100000, help="Max raw markdown chars used for wiki-link extraction. <=0 disables truncation.")
     parser.add_argument("--max-llm-neighbor-candidates", type=int, default=40, help="Maximum rule-recalled wiki links sent to WIKI_NEIGHBOR_MODEL per page.")
     parser.add_argument("--per-query-image-limit", type=int, default=3, help="Image search results per visual query.")
     parser.add_argument("--max-images-per-plan", type=int, default=5, help="Accepted images per visual plan.")
+    parser.add_argument(
+        "--image-budget-chars",
+        type=int,
+        default=8000,
+        help="Approximate text-description chars needed for one additional visual plan. Pages below the internal minimum threshold produce no visual plans.",
+    )
     parser.add_argument("--no-images", action="store_true", help="Disable visual planning and image discovery.")
     parser.add_argument(
         "--force-accept-images",
@@ -229,6 +300,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
     check_python_version()
+
+    seed_urls: list[str] = []
+    if args.seed_urls_file:
+        seed_file_path = Path(args.seed_urls_file)
+        if not seed_file_path.is_absolute():
+            seed_file_path = PROJECT_ROOT / seed_file_path
+        seed_urls.extend(load_seed_urls_file(seed_file_path))
+    if args.seed_url:
+        seed_urls.append(args.seed_url)
+    if not seed_urls:
+        seed_urls = [DEFAULT_SEED_URL]
+    # Preserve order while deduplicating.
+    seed_urls = list(dict.fromkeys(seed_urls))
 
     env_path = Path(args.env_file)
     if not env_path.is_absolute():
@@ -257,7 +341,7 @@ def main(argv: list[str] | None = None) -> int:
     if not args.skip_reader_check:
         ok, message = check_reader_service(
             args.reader_base_url,
-            test_url=args.seed_url,
+            test_url=seed_urls[0],
             timeout_s=args.reader_check_timeout,
         )
         if not ok:
@@ -270,6 +354,7 @@ def main(argv: list[str] | None = None) -> int:
     if not store_dir.is_absolute():
         store_dir = PROJECT_ROOT / store_dir
     store = JsonlGraphStore(store_dir)
+    git_metadata = current_git_metadata(PROJECT_ROOT)
 
     reader = EnhancedReaderClient(base_url=args.reader_base_url)
     wiki_builder = WikiTextBuilder(
@@ -291,7 +376,10 @@ def main(argv: list[str] | None = None) -> int:
     visual_planner = None
     image_builder = None
     if not args.no_images:
-        visual_planner = LLMVisualSearchPlanner(model_client=LLM_WORKER)
+        visual_planner = LLMVisualSearchPlanner(
+            model_client=LLM_WORKER,
+            target_chars_per_budget=args.image_budget_chars,
+        )
         backend_builders = {
             "commons": CommonsImageSearchClient,
             "commons_serpapi": CommonsSerpApiSearchClient,
@@ -356,8 +444,15 @@ def main(argv: list[str] | None = None) -> int:
         run_id=args.run_id,
         resume=not args.fresh,
     )
+    run_config_path = save_run_config(
+        store_dir,
+        args=args,
+        env_path=env_path,
+        loaded_env=loaded_env,
+        git_metadata=git_metadata,
+    )
     if runner.strategy.queue_size() == 0:
-        runner.add_seed(args.seed_url)
+        runner.add_seeds(seed_urls)
 
     started_at = time.perf_counter()
     result = runner.run()
@@ -365,7 +460,17 @@ def main(argv: list[str] | None = None) -> int:
     store_size = directory_size_bytes(store_dir)
     print("=== min graph run ===")
     print(f"env_file: {env_path} ({len(loaded_env)} vars loaded)")
+    print(f"run_config: {run_config_path}")
+    if git_metadata.get("commit"):
+        print(
+            "git: "
+            f"commit={git_metadata.get('commit')} "
+            f"branch={git_metadata.get('branch')} "
+            f"dirty={git_metadata.get('dirty')}"
+        )
     print(f"store_dir: {store_dir}")
+    print(f"seed_count: {len(seed_urls)}")
+    print(f"seed_preview: {seed_urls[:5]}")
     print(f"run_id: {result.run_id}")
     print(f"status: {result.status}")
     print(f"steps: {result.steps}")
