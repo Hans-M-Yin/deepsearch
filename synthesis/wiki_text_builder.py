@@ -833,7 +833,7 @@ class WikiTextBuilder:
             return candidates
 
         source_title = self._title_from_url(source_url) or source_url
-        debug_enabled = os.environ.get("WIKI_NEIGHBOR_DEBUG", "1") != "0"
+        debug_enabled = os.environ.get("WIKI_NEIGHBOR_DEBUG", "0") != "0"
         ranked_candidates = sorted(candidates, key=lambda item: (-item.score, item.rank or 10**9))
         prompt_candidates = ranked_candidates[: max(1, self.max_llm_neighbor_candidates)]
         rule_scores = {candidate.url: candidate.score for candidate in prompt_candidates}
