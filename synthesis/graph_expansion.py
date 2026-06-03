@@ -140,6 +140,7 @@ class NodeExpansionResult:
     visual_plans: list[VisualSearchPlan] = field(default_factory=list)
     image_results: list[ImageDiscoveryResult] = field(default_factory=list)
     materialized_edges: list[Edge] = field(default_factory=list)
+    parent_link_failures: list[dict[str, Any]] = field(default_factory=list)
     queued_tasks: list[ExpansionTask] = field(default_factory=list)
     error: str | None = None
     timing: dict[str, float] = field(default_factory=dict)
@@ -153,6 +154,7 @@ class NodeExpansionResult:
             "visual_plans": [plan.to_dict() for plan in self.visual_plans],
             "image_results": [result.to_dict() for result in self.image_results],
             "materialized_edges": [edge.to_dict() for edge in self.materialized_edges],
+            "parent_link_failures": [dict(item) for item in self.parent_link_failures],
             "queued_tasks": [task.to_dict() for task in self.queued_tasks],
             "error": self.error,
             "timing": self.timing,
@@ -278,14 +280,14 @@ class GraphExpansionStrategy:
             )
 
             started = time.perf_counter()
-            materialized_edges = self._materialize_pending_parent_links(
+            materialized_edges, parent_link_failures = self._materialize_pending_parent_links(
                 task,
                 target_result=text_result,
                 run_id=run_id,
             )
             timing["materialize_parent_edges_s"] = time.perf_counter() - started
             _trace_timing(
-                f"[expand-task] stage=materialize_parent_edges url={task.url!r} elapsed_s={timing['materialize_parent_edges_s']:.3f} edges={len(materialized_edges)}"
+                f"[expand-task] stage=materialize_parent_edges url={task.url!r} elapsed_s={timing['materialize_parent_edges_s']:.3f} edges={len(materialized_edges)} failures={len(parent_link_failures)}"
             )
 
             started = time.perf_counter()
@@ -328,6 +330,7 @@ class GraphExpansionStrategy:
                 visual_plans=visual_plans,
                 image_results=image_results,
                 materialized_edges=materialized_edges,
+                parent_link_failures=parent_link_failures,
                 queued_tasks=queued_tasks,
                 timing=timing,
             )
@@ -425,11 +428,12 @@ class GraphExpansionStrategy:
         *,
         target_result: WikiTextBuildResult,
         run_id: str | None,
-    ) -> list[Edge]:
+    ) -> tuple[list[Edge], list[dict[str, Any]]]:
         pending_links = list(task.metadata.get("pending_parent_links") or [])
         with self._lock:
             pending_links.extend(self._pending_parent_links_by_url.pop(task.url, []))
         materialized: list[Edge] = []
+        failures: list[dict[str, Any]] = []
         for pending in pending_links:
             edge = self._materialize_pending_parent_link(
                 pending,
@@ -438,7 +442,116 @@ class GraphExpansionStrategy:
             )
             if edge is not None:
                 materialized.append(edge)
-        return materialized
+                continue
+            diagnostic = self._diagnose_pending_parent_link_failure(
+                pending,
+                target_result=target_result,
+            )
+            if diagnostic is not None:
+                failures.append(diagnostic)
+        return materialized, failures
+
+    def _diagnose_pending_parent_link_failure(
+        self,
+        pending: dict[str, Any],
+        *,
+        target_result: WikiTextBuildResult,
+    ) -> dict[str, Any] | None:
+        link_type = pending.get("link_type") or "wiki_link"
+        target_node = target_result.node
+        base = {
+            "link_type": link_type,
+            "target_node_id": target_node.node_id,
+            "target_title": target_node.title,
+            "target_url": target_node.source.url if target_node.source else None,
+        }
+        if link_type == "image_entity":
+            parent_node_id = pending.get("parent_node_id")
+            source_evidence_id = pending.get("source_evidence_id")
+            entity = pending.get("entity")
+            if not parent_node_id:
+                return {
+                    **base,
+                    "reason": "missing_parent_image_node_id",
+                    "source_evidence_id": source_evidence_id,
+                }
+            if not source_evidence_id:
+                return {
+                    **base,
+                    "reason": "missing_source_image_evidence_id",
+                    "parent_node_id": parent_node_id,
+                }
+            if not isinstance(entity, dict):
+                return {
+                    **base,
+                    "reason": "invalid_grounded_entity_payload",
+                    "parent_node_id": parent_node_id,
+                    "source_evidence_id": source_evidence_id,
+                }
+            if self.store.get_node(parent_node_id) is None:
+                return {
+                    **base,
+                    "reason": "missing_parent_image_node",
+                    "parent_node_id": parent_node_id,
+                    "source_evidence_id": source_evidence_id,
+                    "entity_name": entity.get("name"),
+                    "entity_type": entity.get("type"),
+                }
+            if self.store.get_evidence(source_evidence_id) is None:
+                return {
+                    **base,
+                    "reason": "missing_source_image_evidence",
+                    "parent_node_id": parent_node_id,
+                    "source_evidence_id": source_evidence_id,
+                    "entity_name": entity.get("name"),
+                    "entity_type": entity.get("type"),
+                }
+            return {
+                **base,
+                "reason": "unknown_image_entity_parent_link_failure",
+                "parent_node_id": parent_node_id,
+                "source_evidence_id": source_evidence_id,
+                "entity_name": entity.get("name"),
+                "entity_type": entity.get("type"),
+            }
+
+        parent_node_id = pending.get("parent_node_id")
+        source_evidence_id = pending.get("source_evidence_id")
+        candidate_record = pending.get("candidate")
+        if not parent_node_id:
+            return {**base, "reason": "missing_parent_node_id", "source_evidence_id": source_evidence_id}
+        if not source_evidence_id:
+            return {**base, "reason": "missing_source_evidence_id", "parent_node_id": parent_node_id}
+        if not isinstance(candidate_record, dict):
+            return {
+                **base,
+                "reason": "invalid_candidate_payload",
+                "parent_node_id": parent_node_id,
+                "source_evidence_id": source_evidence_id,
+            }
+        if self.store.get_node(parent_node_id) is None:
+            return {
+                **base,
+                "reason": "missing_parent_text_node",
+                "parent_node_id": parent_node_id,
+                "source_evidence_id": source_evidence_id,
+                "candidate_title": candidate_record.get("title"),
+            }
+        if self.store.get_evidence(source_evidence_id) is None:
+            return {
+                **base,
+                "reason": "missing_source_text_evidence",
+                "parent_node_id": parent_node_id,
+                "source_evidence_id": source_evidence_id,
+                "candidate_title": candidate_record.get("title"),
+            }
+        return {
+            **base,
+            "reason": "unknown_wiki_parent_link_failure",
+            "parent_node_id": parent_node_id,
+            "source_evidence_id": source_evidence_id,
+            "candidate_title": candidate_record.get("title"),
+        }
 
     def _materialize_pending_parent_link(
         self,

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import os
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
@@ -213,32 +213,51 @@ class GraphRunner:
         remaining_steps = self.config.max_steps - self.state.step
         if remaining_steps <= 0:
             return []
-        batch_size = self.config.batch_size or self.config.parallel_workers
-        batch_size = max(1, min(int(batch_size), int(self.config.parallel_workers), remaining_steps))
-        tasks = self.strategy.pop_next_batch(batch_size)
-        if not tasks:
+        max_inflight = self.config.batch_size or self.config.parallel_workers
+        max_inflight = max(1, min(int(max_inflight), int(self.config.parallel_workers), remaining_steps))
+
+        def can_submit_more(completed_count: int, in_flight_count: int) -> bool:
+            if completed_count + in_flight_count >= remaining_steps:
+                return False
+            if self.config.max_nodes is not None and self.store.stats().get("nodes", 0) >= self.config.max_nodes:
+                return False
+            return self.strategy.queue_size() > 0
+
+        initial_tasks = self.strategy.pop_next_batch(max_inflight)
+        if not initial_tasks:
             return []
 
         results: list[NodeExpansionResult] = []
         with ThreadPoolExecutor(max_workers=self.config.parallel_workers) as executor:
-            future_to_task = {
-                executor.submit(self.strategy.expand_task, task, run_id=self.state.run_id): task
-                for task in tasks
-            }
-            for future in as_completed(future_to_task):
-                task = future_to_task[future]
-                try:
-                    results.append(future.result())
-                except Exception as exc:
-                    task.status = ExpansionTaskStatus.FAILED
-                    results.append(
-                        NodeExpansionResult(
-                            task=task,
-                            error=f"{exc.__class__.__name__}: {exc}",
-                        )
-                    )
+            future_to_task = {}
+            for task in initial_tasks:
+                future_to_task[executor.submit(self.strategy.expand_task, task, run_id=self.state.run_id)] = task
 
-        results.sort(key=lambda result: result.task.priority)
+            while future_to_task:
+                done, _ = wait(tuple(future_to_task.keys()), return_when=FIRST_COMPLETED)
+                for future in done:
+                    task = future_to_task.pop(future)
+                    try:
+                        results.append(future.result())
+                    except Exception as exc:
+                        task.status = ExpansionTaskStatus.FAILED
+                        results.append(
+                            NodeExpansionResult(
+                                task=task,
+                                error=f"{exc.__class__.__name__}: {exc}",
+                            )
+                        )
+
+                    while can_submit_more(len(results), len(future_to_task)):
+                        next_task = self.strategy.pop_next_task()
+                        if next_task is None:
+                            break
+                        next_future = executor.submit(
+                            self.strategy.expand_task,
+                            next_task,
+                            run_id=self.state.run_id,
+                        )
+                        future_to_task[next_future] = next_task
         return results
 
     def save_state(self) -> None:
@@ -279,6 +298,8 @@ class GraphRunner:
             "attribute_error": result.attribute_error,
             "queued_count": len(result.queued_tasks),
             "materialized_edge_count": len(result.materialized_edges),
+            "parent_link_failure_count": len(result.parent_link_failures),
+            "parent_link_failures": [dict(item) for item in result.parent_link_failures],
             "visual_plan_count": len(result.visual_plans),
             "image_result_count": len(result.image_results),
             "image_summary": self._summarize_image_results(result.image_results),
@@ -367,6 +388,23 @@ class GraphRunner:
                 flush=True,
             )
             return
+        for failure in result.parent_link_failures:
+            task = result.task
+            print(
+                "[warning] "
+                f"parent_link_missing url={task.url!r} "
+                f"title={task.title!r} "
+                f"depth={task.depth} "
+                f"origin={(task.metadata or {}).get('task_origin')!r} "
+                f"link_type={failure.get('link_type')!r} "
+                f"reason={failure.get('reason')!r} "
+                f"parent_node_id={failure.get('parent_node_id')!r} "
+                f"source_evidence_id={failure.get('source_evidence_id')!r} "
+                f"target_node_id={failure.get('target_node_id')!r} "
+                f"entity_name={failure.get('entity_name')!r}",
+                file=sys.stderr,
+                flush=True,
+            )
         if result.attribute_error:
             task = result.task
             print(
