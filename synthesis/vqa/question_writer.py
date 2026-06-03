@@ -46,6 +46,11 @@ Important semantics by hop type:
   treat this as a normal entity-to-entity relation
 - text -> image:
   treat the target as a key photo / visual scene, not as an image file
+  the edge relation is the retrieval query for finding that image
+  preserve the query's distinctive details
+  do not generalize it into a vague scene description
+  you may lightly rewrite it into natural language, but you must keep the key
+  entity, event, action, and distinguishing scene details
 - image -> text:
   treat the source as a visual clue inside the image, and treat the target as
   the entity identified by that clue
@@ -62,7 +67,8 @@ Return valid JSON with exactly these fields:
   "statement": "...",
   "source": "...",
   "target": "...",
-  "relation": "..."
+  "relation": "...",
+  "retrieval_query": "..."  // required for text -> image, otherwise empty string
 }
 """
 
@@ -92,6 +98,11 @@ You are given:
 
 The hop facts are LATENT reasoning support. They are not meant to be narrated
 step by step to the user.
+
+Some text -> image hops may include a retrieval_query field. When present,
+that retrieval query is a high-precision visual anchor for the image and is
+often more specific than the natural-language statement. Preserve its key
+distinguishing details, but do not copy it verbatim in a search-engine style.
 
 Your job is to write one natural search or deep-research question that:
 - sounds like a realistic user request
@@ -282,6 +293,9 @@ class QuestionWriter:
         source = str(parsed.get("source") or "").strip()
         target = str(parsed.get("target") or "").strip()
         relation = str(parsed.get("relation") or hop.relation or hop.edge_type or "").strip()
+        retrieval_query = str(parsed.get("retrieval_query") or "").strip()
+        if hop.src_modality == "text" and hop.dst_modality == "image" and not retrieval_query:
+            retrieval_query = str(hop.relation or "").strip()
         if not statement or not source or not target:
             return self._fallback_compress_hop(hop)
         return {
@@ -290,6 +304,7 @@ class QuestionWriter:
             "source": source,
             "target": target,
             "relation": relation,
+            "retrieval_query": retrieval_query,
             "edge_id": hop.edge_id,
             "src_node_id": hop.src_node_id,
             "dst_node_id": hop.dst_node_id,
@@ -345,6 +360,7 @@ class QuestionWriter:
                         "relation": item.get("relation"),
                         "target": item.get("target"),
                         "statement": item.get("statement"),
+                        "retrieval_query": item.get("retrieval_query"),
                     }
                     for item in hop_summaries
                 ],
@@ -469,18 +485,27 @@ class QuestionWriter:
     @staticmethod
     def _fallback_compress_hop(hop: HopContext) -> dict[str, Any]:
         relation = hop.relation or hop.edge_type or "is connected to"
+        retrieval_query = ""
         if hop.src_modality == "text" and hop.dst_modality == "text":
             src_label = hop.src_content.get("title") or hop.src_node_id
             dst_label = hop.dst_content.get("title") or hop.dst_node_id
             statement = f"{src_label} {relation} {dst_label}".strip()
         elif hop.src_modality == "text" and hop.dst_modality == "image":
             src_label = hop.src_content.get("title") or hop.src_node_id
+            retrieval_query = str(hop.relation or "").strip()
             dst_label = (
                 hop.dst_content.get("title")
                 or hop.dst_content.get("caption")
+                or retrieval_query
                 or "a key visual scene"
             )
-            statement = f"{src_label} is associated with a key photo or visual scene: {dst_label}."
+            if retrieval_query:
+                statement = (
+                    f"{src_label} is associated with a key photo or visual scene described by the query: "
+                    f"{retrieval_query}."
+                )
+            else:
+                statement = f"{src_label} is associated with a key photo or visual scene: {dst_label}."
         elif hop.src_modality == "image" and hop.dst_modality == "text":
             src_label = QuestionWriter._image_clue_label(hop)
             dst_label = hop.dst_content.get("title") or hop.dst_node_id
@@ -495,6 +520,7 @@ class QuestionWriter:
             "source": src_label,
             "target": dst_label,
             "relation": relation,
+            "retrieval_query": retrieval_query,
             "edge_id": hop.edge_id,
             "src_node_id": hop.src_node_id,
             "dst_node_id": hop.dst_node_id,
@@ -637,6 +663,7 @@ class QuestionWriter:
                         "relation": item.get("relation"),
                         "target": item.get("target"),
                         "statement": item.get("statement"),
+                        "retrieval_query": item.get("retrieval_query"),
                     }
                     for item in hop_summaries
                 ],
