@@ -83,34 +83,54 @@ Return valid JSON with exactly these fields:
 """
 
 
-PROMPT_COMPOSE_QUESTION = """You are writing a multi-hop search question from compressed trajectory evidence.
+PROMPT_COMPOSE_QUESTION = """You are writing a multi-hop SEARCH QUESTION from compressed trajectory evidence.
 
 You are given:
 - a directed list of hop facts
 - the selected final ask target and answer
 - the question opening mode
 
-Write one natural multi-hop question. The question should:
-- sound like a realistic user search/research question
-- require following the reasoning chain from the first hop to the last hop
-- not directly reveal the answer
-- avoid sounding like a template
-- preserve the direction of every hop
+The hop facts are LATENT reasoning support. They are not meant to be narrated
+step by step to the user.
+
+Your job is to write one natural search or deep-research question that:
+- sounds like a realistic user request
+- hides most of the intermediate reasoning chain
+- preserves the true hop direction internally
+- keeps only the clues necessary for the question to remain coherent and solvable
+- does not directly reveal the answer
+
+Do NOT do the following:
+- do not narrate the chain step by step
+- do not explicitly say phrases like:
+  - "starting with"
+  - "then"
+  - "after that"
+  - "following that clue"
+  - "using that clue"
+  - "first ... then ..."
+- do not expose every intermediate entity if the question can stay solvable without it
+- do not turn the output into a summary of the reasoning path
 
 Important direction rule:
 - each hop has an explicit source and target
-- do not reverse a hop when writing the question
+- keep the semantic direction of each hop
+- do not reverse a hop when forming the hidden sub-questions
 - for example, if a hop is:
   source = Kobe Bryant
   relation = played_for
   target = Los Angeles Lakers
-  then a direction-preserving sub-question is:
+  then a direction-preserving hidden step is:
   "Kobe Bryant played for which team?"
   and a direction-reversing wrong version is:
   "Who played for the Los Angeles Lakers?"
 
-Your final question must connect the hops in order, starting from the first
-hop's source and ending at the selected final ask target.
+Question-writing goal:
+- produce one final user-facing question, not a narrated derivation
+- the user should need to search or reason through the hops, but should not see
+  the full chain spelled out
+- intermediate facts may be paraphrased, partially hidden, or omitted
+- preserve the first-hop-to-last-hop logic as latent support
 
 Opening mode rules:
 - if opening_mode is "text_start", begin naturally from the first hop's source
@@ -311,9 +331,21 @@ class QuestionWriter:
             },
             trace_label="compose_question",
         )
-        question = str(parsed.get("question") or "").strip()
+        question = self._clean_composed_question(str(parsed.get("question") or "").strip())
         answer = str(parsed.get("answer") or target_ask.get("answer") or "").strip()
         answer_type = str(parsed.get("answer_type") or target_ask.get("answer_type") or "other").strip()
+        if (
+            not question
+            or not answer
+            or self._looks_like_chain_narration(question)
+        ):
+            rewritten = self._rewrite_chain_narration(
+                opening_mode=opening_mode,
+                hop_summaries=hop_summaries,
+                target_ask=target_ask,
+            )
+            if rewritten is not None:
+                question = rewritten
         if not question or not answer:
             return self._fallback_compose_question(
                 path=path,
@@ -517,11 +549,16 @@ class QuestionWriter:
         answer_type = str(target_ask.get("answer_type") or "other")
         if opening_mode == "image_start":
             question = (
-                f"Starting from the given image, follow this chain of clues: {hop_text}. "
-                f"Based on the final target, what is {ask_target}?"
+                f"In the given image, follow the relevant visual and factual clues needed to identify {ask_target}. "
+                f"{hop_text} What is it?"
             )
         else:
-            question = f"Follow this chain of clues: {hop_text}. Based on the final target, what is {ask_target}?"
+            first_source = str(hop_summaries[0].get("source") or "this subject") if hop_summaries else "this subject"
+            question = (
+                f"Using {first_source} as the starting clue, search through the relevant facts needed to determine "
+                f"{ask_target}. What is it?"
+            )
+        question = QuestionWriter._clean_composed_question(question)
         return QuestionDraft(
             question=question,
             answer=answer,
@@ -530,6 +567,77 @@ class QuestionWriter:
             used_evidence_ids=[item.get("edge_id", "") for item in hop_summaries if item.get("edge_id")],
             metadata={"target_ask": target_ask},
         )
+
+    @staticmethod
+    def _looks_like_chain_narration(question: str) -> bool:
+        lowered = question.lower()
+        bad_patterns = (
+            "starting with",
+            "follow this chain",
+            "following that clue",
+            "using that clue",
+            "then looking at",
+            "then finding",
+            "then following",
+            "first find",
+            "first identify",
+        )
+        return any(pattern in lowered for pattern in bad_patterns)
+
+    def _rewrite_chain_narration(
+        self,
+        *,
+        opening_mode: str,
+        hop_summaries: list[dict[str, Any]],
+        target_ask: dict[str, Any],
+    ) -> str | None:
+        if self.model_client is None:
+            return None
+        parsed = self._generate_json(
+            system=(
+                "You are rewriting a bad multi-hop question draft.\n\n"
+                "The previous draft explicitly narrated the reasoning chain.\n"
+                "Rewrite it into ONE natural search question.\n"
+                "Do not narrate the chain. Do not use phrases like 'starting with', "
+                "'then', 'following that clue', or 'using that clue'.\n"
+                "Keep the latent reasoning structure, but hide the step-by-step derivation.\n\n"
+                "Return valid JSON with exactly these fields:\n"
+                "{\n"
+                '  "question": "..."\n'
+                "}\n"
+            ),
+            user_payload={
+                "opening_mode": opening_mode,
+                "hop_facts": [
+                    {
+                        "source": item.get("source"),
+                        "relation": item.get("relation"),
+                        "target": item.get("target"),
+                        "statement": item.get("statement"),
+                    }
+                    for item in hop_summaries
+                ],
+                "target_ask": target_ask,
+            },
+            trace_label="rewrite_chain_narration",
+        )
+        question = self._clean_composed_question(str(parsed.get("question") or "").strip())
+        if not question or self._looks_like_chain_narration(question):
+            return None
+        return question
+
+    @staticmethod
+    def _clean_composed_question(question: str) -> str:
+        question = re.sub(r"\s+", " ", question).strip()
+        for prefix in (
+            "Starting with ",
+            "Starting from ",
+            "Follow this chain of clues: ",
+            "Using the following clues, ",
+        ):
+            if question.startswith(prefix):
+                question = question[len(prefix):].strip()
+        return question
 
 
 def _debug_main() -> None:
