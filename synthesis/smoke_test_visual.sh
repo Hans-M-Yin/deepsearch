@@ -1,5 +1,5 @@
 mkdir -p runs/multi_seed_visual_smoke_2
-
+echo "Start Generate."
 python synthesis/run_min_graph.py \
   --seed-urls-file synthesis/seeds.txt \
   --store-dir runs/multi_seed_visual_smoke_2 \
