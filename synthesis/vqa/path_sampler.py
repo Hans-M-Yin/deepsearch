@@ -43,6 +43,7 @@ class SamplerConfiguration:
     allowed_start_node_types: tuple[str, ...] = ()
     allowed_end_node_types: tuple[str, ...] = ()
     edge_penalty_alpha: float = 1.0
+    image_spacing_enabled: bool = True
     allowed_edge_types: tuple[str, ...] = (
         "wiki_link",
         "wiki_attribute",
@@ -186,7 +187,7 @@ class RandomPathSampler(PathSampler):
         hop_count = self._sample_hop_count(rng)
 
         for _ in range(hop_count):
-            neighbors = self.graph.neighbors(current)
+            neighbors = self._traversable_neighbors(current)
             if self.config.require_simple_path:
                 neighbors = [edge for edge in neighbors if edge.get("dst_node_id") not in node_ids]
             neighbors = [edge for edge in neighbors if edge.get("edge_id") not in used_edge_ids]
@@ -194,7 +195,7 @@ class RandomPathSampler(PathSampler):
                 if len(edge_ids) < self.config.min_hops:
                     return None, "too_short"
                 return None, "dead_end"
-            edge = self._weighted_edge_choice(neighbors, rng=rng)
+            edge = self._weighted_edge_choice(neighbors, node_ids=node_ids, rng=rng)
             current = edge["dst_node_id"]
             if self.config.require_simple_path and current in node_ids:
                 return None, "cycle"
@@ -236,6 +237,13 @@ class RandomPathSampler(PathSampler):
         )
         return candidate, None
 
+    def _traversable_neighbors(self, node_id: str) -> list[dict[str, Any]]:
+        node_type = self.graph.node_type(node_id)
+        neighbors = self.graph.neighbors(node_id)
+        if node_type == "text":
+            return [edge for edge in neighbors if edge.get("edge_type") != "image_depicts"]
+        return neighbors
+
     def _candidate_start_nodes(self) -> list[str]:
         node_ids = self.graph.list_node_ids()
         if not self.config.allowed_start_node_types:
@@ -252,10 +260,16 @@ class RandomPathSampler(PathSampler):
             return True
         return node_type in set(self.config.allowed_end_node_types)
 
-    def _weighted_edge_choice(self, neighbors: list[dict[str, Any]], *, rng: random.Random) -> dict[str, Any]:
+    def _weighted_edge_choice(
+        self,
+        neighbors: list[dict[str, Any]],
+        *,
+        node_ids: list[str],
+        rng: random.Random,
+    ) -> dict[str, Any]:
         if len(neighbors) == 1 or self.config.edge_penalty_alpha == 0:
             return rng.choice(neighbors)
-        weights = [self._edge_weight(edge.get("edge_id")) for edge in neighbors]
+        weights = [self._candidate_weight(edge, node_ids=node_ids) for edge in neighbors]
         return rng.choices(neighbors, weights=weights, k=1)[0]
 
     def _sample_hop_count(self, rng: random.Random) -> int:
@@ -274,6 +288,30 @@ class RandomPathSampler(PathSampler):
             return 1.0
         count = self.edge_usage_counts.get(edge_id, 0)
         return 1.0 / (1.0 + self.config.edge_penalty_alpha * count)
+
+    def _candidate_weight(self, edge: dict[str, Any], *, node_ids: list[str]) -> float:
+        weight = self._edge_weight(edge.get("edge_id"))
+        if not self.config.image_spacing_enabled:
+            return weight
+        next_node_id = edge.get("dst_node_id")
+        if not isinstance(next_node_id, str):
+            return weight
+        if self.graph.node_type(next_node_id) != "image":
+            return weight
+        return weight * self._image_spacing_factor(node_ids)
+
+    def _image_spacing_factor(self, node_ids: list[str]) -> float:
+        last_image_index: int | None = None
+        for index in range(len(node_ids) - 1, -1, -1):
+            if self.graph.node_type(node_ids[index]) == "image":
+                last_image_index = index
+                break
+        if last_image_index is None:
+            return 1.0
+        distance = len(node_ids) - 1 - last_image_index
+        if distance <= 0:
+            return 1.0
+        return distance / (distance + 1.0)
 
     def _register_edge_usage(self, edge_ids: list[str]) -> None:
         for edge_id in edge_ids:
@@ -327,6 +365,11 @@ def _debug_main() -> None:
     parser.add_argument("--max-hops", type=int, default=5)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--edge-penalty-alpha", type=float, default=1.0)
+    parser.add_argument(
+        "--disable-image-spacing",
+        action="store_true",
+        help="Disable the extra image-spacing penalty when choosing image neighbors.",
+    )
     parser.add_argument("--min-modality-switches", type=int, default=0)
     parser.add_argument(
         "--hop-sampling-strategy",
@@ -344,6 +387,7 @@ def _debug_main() -> None:
             max_hops=args.max_hops,
             random_seed=args.seed,
             edge_penalty_alpha=args.edge_penalty_alpha,
+            image_spacing_enabled=not args.disable_image_spacing,
             min_modality_switches=args.min_modality_switches,
             hop_sampling_strategy=args.hop_sampling_strategy,
             max_samples=1,

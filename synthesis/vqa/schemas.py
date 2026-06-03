@@ -114,7 +114,6 @@ class QuestionDraft:
     answer: str
     answer_type: str
     reasoning_steps: list[dict[str, Any]] = field(default_factory=list)
-    why_image_is_needed: str | None = None
     used_evidence_ids: list[str] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
 

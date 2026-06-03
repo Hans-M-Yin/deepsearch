@@ -6,12 +6,11 @@ from dataclasses import dataclass
 
 from synthesis.store import JsonlGraphStore
 
-from .evidence_builder import EvidenceBuilder
 from .graph_view import GraphView
 from .obfuscation import ObfuscationProcessor
 from .path_sampler import RandomPathSampler, SamplerConfiguration
 from .question_writer import QuestionWriter
-from .schemas import SampleStatus, VqaSample
+from .schemas import EvidenceBundle, SampleStatus, VqaSample
 from .verifier import SampleVerifier
 
 
@@ -22,7 +21,6 @@ class VqaGenerationPipeline:
     store: JsonlGraphStore
     config: SamplerConfiguration
     sampler: RandomPathSampler | None = None
-    evidence_builder: EvidenceBuilder | None = None
     obfuscator: ObfuscationProcessor | None = None
     writer: QuestionWriter | None = None
     verifier: SampleVerifier | None = None
@@ -31,7 +29,6 @@ class VqaGenerationPipeline:
         graph = GraphView(self.store, allowed_edge_types=set(self.config.allowed_edge_types))
         self.graph = graph
         self.sampler = self.sampler or RandomPathSampler(graph=graph, config=self.config)
-        self.evidence_builder = self.evidence_builder or EvidenceBuilder(graph=graph)
         self.obfuscator = self.obfuscator or ObfuscationProcessor()
         self.writer = self.writer or QuestionWriter()
         self.verifier = self.verifier or SampleVerifier()
@@ -42,10 +39,13 @@ class VqaGenerationPipeline:
         for path in self.sampler.generate(limit=sample_limit):
             target_node = self.graph.get_node(path.target_node_id) or {}
             target_title = target_node.get("title")
-            evidence = self.evidence_builder.build(path)
-            evidence = self.obfuscator.pre_obfuscate(evidence, target_title=target_title)
-            draft = self.writer.draft(path=path, evidence=evidence)
-            polished = self.writer.polish(draft=draft, path=path, evidence=evidence)
+            evidence = EvidenceBundle(
+                bundle_id=f"bundle_{path.path_id}",
+                path_id=path.path_id,
+                metadata={"placeholder": True, "source": "pipeline_without_evidence_builder"},
+            )
+            draft = self.writer.draft(path=path, graph=self.graph)
+            polished = self.writer.polish(draft=draft, path=path, graph=self.graph)
             polished = self.obfuscator.post_obfuscate(polished, target_title=target_title)
             verification = self.verifier.verify(question=polished)
             status = SampleStatus.VERIFIED if verification.final_keep else SampleStatus.REJECTED

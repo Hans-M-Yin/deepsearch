@@ -26,13 +26,11 @@ class ObfuscationProcessor:
         if not target_title:
             return draft
         question = self._mask_text(draft.question, target_title)
-        why_image = None if draft.why_image_is_needed is None else self._mask_text(draft.why_image_is_needed, target_title)
         return QuestionDraft(
             question=question,
             answer=draft.answer,
             answer_type=draft.answer_type,
             reasoning_steps=list(draft.reasoning_steps),
-            why_image_is_needed=why_image,
             used_evidence_ids=list(draft.used_evidence_ids),
             metadata=dict(draft.metadata),
         )
