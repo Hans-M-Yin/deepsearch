@@ -2,10 +2,20 @@
 
 from __future__ import annotations
 
+import argparse
 from dataclasses import asdict, dataclass, field
 from hashlib import sha256
+import json
+from pathlib import Path
 import random
+import sys
 from typing import Any
+
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    __package__ = "synthesis.vqa"
+
+from synthesis.store import JsonlGraphStore
 
 from .graph_view import GraphView
 from .schemas import PathCandidate, TrajectoryStats
@@ -26,6 +36,7 @@ class SamplerConfiguration:
     random_seed: int = 0
     max_attempts_multiplier: int = 20
     min_attempts: int = 100
+    hop_sampling_strategy: str = "middle_biased"
     require_simple_path: bool = True
     min_modality_switches: int = 0
     dedup_by_exact_signature: bool = True
@@ -52,6 +63,8 @@ class SamplerConfiguration:
             raise ValueError("max_attempts_multiplier must be positive")
         if self.min_attempts <= 0:
             raise ValueError("min_attempts must be positive")
+        if self.hop_sampling_strategy not in {"uniform", "middle_biased"}:
+            raise ValueError("hop_sampling_strategy must be 'uniform' or 'middle_biased'")
         if self.min_modality_switches < 0:
             raise ValueError("min_modality_switches must be >= 0")
         if self.edge_penalty_alpha < 0:
@@ -170,7 +183,7 @@ class RandomPathSampler(PathSampler):
         relations: list[str] = []
         used_edge_ids: set[str] = set()
         current = start_node_id
-        hop_count = rng.randint(self.config.min_hops, self.config.max_hops)
+        hop_count = self._sample_hop_count(rng)
 
         for _ in range(hop_count):
             neighbors = self.graph.neighbors(current)
@@ -245,6 +258,17 @@ class RandomPathSampler(PathSampler):
         weights = [self._edge_weight(edge.get("edge_id")) for edge in neighbors]
         return rng.choices(neighbors, weights=weights, k=1)[0]
 
+    def _sample_hop_count(self, rng: random.Random) -> int:
+        if self.config.min_hops == self.config.max_hops:
+            return self.config.min_hops
+        if self.config.hop_sampling_strategy == "uniform":
+            return rng.randint(self.config.min_hops, self.config.max_hops)
+
+        mid = (self.config.min_hops + self.config.max_hops) / 2.0
+        sampled = rng.triangular(self.config.min_hops, self.config.max_hops, mid)
+        hop_count = int(round(sampled))
+        return max(self.config.min_hops, min(self.config.max_hops, hop_count))
+
     def _edge_weight(self, edge_id: str | None) -> float:
         if not edge_id:
             return 1.0
@@ -289,3 +313,52 @@ class RandomPathSampler(PathSampler):
             image_only_at_end=image_positions == [len(modality_sequence) - 1],
             has_mid_image=any(0 < pos < len(modality_sequence) - 1 for pos in image_positions),
         )
+
+
+def _debug_main() -> None:
+    parser = argparse.ArgumentParser(description="Debug one sampled trajectory from an existing graph store.")
+    parser.add_argument(
+        "--graph-dir",
+        type=Path,
+        default=Path("runs/kobe_text_only"),
+        help="Directory containing nodes.jsonl/edges.jsonl graph tables.",
+    )
+    parser.add_argument("--min-hops", type=int, default=3)
+    parser.add_argument("--max-hops", type=int, default=5)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--edge-penalty-alpha", type=float, default=1.0)
+    parser.add_argument("--min-modality-switches", type=int, default=0)
+    parser.add_argument(
+        "--hop-sampling-strategy",
+        choices=("uniform", "middle_biased"),
+        default="middle_biased",
+    )
+    args = parser.parse_args()
+
+    store = JsonlGraphStore(args.graph_dir)
+    graph = GraphView(store, allowed_edge_types=set(SamplerConfiguration().allowed_edge_types))
+    sampler = RandomPathSampler(
+        graph=graph,
+        config=SamplerConfiguration(
+            min_hops=args.min_hops,
+            max_hops=args.max_hops,
+            random_seed=args.seed,
+            edge_penalty_alpha=args.edge_penalty_alpha,
+            min_modality_switches=args.min_modality_switches,
+            hop_sampling_strategy=args.hop_sampling_strategy,
+            max_samples=1,
+        ),
+    )
+    candidate = sampler.generate_one()
+    print(f"graph_dir: {args.graph_dir}")
+    print(f"store_stats: {json.dumps(store.stats(), ensure_ascii=False)}")
+    print(f"sampler_stats: {json.dumps(sampler.last_generation_stats.to_dict() if sampler.last_generation_stats else {}, ensure_ascii=False)}")
+    if candidate is None:
+        print("trajectory: null")
+        return
+    print("trajectory:")
+    print(json.dumps(candidate.to_dict(), ensure_ascii=False, indent=2))
+
+
+if __name__ == "__main__":
+    _debug_main()

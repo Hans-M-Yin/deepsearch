@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from synthesis.store import JsonlGraphStore
@@ -15,6 +15,10 @@ class GraphView:
 
     store: JsonlGraphStore
     allowed_edge_types: set[str] | None = None
+    nodes_by_id: dict[str, dict[str, Any]] = field(init=False)
+    edges_by_id: dict[str, dict[str, Any]] = field(init=False)
+    out_edges: dict[str, list[dict[str, Any]]] = field(init=False)
+    in_edges: dict[str, list[dict[str, Any]]] = field(init=False)
 
     def __post_init__(self) -> None:
         self.nodes_by_id: dict[str, dict[str, Any]] = {
