@@ -166,6 +166,7 @@ class GraphRunner:
             for result in results:
                 self.state.step += 1
                 self._record_result(result)
+                self._emit_node_status(result)
                 self._emit_progress()
                 self._emit_warning(result)
                 if result.error:
@@ -316,6 +317,35 @@ class GraphRunner:
             print(f"\r{padded}", end="", file=sys.stderr, flush=True)
             return
         print(line, file=sys.stderr, flush=True)
+
+    def _emit_node_status(self, result: NodeExpansionResult) -> None:
+        stats = self.store.stats()
+        nodes = self.store.list_nodes()
+        text_count = 0
+        image_count = 0
+        latest_title: str | None = None
+        latest_created_at: str = ""
+        for node in nodes:
+            node_type = node.get("node_type")
+            if node_type == "text":
+                text_count += 1
+            elif node_type == "image":
+                image_count += 1
+            created_at = str(node.get("created_at") or "")
+            if created_at >= latest_created_at:
+                latest_created_at = created_at
+                latest_title = node.get("title") or node.get("node_id")
+        task_title = result.task.title or result.task.url
+        print(
+            "[node-status] "
+            f"task={task_title!r} "
+            f"nodes={int(stats.get('nodes', 0))} "
+            f"text={text_count} "
+            f"image={image_count} "
+            f"latest={latest_title!r}",
+            file=sys.stderr,
+            flush=True,
+        )
 
     def _finish_progress(self) -> None:
         if not self.config.show_progress:
