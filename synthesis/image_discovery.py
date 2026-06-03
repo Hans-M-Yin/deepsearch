@@ -745,6 +745,7 @@ class ImageDiscoveryBuilder:
             image_evidence=image_evidence,
             run_id=run_id,
             source_node_title=source_node_title,
+            source_query_text=candidate.source_query.query,
         )
 
         if persist:
@@ -1868,6 +1869,7 @@ class ImageDiscoveryBuilder:
         image_evidence: Evidence,
         run_id: str | None,
         source_node_title: str | None,
+        source_query_text: str | None,
     ) -> tuple[list[Edge], list[dict[str, Any]]]:
         if self.store is None or not grounded_entities:
             return [], []
@@ -1875,9 +1877,13 @@ class ImageDiscoveryBuilder:
         edges: list[Edge] = []
         unresolved: list[dict[str, Any]] = []
         queued_tasks: list[dict[str, Any]] = []
+        blocked_query_entities = self._query_implied_entity_labels(source_query_text)
         for entity in grounded_entities:
             if not self._should_expand_entity(entity):
                 unresolved.append({**entity, "status": "filtered_out"})
+                continue
+            if self._is_query_implied_entity(entity, blocked_query_entities):
+                unresolved.append({**entity, "status": "filtered_by_query_entity_overlap"})
                 continue
             matched_node = self._match_text_node(entity.get("name"))
             if matched_node is None:
@@ -1945,6 +1951,36 @@ class ImageDiscoveryBuilder:
             image_node.metadata = dict(image_node.metadata or {})
             image_node.metadata["unresolved_grounded_entities"] = unresolved
         return edges, queued_tasks
+
+    def _query_implied_entity_labels(self, query_text: str | None) -> set[str]:
+        if self.store is None or not query_text:
+            return set()
+        normalized_query = self._normalize_entity_label(query_text)
+        if not normalized_query:
+            return set()
+
+        blocked: set[str] = set()
+        query_tokens = set(normalized_query.split())
+        for node in self.store.list_nodes():
+            if node.get("node_type") != NodeType.TEXT.value:
+                continue
+            labels = [node.get("title") or "", *(node.get("aliases") or [])]
+            for label in labels:
+                normalized_label = self._normalize_entity_label(label)
+                if not normalized_label or len(normalized_label) < 4:
+                    continue
+                label_tokens = set(normalized_label.split())
+                if not label_tokens:
+                    continue
+                if normalized_label == normalized_query or label_tokens.issubset(query_tokens):
+                    blocked.add(normalized_label)
+        return blocked
+
+    def _is_query_implied_entity(self, entity: dict[str, Any], blocked_query_entities: set[str]) -> bool:
+        label = self._normalize_entity_label(entity.get("name") or "")
+        if not label:
+            return False
+        return label in blocked_query_entities
 
     def _resolve_grounded_entity(
         self,

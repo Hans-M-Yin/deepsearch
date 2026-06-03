@@ -75,9 +75,7 @@ Return valid JSON with exactly these fields:
 
 PROMPT_SELECT_TARGET = """You are selecting a good final ask from the target node of a multi-hop search problem.
 
-Choose one answerable target from the final node. Prefer something slightly
-harder than directly asking for the node name when a more specific but still
-well-supported attribute is available.
+Choose one answerable target from the final node. Prefer a question whose answer is clearly supported by reliable evidence associated with the node, but is not merely a piece of broad common knowledge. When possible, avoid asking for the node name itself or for overly obvious attributes. Instead, select a specific, verifiable detail that requires consulting the relevant evidence while remaining unambiguous and well-supported.
 
 Return valid JSON with exactly these fields:
 {

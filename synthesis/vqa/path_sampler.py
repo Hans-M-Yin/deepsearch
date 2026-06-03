@@ -120,9 +120,12 @@ class RandomPathSampler(PathSampler):
 
     used_exact_signatures: set[str] = field(default_factory=set)
     edge_usage_counts: dict[str, int] = field(default_factory=dict)
+    _rng: random.Random = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self._rng = random.Random(self.config.random_seed)
 
     def generate_one(self) -> PathCandidate | None:
-        rng = random.Random(self.config.random_seed)
         node_ids = self._candidate_start_nodes()
         if not node_ids:
             self.last_generation_stats = SamplerGenerationStats(requested=1, attempts=0, accepted=0)
@@ -134,8 +137,8 @@ class RandomPathSampler(PathSampler):
         while attempts < max_attempts:
             attempts += 1
             stats.attempts = attempts
-            start_node_id = rng.choice(node_ids)
-            candidate, reject_reason = self._sample_one(start_node_id=start_node_id, rng=rng)
+            start_node_id = self._rng.choice(node_ids)
+            candidate, reject_reason = self._sample_one(start_node_id=start_node_id, rng=self._rng)
             if candidate is None:
                 self._count_rejection(stats, reject_reason)
                 continue
