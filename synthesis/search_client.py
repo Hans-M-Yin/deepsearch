@@ -2,15 +2,23 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
 import sys
+import time
 from dataclasses import asdict, dataclass, field
 from enum import Enum
+from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover
+    fcntl = None
 
 
 def _jsonify(value: Any) -> Any:
@@ -74,6 +82,160 @@ class SearchClient(Protocol):
 
     def search_image(self, query: str, *, limit: int = 10, **kwargs: Any) -> SearchResponse:
         """Return image search results."""
+
+
+class SerperApiKeyPool:
+    """Simple cross-process credit-tracked key pool for Serper."""
+
+    def __init__(
+        self,
+        *,
+        keys: list[str],
+        state_path: str | Path | None = None,
+        default_credits: int = 2500,
+        min_remaining: int = 100,
+    ) -> None:
+        cleaned = [key.strip() for key in keys if key and key.strip()]
+        if not cleaned:
+            raise ValueError("Serper API key pool requires at least one key.")
+        self.keys = cleaned
+        self.default_credits = max(1, int(default_credits))
+        self.min_remaining = max(0, int(min_remaining))
+        configured_path = state_path or os.environ.get("SERPER_API_POOL_STATE_FILE") or "synthesis/.serper_pool_state.json"
+        self.state_path = Path(configured_path)
+        if not self.state_path.is_absolute():
+            self.state_path = Path.cwd() / self.state_path
+        self.state_path.parent.mkdir(parents=True, exist_ok=True)
+
+    @staticmethod
+    def key_id(key: str) -> str:
+        return hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
+
+    @classmethod
+    def from_env(cls) -> "SerperApiKeyPool" | None:
+        keys = cls._load_keys_from_env()
+        if not keys:
+            return None
+        return cls(
+            keys=keys,
+            state_path=os.environ.get("SERPER_API_POOL_STATE_FILE"),
+            default_credits=int(os.environ.get("SERPER_API_POOL_DEFAULT_CREDITS") or 2500),
+            min_remaining=int(os.environ.get("SERPER_API_POOL_MIN_REMAINING") or 100),
+        )
+
+    @staticmethod
+    def _load_keys_from_env() -> list[str]:
+        if os.environ.get("SERPER_API_KEYS"):
+            return [item.strip() for item in os.environ["SERPER_API_KEYS"].split(",") if item.strip()]
+        keys_file = os.environ.get("SERPER_API_KEYS_FILE")
+        if not keys_file:
+            return []
+        path = Path(keys_file)
+        if not path.is_absolute():
+            path = Path.cwd() / path
+        if not path.exists():
+            raise FileNotFoundError(f"Serper API keys file does not exist: {path}")
+        keys: list[str] = []
+        for raw_line in path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            keys.append(line)
+        return keys
+
+    def acquire_key(self) -> tuple[str, dict[str, Any]]:
+        state = self._with_locked_state(self._acquire_from_state)
+        key = state.pop("_selected_key")
+        metadata = state.pop("_selected_metadata")
+        return key, metadata
+
+    def _acquire_from_state(self, state: dict[str, Any]) -> dict[str, Any]:
+        now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        pool = dict(state.get("keys") or {})
+        ordered_ids = []
+        for key in self.keys:
+            key_id = self.key_id(key)
+            ordered_ids.append(key_id)
+            record = dict(pool.get(key_id) or {})
+            record.setdefault("remaining_credits", self.default_credits)
+            record.setdefault("initial_credits", self.default_credits)
+            record.setdefault("disabled", False)
+            record.setdefault("masked_key", self._mask_key(key))
+            pool[key_id] = record
+
+        selected_key: str | None = None
+        selected_id: str | None = None
+        for key in self.keys:
+            key_id = self.key_id(key)
+            record = pool[key_id]
+            remaining = int(record.get("remaining_credits") or 0)
+            disabled = bool(record.get("disabled"))
+            if disabled:
+                continue
+            if remaining <= self.min_remaining:
+                continue
+            selected_key = key
+            selected_id = key_id
+            break
+
+        if selected_key is None or selected_id is None:
+            raise RuntimeError(
+                "No Serper API key in the pool has enough remaining credits. "
+                f"Minimum remaining threshold: {self.min_remaining}."
+            )
+
+        selected = pool[selected_id]
+        selected["remaining_credits"] = max(0, int(selected.get("remaining_credits") or 0) - 1)
+        selected["last_used_at"] = now
+        pool[selected_id] = selected
+        state["keys"] = pool
+        state["key_order"] = ordered_ids
+        state["updated_at"] = now
+        state["default_credits"] = self.default_credits
+        state["min_remaining"] = self.min_remaining
+        state["_selected_key"] = selected_key
+        state["_selected_metadata"] = {
+            "key_id": selected_id,
+            "masked_key": selected.get("masked_key"),
+            "remaining_credits": selected.get("remaining_credits"),
+            "initial_credits": selected.get("initial_credits"),
+        }
+        return state
+
+    def _with_locked_state(self, callback) -> dict[str, Any]:
+        lock_path = self.state_path.with_suffix(self.state_path.suffix + ".lock")
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with lock_path.open("a+", encoding="utf-8") as lock_handle:
+            if fcntl is not None:
+                fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+            try:
+                state = self._read_state()
+                updated = callback(state)
+                self._write_state(updated)
+                return updated
+            finally:
+                if fcntl is not None:
+                    fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+
+    def _read_state(self) -> dict[str, Any]:
+        if not self.state_path.exists():
+            return {}
+        try:
+            return json.loads(self.state_path.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+
+    def _write_state(self, state: dict[str, Any]) -> None:
+        persisted = {key: value for key, value in state.items() if not key.startswith("_")}
+        tmp_path = self.state_path.with_suffix(self.state_path.suffix + ".tmp")
+        tmp_path.write_text(json.dumps(persisted, ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+        os.replace(tmp_path, self.state_path)
+
+    @staticmethod
+    def _mask_key(key: str) -> str:
+        if len(key) <= 8:
+            return key
+        return f"{key[:4]}...{key[-4:]}"
 
 
 class OpenSerpSearchClient:
@@ -347,37 +509,57 @@ class SerperSearchClient:
         self,
         *,
         api_key: str | None = None,
+        api_keys: list[str] | None = None,
         search_url: str | None = None,
         images_url: str | None = None,
         timeout_s: float = 60.0,
+        pool_state_path: str | Path | None = None,
+        pool_default_credits: int | None = None,
+        pool_min_remaining: int | None = None,
     ) -> None:
         self.api_key = api_key or os.environ.get("SERPER_API_KEY")
+        self.key_pool: SerperApiKeyPool | None = None
+        if api_keys:
+            self.key_pool = SerperApiKeyPool(
+                keys=api_keys,
+                state_path=pool_state_path,
+                default_credits=pool_default_credits or int(os.environ.get("SERPER_API_POOL_DEFAULT_CREDITS") or 2500),
+                min_remaining=pool_min_remaining or int(os.environ.get("SERPER_API_POOL_MIN_REMAINING") or 100),
+            )
+        elif not self.api_key:
+            self.key_pool = SerperApiKeyPool.from_env()
         self.search_url = search_url or os.environ.get("SERPER_SEARCH_URL") or "https://google.serper.dev/search"
         self.images_url = images_url or os.environ.get("SERPER_IMAGES_URL") or "https://google.serper.dev/images"
         self.timeout_s = timeout_s
 
     def search_text(self, query: str, *, limit: int = 10, **kwargs: Any) -> SearchResponse:
-        raw, status_code = self._post_json(self.search_url, self._serper_body(query, limit, kwargs))
+        raw, status_code, metadata = self._post_json(self.search_url, self._serper_body(query, limit, kwargs))
         return SearchResponse(
             query=query,
             engine="serper:search",
             results=self._parse_text_results(raw),
             raw_response=raw,
             status_code=status_code,
+            metadata=metadata,
         )
 
     def search_image(self, query: str, *, limit: int = 10, **kwargs: Any) -> SearchResponse:
-        raw, status_code = self._post_json(self.images_url, self._serper_body(query, limit, kwargs))
+        raw, status_code, metadata = self._post_json(self.images_url, self._serper_body(query, limit, kwargs))
         return SearchResponse(
             query=query,
             engine="serper:images",
             results=self._parse_image_results(raw),
             raw_response=raw,
             status_code=status_code,
+            metadata=metadata,
         )
 
-    def _post_json(self, url: str, body: dict[str, Any]) -> tuple[dict[str, Any], int]:
-        if not self.api_key:
+    def _post_json(self, url: str, body: dict[str, Any]) -> tuple[dict[str, Any], int, dict[str, Any]]:
+        api_key = self.api_key
+        pool_metadata: dict[str, Any] = {}
+        if self.key_pool is not None:
+            api_key, pool_metadata = self.key_pool.acquire_key()
+        if not api_key:
             raise ValueError("Serper API key is required. Set SERPER_API_KEY or pass api_key explicitly.")
 
         payload = json.dumps(body).encode("utf-8")
@@ -387,7 +569,7 @@ class SerperSearchClient:
             headers={
                 "Accept": "application/json",
                 "Content-Type": "application/json",
-                "X-API-KEY": self.api_key,
+                "X-API-KEY": api_key,
             },
             method="POST",
         )
@@ -396,7 +578,10 @@ class SerperSearchClient:
             status_code = response.getcode()
         raw = json.loads(response_payload)
         self._log_raw_response(url=url, body=body, status_code=status_code, raw=raw)
-        return raw, status_code
+        metadata = {
+            "serper_key_pool": pool_metadata if pool_metadata else None,
+        }
+        return raw, status_code, metadata
 
     @staticmethod
     def _log_raw_response(
