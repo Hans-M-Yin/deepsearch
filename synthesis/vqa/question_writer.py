@@ -739,19 +739,22 @@ def _debug_main() -> None:
     )
     context = writer.build_writer_context(path=path, graph=graph)
     hop_summaries = [writer.compress_hop(hop=hop) for hop in context.hops]
-    target_ask = writer.select_target_ask(context=context)
     draft = writer.compose_question(path=path, graph=graph, context=context)
 
     print("path:")
     print(json.dumps(path.to_dict(), ensure_ascii=False, indent=2))
-    print("writer_context:")
-    print(json.dumps(context.to_dict(), ensure_ascii=False, indent=2))
     print("hop_summaries:")
     print(json.dumps(hop_summaries, ensure_ascii=False, indent=2))
-    print("target_ask:")
-    print(json.dumps(target_ask, ensure_ascii=False, indent=2))
-    print("draft:")
-    print(json.dumps(draft.to_dict(), ensure_ascii=False, indent=2))
+    print("question:")
+    print(json.dumps(
+        {
+            "question": draft.question,
+            "answer": draft.answer,
+            "answer_type": draft.answer_type,
+        },
+        ensure_ascii=False,
+        indent=2,
+    ))
 
 
 if __name__ == "__main__":

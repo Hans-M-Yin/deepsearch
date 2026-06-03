@@ -89,6 +89,8 @@ class SamplerGenerationStats:
     rejected_modality_switch: int = 0
     rejected_start_type: int = 0
     rejected_end_type: int = 0
+    accepted_start_node_id: str | None = None
+    recent_start_node_ids: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -102,7 +104,7 @@ class PathSampler:
     config: SamplerConfiguration
     last_generation_stats: SamplerGenerationStats | None = None
 
-    def generate_one(self) -> PathCandidate | None:
+    def generate_one(self, start_node_id: str | None = None) -> PathCandidate | None:
         raise NotImplementedError
 
     def generate(self, limit: int | None = None) -> list[PathCandidate]:
@@ -125,10 +127,21 @@ class RandomPathSampler(PathSampler):
     def __post_init__(self) -> None:
         self._rng = random.Random(self.config.random_seed)
 
-    def generate_one(self) -> PathCandidate | None:
+    def generate_one(self, start_node_id: str | None = None) -> PathCandidate | None:
         node_ids = self._candidate_start_nodes()
         if not node_ids:
             self.last_generation_stats = SamplerGenerationStats(requested=1, attempts=0, accepted=0)
+            return None
+
+        forced_start_node_id = start_node_id
+        if forced_start_node_id is not None and forced_start_node_id not in node_ids:
+            self.last_generation_stats = SamplerGenerationStats(
+                requested=1,
+                attempts=0,
+                accepted=0,
+                rejected_start_type=1,
+                recent_start_node_ids=[forced_start_node_id],
+            )
             return None
 
         stats = SamplerGenerationStats(requested=1)
@@ -137,8 +150,10 @@ class RandomPathSampler(PathSampler):
         while attempts < max_attempts:
             attempts += 1
             stats.attempts = attempts
-            start_node_id = self._rng.choice(node_ids)
-            candidate, reject_reason = self._sample_one(start_node_id=start_node_id, rng=self._rng)
+            sampled_start_node_id = forced_start_node_id or self._rng.choice(node_ids)
+            stats.recent_start_node_ids.append(sampled_start_node_id)
+            stats.recent_start_node_ids = stats.recent_start_node_ids[-10:]
+            candidate, reject_reason = self._sample_one(start_node_id=sampled_start_node_id, rng=self._rng)
             if candidate is None:
                 self._count_rejection(stats, reject_reason)
                 continue
@@ -148,6 +163,7 @@ class RandomPathSampler(PathSampler):
             self.used_exact_signatures.add(candidate.exact_signature)
             self._register_edge_usage(candidate.edge_ids)
             stats.accepted = 1
+            stats.accepted_start_node_id = sampled_start_node_id
             self.last_generation_stats = stats
             return candidate
         self.last_generation_stats = stats
@@ -367,6 +383,11 @@ def _debug_main() -> None:
     parser.add_argument("--min-hops", type=int, default=3)
     parser.add_argument("--max-hops", type=int, default=5)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--start-node-id",
+        default=None,
+        help="Optional fixed start node id for debugging one specific trajectory root.",
+    )
     parser.add_argument("--edge-penalty-alpha", type=float, default=1.0)
     parser.add_argument(
         "--disable-image-spacing",
@@ -396,7 +417,7 @@ def _debug_main() -> None:
             max_samples=1,
         ),
     )
-    candidate = sampler.generate_one()
+    candidate = sampler.generate_one(start_node_id=args.start_node_id)
     print(f"graph_dir: {args.graph_dir}")
     print(f"store_stats: {json.dumps(store.stats(), ensure_ascii=False)}")
     print(f"sampler_stats: {json.dumps(sampler.last_generation_stats.to_dict() if sampler.last_generation_stats else {}, ensure_ascii=False)}")
