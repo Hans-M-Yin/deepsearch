@@ -2068,7 +2068,7 @@ class ImageDiscoveryBuilder:
             plan.source_node_id,
             image_node.node_id,
             edge_type=EdgeType.SEARCH_RETRIEVED,
-            relation="retrieved_image_for_visual_target",
+            relation=query.query or "retrieved_image_for_visual_target",
             src_node_type=NodeType.TEXT.value,
             dst_node_type=NodeType.IMAGE.value,
             evidence_refs=[
