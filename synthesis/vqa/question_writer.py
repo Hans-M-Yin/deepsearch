@@ -99,6 +99,8 @@ Your job is to write one natural search or deep-research question that:
 - preserves the true hop direction internally
 - keeps only the clues necessary for the question to remain coherent and solvable
 - does not directly reveal the answer
+- is easy to read as a SINGLE clear question
+- has a clearly understandable final ask
 
 Do NOT do the following:
 - do not narrate the chain step by step
@@ -131,6 +133,25 @@ Question-writing goal:
   the full chain spelled out
 - intermediate facts may be paraphrased, partially hidden, or omitted
 - preserve the first-hop-to-last-hop logic as latent support
+
+Clarity rules:
+- write one main question, not a loose pile of clues
+- the reader should be able to understand what is being asked after one careful read
+- keep referents clear: avoid too many vague "this", "that", or "the one"
+- prefer layered constraints that narrow the target step by step
+- end with a very explicit final ask, such as:
+  - "which player ... ?"
+  - "what is the name of ... ?"
+  - "which team ... ?"
+  - "how many ... ?"
+- do not let the final ask get buried inside a long sentence
+
+Good style example:
+- "In the championship celebration image of a certain NBA team, one player later had an award named after him after winning it four times. Other than him, which player also won that award four times?"
+
+Bad style example:
+- "From the image ..., then ..., and following that clue ..., what ... ?"
+- a long sentence where the reader cannot tell what the final question is asking
 
 Opening mode rules:
 - if opening_mode is "text_start", begin naturally from the first hop's source
@@ -596,11 +617,13 @@ class QuestionWriter:
         parsed = self._generate_json(
             system=(
                 "You are rewriting a bad multi-hop question draft.\n\n"
-                "The previous draft explicitly narrated the reasoning chain.\n"
+                "The previous draft explicitly narrated the reasoning chain or was too hard to read.\n"
                 "Rewrite it into ONE natural search question.\n"
                 "Do not narrate the chain. Do not use phrases like 'starting with', "
                 "'then', 'following that clue', or 'using that clue'.\n"
-                "Keep the latent reasoning structure, but hide the step-by-step derivation.\n\n"
+                "Keep the latent reasoning structure, but hide the step-by-step derivation.\n"
+                "Make the question easy to read, with a clear final ask.\n"
+                "Prefer one main question with layered constraints, not a loose string of facts.\n\n"
                 "Return valid JSON with exactly these fields:\n"
                 "{\n"
                 '  "question": "..."\n'
