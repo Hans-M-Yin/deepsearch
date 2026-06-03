@@ -23,6 +23,7 @@ if __package__ in (None, ""):
     __package__ = "synthesis.vqa"
 
 from synthesis.model_worker import ModelMessage, ModelRequest, ModelWorkerClient
+from synthesis.model_worker import LLM_WORKER
 from synthesis.store import JsonlGraphStore
 
 from .graph_view import GraphView
@@ -544,6 +545,11 @@ def _debug_main() -> None:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--edge-penalty-alpha", type=float, default=1.0)
     parser.add_argument(
+        "--model-alias",
+        default=None,
+        help="Optional model alias registered in synthesis/models.json. If omitted, fallback logic is used.",
+    )
+    parser.add_argument(
         "--hop-sampling-strategy",
         choices=("uniform", "middle_biased"),
         default="middle_biased",
@@ -571,7 +577,10 @@ def _debug_main() -> None:
         print("path: null")
         return
 
-    writer = QuestionWriter()
+    writer = QuestionWriter(
+        model_client=LLM_WORKER if args.model_alias else None,
+        model=args.model_alias,
+    )
     context = writer.build_writer_context(path=path, graph=graph)
     hop_summaries = [writer.compress_hop(hop=hop) for hop in context.hops]
     target_ask = writer.select_target_ask(context=context)
