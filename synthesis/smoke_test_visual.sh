@@ -12,6 +12,4 @@ python synthesis/run_min_graph.py \
   --max-depth 64 \
   --parallel-workers 64 \
   --batch-size 64 \
-  --image-backend serper \
-  2>&1 | tee runs/multi_seed_visual_smoke_2/run.log
-  
+  --image-backend serper 
