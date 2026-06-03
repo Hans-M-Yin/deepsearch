@@ -1,0 +1,158 @@
+tee: runs/multi_seed_visual_smoke_2/run.log: No such file or directory
+python: can't open file '/mnt/hdfs/byte_ai_sales/user/user/yinzhihan/agent/OpenSearch-VL/run_min_graph.py': [Errno 2] No such file or directory
+python: can't open file '/mnt/hdfs/byte_ai_sales/user/user/yinzhihan/agent/OpenSearch-VL/run_min_graph.py': [Errno 2] No such file or directory
+[progress] steps=1/12345678 queue=42 nodes=11/512 edges=0 completed=1 failed=0 skipped=0
+[progress] steps=2/12345678 queue=42 nodes=11/512 edges=0 completed=1 failed=1 skipped=0
+[warning] task_failed url='https://en.wikipedia.org/wiki/IPhone_(1st_generation)' title=None depth=0 error=KeyError: 'Model alias is not registered: gpt54_internal_azure'
+[progress] steps=3/12345678 queue=42 nodes=11/512 edges=0 completed=1 failed=2 skipped=0
+[warning] task_failed url='https://en.wikipedia.org/wiki/Bird_in_Space' title=None depth=0 error=KeyError: 'Model alias is not registered: gpt54_internal_azure'
+[progress] steps=4/12345678 queue=42 nodes=11/512 edges=0 completed=1 failed=3 skipped=0
+[warning] task_failed url='https://en.wikipedia.org/wiki/Shou_Chew' title=None depth=0 error=KeyError: 'Model alias is not registered: gpt54_internal_azure'
+[progress] steps=5/12345678 queue=42 nodes=11/512 edges=0 completed=1 failed=4 skipped=0
+[warning] task_failed url='https://en.wikipedia.org/wiki/Book_of_Kells' title=None depth=0 error=KeyError: 'Model alias is not registered: gpt54_internal_azure'
+[progress] steps=6/12345678 queue=42 nodes=11/512 edges=0 completed=1 failed=5 skipped=0
+[warning] task_failed url='https://en.wikipedia.org/wiki/Thriller_(album)' title=None depth=0 error=KeyError: 'Model alias is not registered: gpt54_internal_azure'
+[progress] steps=7/12345678 queue=42 nodes=11/512 edges=0 completed=1 failed=6 skipped=0
+[warning] task_failed url='https://en.wikipedia.org/wiki/Taylor_Swift' title=None depth=0 error=KeyError: 'Model alias is not registered: gpt54_internal_azure'
+[progress] steps=8/12345678 queue=42 nodes=11/512 edges=0 completed=1 failed=7 skipped=0
+[warning] task_failed url='https://en.wikipedia.org/wiki/Kobe_Bryant' title=None depth=0 error=KeyError: 'Model alias is not registered: gpt54_internal_azure'
+[progress] steps=9/12345678 queue=42 nodes=11/512 edges=0 completed=1 failed=8 skipped=0
+[warning] task_failed url='https://en.wikipedia.org/wiki/Mona_Lisa' title=None depth=0 error=KeyError: 'Model alias is not registered: gpt54_internal_azure'
+[progress] steps=10/12345678 queue=42 nodes=11/512 edges=0 completed=1 failed=9 skipped=0
+[warning] task_failed url='https://en.wikipedia.org/wiki/Chien-Shiung_Wu' title=None depth=0 error=KeyError: 'Model alias is not registered: gpt54_internal_azure'
+[progress] steps=11/12345678 queue=42 nodes=11/512 edges=0 completed=1 failed=10 skipped=0
+[warning] task_failed url='https://en.wikipedia.org/wiki/Ada_Hegerberg' title=None depth=0 error=KeyError: 'Model alias is not registered: gpt54_internal_azure'
+[progress] steps=12/12345678 queue=3 nodes=51/512 edges=1 completed=1 failed=11 skipped=0
+[warning] task_failed url='https://en.wikipedia.org/wiki/Robert_Andrews_Millikan' title='Robert Andrews Millikan' depth=1 error=APITimeoutError: Request timed out.
+[progress] steps=13/12345678 queue=3 nodes=51/512 edges=1 completed=1 failed=12 skipped=0
+[warning] task_failed url='https://en.wikipedia.org/wiki/NBA_All-Star_Game_Kobe_Bryant_Most_Valuable_Player' title='NBA All-Star Game Kobe Bryant Most Valuable Player' depth=1 error=APITimeoutError: Request timed out.
+[progress] steps=14/12345678 queue=3 nodes=51/512 edges=1 completed=1 failed=13 skipped=0
+[warning] task_failed url='https://en.wikipedia.org/wiki/AT%26T_Mobility' title='AT&T Mobility' depth=1 error=APITimeoutError: Request timed out.
+[progress] steps=15/12345678 queue=3 nodes=51/512 edges=1 completed=1 failed=14 skipped=0
+[warning] task_failed url='https://en.wikipedia.org/wiki/Merrill_Lynch' title='Merrill Lynch' depth=1 error=APITimeoutError: Request timed out.
+[progress] steps=16/12345678 queue=3 nodes=51/512 edges=1 completed=1 failed=15 skipped=0
+[warning] task_failed url='https://en.wikipedia.org/wiki/Early_iPhone_systems-on-chip' title='Early iPhone systems-on-chip' depth=1 error=APITimeoutError: Request timed out.
+[progress] steps=17/12345678 queue=3 nodes=51/512 edges=1 completed=1 failed=16 skipped=0
+[warning] task_failed url='https://en.wikipedia.org/wiki/Kells,_County_Meath' title='Kells, County Meath' depth=1 error=APITimeoutError: Request timed out.
+[progress] steps=18/12345678 queue=3 nodes=51/512 edges=1 completed=1 failed=17 skipped=0
+[warning] task_failed url='https://en.wikipedia.org/wiki/Second_inauguration_of_Donald_Trump' title='Second inauguration of Donald Trump' depth=1 error=APITimeoutError: Request timed out.
+[progress] steps=19/12345678 queue=3 nodes=51/512 edges=1 completed=1 failed=18 skipped=0
+[warning] task_failed url='https://en.wikipedia.org/wiki/Grammy_Award_for_Album_of_the_Year' title='Grammy Award for Album of the Year' depth=1 error=APITimeoutError: Request timed out.
+[progress] steps=20/12345678 queue=3 nodes=51/512 edges=1 completed=1 failed=19 skipped=0
+[warning] task_failed url='https://en.wikipedia.org/wiki/Parity_(physics)' title='Parity (physics)' depth=1 error=APITimeoutError: Request timed out.
+[progress] steps=21/12345678 queue=3 nodes=51/512 edges=1 completed=1 failed=20 skipped=0
+[warning] task_failed url='https://en.wikipedia.org/wiki/Gherardini_family' title='Gherardini family' depth=1 error=APITimeoutError: Request timed out.
+[progress] steps=22/12345678 queue=3 nodes=51/512 edges=1 completed=1 failed=21 skipped=0
+[warning] task_failed url='https://en.wikipedia.org/wiki/National_service_in_Singapore' title='National service in Singapore' depth=1 error=APITimeoutError: Request timed out.
+[progress] steps=23/12345678 queue=3 nodes=51/512 edges=1 completed=1 failed=21 skipped=1
+[warning] attribute_extract_failed url='https://en.wikipedia.org/wiki/Off%5C_the%5C_Wall' title='Off\\ the\\ Wall' depth=1 error=InvalidWikiPageError: Wikipedia page does not exist as an article: https://en.wikipedia.org/wiki/Off%5C_the%5C_Wall
+[progress] steps=24/12345678 queue=3 nodes=51/512 edges=1 completed=1 failed=22 skipped=1
+[warning] task_failed url='https://en.wikipedia.org/wiki/NBA_All-Star_Game_Kobe_Bryant_Most_Valuable_Player_Award' title='NBA All-Star Game Kobe Bryant Most Valuable Player Award' depth=1 error=APITimeoutError: Request timed out.
+[progress] steps=25/12345678 queue=3 nodes=51/512 edges=1 completed=1 failed=22 skipped=2
+[warning] attribute_extract_failed url='https://en.wikipedia.org/wiki/Taylor%5C_Swift%5C_(album)' title='Taylor\\ Swift\\ (album)' depth=1 error=InvalidWikiPageError: Wikipedia page does not exist as an article: https://en.wikipedia.org/wiki/Taylor%5C_Swift%5C_(album)
+[progress] steps=26/12345678 queue=3 nodes=51/512 edges=1 completed=1 failed=23 skipped=2
+[warning] task_failed url='https://en.wikipedia.org/wiki/UEFA_Women%27s_Champions_League' title="UEFA Women's Champions League" depth=1 error=APITimeoutError: Request timed out.
+[progress] steps=27/12345678 queue=3 nodes=51/512 edges=1 completed=1 failed=24 skipped=2
+[warning] task_failed url='https://en.wikipedia.org/wiki/Guinness_World_Records' title='Guinness World Records' depth=1 error=APITimeoutError: Request timed out.
+[progress] steps=28/12345678 queue=3 nodes=51/512 edges=1 completed=1 failed=25 skipped=2
+[warning] task_failed url='https://en.wikipedia.org/wiki/U.S._Customs' title='U.S. Customs' depth=1 error=APITimeoutError: Request timed out.
+[progress] steps=29/12345678 queue=3 nodes=51/512 edges=1 completed=1 failed=26 skipped=2
+[warning] task_failed url='https://en.wikipedia.org/wiki/United_States_House_Committee_on_Energy_and_Commerce' title='United States House Committee on Energy and Commerce' depth=1 error=APITimeoutError: Request timed out.
+[progress] steps=30/12345678 queue=3 nodes=51/512 edges=1 completed=1 failed=27 skipped=2
+[warning] task_failed url='https://en.wikipedia.org/wiki/UEFA_Best_Women%27s_Player_in_Europe_Award' title="UEFA Best Women's Player in Europe Award" depth=1 error=APITimeoutError: Request timed out.
+[progress] steps=31/12345678 queue=3 nodes=51/512 edges=1 completed=1 failed=28 skipped=2
+[warning] task_failed url='https://en.wikipedia.org/wiki/Mona_Lisa_(opera)' title='Mona Lisa (opera)' depth=1 error=APITimeoutError: Request timed out.
+[progress] steps=32/12345678 queue=3 nodes=51/512 edges=1 completed=1 failed=29 skipped=2
+[warning] task_failed url='https://en.wikipedia.org/wiki/Insular_art' title='Insular art' depth=1 error=APITimeoutError: Request timed out.
+[progress] steps=33/12345678 queue=3 nodes=51/512 edges=1 completed=1 failed=30 skipped=2
+[warning] task_failed url='https://en.wikipedia.org/wiki/2013_UEFA_Women%27s_Championship' title="2013 UEFA Women's Championship" depth=1 error=APITimeoutError: Request timed out.
+[progress] steps=34/12345678 queue=3 nodes=51/512 edges=1 completed=1 failed=31 skipped=2
+[warning] task_failed url='https://en.wikipedia.org/wiki/National_Gallery_of_Art' title='National Gallery of Art' depth=1 error=APITimeoutError: Request timed out.
+[progress] steps=35/12345678 queue=3 nodes=51/512 edges=1 completed=1 failed=32 skipped=2
+[warning] task_failed url='https://en.wikipedia.org/wiki/IPhone_OS_1' title='IPhone OS 1' depth=1 error=APITimeoutError: Request timed out.
+[progress] steps=36/12345678 queue=3 nodes=51/512 edges=1 completed=1 failed=33 skipped=2
+[warning] task_failed url='https://en.wikipedia.org/wiki/Tom_W._Bonner_Prize' title='Tom W. Bonner Prize' depth=1 error=APITimeoutError: Request timed out.
+[progress] steps=37/12345678 queue=3 nodes=51/512 edges=1 completed=1 failed=34 skipped=2
+[warning] task_failed url='https://en.wikipedia.org/wiki/Big_Machine_Records' title='Big Machine Records' depth=1 error=APITimeoutError: Request timed out.
+[progress] steps=38/12345678 queue=3 nodes=51/512 edges=1 completed=1 failed=35 skipped=2
+[warning] task_failed url='https://en.wikipedia.org/wiki/Metropolitan_Museum_of_Art' title='Metropolitan Museum of Art' depth=1 error=APITimeoutError: Request timed out.
+[progress] steps=39/12345678 queue=3 nodes=51/512 edges=1 completed=1 failed=36 skipped=2
+[warning] task_failed url='https://en.wikipedia.org/wiki/Biograph_Company' title='Biograph Company' depth=1 error=APITimeoutError: Request timed out.
+[progress] steps=40/12345678 queue=3 nodes=51/512 edges=1 completed=1 failed=37 skipped=2
+[warning] task_failed url='https://en.wikipedia.org/wiki/Epic_Records' title='Epic Records' depth=1 error=APITimeoutError: Request timed out.
+[progress] steps=41/12345678 queue=3 nodes=51/512 edges=1 completed=1 failed=38 skipped=2
+[warning] task_failed url='https://en.wikipedia.org/wiki/Library_of_Trinity_College_Dublin' title='Library of Trinity College Dublin' depth=1 error=APITimeoutError: Request timed out.
+[progress] steps=42/12345678 queue=3 nodes=51/512 edges=1 completed=1 failed=39 skipped=2
+[warning] task_failed url='https://en.wikipedia.org/wiki/University_of_California,_Berkeley' title='University of California, Berkeley' depth=1 error=APITimeoutError: Request timed out.
+[progress] steps=43/12345678 queue=3 nodes=51/512 edges=1 completed=1 failed=40 skipped=2
+[warning] task_failed url='https://en.wikipedia.org/wiki/Auguste_and_Louis_Lumi%C3%A8re' title='Auguste and Louis Lumière' depth=1 error=APITimeoutError: Request timed out.
+[progress] steps=44/12345678 queue=3 nodes=51/512 edges=1 completed=1 failed=41 skipped=2
+[warning] task_failed url='https://en.wikipedia.org/wiki/Lower_Merion_High_School' title='Lower Merion High School' depth=1 error=APITimeoutError: Request timed out.
+[progress] steps=45/12345678 queue=3 nodes=51/512 edges=1 completed=1 failed=42 skipped=2
+[warning] task_failed url='https://en.wikipedia.org/wiki/Leonardo_da_Vinci' title='Leonardo da Vinci' depth=1 error=APITimeoutError: Request timed out.
+[progress] steps=46/12345678 queue=3 nodes=51/512 edges=1 completed=1 failed=43 skipped=2
+[warning] task_failed url='https://en.wikipedia.org/wiki/Apple_Inc.' title='Apple Inc.' depth=1 error=APITimeoutError: Request timed out.
+[progress] steps=47/12345678 queue=3 nodes=51/512 edges=1 completed=1 failed=44 skipped=2
+[warning] task_failed url='https://en.wikipedia.org/wiki/Constantin_Br%C3%A2ncu%C8%99i' title='Constantin Brâncuși' depth=1 error=APITimeoutError: Request timed out.
+[progress] steps=48/12345678 queue=3 nodes=51/512 edges=1 completed=1 failed=45 skipped=2
+[warning] task_failed url='https://en.wikipedia.org/wiki/OL_Lyonnes' title='OL Lyonnes' depth=1 error=APITimeoutError: Request timed out.
+[progress] steps=49/12345678 queue=3 nodes=51/512 edges=1 completed=1 failed=46 skipped=2
+[warning] task_failed url='https://en.wikipedia.org/wiki/Los_Angeles_Lakers' title='Los Angeles Lakers' depth=1 error=APITimeoutError: Request timed out.
+[progress] steps=50/12345678 queue=3 nodes=51/512 edges=1 completed=1 failed=47 skipped=2
+[warning] task_failed url='https://en.wikipedia.org/wiki/University_College_London' title='University College London' depth=1 error=APITimeoutError: Request timed out.
+[progress] steps=51/12345678 queue=3 nodes=51/512 edges=1 completed=1 failed=48 skipped=2
+[warning] task_failed url='https://en.wikipedia.org/wiki/Westlake_Recording_Studios' title='Westlake Recording Studios' depth=1 error=APITimeoutError: Request timed out.
+[progress] steps=52/12345678 queue=3 nodes=51/512 edges=1 completed=2 failed=48 skipped=2
+[progress] steps=53/12345678 queue=3 nodes=51/512 edges=1 completed=2 failed=49 skipped=2
+[warning] task_failed url='https://en.wikipedia.org/wiki/Columba' title='Columba' depth=1 error=APITimeoutError: Request timed out.
+[progress] steps=54/12345678 queue=0 nodes=54/512 edges=1 completed=2 failed=50 skipped=2
+[warning] task_failed url='https://en.wikipedia.org/wiki/Zanele_Muholi' title='Zanele Muholi' depth=2 error=APITimeoutError: Request timed out.
+[progress] steps=55/12345678 queue=0 nodes=54/512 edges=1 completed=2 failed=51 skipped=2
+[warning] task_failed url='https://en.wikipedia.org/wiki/Anton_Corbijn' title='Anton Corbijn' depth=2 error=APITimeoutError: Request timed out.
+[progress] steps=56/12345678 queue=0 nodes=54/512 edges=1 completed=2 failed=52 skipped=2
+[warning] task_failed url='https://en.wikipedia.org/wiki/Henry_Bond' title='Henry Bond' depth=2 error=APITimeoutError: Request timed out.
+[preflight] Enhanced Reader reachable, status=200, test_url=https://en.wikipedia.org/wiki/Kobe_Bryant
+=== min graph run ===
+env_file: /mnt/hdfs/byte_ai_sales/user/user/yinzhihan/agent/OpenSearch-VL/synthesis/.env (21 vars loaded)
+run_config: /mnt/hdfs/byte_ai_sales/user/user/yinzhihan/agent/OpenSearch-VL/runs/multi_seed_visual_smoke_2/run_config.json
+git: commit=25795ae2e3e4328b16fecaa37ad305a99a998bc8 branch=main dirty=True
+store_dir: /mnt/hdfs/byte_ai_sales/user/user/yinzhihan/agent/OpenSearch-VL/runs/multi_seed_visual_smoke_2
+seed_count: 11
+seed_preview: ['https://en.wikipedia.org/wiki/Kobe_Bryant', 'https://en.wikipedia.org/wiki/Taylor_Swift', 'https://en.wikipedia.org/wiki/Shou_Chew', 'https://en.wikipedia.org/wiki/IPhone_(1st_generation)', 'https://en.wikipedia.org/wiki/Mona_Lisa']
+run_id: run_20260602_232453
+status: completed
+steps: 56
+queue_size: 0
+completed: 2
+failed: 52
+skipped: 2
+store_stats: {'nodes': 54, 'edges': 1, 'assets': 0, 'evidence': 54, 'search_snapshots': 0}
+last_error: APITimeoutError: Request timed out.
+last_failed_task:
+  url: https://en.wikipedia.org/wiki/Henry_Bond
+  title: Henry Bond
+  depth: 2
+  error: APITimeoutError: Request timed out.
+graph_density: directed=0.000349 undirected_upper_bound=0.000699 avg_out_degree=0.02 avg_total_degree=0.04
+image_summary: returned=0 accepted=0 rejected=0 fetch_failed=0
+elapsed_s: 1626.57
+elapsed: 27m 6.57s
+store_size_bytes: 2498434
+store_size: 2.38 MB
+timing_summary:
+  steps_with_timing: 54
+  attribute_s: total=0.00s avg=0.00s p50=0.00s max=0.00s
+  image_expansion_s: total=0.00s avg=0.00s p50=0.00s max=0.00s
+  materialize_parent_edges_s: total=8.76s avg=0.73s p50=0.00s max=8.76s
+  queue_neighbors_s: total=10.34s avg=0.86s p50=0.01s max=3.81s
+  text_build_s: total=15765.88s avg=291.96s p50=325.12s max=388.71s
+  text_cache_lookup_input_s: total=0.00s avg=0.00s p50=0.00s max=0.00s
+  text_cache_lookup_page_s: total=0.00s avg=0.00s p50=0.00s max=0.00s
+  text_link_extract_s: total=12408.16s avg=229.78s p50=255.64s max=361.66s
+  text_node_evidence_create_s: total=0.07s avg=0.00s p50=0.00s max=0.00s
+  text_persist_s: total=392.29s avg=7.26s p50=5.62s max=17.11s
+  text_reader_read_s: total=2965.36s avg=54.91s p50=58.36s max=76.31s
+  text_total_s: total=15765.87s avg=291.96s p50=325.12s max=388.71s
+  text_validate_and_truncate_s: total=0.07s avg=0.00s p50=0.00s max=0.00s
+  total_s: total=31155.89s avg=576.96s p50=693.97s max=750.21s
+last_error: APITimeoutError: Request timed out.

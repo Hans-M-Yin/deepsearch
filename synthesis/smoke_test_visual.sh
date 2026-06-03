@@ -1,6 +1,6 @@
-mkdir -p runs/multi_seed_visual_smoke
+mkdir -p runs/multi_seed_visual_smoke_2
 
-python run_min_graph.py \
+python synthesis/run_min_graph.py \
   --seed-urls-file synthesis/seeds.txt \
   --store-dir runs/multi_seed_visual_smoke_2 \
   --reader-base-url http://10.124.136.6:8004 \
