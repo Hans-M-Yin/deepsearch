@@ -147,13 +147,18 @@ class RandomPathSampler(PathSampler):
         stats = SamplerGenerationStats(requested=1)
         max_attempts = max(self.config.max_attempts_multiplier, self.config.min_attempts)
         attempts = 0
+        target_hop_count = self._sample_hop_count(self._rng)
         while attempts < max_attempts:
             attempts += 1
             stats.attempts = attempts
             sampled_start_node_id = forced_start_node_id or self._rng.choice(node_ids)
             stats.recent_start_node_ids.append(sampled_start_node_id)
             stats.recent_start_node_ids = stats.recent_start_node_ids[-10:]
-            candidate, reject_reason = self._sample_one(start_node_id=sampled_start_node_id, rng=self._rng)
+            candidate, reject_reason = self._sample_one(
+                start_node_id=sampled_start_node_id,
+                rng=self._rng,
+                hop_count=target_hop_count,
+            )
             if candidate is None:
                 self._count_rejection(stats, reject_reason)
                 continue
@@ -164,6 +169,7 @@ class RandomPathSampler(PathSampler):
             self._register_edge_usage(candidate.edge_ids)
             stats.accepted = 1
             stats.accepted_start_node_id = sampled_start_node_id
+            candidate.metadata["sampled_hop_count"] = target_hop_count
             self.last_generation_stats = stats
             return candidate
         self.last_generation_stats = stats
@@ -196,14 +202,20 @@ class RandomPathSampler(PathSampler):
         """Backward-compatible alias for early callers."""
         return self.generate(limit=limit)
 
-    def _sample_one(self, *, start_node_id: str, rng: random.Random) -> tuple[PathCandidate | None, str | None]:
+    def _sample_one(
+        self,
+        *,
+        start_node_id: str,
+        rng: random.Random,
+        hop_count: int | None = None,
+    ) -> tuple[PathCandidate | None, str | None]:
         node_ids = [start_node_id]
         edge_ids: list[str] = []
         edge_types: list[str] = []
         relations: list[str] = []
         used_edge_ids: set[str] = set()
         current = start_node_id
-        hop_count = self._sample_hop_count(rng)
+        hop_count = hop_count if hop_count is not None else self._sample_hop_count(rng)
 
         for _ in range(hop_count):
             neighbors = self._traversable_neighbors(current)
@@ -251,6 +263,7 @@ class RandomPathSampler(PathSampler):
             core_signature=core_signature,
             metadata={
                 "sampling_policy": "random",
+                "sampled_hop_count": hop_count,
                 "sampler_config": self.config.to_dict(),
             },
         )
