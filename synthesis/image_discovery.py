@@ -100,8 +100,7 @@ Use candidate metadata only to disambiguate what is visible. The preferred textu
 Important grounding rules:
 1. Include indirect but clearly visible searchable entities when they are visually grounded.
    - Examples: an Adidas or Nike logo on clothing, a team crest on a jersey, a visible brand mark on an object. These marks point to a unique brand.
-2. Do not output duplicate entities that refer to the same real-world entity.
-   - Merge aliases, OCR handles, usernames, and alternate surface forms into the canonical entity and mention the alias in the evidence instead.
+   
 Output guidance:
 1. `relation_to_image` is a visual locator, not an abstract semantic relation.
    It should help a user immediately point to the entity inside the image.
