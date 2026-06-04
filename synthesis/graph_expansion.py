@@ -50,11 +50,17 @@ class ExpansionTaskStatus(str, Enum):
     SKIPPED = "skipped"
 
 
+class ExpansionTaskType(str, Enum):
+    TEXT_EXPAND = "text_expand"
+    IMAGE_EXPAND = "image_expand"
+
+
 @dataclass(slots=True)
 class ExpansionTask:
     """A queued text node/page waiting to be built."""
 
     url: str
+    task_type: ExpansionTaskType = ExpansionTaskType.TEXT_EXPAND
     depth: int = 0
     title: str | None = None
     parent_node_id: str | None = None
@@ -65,6 +71,14 @@ class ExpansionTask:
 
     def to_dict(self) -> dict[str, Any]:
         return _jsonify(asdict(self))
+
+    def dedupe_key(self) -> str:
+        if self.task_type == ExpansionTaskType.IMAGE_EXPAND:
+            source_node_id = (self.metadata or {}).get("source_text_node_id")
+            if source_node_id:
+                return f"{self.task_type.value}:{source_node_id}"
+            return f"{self.task_type.value}:{self.url}"
+        return f"{self.task_type.value}:{self.url}"
 
     @classmethod
     def from_wiki_link(
@@ -83,6 +97,7 @@ class ExpansionTask:
         }
         return cls(
             url=candidate.url,
+            task_type=ExpansionTaskType.TEXT_EXPAND,
             depth=depth,
             title=candidate.title,
             parent_node_id=parent_node_id,
@@ -116,6 +131,7 @@ class ExpansionTask:
         }
         return cls(
             url=url,
+            task_type=ExpansionTaskType.TEXT_EXPAND,
             depth=0,
             title=title,
             parent_node_id=parent_image_node_id,
@@ -125,6 +141,30 @@ class ExpansionTask:
                 "task_origin": "image_entity",
                 "entity_name": entity.get("name"),
                 "entity_type": entity.get("type"),
+            },
+        )
+
+    @classmethod
+    def from_image_expansion(
+        cls,
+        *,
+        url: str,
+        title: str | None,
+        depth: int,
+        source_text_node_id: str,
+        source_evidence_id: str,
+    ) -> "ExpansionTask":
+        return cls(
+            url=url,
+            task_type=ExpansionTaskType.IMAGE_EXPAND,
+            depth=depth,
+            title=title,
+            parent_node_id=source_text_node_id,
+            priority=1.0,
+            metadata={
+                "task_origin": "image_expand",
+                "source_text_node_id": source_text_node_id,
+                "source_evidence_id": source_evidence_id,
             },
         )
 
@@ -191,7 +231,7 @@ class GraphExpansionStrategy:
         self.image_builder = image_builder
         self.config = config or GraphExpansionConfig()
         self._queue: deque[ExpansionTask] = deque()
-        self._seen_urls: set[str] = set()
+        self._seen_task_keys: set[str] = set()
         self._pending_parent_links_by_url: dict[str, list[dict[str, Any]]] = {}
         self._lock = RLock()
 
@@ -208,9 +248,10 @@ class GraphExpansionStrategy:
 
     def enqueue(self, task: ExpansionTask) -> bool:
         with self._lock:
-            if task.url in self._seen_urls:
+            task_key = task.dedupe_key()
+            if task_key in self._seen_task_keys:
                 return False
-            self._seen_urls.add(task.url)
+            self._seen_task_keys.add(task_key)
             pending_links = self._pending_parent_links_by_url.pop(task.url, [])
             if pending_links:
                 links = list(task.metadata.get("pending_parent_links") or [])
@@ -247,13 +288,13 @@ class GraphExpansionStrategy:
         with self._lock:
             return [task.to_dict() for task in self._queue]
 
-    def seen_urls(self) -> list[str]:
+    def seen_task_keys(self) -> list[str]:
         with self._lock:
-            return sorted(self._seen_urls)
+            return sorted(self._seen_task_keys)
 
-    def add_seen_urls(self, urls: list[str]) -> None:
+    def add_seen_task_keys(self, keys: list[str]) -> None:
         with self._lock:
-            self._seen_urls.update(urls)
+            self._seen_task_keys.update(keys)
 
     def expand_task(
         self,
@@ -261,6 +302,9 @@ class GraphExpansionStrategy:
         *,
         run_id: str | None = None,
     ) -> NodeExpansionResult:
+        if task.task_type == ExpansionTaskType.IMAGE_EXPAND:
+            return self._expand_image_task(task, run_id=run_id)
+
         total_started = time.perf_counter()
         timing: dict[str, float] = {}
         _trace_timing(f"[expand-task] phase=start url={task.url!r} title={task.title!r} depth={task.depth}")
@@ -313,11 +357,12 @@ class GraphExpansionStrategy:
             )
 
             started = time.perf_counter()
-            visual_plans, image_results, image_queued_tasks = self._expand_images(text_result, run_id=run_id)
-            queued_tasks.extend(image_queued_tasks)
-            timing["image_expansion_s"] = time.perf_counter() - started
+            image_task = self._enqueue_image_expansion_task(text_result, depth=task.depth)
+            if image_task is not None:
+                queued_tasks.append(image_task)
+            timing["image_enqueue_s"] = time.perf_counter() - started
             _trace_timing(
-                f"[expand-task] stage=image_expand url={task.url!r} elapsed_s={timing['image_expansion_s']:.3f} plans={len(visual_plans)} image_nodes={sum(1 for item in image_results if item.image_node is not None)}"
+                f"[expand-task] stage=image_enqueue url={task.url!r} elapsed_s={timing['image_enqueue_s']:.3f} queued={'yes' if image_task is not None else 'no'}"
             )
             timing["total_s"] = time.perf_counter() - total_started
             _trace_timing(f"[expand-task] phase=done url={task.url!r} elapsed_s={timing['total_s']:.3f}")
@@ -327,8 +372,8 @@ class GraphExpansionStrategy:
                 text_result=text_result,
                 attribute_evidence=attribute_evidence,
                 attribute_error=attribute_error,
-                visual_plans=visual_plans,
-                image_results=image_results,
+                visual_plans=[],
+                image_results=[],
                 materialized_edges=materialized_edges,
                 parent_link_failures=parent_link_failures,
                 queued_tasks=queued_tasks,
@@ -348,6 +393,61 @@ class GraphExpansionStrategy:
             task.status = ExpansionTaskStatus.FAILED
             timing["total_s"] = time.perf_counter() - total_started
             _trace_timing(f"[expand-task] phase=failed url={task.url!r} elapsed_s={timing['total_s']:.3f} error={exc.__class__.__name__}: {exc}")
+            return NodeExpansionResult(
+                task=task,
+                error=f"{exc.__class__.__name__}: {exc}",
+                timing=timing,
+            )
+
+    def _expand_image_task(
+        self,
+        task: ExpansionTask,
+        *,
+        run_id: str | None = None,
+    ) -> NodeExpansionResult:
+        total_started = time.perf_counter()
+        timing: dict[str, float] = {}
+        _trace_timing(f"[expand-image-task] phase=start url={task.url!r} title={task.title!r} depth={task.depth}")
+        try:
+            started = time.perf_counter()
+            text_result = self.wiki_builder.build_from_url(
+                task.url,
+                title=task.title,
+                run_id=run_id,
+                persist=self.config.persist,
+            )
+            timing["image_source_load_s"] = time.perf_counter() - started
+            for key, value in text_result.timing.items():
+                timing[f"image_source_{key}"] = value
+            _trace_timing(
+                f"[expand-image-task] stage=source_load url={task.url!r} elapsed_s={timing['image_source_load_s']:.3f} node_id={text_result.node.node_id!r} cache={'yes' if text_result.from_cache else 'no'}"
+            )
+
+            started = time.perf_counter()
+            visual_plans, image_results, queued_tasks = self._expand_images(text_result, run_id=run_id)
+            timing["image_expansion_s"] = time.perf_counter() - started
+            _trace_timing(
+                f"[expand-image-task] stage=image_expand url={task.url!r} elapsed_s={timing['image_expansion_s']:.3f} plans={len(visual_plans)} image_nodes={sum(1 for item in image_results if item.image_node is not None)}"
+            )
+            timing["total_s"] = time.perf_counter() - total_started
+            _trace_timing(f"[expand-image-task] phase=done url={task.url!r} elapsed_s={timing['total_s']:.3f}")
+            task.status = ExpansionTaskStatus.DONE
+            return NodeExpansionResult(
+                task=task,
+                text_result=text_result,
+                visual_plans=visual_plans,
+                image_results=image_results,
+                materialized_edges=[],
+                parent_link_failures=[],
+                queued_tasks=queued_tasks,
+                timing=timing,
+            )
+        except Exception as exc:
+            task.status = ExpansionTaskStatus.FAILED
+            timing["total_s"] = time.perf_counter() - total_started
+            _trace_timing(
+                f"[expand-image-task] phase=failed url={task.url!r} elapsed_s={timing['total_s']:.3f} error={exc.__class__.__name__}: {exc}"
+            )
             return NodeExpansionResult(
                 task=task,
                 error=f"{exc.__class__.__name__}: {exc}",
@@ -727,6 +827,30 @@ class GraphExpansionStrategy:
             quality_reasons=list(record.get("quality_reasons") or []),
         )
 
+    def _enqueue_image_expansion_task(
+        self,
+        text_result: WikiTextBuildResult,
+        *,
+        depth: int,
+    ) -> ExpansionTask | None:
+        if not self.config.enable_image_expansion:
+            return None
+        if self.visual_planner is None or self.image_builder is None:
+            return None
+        source_url = text_result.node.source.url if text_result.node.source else None
+        if not source_url:
+            return None
+        task = ExpansionTask.from_image_expansion(
+            url=source_url,
+            title=text_result.node.title,
+            depth=depth,
+            source_text_node_id=text_result.node.node_id,
+            source_evidence_id=text_result.text_evidence.evidence_id,
+        )
+        if self.enqueue(task):
+            return task
+        return None
+
     def _expand_images(
         self,
         text_result: WikiTextBuildResult,
@@ -869,11 +993,14 @@ def _smoke_test() -> None:
 
     from .edges import Edge, EdgeType
     from .evidence import EvidenceType, SearchEngine, SearchSnapshot
-    from .nodes import TextNode
+    from .image_discovery import ImageDiscoveryResult
+    from .nodes import NodeSource, TextNode
+    from .visual_planner import SearchQuerySpec, VisualSearchPlan
 
     class MockWikiBuilder:
         def __init__(self, store: JsonlGraphStore) -> None:
             self.store = store
+            self.read_calls = 0
 
         def build_from_url(
             self,
@@ -883,8 +1010,18 @@ def _smoke_test() -> None:
             run_id: str | None = None,
             persist: bool = True,
         ) -> WikiTextBuildResult:
+            cached = self._cached_build_result(url)
+            if cached is not None:
+                return cached
+            self.read_calls += 1
             page_title = title or ("Neighbor" if url.endswith("/Neighbor") else "Seed")
-            node = TextNode.from_webpage(url, title=page_title, description=f"{page_title} page")
+            node = TextNode(
+                node_id=TextNode.make_id("wikipedia_page", url),
+                subtype="wiki_page",
+                title=page_title,
+                description=f"{page_title} page",
+                source=NodeSource(source_type="wikipedia", url=url),
+            )
             evidence = Evidence.create(
                 EvidenceType.WEB_TEXT,
                 content=f"{page_title} page",
@@ -921,6 +1058,32 @@ def _smoke_test() -> None:
                 edges=[],
             )
 
+        def _cached_build_result(self, page_url: str) -> WikiTextBuildResult | None:
+            node_id = TextNode.make_id("wikipedia_page", page_url)
+            node_record = self.store.get_node(node_id)
+            if node_record is None:
+                return None
+            evidence_record = None
+            for evidence in self.store.list_evidence():
+                if evidence.get("evidence_type") != EvidenceType.WEB_TEXT.value:
+                    continue
+                if node_id in evidence.get("node_ids", []):
+                    evidence_record = evidence
+                    break
+            if evidence_record is None:
+                return None
+            snapshot = SearchSnapshot.create(SearchEngine.JINA_READER, query=page_url)
+            result = WikiTextBuildResult(
+                node=WikiTextBuilder._text_node_from_record(node_record),
+                text_evidence=WikiTextBuilder._evidence_from_record(evidence_record),
+                snapshot=snapshot,
+                linked_entities=[],
+                edges=[],
+                from_cache=True,
+            )
+            result.timing = {"total_s": 0.0}
+            return result
+
         def _edge_to_linked_entity(
             self,
             source_node: TextNode,
@@ -953,11 +1116,54 @@ def _smoke_test() -> None:
                 self.store.upsert_evidence(evidence)
             return evidence
 
+    class MockVisualPlanner:
+        def plan(
+            self,
+            *,
+            node: dict[str, Any],
+            page_text: str,
+            source_evidence_ids: list[str] | None = None,
+            run_id: str | None = None,
+        ) -> list[VisualSearchPlan]:
+            del page_text, run_id
+            target = Evidence.create(
+                EvidenceType.VISUAL_TARGET,
+                content=f"visual target for {node.get('title')}",
+                node_ids=[node.get("node_id")] if node.get("node_id") else [],
+            )
+            return [
+                VisualSearchPlan.create(
+                    target,
+                    queries=[
+                        SearchQuerySpec.create(
+                            f"{node.get('title')} image",
+                            target.evidence_id,
+                        )
+                    ],
+                    source_node_id=node.get("node_id"),
+                    source_evidence_ids=source_evidence_ids or [],
+                )
+            ]
+
+    class MockImageBuilder:
+        def discover_for_plan(
+            self,
+            plan: VisualSearchPlan,
+            *,
+            run_id: str | None = None,
+            persist: bool = True,
+        ) -> ImageDiscoveryResult:
+            del run_id, persist
+            return ImageDiscoveryResult(plan_id=plan.plan_id)
+
     with tempfile.TemporaryDirectory() as tmpdir:
         store = JsonlGraphStore(tmpdir)
+        wiki_builder = MockWikiBuilder(store)
         strategy = GraphExpansionStrategy(
             store=store,
-            wiki_builder=MockWikiBuilder(store),
+            wiki_builder=wiki_builder,
+            visual_planner=MockVisualPlanner(),
+            image_builder=MockImageBuilder(),
             config=GraphExpansionConfig(max_depth=1, max_new_text_neighbors=1, enable_image_expansion=False),
         )
         strategy.add_seed("https://en.wikipedia.org/wiki/Seed")
@@ -971,6 +1177,28 @@ def _smoke_test() -> None:
         assert child_result is not None
         assert len(child_result.materialized_edges) == 1
         assert store.stats()["edges"] == 1
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = JsonlGraphStore(tmpdir)
+        wiki_builder = MockWikiBuilder(store)
+        strategy = GraphExpansionStrategy(
+            store=store,
+            wiki_builder=wiki_builder,
+            visual_planner=MockVisualPlanner(),
+            image_builder=MockImageBuilder(),
+            config=GraphExpansionConfig(max_depth=0, max_new_text_neighbors=0, enable_image_expansion=True),
+        )
+        strategy.add_seed("https://en.wikipedia.org/wiki/Seed")
+        result = strategy.expand_next(run_id="run_smoke")
+        assert result is not None
+        assert len(result.queued_tasks) == 1
+        assert result.queued_tasks[0].task_type == ExpansionTaskType.IMAGE_EXPAND
+        assert strategy.queue_size() == 1
+        assert wiki_builder.read_calls == 1
+        image_result = strategy.expand_next(run_id="run_smoke")
+        assert image_result is not None
+        assert image_result.task.task_type == ExpansionTaskType.IMAGE_EXPAND
+        assert wiki_builder.read_calls == 1
     print("graph_expansion smoke test passed")
 
 

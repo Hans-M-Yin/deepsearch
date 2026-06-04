@@ -19,6 +19,7 @@ if __package__ in (None, ""):
 from .graph_expansion import (
     ExpansionTask,
     ExpansionTaskStatus,
+    ExpansionTaskType,
     GraphExpansionStrategy,
     NodeExpansionResult,
 )
@@ -67,7 +68,7 @@ class GraphRunnerState:
     failed_tasks: list[dict[str, Any]] = field(default_factory=list)
     skipped_tasks: list[dict[str, Any]] = field(default_factory=list)
     queue: list[dict[str, Any]] = field(default_factory=list)
-    seen_urls: list[str] = field(default_factory=list)
+    seen_task_keys: list[str] = field(default_factory=list)
     stats: dict[str, Any] = field(default_factory=dict)
     created_at: str = field(default_factory=_utc_now)
     updated_at: str = field(default_factory=_utc_now)
@@ -85,7 +86,7 @@ class GraphRunnerState:
             failed_tasks=list(payload.get("failed_tasks") or []),
             skipped_tasks=list(payload.get("skipped_tasks") or []),
             queue=list(payload.get("queue") or []),
-            seen_urls=list(payload.get("seen_urls") or []),
+            seen_task_keys=list(payload.get("seen_task_keys") or payload.get("seen_urls") or []),
             stats=dict(payload.get("stats") or {}),
             created_at=payload.get("created_at", _utc_now()),
             updated_at=payload.get("updated_at", _utc_now()),
@@ -282,11 +283,11 @@ class GraphRunner:
     def _restore_strategy_state(self) -> None:
         for task_record in self.state.queue:
             self.strategy.enqueue(self._task_from_record(task_record))
-        self.strategy.add_seen_urls(self.state.seen_urls)
+        self.strategy.add_seen_task_keys(self.state.seen_task_keys)
 
     def _sync_state_from_strategy(self) -> None:
         self.state.queue = self.strategy.queue_records()
-        self.state.seen_urls = self.strategy.seen_urls()
+        self.state.seen_task_keys = self.strategy.seen_task_keys()
 
     def _record_result(self, result: NodeExpansionResult) -> None:
         record = {
@@ -524,6 +525,7 @@ class GraphRunner:
     def _task_from_record(record: dict[str, Any]) -> ExpansionTask:
         return ExpansionTask(
             url=record["url"],
+            task_type=ExpansionTaskType(record.get("task_type", ExpansionTaskType.TEXT_EXPAND.value)),
             depth=int(record.get("depth", 0)),
             title=record.get("title"),
             parent_node_id=record.get("parent_node_id"),

@@ -108,6 +108,15 @@ WIKI_VOID_TAGS = {
 }
 
 
+class StageError(Exception):
+    """Wrap an internal stage failure with an explicit stage label."""
+
+    def __init__(self, stage: str, cause: Exception) -> None:
+        super().__init__(f"{stage} failed: {cause}")
+        self.stage = stage
+        self.cause = cause
+
+
 def normalize_url(target_url: str) -> str:
     if target_url.startswith(("http://", "https://")):
         return target_url
@@ -476,6 +485,54 @@ async def timed_call(label: str, coro, timing: dict[str, Any]):
         timing[f"{label}_s"] = time.perf_counter() - started
 
 
+async def timed_stage_call(stage: str, coro, timing: dict[str, Any]):
+    try:
+        return await timed_call(stage, coro, timing)
+    except Exception as exc:
+        raise StageError(stage, exc) from exc
+
+
+def _shorten(value: Any, limit: int = 800) -> str | None:
+    if value is None:
+        return None
+    text = str(value)
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "...<truncated>"
+
+
+def record_failure_debug(
+    timing: dict[str, Any],
+    *,
+    stage: str,
+    exc: Exception,
+) -> None:
+    timing["failure_stage"] = stage
+    timing["failure_exception_type"] = exc.__class__.__name__
+    timing["failure_exception"] = _shorten(repr(exc), limit=1200)
+
+    if isinstance(exc, httpx.HTTPStatusError):
+        response = exc.response
+        timing["failure_upstream_status_code"] = response.status_code
+        timing["failure_upstream_reason"] = response.reason_phrase
+        timing["failure_upstream_url"] = str(response.request.url)
+        try:
+            timing["failure_response_preview"] = _shorten(response.text, limit=1200)
+        except Exception:
+            pass
+        return
+
+    if isinstance(exc, httpx.TimeoutException):
+        request = getattr(exc, "request", None)
+        if request is not None:
+            timing["failure_upstream_url"] = str(request.url)
+        return
+
+    request = getattr(exc, "request", None)
+    if request is not None:
+        timing["failure_upstream_url"] = str(request.url)
+
+
 @app.get("/{target_url:path}")
 async def read(target_url: str, request: Request):
     total_started = time.perf_counter()
@@ -487,17 +544,43 @@ async def read(target_url: str, request: Request):
         try:
             fetch_started = time.perf_counter()
             markdown_response, html_response = await asyncio.gather(
-                timed_call("fetch_markdown", fetch_markdown(client, url), debug_timing),
-                timed_call("fetch_html", fetch_html(client, url), debug_timing),
+                timed_stage_call("fetch_markdown", fetch_markdown(client, url), debug_timing),
+                timed_stage_call("fetch_html", fetch_html(client, url), debug_timing),
             )
             fetch_done = time.perf_counter()
             debug_timing["fetch_markdown_html_parallel_s"] = fetch_done - fetch_started
             html = html_response
             readerlm_started = time.perf_counter()
-            markdown = await convert_html_to_markdown(client, html, source_url=url, debug_timing=debug_timing)
+            markdown = await timed_stage_call(
+                "readerlm",
+                convert_html_to_markdown(client, html, source_url=url, debug_timing=debug_timing),
+                debug_timing,
+            )
             debug_timing["readerlm_s"] = time.perf_counter() - readerlm_started
+        except StageError as exc:
+            debug_timing["total_s"] = time.perf_counter() - total_started
+            record_failure_debug(debug_timing, stage=exc.stage, exc=exc.cause)
+            message = f"Enhanced Reader error for {url}: {exc.stage} failed: {exc.cause}"
+            if wants_json:
+                return JSONResponse(
+                    status_code=502,
+                    content={
+                        "data": None,
+                        "code": 502,
+                        "status": 502,
+                        "message": message,
+                        "debug_timing": debug_timing,
+                    },
+                )
+            return Response(
+                message,
+                status_code=502,
+                media_type="text/plain",
+                headers={"X-Debug-Timing-Total-S": f"{debug_timing['total_s']:.6f}"},
+            )
         except Exception as exc:
             debug_timing["total_s"] = time.perf_counter() - total_started
+            record_failure_debug(debug_timing, stage="unknown", exc=exc)
             message = f"Enhanced Reader error for {url}: {exc}"
             if wants_json:
                 return JSONResponse(

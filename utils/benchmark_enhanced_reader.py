@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from collections import Counter
 import json
 import random
 import statistics
@@ -155,9 +156,16 @@ class RequestResult:
     elapsed_s: float
     content_chars: int = 0
     error: str | None = None
+    server_error_message: str | None = None
+    response_preview: str | None = None
     debug_total_s: float | None = None
     debug_fetch_parallel_s: float | None = None
     debug_readerlm_s: float | None = None
+    debug_payload: dict[str, Any] | None = None
+    failure_stage: str | None = None
+    failure_exception_type: str | None = None
+    failure_upstream_status_code: int | None = None
+    failure_upstream_url: str | None = None
 
 
 def parse_args() -> argparse.Namespace:
@@ -225,8 +233,43 @@ async def fetch_one(
             timeout=timeout_s,
         )
         elapsed_s = time.perf_counter() - started
-        response.raise_for_status()
-        payload: dict[str, Any] = response.json()
+        payload: dict[str, Any] | None = None
+        response_preview: str | None = None
+        try:
+            payload = response.json()
+        except Exception:
+            text = response.text
+            response_preview = text[:1000] if text else None
+        if response.is_error:
+            debug = {}
+            if isinstance(payload, dict):
+                debug = payload.get("debug_timing") or {}
+            return RequestResult(
+                url=url,
+                ok=False,
+                status_code=response.status_code,
+                elapsed_s=elapsed_s,
+                error=f"HTTPStatusError: Server error '{response.status_code} {response.reason_phrase}' for url '{response.url}'",
+                server_error_message=payload.get("message") if isinstance(payload, dict) else None,
+                response_preview=response_preview,
+                debug_total_s=float(debug["total_s"]) if debug.get("total_s") is not None else None,
+                debug_fetch_parallel_s=(
+                    float(debug["fetch_markdown_html_parallel_s"])
+                    if debug.get("fetch_markdown_html_parallel_s") is not None
+                    else None
+                ),
+                debug_readerlm_s=float(debug["readerlm_s"]) if debug.get("readerlm_s") is not None else None,
+                debug_payload=debug if isinstance(debug, dict) and debug else None,
+                failure_stage=debug.get("failure_stage") if isinstance(debug, dict) else None,
+                failure_exception_type=debug.get("failure_exception_type") if isinstance(debug, dict) else None,
+                failure_upstream_status_code=(
+                    int(debug["failure_upstream_status_code"])
+                    if isinstance(debug, dict) and debug.get("failure_upstream_status_code") is not None
+                    else None
+                ),
+                failure_upstream_url=debug.get("failure_upstream_url") if isinstance(debug, dict) else None,
+            )
+        assert isinstance(payload, dict)
         data = payload.get("data") or {}
         debug = payload.get("debug_timing") or data.get("debug_timing") or {}
         content = data.get("content") or ""
@@ -243,6 +286,7 @@ async def fetch_one(
                 else None
             ),
             debug_readerlm_s=float(debug["readerlm_s"]) if debug.get("readerlm_s") is not None else None,
+            debug_payload=debug if isinstance(debug, dict) and debug else None,
         )
     except Exception as exc:
         return RequestResult(
@@ -344,12 +388,37 @@ def print_summary(results: list[RequestResult], wall_s: float, concurrency: int)
             f"max={max(content_values)}"
         )
     if failed_results:
+        stage_counts = Counter(item.failure_stage or "unknown" for item in failed_results)
+        exception_counts = Counter(item.failure_exception_type or "unknown" for item in failed_results)
+        print(f"failure_stage_counts: {dict(stage_counts)}")
+        print(f"failure_exception_type_counts: {dict(exception_counts)}")
         print("sample_failures:")
         for item in failed_results[:10]:
             print(
                 f"  status={item.status_code!r} elapsed_s={item.elapsed_s:.3f} "
                 f"url={item.url} error={item.error}"
             )
+            if item.failure_stage or item.failure_exception_type:
+                print(
+                    "    failure_meta="
+                    f"stage={item.failure_stage!r} "
+                    f"exception_type={item.failure_exception_type!r} "
+                    f"upstream_status_code={item.failure_upstream_status_code!r} "
+                    f"upstream_url={item.failure_upstream_url!r}"
+                )
+            if item.server_error_message:
+                print(f"    message={item.server_error_message}")
+            if item.debug_total_s is not None or item.debug_fetch_parallel_s is not None or item.debug_readerlm_s is not None:
+                print(
+                    "    debug_timing="
+                    f"total_s={item.debug_total_s!r} "
+                    f"fetch_parallel_s={item.debug_fetch_parallel_s!r} "
+                    f"readerlm_s={item.debug_readerlm_s!r}"
+                )
+            if item.debug_payload:
+                print(f"    debug_payload={json.dumps(item.debug_payload, ensure_ascii=False)}")
+            if item.response_preview:
+                print(f"    response_preview={item.response_preview!r}")
 
 
 def maybe_write_json(path: str, results: list[RequestResult], wall_s: float, args: argparse.Namespace) -> None:
@@ -370,9 +439,16 @@ def maybe_write_json(path: str, results: list[RequestResult], wall_s: float, arg
                 "elapsed_s": item.elapsed_s,
                 "content_chars": item.content_chars,
                 "error": item.error,
+                "server_error_message": item.server_error_message,
+                "response_preview": item.response_preview,
                 "debug_total_s": item.debug_total_s,
                 "debug_fetch_parallel_s": item.debug_fetch_parallel_s,
                 "debug_readerlm_s": item.debug_readerlm_s,
+                "debug_payload": item.debug_payload,
+                "failure_stage": item.failure_stage,
+                "failure_exception_type": item.failure_exception_type,
+                "failure_upstream_status_code": item.failure_upstream_status_code,
+                "failure_upstream_url": item.failure_upstream_url,
             }
             for item in results
         ],
