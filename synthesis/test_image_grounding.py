@@ -19,6 +19,7 @@ import json
 import mimetypes
 import os
 from pathlib import Path
+import time
 from typing import Any
 
 if __package__ in (None, ""):
@@ -273,14 +274,18 @@ def main() -> int:
 
     if args.skip_check:
         validation = _force_accept_validation(builder, search_result, local_image_path)
+        validation_elapsed_s = 0.0
     else:
+        validation_started_at = time.perf_counter()
         validation = _run_image_check(
             builder=builder,
             plan=plan,
             search_result=search_result,
             local_image_path=local_image_path,
         )
+        validation_elapsed_s = time.perf_counter() - validation_started_at
 
+    grounding_started_at = time.perf_counter()
     grounding = builder.image_ground(
         plan=plan,
         search_result=search_result,
@@ -288,6 +293,7 @@ def main() -> int:
         validation=validation,
         run_id="manual_test",
     )
+    grounding_elapsed_s = time.perf_counter() - grounding_started_at
     filtered_grounding = _filter_grounded_entities(
         builder=builder,
         args=args,
@@ -304,6 +310,11 @@ def main() -> int:
         "validation": validation.to_dict(),
         "grounding": grounding,
         "filtered_grounding": filtered_grounding,
+        "timing": {
+            "image_check_s": validation_elapsed_s,
+            "image_ground_s": grounding_elapsed_s,
+            "total_s": validation_elapsed_s + grounding_elapsed_s,
+        },
         "image_node_metadata": image_node.metadata,
     }
     if args.pretty:
