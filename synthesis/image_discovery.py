@@ -118,7 +118,6 @@ Output guidance:
    - relative location in the frame
    - nearby object or nearby person
    - distinctive clothing, pose, or visible mark
-   - visible UI location for handles or platform names
 4. Avoid abstract or non-localizable relations such as:
    - depicted in image
    - shown in image
