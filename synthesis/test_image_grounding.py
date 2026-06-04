@@ -64,6 +64,12 @@ def parse_args() -> argparse.Namespace:
         help="Visual target text. Defaults to title/snippet if omitted.",
     )
     parser.add_argument(
+        "--query-text",
+        type=str,
+        default="",
+        help="Explicit visual-plan query text used for image search and query-overlap filtering. Defaults to target-text.",
+    )
+    parser.add_argument(
         "--env-file",
         type=str,
         default=str(DEFAULT_ENV_PATH),
@@ -101,6 +107,7 @@ def _build_search_result(args: argparse.Namespace) -> ImageSearchResult:
 
 def _build_plan(args: argparse.Namespace, search_result: ImageSearchResult) -> VisualSearchPlan:
     target_text = (args.target_text or args.snippet or args.title or "Test image grounding").strip()
+    query_text = (args.query_text or target_text).strip()
     target = Evidence.create(
         EvidenceType.WEB_TEXT,
         content=target_text,
@@ -109,7 +116,7 @@ def _build_plan(args: argparse.Namespace, search_result: ImageSearchResult) -> V
         evidence_key=f"manual_target:{target_text}",
     )
     query = SearchQuerySpec.create(
-        target_text,
+        query_text,
         target.evidence_id,
         expected_visual=target_text,
         source="manual_test",

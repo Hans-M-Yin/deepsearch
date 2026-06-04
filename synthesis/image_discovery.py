@@ -97,15 +97,86 @@ Keep entities only if they are named or uniquely identifiable, such as a person,
 
 Use candidate metadata only to disambiguate what is visible. The preferred textual description may help identify a visible person or entity when the image alone is insufficient, but do not invent entities that are not visually supported.
 
+Important grounding rules:
+1. Include indirect but clearly visible searchable entities when they are visually grounded.
+   - Examples: an Adidas or Nike logo on clothing, a team crest on a jersey, a visible brand mark on an object. These marks point to a unique brand.
+2. Do not output duplicate entities that refer to the same real-world entity.
+   - Merge aliases, OCR handles, usernames, and alternate surface forms into the canonical entity and mention the alias in the evidence instead.
+Output guidance:
+1. `relation_to_image` is a visual locator, not an abstract semantic relation.
+   It should help a user immediately point to the entity inside the image.
+2. Describe the entity using visible position, local context, or distinctive appearance.
+   Good examples:
+   - second row, third person from the left
+   - rightmost person on the album cover
+   - gold trophy held in the man's arms
+   - landmark behind the main character
+   - logo on the front of the jersey
+   - account name at the top of the screenshot
+3. Prefer short, concrete, image-grounded locators:
+   - relative position in a group
+   - relative location in the frame
+   - nearby object or nearby person
+   - distinctive clothing, pose, or visible mark
+   - visible UI location for handles or platform names
+4. Avoid abstract or non-localizable relations such as:
+   - depicted in image
+   - shown in image
+   - associated with image
+   - represented in image
+   These are too generic and do not help locate the entity.
+5. If the image contains multiple people or objects, `relation_to_image` must disambiguate the target.
+6. `evidence` should be one short sentence explaining the visible cue that supports the grounding.
+7. If two surface forms refer to the same entity, output only the canonical one and mention the alias/handle inside `evidence`.
+
+Examples:
+- For a 2025 G20 summit group photo:
+  `entity: Emmanuel Macron | second row, third person from the left | visible as the suited male figure in that position`
+- For the Queen II album cover:
+  `entity: Roger Taylor | rightmost person on the album cover | visible as the face at the far right of the four-person composition`
+- For a John Wick 4 poster:
+  `entity: Eiffel Tower | landmark behind the main character | visible rising in the background behind John Wick`
+
 Output exactly one block:
 <ground>
 caption: one concise image caption
-visual_fact: visible fact 1
-visual_fact: visible fact 2
-ocr_text: visible text if any
-entity: name | type | relation_to_image | evidence
-entity: name | type | relation_to_image | evidence
+entity: name | relation_to_image | evidence
+entity: name | relation_to_image | evidence
 </ground>
+"""
+
+
+PROMPT_IMAGE_QUERY_ENTITY_FILTER = """You are filtering grounded image entities for multi-hop graph expansion.
+
+Goal:
+We only want image-derived entities that add new information beyond the visual query itself.
+
+Task:
+Given:
+- the source text node title
+- the visual query text
+- a list of grounded candidate entities from the image
+
+Decide for each candidate whether it should be blocked because it is already explicitly mentioned in the query, or is just an alias / handle / surface form of an entity already mentioned in the query.
+
+Block an entity if:
+- it is the same entity as one already mentioned in the query
+- it is only an alias, OCR handle, username, nickname, or alternate surface form of an entity already mentioned in the query
+
+Keep an entity if:
+- it is a new entity not already present in the query
+- it is related to the query subject but still introduces a distinct new entity
+
+Important:
+- Be conservative. Only block when the overlap is clear.
+- Do not block entities merely because they are associated with the query subject.
+- Example: if the query mentions Lionel Messi, block "Messi" or "leomessi", but keep "Argentina national football team" unless the query already mentions it.
+
+Output exactly one block:
+<filter>
+entity: candidate name | block|keep | short reason
+entity: candidate name | block|keep | short reason
+</filter>
 """
 
 
@@ -807,8 +878,6 @@ class ImageDiscoveryBuilder:
         if not model_alias:
             grounding = {
                 "caption": image_node.caption,
-                "visual_facts": validation.metadata.get("visual_facts", []),
-                "ocr_texts": [],
                 "grounded_entities": [],
                 "check": "not_configured",
             }
@@ -824,8 +893,6 @@ class ImageDiscoveryBuilder:
             self._log_invalid_image_url(search_result.image_url, precheck_error, stage="image_ground")
             grounding = {
                 "caption": image_node.caption,
-                "visual_facts": validation.metadata.get("visual_facts", []),
-                "ocr_texts": [],
                 "grounded_entities": [],
                 "check": "image_url_precheck_failed",
                 "raw_model_output": None,
@@ -891,8 +958,6 @@ class ImageDiscoveryBuilder:
             self._log_invalid_image_url(search_result.image_url, error, stage="image_ground")
             grounding = {
                 "caption": image_node.caption,
-                "visual_facts": validation.metadata.get("visual_facts", []),
-                "ocr_texts": [],
                 "grounded_entities": [],
                 "check": "mllm_grounding_failed",
                 "raw_model_output": error,
@@ -924,7 +989,6 @@ class ImageDiscoveryBuilder:
             f"source_page_url: {search_result.source_page_url or ''}\n\n"
             "Prior image_check:\n"
             f"reason: {validation.reason or ''}\n"
-            f"visual_facts: {validation.metadata.get('visual_facts', [])}\n"
         )
 
     @staticmethod
@@ -943,8 +1007,6 @@ class ImageDiscoveryBuilder:
         block = match.group(1) if match else text
         grounding: dict[str, Any] = {
             "caption": None,
-            "visual_facts": [],
-            "ocr_texts": [],
             "grounded_entities": [],
             "raw_model_output": text,
             "run_id": run_id,
@@ -961,10 +1023,6 @@ class ImageDiscoveryBuilder:
                 continue
             if key == "caption":
                 grounding["caption"] = value
-            elif key == "visual_fact":
-                grounding["visual_facts"].append(value)
-            elif key == "ocr_text":
-                grounding["ocr_texts"].append(value)
             elif key == "entity":
                 entity = ImageDiscoveryBuilder._parse_grounded_entity(value)
                 if entity is not None:
@@ -978,9 +1036,8 @@ class ImageDiscoveryBuilder:
             return None
         return {
             "name": parts[0],
-            "type": parts[1] if len(parts) > 1 else None,
-            "relation_to_image": parts[2] if len(parts) > 2 else "depicts",
-            "evidence": parts[3] if len(parts) > 3 else None,
+            "relation_to_image": parts[1] if len(parts) > 1 and parts[1] else "depicted in image",
+            "evidence": parts[2] if len(parts) > 2 else None,
         }
 
     @staticmethod
@@ -990,8 +1047,6 @@ class ImageDiscoveryBuilder:
             image_node.caption = caption
             image_node.summary = caption
         image_node.metadata = dict(image_node.metadata or {})
-        image_node.metadata["visual_facts"] = grounding.get("visual_facts", [])
-        image_node.metadata["ocr_texts"] = grounding.get("ocr_texts", [])
         image_node.metadata["grounded_entities"] = grounding.get("grounded_entities", [])
         image_node.metadata["image_grounding"] = {
             "check": grounding.get("check"),
@@ -1877,7 +1932,11 @@ class ImageDiscoveryBuilder:
         edges: list[Edge] = []
         unresolved: list[dict[str, Any]] = []
         queued_tasks: list[dict[str, Any]] = []
-        blocked_query_entities = self._query_implied_entity_labels(source_query_text)
+        blocked_query_entities = self._query_implied_entity_labels(
+            source_query_text,
+            source_node_title=source_node_title,
+            grounded_entities=grounded_entities,
+        )
         for entity in grounded_entities:
             if not self._should_expand_entity(entity):
                 unresolved.append({**entity, "status": "filtered_out"})
@@ -1952,8 +2011,23 @@ class ImageDiscoveryBuilder:
             image_node.metadata["unresolved_grounded_entities"] = unresolved
         return edges, queued_tasks
 
-    def _query_implied_entity_labels(self, query_text: str | None) -> set[str]:
-        if self.store is None or not query_text:
+    def _query_implied_entity_labels(
+        self,
+        query_text: str | None,
+        *,
+        source_node_title: str | None = None,
+        grounded_entities: list[dict[str, Any]] | None = None,
+    ) -> set[str]:
+        if not query_text:
+            return set()
+        blocked_from_llm = self._query_implied_entity_labels_with_llm(
+            query_text,
+            source_node_title=source_node_title,
+            grounded_entities=grounded_entities or [],
+        )
+        if blocked_from_llm:
+            return blocked_from_llm
+        if self.store is None:
             return set()
         normalized_query = self._normalize_entity_label(query_text)
         if not normalized_query:
@@ -1961,6 +2035,13 @@ class ImageDiscoveryBuilder:
 
         blocked: set[str] = set()
         query_tokens = set(normalized_query.split())
+        source_title_label = self._normalize_entity_label(source_node_title or "")
+        if source_title_label and (
+            source_title_label == normalized_query
+            or source_title_label in normalized_query
+            or set(source_title_label.split()).issubset(query_tokens)
+        ):
+            blocked.add(source_title_label)
         for node in self.store.list_nodes():
             if node.get("node_type") != NodeType.TEXT.value:
                 continue
@@ -1972,8 +2053,84 @@ class ImageDiscoveryBuilder:
                 label_tokens = set(normalized_label.split())
                 if not label_tokens:
                     continue
-                if normalized_label == normalized_query or label_tokens.issubset(query_tokens):
+                if (
+                    normalized_label == normalized_query
+                    or normalized_label in normalized_query
+                    or label_tokens.issubset(query_tokens)
+                    or (len(label_tokens) == 1 and next(iter(label_tokens)) in query_tokens)
+                ):
                     blocked.add(normalized_label)
+        return blocked
+
+    def _query_implied_entity_labels_with_llm(
+        self,
+        query_text: str,
+        *,
+        source_node_title: str | None,
+        grounded_entities: list[dict[str, Any]],
+    ) -> set[str]:
+        if not grounded_entities:
+            return set()
+        model_alias = (
+            os.environ.get("IMAGE_QUERY_ENTITY_FILTER_MODEL")
+            or os.environ.get("IMAGE_GROUND_MODEL")
+            or self.image_check_model_alias
+        )
+        if not model_alias:
+            return set()
+        candidate_names = []
+        seen: set[str] = set()
+        for entity in grounded_entities:
+            label = (entity.get("name") or "").strip()
+            normalized = self._normalize_entity_label(label)
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            candidate_names.append(label)
+        if not candidate_names:
+            return set()
+        try:
+            response = self.model_client.generate(
+                ModelRequest(
+                    model=model_alias,
+                    messages=[
+                        ModelMessage(role="system", content=PROMPT_IMAGE_QUERY_ENTITY_FILTER),
+                        ModelMessage(
+                            role="user",
+                            content=(
+                                f"Source text node title:\n{source_node_title or ''}\n\n"
+                                f"Visual query text:\n{query_text}\n\n"
+                                "Grounded candidate entities:\n"
+                                + "\n".join(f"- {name}" for name in candidate_names)
+                            ),
+                        ),
+                    ],
+                    temperature=0.0,
+                    metadata={"trace_label": f"image_query_entity_filter:{source_node_title or ''}:{query_text[:80]}"},
+                )
+            )
+        except Exception:
+            return set()
+        return self._parse_query_entity_filter_response(response.content)
+
+    def _parse_query_entity_filter_response(self, text: str) -> set[str]:
+        match = re.search(r"<filter>(.*?)</filter>", text, flags=re.DOTALL | re.IGNORECASE)
+        block = match.group(1) if match else text
+        blocked: set[str] = set()
+        for raw_line in block.splitlines():
+            line = raw_line.strip()
+            if not line.lower().startswith("entity:"):
+                continue
+            value = line.split(":", 1)[1].strip()
+            parts = [part.strip() for part in value.split("|")]
+            if len(parts) < 2:
+                continue
+            name = parts[0]
+            decision = parts[1].lower()
+            if decision == "block":
+                normalized = self._normalize_entity_label(name)
+                if normalized:
+                    blocked.add(normalized)
         return blocked
 
     def _is_query_implied_entity(self, entity: dict[str, Any], blocked_query_entities: set[str]) -> bool:
