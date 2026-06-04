@@ -156,3 +156,44 @@ timing_summary:
   text_validate_and_truncate_s: total=0.07s avg=0.00s p50=0.00s max=0.00s
   total_s: total=31155.89s avg=576.96s p50=693.97s max=750.21s
 last_error: APITimeoutError: Request timed out.
+/usr/local/lib/python3.12/dist-packages/requests/__init__.py:113: RequestsDependencyWarning: urllib3 (1.26.20) or chardet (7.4.3)/charset_normalizer (3.4.3) doesn't match a supported version!
+  warnings.warn(
+INFO 06-04 01:22:25 [__init__.py:216] Automatically detected platform cuda.
+usage: vllm [-h] [-v] {chat,complete,serve,bench,collect-env,run-batch} ...
+vllm: error: unrecognized arguments:  f
+/usr/local/lib/python3.12/dist-packages/requests/__init__.py:113: RequestsDependencyWarning: urllib3 (1.26.20) or chardet (7.4.3)/charset_normalizer (3.4.3) doesn't match a supported version!
+  warnings.warn(
+Traceback (most recent call last):
+  File "/usr/local/bin/vllm", line 4, in <module>
+    from vllm.entrypoints.cli.main import main
+  File "/usr/local/lib/python3.12/dist-packages/vllm/entrypoints/cli/__init__.py", line 3, in <module>
+    from vllm.entrypoints.cli.benchmark.latency import BenchmarkLatencySubcommand
+  File "/usr/local/lib/python3.12/dist-packages/vllm/entrypoints/cli/benchmark/latency.py", line 5, in <module>
+    from vllm.benchmarks.latency import add_cli_args, main
+  File "/usr/local/lib/python3.12/dist-packages/vllm/benchmarks/latency.py", line 18, in <module>
+    from vllm.engine.arg_utils import EngineArgs
+  File "/usr/local/lib/python3.12/dist-packages/vllm/engine/arg_utils.py", line 24, in <module>
+    from vllm.config import (BlockSize, CacheConfig, CacheDType, CompilationConfig,
+  File "/usr/local/lib/python3.12/dist-packages/vllm/config/__init__.py", line 26, in <module>
+    from vllm.config.cache import (BlockSize, CacheConfig, CacheDType, MambaDType,
+  File "/usr/local/lib/python3.12/dist-packages/vllm/config/cache.py", line 15, in <module>
+    from vllm.utils import GiB_bytes, get_cpu_memory
+  File "/usr/local/lib/python3.12/dist-packages/vllm/utils/__init__.py", line 71, in <module>
+    from transformers.tokenization_utils_base import BatchEncoding
+  File "/usr/local/lib/python3.12/dist-packages/transformers/__init__.py", line 961, in <module>
+    sys.modules[__name__] = _LazyModule(
+                            ^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/transformers/utils/import_utils.py", line 2253, in __init__
+    self.__all__.extend(module_keys | set(chain(*module.values())))
+                                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+KeyboardInterrupt
+/usr/local/lib/python3.12/dist-packages/requests/__init__.py:113: RequestsDependencyWarning: urllib3 (1.26.20) or chardet (7.4.3)/charset_normalizer (3.4.3) doesn't match a supported version!
+  warnings.warn(
+INFO 06-04 01:35:02 [__init__.py:216] Automatically detected platform cuda.
+usage: vllm [-h] [-v] {chat,complete,serve,bench,collect-env,run-batch} ...
+vllm: error: unrecognized arguments:  f
+/usr/local/lib/python3.12/dist-packages/requests/__init__.py:113: RequestsDependencyWarning: urllib3 (1.26.20) or chardet (7.4.3)/charset_normalizer (3.4.3) doesn't match a supported version!
+  warnings.warn(
+INFO 06-04 01:36:27 [__init__.py:216] Automatically detected platform cuda.
+usage: vllm [-h] [-v] {chat,complete,serve,bench,collect-env,run-batch} ...
+vllm: error: unrecognized arguments:  

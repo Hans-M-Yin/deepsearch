@@ -70,7 +70,7 @@ start_readerlm() {
   (
     cd "${PROJECT_DIR}"
     nohup vllm serve "${READERLM_MODEL_PATH}" \
-      --host 0.0.0.0 \ f
+      --host 0.0.0.0 \
       --port "${READERLM_PORT}" \
       --served-model-name "${READERLM_SERVED_MODEL_NAME}" \
       --tensor-parallel-size 2 \
