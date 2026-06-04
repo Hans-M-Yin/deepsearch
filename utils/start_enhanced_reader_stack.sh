@@ -15,6 +15,7 @@ READER_PORT="${READER_PORT:-8001}"
 RAW_READER_PORT="${RAW_READER_PORT:-8002}"
 READERLM_PORT="${READERLM_PORT:-8003}"
 ENHANCED_READER_PORT="${ENHANCED_READER_PORT:-8004}"
+ENHANCED_READER_WORKERS="${ENHANCED_READER_WORKERS:-4}"
 
 READER_LOG="${READER_LOG:-${READER_DIR}/reader_log}"
 VLLM_READER_LM_LOG="${VLLM_READER_LM_LOG:-${PROJECT_DIR}/vllm_reader_lm_log}"
@@ -99,10 +100,12 @@ start_enhanced_reader() {
       uvicorn utils.enhanced_reader:app \
         --host 0.0.0.0 \
         --port "${ENHANCED_READER_PORT}" \
+        --workers "${ENHANCED_READER_WORKERS}" \
       > "${ENHANCED_READER_LOG}" 2>&1 &
     echo $! > "${PROJECT_DIR}/enhanced_reader.pid"
   )
   echo "Enhanced Reader log: ${ENHANCED_READER_LOG}"
+  echo "Enhanced Reader workers: ${ENHANCED_READER_WORKERS}"
 }
 
 main() {
@@ -120,6 +123,7 @@ Endpoints:
   Raw Reader HTML endpoint: ${RAW_READER_URL}
   ReaderLM API endpoint:    ${READERLM_API_BASE}
   Enhanced Reader endpoint: http://127.0.0.1:${ENHANCED_READER_PORT}
+  Enhanced Reader workers:  ${ENHANCED_READER_WORKERS}
 
 Use this for OpenSearch-VL:
   export JINA_READER_URL="http://127.0.0.1:${ENHANCED_READER_PORT}"
