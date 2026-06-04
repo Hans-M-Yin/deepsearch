@@ -966,7 +966,12 @@ class ImageDiscoveryBuilder:
             self._apply_grounding_to_image_node(image_node, grounding)
             return grounding
 
-        grounding = self._parse_image_ground_response(response.content, run_id=run_id)
+        grounding = self._parse_image_ground_response(
+            response.content,
+            run_id=run_id,
+            model_alias=model_alias,
+            usage=response.usage,
+        )
         self._apply_grounding_to_image_node(image_node, grounding)
         return grounding
 
@@ -1000,7 +1005,13 @@ class ImageDiscoveryBuilder:
         return snippet
 
     @staticmethod
-    def _parse_image_ground_response(text: str, *, run_id: str | None) -> dict[str, Any]:
+    def _parse_image_ground_response(
+        text: str,
+        *,
+        run_id: str | None,
+        model_alias: str | None = None,
+        usage: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         match = re.search(r"<ground>(.*?)</ground>", text, flags=re.DOTALL | re.IGNORECASE)
         block = match.group(1) if match else text
         grounding: dict[str, Any] = {
@@ -1008,6 +1019,8 @@ class ImageDiscoveryBuilder:
             "grounded_entities": [],
             "raw_model_output": text,
             "run_id": run_id,
+            "model_alias": model_alias,
+            "usage": usage,
             "check": "mllm_grounding",
         }
         for raw_line in block.splitlines():
@@ -1048,6 +1061,8 @@ class ImageDiscoveryBuilder:
         image_node.metadata["grounded_entities"] = grounding.get("grounded_entities", [])
         image_node.metadata["image_grounding"] = {
             "check": grounding.get("check"),
+            "model_alias": grounding.get("model_alias"),
+            "usage": grounding.get("usage"),
             "raw_model_output": grounding.get("raw_model_output"),
             "run_id": grounding.get("run_id"),
         }
@@ -1665,7 +1680,12 @@ class ImageDiscoveryBuilder:
             model_image_url=image_for_model,
             model_output=response.content,
         )
-        return self._parse_image_check_response(response.content, run_id=run_id)
+        return self._parse_image_check_response(
+            response.content,
+            run_id=run_id,
+            model_alias=model_alias,
+            usage=response.usage,
+        )
 
     @staticmethod
     def _log_image_model_call(
@@ -1695,7 +1715,13 @@ class ImageDiscoveryBuilder:
         )
 
     @staticmethod
-    def _parse_image_check_response(text: str, *, run_id: str | None) -> ImageValidationResult:
+    def _parse_image_check_response(
+        text: str,
+        *,
+        run_id: str | None,
+        model_alias: str | None = None,
+        usage: dict[str, Any] | None = None,
+    ) -> ImageValidationResult:
         match = re.search(r"<check>(.*?)</check>", text, flags=re.DOTALL | re.IGNORECASE)
         block = match.group(1) if match else text
         fields: dict[str, Any] = {"visual_facts": []}
@@ -1726,6 +1752,8 @@ class ImageDiscoveryBuilder:
             reason=fields.get("reason"),
             metadata={
                 "check": "mllm_semantic",
+                "model_alias": model_alias,
+                "usage": usage,
                 "visual_facts": fields.get("visual_facts", []),
                 "raw_model_output": text,
                 "run_id": run_id,

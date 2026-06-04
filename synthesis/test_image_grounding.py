@@ -246,6 +246,20 @@ def _filter_grounded_entities(
     }
 
 
+def _model_diagnostics(validation: ImageValidationResult, grounding: dict[str, Any]) -> dict[str, Any]:
+    validation_meta = validation.metadata or {}
+    check_raw = validation_meta.get("raw_model_output")
+    grounding_raw = grounding.get("raw_model_output")
+    return {
+        "image_check_model": validation_meta.get("model_alias"),
+        "image_check_usage": validation_meta.get("usage"),
+        "image_check_raw_output_chars": len(check_raw) if isinstance(check_raw, str) else None,
+        "image_ground_model": grounding.get("model_alias"),
+        "image_ground_usage": grounding.get("usage"),
+        "image_ground_raw_output_chars": len(grounding_raw) if isinstance(grounding_raw, str) else None,
+    }
+
+
 def main() -> int:
     args = parse_args()
     load_env_file(Path(args.env_file))
@@ -299,6 +313,7 @@ def main() -> int:
         args=args,
         grounded_entities=list(grounding.get("grounded_entities") or []),
     )
+    model_diagnostics = _model_diagnostics(validation, grounding)
 
     output = {
         "image": {
@@ -310,6 +325,7 @@ def main() -> int:
         "validation": validation.to_dict(),
         "grounding": grounding,
         "filtered_grounding": filtered_grounding,
+        "model_diagnostics": model_diagnostics,
         "timing": {
             "image_check_s": validation_elapsed_s,
             "image_ground_s": grounding_elapsed_s,
