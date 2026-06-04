@@ -1,3 +1,1 @@
-/usr/local/lib/python3.12/dist-packages/requests/__init__.py:113: RequestsDependencyWarning: urllib3 (1.26.20) or chardet (7.4.3)/charset_normalizer (3.4.3) doesn't match a supported version!
-  warnings.warn(
-INFO 06-04 01:37:01 [__init__.py:216] Automatically detected platform cuda.
+INFO 06-04 02:58:53 [__init__.py:216] Automatically detected platform cuda.

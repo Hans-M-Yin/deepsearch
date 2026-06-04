@@ -1,0 +1,285 @@
+INFO:     Uvicorn running on http://0.0.0.0:8004 (Press CTRL+C to quit)
+INFO:     Started parent process [354490]
+INFO:     Started server process [354502]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Started server process [354500]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Started server process [354499]
+INFO:     Started server process [354501]
+INFO:     Waiting for application startup.
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Application startup complete.
+INFO:     10.124.136.6:36168 - "GET /https%3A//en.wikipedia.org/wiki/Global_warming HTTP/1.1" 502 Bad Gateway
+INFO:     10.124.136.6:36220 - "GET /https%3A//en.wikipedia.org/wiki/Music HTTP/1.1" 502 Bad Gateway
+INFO:     10.124.136.6:36234 - "GET /https%3A//en.wikipedia.org/wiki/France HTTP/1.1" 502 Bad Gateway
+INFO:     10.124.136.6:36196 - "GET /https%3A//en.wikipedia.org/wiki/Islam HTTP/1.1" 502 Bad Gateway
+INFO:     10.124.136.6:36364 - "GET /https%3A//en.wikipedia.org/wiki/United_Kingdom HTTP/1.1" 502 Bad Gateway
+INFO:     10.124.136.6:36392 - "GET /https%3A//en.wikipedia.org/wiki/Biology HTTP/1.1" 502 Bad Gateway
+INFO:     10.124.136.6:36378 - "GET /https%3A//en.wikipedia.org/wiki/Psychology HTTP/1.1" 502 Bad Gateway
+INFO:     10.124.136.6:36354 - "GET /https%3A//en.wikipedia.org/wiki/Socialism HTTP/1.1" 502 Bad Gateway
+INFO:     10.124.136.6:36406 - "GET /https%3A//en.wikipedia.org/wiki/London HTTP/1.1" 502 Bad Gateway
+INFO:     10.124.136.6:36266 - "GET /https%3A//en.wikipedia.org/wiki/Beijing HTTP/1.1" 502 Bad Gateway
+INFO:     10.124.136.6:36272 - "GET /https%3A//en.wikipedia.org/wiki/DNA HTTP/1.1" 502 Bad Gateway
+INFO:     10.124.136.6:36252 - "GET /https%3A//en.wikipedia.org/wiki/Solar_System HTTP/1.1" 502 Bad Gateway
+INFO:     10.124.136.6:36276 - "GET /https%3A//en.wikipedia.org/wiki/Ancient_Egypt HTTP/1.1" 502 Bad Gateway
+INFO:     10.124.136.6:36284 - "GET /https%3A//en.wikipedia.org/wiki/European_Union HTTP/1.1" 502 Bad Gateway
+INFO:     10.124.136.6:36308 - "GET /https%3A//en.wikipedia.org/wiki/World_War_I HTTP/1.1" 502 Bad Gateway
+INFO:     10.124.136.6:36448 - "GET /https%3A//en.wikipedia.org/wiki/OpenAI HTTP/1.1" 502 Bad Gateway
+INFO:     10.124.136.6:36464 - "GET /https%3A//en.wikipedia.org/wiki/Artificial_intelligence HTTP/1.1" 502 Bad Gateway
+INFO:     10.124.136.6:36334 - "GET /https%3A//en.wikipedia.org/wiki/Germany HTTP/1.1" 502 Bad Gateway
+INFO:     10.124.136.6:36446 - "GET /https%3A//en.wikipedia.org/wiki/Television HTTP/1.1" 502 Bad Gateway
+INFO:     10.124.136.6:36434 - "GET /https%3A//en.wikipedia.org/wiki/Capitalism HTTP/1.1" 502 Bad Gateway
+INFO:     10.124.136.6:36452 - "GET /https%3A//en.wikipedia.org/wiki/Cold_War HTTP/1.1" 502 Bad Gateway
+INFO:     10.124.136.6:36476 - "GET /https%3A//en.wikipedia.org/wiki/LeBron_James HTTP/1.1" 502 Bad Gateway
+INFO:     10.124.136.6:36482 - "GET /https%3A//en.wikipedia.org/wiki/Isaac_Newton HTTP/1.1" 502 Bad Gateway
+INFO:     10.124.136.6:36492 - "GET /https%3A//en.wikipedia.org/wiki/Economics HTTP/1.1" 502 Bad Gateway
+INFO:     10.124.136.6:36508 - "GET /https%3A//en.wikipedia.org/wiki/Leonardo_da_Vinci HTTP/1.1" 502 Bad Gateway
+INFO:     10.124.136.6:36504 - "GET /https%3A//en.wikipedia.org/wiki/Lionel_Messi HTTP/1.1" 502 Bad Gateway
+INFO:     10.124.136.6:36550 - "GET /https%3A//en.wikipedia.org/wiki/Evolution HTTP/1.1" 502 Bad Gateway
+INFO:     10.124.136.6:36518 - "GET /https%3A//en.wikipedia.org/wiki/Industrial_Revolution HTTP/1.1" 502 Bad Gateway
+INFO:     10.124.136.6:36534 - "GET /https%3A//en.wikipedia.org/wiki/Japan HTTP/1.1" 502 Bad Gateway
+INFO:     10.124.136.6:36552 - "GET /https%3A//en.wikipedia.org/wiki/Sociology HTTP/1.1" 502 Bad Gateway
+[enhanced_reader][url_leak] ReaderLM output contains '(http'. url=https://en.wikipedia.org/wiki/Internet input=/tmp/enhanced_reader_url_leaks/d242af66cf0d.before_readerlm.html output=/tmp/enhanced_reader_url_leaks/d242af66cf0d.after_readerlm.md
+[enhanced_reader][url_leak][before_preview] <div class="ext-chart-js mw-parser-output"><span typeof="mw:File"> Page semi-protected </span></div><div id="mw-content-text" class="mw-body-content"><div class="mw-subjectpageheader">
+</div><div class="mw-content-ltr ext-chart-js mw-parser-output" lang="en" dir="ltr">
+<div role="note" class="hatnote navigation-not-searchable"><span>This article is about the worldwide computer network. For the global system of pages accessed through URLs via the Internet, see World Wide Web. For other uses, see Internet (disambiguation).</span> <span>"Interweb" redirects here; not to be confused with Interweb (song).</span></div>
+<p class="mw-empty-elt">
+
+
+</p>
+
+<table class="sidebar sidebar-collapse nomobile nowraplinks hlist" role="navigation"><tbody><tr><th class="sidebar-title">Internet</th></tr><tr><td class="sidebar-image"><span class="skin-invert" typeof="mw:File"> Visualization of Internet routing paths </span><div class="sidebar-caption">An Opte Project visualization of routing paths through a portion of the Internet</div></td></tr><tr><td class="sidebar-above" style="border-bottom:0">
+<ul><li><span class="noviewer" typeof="mw:File"><span title="List-Class article"></span></span> Index</li>
+<li>Outline</li></ul></td></tr><tr><td class="sidebar-content">
+<div class="sidebar-list mw-collapsible"><div class="sidebar-list-title" style="background:transparent;border-top:1px solid #aaa;text-align:center;color: var(--color-base)">General</div><div class="sidebar-list-content mw-collapsible-content">
+<ul><li>Access</li>
+<li>Activism
+<ul><li>Slacktivism</li></ul></li>
+<li>Censorship</li>
+<li>Data activism</li>
+<li>Democracy</li>
+<li>Digital divide</li>
+<li>Digital rights</li>
+<li>Digital public goods</li>
+<li>Freedom
+<ul><li>Freedom of information</li></ul></li>
+<li>Media capture</li>
+<li>Net neutrality</li>
+<li>Phenomena
+<ul><li>Meme</li></ul></li>
+<li>Privacy</li>
+<li>Right to access</li>
+<li>Sociology</li>
+<li>Usage</li>
+<li>Vigilantism</li>
+<li>Virtual community</li>
+<li>Virtual
+[enhanced_reader][url_leak][after_preview] ```markdown
+# The Internet
+
+The **Internet** (or **internet**) is the global system of interconnected computer networks that uses the Internet protocol suite (TCP/IP) to communicate between networks and devices. It is a network of networks that comprises private, public, academic, business, and government networks of local to global scope, linked by electronic, wireless, and optical networking technologies. The Internet carries a vast range of information services and resources, such as the interlinked hypertext documents and applications of the World Wide Web (WWW), electronic mail, discussion groups, internet telephony, streaming media and file sharing.
+
+Most traditional communication media, including telephone, radio, television, paper mail, newspapers, and print publishing, have been transformed by the Internet, giving rise to new media such as email, online music, digital newspapers, news aggregators, and audio and video streaming websites. The Internet has enabled and accelerated new forms of personal interaction through instant messaging, Internet forums, and social networking services. Online shopping has also grown to occupy a significant market across industries, enabling firms to extend brick and mortar presences to serve larger markets. Business-to-business and financial services on the Internet affect supply chains across entire industries.
+
+The origins of the Internet date back to research that enabled the time-sharing of computer resources, the development of packet switching, and the design of computer networks for data communication. The set of communication protocols to enable internetworking on the Internet arose from research and development commissioned in the 1970s by the Defense Advanced Research Projects Agency (DARPA) of the United States Department of Defense in collaboration with universities and researchers across the United States, United Kingdom and France.
+
+The Internet has no single centralized governance in either technological imple
+INFO:     10.124.136.6:36158 - "GET /https%3A//en.wikipedia.org/wiki/Internet HTTP/1.1" 200 OK
+[enhanced_reader][url_leak] ReaderLM output contains '(http'. url=https://en.wikipedia.org/wiki/Elon_Musk input=/tmp/enhanced_reader_url_leaks/5bf0229f7a49.before_readerlm.html output=/tmp/enhanced_reader_url_leaks/5bf0229f7a49.after_readerlm.md
+[enhanced_reader][url_leak][before_preview] <div class="mw-parser-output"><span typeof="mw:File"> Page extended-confirmed-protected </span></div><div id="mw-content-text" class="mw-body-content"><div class="mw-subjectpageheader">
+</div><div class="mw-content-ltr mw-parser-output" lang="en" dir="ltr">
+<div role="note" class="hatnote navigation-not-searchable">For other uses, see Elon Musk (disambiguation).</div>
+<p class="mw-empty-elt">
+
+
+</p>
+<table class="infobox biography vcard"><tbody><tr><th colspan="2" class="infobox-above"><div class="fn">Elon Musk</div><div class="honorific-suffix" style="font-size: 80%; font-weight: normal;">FRS</div></th></tr><tr><td colspan="2" class="infobox-image"><span class="mw-default-size" typeof="mw:File/Frameless"></span><div class="infobox-caption">Musk in 2025</div></td></tr><tr><th scope="row" class="infobox-label">Born</th><td class="infobox-data"><div style="display:inline" class="nickname">Elon Reeve Musk</div><br><span style="display:none"> (<span class="bday">1971-06-28</span>) </span>June 28, 1971<br><div style="display:inline" class="birthplace">Pretoria, South Africa</div><span style="display:none" data-plural="1"></span></td></tr><tr><th scope="row" class="infobox-label">Citizenship</th><td class="infobox-data category"><div class="plainlist"><ul><li>South Africa (since 1971)</li><li>Canada (since 1971)</li><li>United States (since 2002)</li></ul></div></td></tr><tr><th scope="row" class="infobox-label">Education</th><td class="infobox-data">University of Pennsylvania (BA, BS)</td></tr><tr><th scope="row" class="infobox-label">Occupations</th><td class="infobox-data role"><div class="plainlist"><ul style="margin-left:1em;text-indent:-1em;"><li>CEO and product architect of Tesla</li><li>Founder, CEO, and chief engineer of SpaceX</li><li>Founder and CEO of xAI</li><li>Founder and CTO of X Corp.</li><li>Co-founder of Neuralink, the Boring Company, OpenAI, Zip2, X.com and PayPal</li><li>President of the Musk Foundation</li></ul></div></td></tr><tr><th scope="row" cla
+[enhanced_reader][url_leak][after_preview] # Elon Musk
+
+![Musk in 2025](https://upload.wikimedia.org/wikipedia/commons/thumb/f/fd/Elon_Musk_%282025%29.jpg/220px-Elon_Musk_%282025%29.jpg)
+
+## Personal
+
+- **Awards and Honors**
+- **Business Career**
+- **Views**
+- **Family**
+- **International Relations**
+- **Legal Affairs**
+- **Public Image**
+- **Texas Institute of Technology and Science**
+- **Wealth**
+
+## Senior Advisor to the President
+
+- **In office**: January 20, 2025 – May 30, 2025
+- **Serving with**: Massad Boulos
+
+- **President**: Donald Trump
+
+## Spouses
+
+- **Justine Wilson** (m. 2000; div. 2008)
+- **Talulah Riley** (m. 2010; div. 2012)
+- **Married III** (m. 2013; div. 2016)
+
+## Children
+
+- **14**, including Vivian Wilson
+
+## Parents
+
+- **Errol Musk (father)**
+- **Maye Musk (mother)**
+
+## Relatives
+
+- **Musk family**
+
+## Awards
+
+- **Full list**
+
+---
+
+## Business Career
+
+### Zip2
+
+- **Company**: Zip2
+- **Funding**: $500,000 (equivalent to $1,600,000 in 2025)
+- **Notable Events**:
+  - Co-founded Zip2 in 1995.
+  - Sold to NetChoice in 1999, receiving $22 million (equivalent to $43,000,000 in 2025).
+  - Acquired by Compaq in February 2000.
+
+### X.com and PayPal
+
+- **Company**: X.com
+- **Funding**: $1.5 billion (equivalent to $2,400,000,000 in 2025)
+- **Notable Events**:
+  - Merged with PayPal in 2002.
+  - Acquired by eBay in 2002.
+  - Acquired by Square in 2017.
+
+### SpaceX
+
+- **Company**: SpaceX
+- **Funding**: $10 billion (equivalent to $12,000,000,000 in 2025)
+- **Notable Events**:
+  - First successful launch of the Falcon 1 rocket in 2008.
+  - First crewed flight of the Dragon spacecraft in 2012.
+  - Launch of the Falcon Heavy in 2018.
+  - First human crewed mission to the ISS in 2020.
+  - Contract with NASA to build a spacecraft for deorbiting the ISS in 2024.
+
+### Tesla, Inc.
+
+- **Company**: Tesla, Inc.
+- **Funding**: $11.72% of shares ($175.8 million; equivalent to $320,000,000 in 2025)
+- **Notable Events**:
+  - Launch of the Roadster in 2008.
+  - Launch of the Model S in 2012.
+  - Launch of the Model 
+INFO:     10.124.136.6:36180 - "GET /https%3A//en.wikipedia.org/wiki/Elon_Musk HTTP/1.1" 200 OK
+INFO:     10.124.136.6:36340 - "GET /https%3A//en.wikipedia.org/wiki/World_Wide_Web HTTP/1.1" 200 OK
+INFO:     10.124.136.6:36422 - "GET /https%3A//en.wikipedia.org/wiki/Weather HTTP/1.1" 200 OK
+INFO:     10.124.136.6:36098 - "GET /https%3A//en.wikipedia.org/wiki/Communism HTTP/1.1" 200 OK
+INFO:     10.124.136.6:36560 - "GET /https%3A//en.wikipedia.org/wiki/Han_dynasty HTTP/1.1" 200 OK
+INFO:     10.124.136.6:36562 - "GET /https%3A//en.wikipedia.org/wiki/General_relativity HTTP/1.1" 200 OK
+INFO:     10.124.136.6:36134 - "GET /https%3A//en.wikipedia.org/wiki/Ottoman_Empire HTTP/1.1" 200 OK
+INFO:     10.124.136.6:36144 - "GET /https%3A//en.wikipedia.org/wiki/Buddhism HTTP/1.1" 200 OK
+[enhanced_reader][url_leak] ReaderLM output contains '(http'. url=https://en.wikipedia.org/wiki/Michael_Jordan input=/tmp/enhanced_reader_url_leaks/1630f6108ec4.before_readerlm.html output=/tmp/enhanced_reader_url_leaks/1630f6108ec4.after_readerlm.md
+[enhanced_reader][url_leak][before_preview] <div class="mw-parser-output"><span typeof="mw:File"> Featured article </span></div><div class="mw-parser-output"><span typeof="mw:File"> Page semi-protected </span></div><div id="mw-content-text" class="mw-body-content"><div class="mw-subjectpageheader">
+</div><div class="mw-content-ltr mw-parser-output" lang="en" dir="ltr">
+<div role="note" class="hatnote navigation-not-searchable">For other uses, see Michael Jordan (disambiguation).</div>
+<p class="mw-empty-elt">
+
+
+
+</p>
+<table class="infobox vcard" style="width:25em"><caption class="infobox-title fn summary" style="font-size: 125%">Michael Jordan</caption><tbody><tr><td colspan="2" class="infobox-image"><span class="mw-default-size" typeof="mw:File/Frameless"> Man smiling at the camera </span><div class="infobox-caption">Jordan in 2014</div></td></tr><tr><th colspan="2" class="infobox-header" style="background-color: #00788C !important; color: #FFFFFF !important; border: 2.5px solid #1D1160 !important;">Charlotte Hornets</th></tr><tr><th scope="row" class="infobox-label" style="text-align: left;">Title</th><td class="infobox-data role">Minority owner</td></tr><tr><th scope="row" class="infobox-label" style="text-align: left;">League</th><td class="infobox-data">NBA</td></tr><tr><th colspan="2" class="infobox-header" style="background-color: #00788C !important; color: #FFFFFF !important; border: 2.5px solid #1D1160 !important;">Personal information</th></tr><tr><th scope="row" class="infobox-label" style="text-align: left;">Born</th><td class="infobox-data"><span style="display:none"> (<span class="bday">1963-02-17</span>) </span>February 17, 1963<br><div class="birthplace">New York City, New York, U.S.</div><span style="display:none" data-plural="1"></span></td></tr><tr><th scope="row" class="infobox-label" style="text-align: left;">Listed height</th><td class="infobox-data">6&nbsp;ft 6&nbsp;in (1.98&nbsp;m)</td></tr><tr><th scope="row" class="infobox-label" style="text-align: left;">Listed weight</th><td class=
+[enhanced_reader][url_leak][after_preview] # Michael Jordan
+
+![Image 1: Michael Jordan](https://en.wikipedia.org/wiki/File:Michael_Jordan_at_Madison_Square_Garden.jpg)
+
+*Charlotte Hornets*
+
+## Title
+Minority owner
+
+## League
+NBA
+
+## Personal Information
+**Born:** February 17, 1963  
+New York City, New York, U.S.
+
+**Listed height:** 6 ft 6 in (1.98 m)
+
+**Listed weight:** 216 lb (98 kg)
+
+## Career Information
+**High school:** Emsley A. Laney (Wilmington, North Carolina)
+
+**College:** North Carolina (1981–1984)
+
+**NBA draft:** 1984: 1st round, 3rd overall pick
+
+**Drafted by:** Chicago Bulls
+
+**Playing career:** 1984–1993, 1995–1998, 2001–2003
+
+**Position:** Shooting guard / small forward
+
+**Number:** 23, 12, 45
+
+## Career History
+| Period | Team |
+| --- | --- |
+| 1984–1993, 1995–1998 | Chicago Bulls |
+| 2001–2003 | Washington Wizards |
+
+## Career Highlights
+- 6x NBA champion (1991–1993, 1996–1998)
+- 6x NBA Finals MVP (1991–1993, 1996–1998)
+- 5x NBA Most Valuable Player (1988, 1991, 1992, 1996, 1998)
+- 14x NBA All-Star (1985–1993, 1996–1998, 2002, 2003)
+- 3x NBA All-Star Game MVP (1988, 1996, 1998)
+- 10x All-NBA First Team (1987–1993, 1996–1998)
+- All-NBA Second Team (1985)
+- NBA Defensive Player of the Year (1988)
+- 9x NBA All-Defensive First Team (1988–1993, 1996–1998)
+- NBA Rookie of the Year (1985)
+- NBA All-Rookie First Team (1985)
+- 10x NBA scoring champion (1987–1993, 1996–1998)
+- 3x NBA steals leader (1988, 1990, 1993)
+- 2x NBA Slam Dunk Contest champion (1987, 1988)
+- No. 23 retired by Chicago Bulls
+- No. 23 retired by Miami Heat
+- 3x AP Athlete of the Year (1991–1993)
+- _Sports Illustrated_ Sportsperson of the Year (1991)
+- NBA anniversary team (50th, 75th)
+- NCAA champion (1982)
+- Consensus national college player of the year (1984)
+- 2x _Sporting News_ National Player of the Year (1983, 1984)
+- 2x Consensus first-team All-American (1983, 1984)
+- ACC Player of the Year (1984)
+- ACC Athlete of the Year (1984)
+- 2x First-team All-ACC (1983, 1984)
+- ACC Rookie of the Year (1982)
+- No. 23 retired by North
+INFO:     10.124.136.6:36190 - "GET /https%3A//en.wikipedia.org/wiki/Michael_Jordan HTTP/1.1" 200 OK
+INFO:     10.124.136.6:36416 - "GET /https%3A//en.wikipedia.org/wiki/Philosophy HTTP/1.1" 200 OK
+INFO:     10.124.136.6:36082 - "GET /https%3A//en.wikipedia.org/wiki/Los_Angeles HTTP/1.1" 200 OK
+INFO:     10.124.136.6:36296 - "GET /https%3A//en.wikipedia.org/wiki/Chinese_language HTTP/1.1" 200 OK
+INFO:     10.124.136.6:36208 - "GET /https%3A//en.wikipedia.org/wiki/Mathematics HTTP/1.1" 200 OK
+INFO:     10.124.136.6:36248 - "GET /https%3A//en.wikipedia.org/wiki/Kobe_Bryant HTTP/1.1" 200 OK
+INFO:     10.124.136.6:36356 - "GET /https%3A//en.wikipedia.org/wiki/Apple_Inc. HTTP/1.1" 200 OK
+INFO:     10.124.136.6:36112 - "GET /https%3A//en.wikipedia.org/wiki/Chicago HTTP/1.1" 200 OK
+INFO:     10.124.136.6:36310 - "GET /https%3A//en.wikipedia.org/wiki/Julius_Caesar HTTP/1.1" 200 OK
+INFO:     10.124.136.6:36118 - "GET /https%3A//en.wikipedia.org/wiki/Catholic_Church HTTP/1.1" 200 OK
+INFO:     10.124.136.6:36322 - "GET /https%3A//en.wikipedia.org/wiki/Chinese_Civil_War HTTP/1.1" 200 OK
