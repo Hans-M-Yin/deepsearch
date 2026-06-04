@@ -70,6 +70,12 @@ def parse_args() -> argparse.Namespace:
         help="Explicit visual-plan query text used for image search and query-overlap filtering. Defaults to target-text.",
     )
     parser.add_argument(
+        "--source-node-title",
+        type=str,
+        default="",
+        help="Optional source text-node title used by entity filtering. Defaults to target-text, then title.",
+    )
+    parser.add_argument(
         "--env-file",
         type=str,
         default=str(DEFAULT_ENV_PATH),
@@ -201,6 +207,44 @@ def _force_accept_validation(builder: ImageDiscoveryBuilder, search_result: Imag
     )
 
 
+def _source_node_title(args: argparse.Namespace) -> str:
+    return (args.source_node_title or args.target_text or args.title or "manual_test_source").strip()
+
+
+def _filter_grounded_entities(
+    *,
+    builder: ImageDiscoveryBuilder,
+    args: argparse.Namespace,
+    grounded_entities: list[dict[str, Any]],
+) -> dict[str, Any]:
+    query_text = (args.query_text or args.target_text or args.snippet or args.title or "").strip()
+    source_node_title = _source_node_title(args)
+    blocked_query_entities = builder._query_implied_entity_labels(
+        query_text,
+        source_node_title=source_node_title,
+        grounded_entities=grounded_entities,
+    )
+
+    kept: list[dict[str, Any]] = []
+    filtered_out: list[dict[str, Any]] = []
+    for entity in grounded_entities:
+        if not builder._should_expand_entity(entity):
+            filtered_out.append({**entity, "status": "filtered_out"})
+            continue
+        if builder._is_query_implied_entity(entity, blocked_query_entities):
+            filtered_out.append({**entity, "status": "filtered_by_query_entity_overlap"})
+            continue
+        kept.append(entity)
+
+    return {
+        "query_text": query_text,
+        "source_node_title": source_node_title,
+        "blocked_query_entities": sorted(blocked_query_entities),
+        "kept_grounded_entities": kept,
+        "filtered_out_entities": filtered_out,
+    }
+
+
 def main() -> int:
     args = parse_args()
     load_env_file(Path(args.env_file))
@@ -244,6 +288,11 @@ def main() -> int:
         validation=validation,
         run_id="manual_test",
     )
+    filtered_grounding = _filter_grounded_entities(
+        builder=builder,
+        args=args,
+        grounded_entities=list(grounding.get("grounded_entities") or []),
+    )
 
     output = {
         "image": {
@@ -254,6 +303,7 @@ def main() -> int:
         },
         "validation": validation.to_dict(),
         "grounding": grounding,
+        "filtered_grounding": filtered_grounding,
         "image_node_metadata": image_node.metadata,
     }
     if args.pretty:
