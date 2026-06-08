@@ -60,7 +60,14 @@ The statement should:
 - be concise
 - avoid unnecessary details
 - avoid asking a question
-- produce source/target that are semantically useful for composing a final question
+- stay faithful to THIS hop only
+- not introduce entities that are not the current source node or current destination node
+
+Anchor rules:
+- source must refer to the current source node only
+- target must refer to the current destination node only
+- do not replace source or target with entities from earlier or later hops
+- do not turn this into a cross-hop summary
 
 Return valid JSON with exactly these fields:
 {
@@ -271,8 +278,10 @@ class QuestionWriter:
         )
 
     def compress_hop(self, *, hop: HopContext) -> dict[str, Any]:
+        source_label = self._hop_anchor_label(hop.src_content, fallback=hop.src_node_id)
+        target_label = self._hop_anchor_label(hop.dst_content, fallback=hop.dst_node_id)
         if self.model_client is None:
-            return self._fallback_compress_hop(hop)
+            return self._fallback_compress_hop(hop, source_label=source_label, target_label=target_label)
         prompt = {
             "hop_type": f"{hop.src_modality}->{hop.dst_modality}",
             "source_node": hop.src_content,
@@ -288,14 +297,14 @@ class QuestionWriter:
             trace_label=f"compress_hop_{hop.hop_index}",
         )
         statement = str(parsed.get("statement") or "").strip()
-        source = str(parsed.get("source") or "").strip()
-        target = str(parsed.get("target") or "").strip()
+        source = source_label
+        target = target_label
         relation = str(parsed.get("relation") or hop.relation or hop.edge_type or "").strip()
         retrieval_query = str(parsed.get("retrieval_query") or "").strip()
         if hop.src_modality == "text" and hop.dst_modality == "image" and not retrieval_query:
             retrieval_query = str(hop.relation or "").strip()
         if not statement or not source or not target:
-            return self._fallback_compress_hop(hop)
+            return self._fallback_compress_hop(hop, source_label=source_label, target_label=target_label)
         return {
             "hop_index": hop.hop_index,
             "statement": statement,
@@ -481,42 +490,40 @@ class QuestionWriter:
         return normalized[: limit - 3].rstrip() + "..."
 
     @staticmethod
-    def _fallback_compress_hop(hop: HopContext) -> dict[str, Any]:
+    def _hop_anchor_label(content: dict[str, Any], *, fallback: str) -> str:
+        return str(content.get("title") or content.get("caption") or fallback)
+
+    @staticmethod
+    def _fallback_compress_hop(
+        hop: HopContext,
+        *,
+        source_label: str | None = None,
+        target_label: str | None = None,
+    ) -> dict[str, Any]:
         relation = hop.relation or hop.edge_type or "is connected to"
         retrieval_query = ""
+        source_label = source_label or QuestionWriter._hop_anchor_label(hop.src_content, fallback=hop.src_node_id)
+        target_label = target_label or QuestionWriter._hop_anchor_label(hop.dst_content, fallback=hop.dst_node_id)
         if hop.src_modality == "text" and hop.dst_modality == "text":
-            src_label = hop.src_content.get("title") or hop.src_node_id
-            dst_label = hop.dst_content.get("title") or hop.dst_node_id
-            statement = f"{src_label} {relation} {dst_label}".strip()
+            statement = f"{source_label} {relation} {target_label}".strip()
         elif hop.src_modality == "text" and hop.dst_modality == "image":
-            src_label = hop.src_content.get("title") or hop.src_node_id
             retrieval_query = str(hop.relation or "").strip()
-            dst_label = (
-                hop.dst_content.get("title")
-                or hop.dst_content.get("caption")
-                or retrieval_query
-                or "a key visual scene"
-            )
             if retrieval_query:
                 statement = (
-                    f"{src_label} is associated with a key photo or visual scene described by the query: "
+                    f"{source_label} is associated with a key photo or visual scene described by the query: "
                     f"{retrieval_query}."
                 )
             else:
-                statement = f"{src_label} is associated with a key photo or visual scene: {dst_label}."
+                statement = f"{source_label} is associated with a key photo or visual scene: {target_label}."
         elif hop.src_modality == "image" and hop.dst_modality == "text":
-            src_label = QuestionWriter._image_clue_label(hop)
-            dst_label = hop.dst_content.get("title") or hop.dst_node_id
-            statement = f"{src_label} refers to {dst_label}."
+            statement = f"{QuestionWriter._image_clue_label(hop)} refers to {target_label}."
         else:
-            src_label = hop.src_content.get("title") or hop.src_content.get("caption") or hop.src_node_id
-            dst_label = hop.dst_content.get("title") or hop.dst_content.get("caption") or hop.dst_node_id
-            statement = f"{src_label} {relation} {dst_label}".strip()
+            statement = f"{source_label} {relation} {target_label}".strip()
         return {
             "hop_index": hop.hop_index,
             "statement": statement,
-            "source": src_label,
-            "target": dst_label,
+            "source": source_label,
+            "target": target_label,
             "relation": relation,
             "retrieval_query": retrieval_query,
             "edge_id": hop.edge_id,
