@@ -52,6 +52,8 @@ class GraphRunnerConfig:
     parallel_workers: int = 1
     batch_size: int | None = None
     show_progress: bool = True
+    persist_visual_plans: bool = True
+    visual_plans_file_name: str = "visual_plans.jsonl"
 
     def to_dict(self) -> dict[str, Any]:
         return _jsonify(asdict(self))
@@ -130,8 +132,10 @@ class GraphRunner:
         self.store = store
         self.config = config or GraphRunnerConfig()
         self.state_path = Path(state_path) if state_path else store.root_dir / self.config.state_file_name
+        self.visual_plans_path = store.root_dir / self.config.visual_plans_file_name
         self.state = self._load_or_create_state(run_id=run_id, resume=resume)
         self._restore_strategy_state()
+        self._saved_visual_plan_ids = self._load_saved_visual_plan_ids()
         self._progress_width = 0
 
     def add_seed(
@@ -312,6 +316,81 @@ class GraphRunner:
             self.state.skipped_tasks.append(record)
         else:
             self.state.completed_tasks.append(record)
+        self._persist_visual_plans(result)
+
+    def _persist_visual_plans(self, result: NodeExpansionResult) -> None:
+        if not self.config.persist_visual_plans or not result.visual_plans:
+            return
+        node = result.text_result.node.to_dict() if result.text_result is not None else None
+        records: list[dict[str, Any]] = []
+        for plan in result.visual_plans:
+            if plan.plan_id in self._saved_visual_plan_ids:
+                continue
+            records.append(self._visual_plan_record(result=result, node=node, plan=plan))
+            self._saved_visual_plan_ids.add(plan.plan_id)
+        if not records:
+            return
+        self.visual_plans_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.visual_plans_path.open("a", encoding="utf-8") as handle:
+            for record in records:
+                handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True))
+                handle.write("\n")
+
+    def _load_saved_visual_plan_ids(self) -> set[str]:
+        if not self.config.persist_visual_plans or not self.visual_plans_path.exists():
+            return set()
+        seen: set[str] = set()
+        try:
+            with self.visual_plans_path.open("r", encoding="utf-8") as handle:
+                for raw_line in handle:
+                    line = raw_line.strip()
+                    if not line:
+                        continue
+                    try:
+                        record = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    plan_id = record.get("plan_id")
+                    if isinstance(plan_id, str) and plan_id:
+                        seen.add(plan_id)
+        except Exception:
+            return set()
+        return seen
+
+    def _visual_plan_record(
+        self,
+        *,
+        result: NodeExpansionResult,
+        node: dict[str, Any] | None,
+        plan: Any,
+    ) -> dict[str, Any]:
+        target = plan.target
+        source = (node or {}).get("source") or {}
+        return {
+            "run_id": self.state.run_id,
+            "step": self.state.step,
+            "task_url": result.task.url,
+            "task_title": result.task.title,
+            "task_depth": result.task.depth,
+            "node_id": (node or {}).get("node_id"),
+            "node_title": (node or {}).get("title") or (node or {}).get("canonical_id"),
+            "node_source_url": source.get("url") if isinstance(source, dict) else None,
+            "plan_id": plan.plan_id,
+            "target_evidence_id": target.evidence_id,
+            "target_description": target.content,
+            "target_type": target.metadata.get("target_type"),
+            "downstream_use": target.metadata.get("downstream_use"),
+            "source_passage": target.metadata.get("source_passage"),
+            "source_quote": target.metadata.get("source_quote"),
+            "uniqueness": target.metadata.get("uniqueness"),
+            "reason": target.metadata.get("reason"),
+            "expected_visual": target.metadata.get("expected_visual") or target.metadata.get("query"),
+            "queries": [query.query for query in plan.queries],
+            "query_specs": [query.to_dict() for query in plan.queries],
+            "target": target.to_dict(),
+            "planner": plan.planner,
+            "metadata": plan.metadata,
+        }
 
     def _emit_progress(self) -> None:
         if not self.config.show_progress:

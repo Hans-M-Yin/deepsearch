@@ -72,7 +72,7 @@ The query must not contain any explicit URL, domain name, filename, image identi
 
 2. You may also use your own knowledge about the subject to propose additional specific events or related objects that are not explicitly mentioned in the Wikipedia text, and rewrite them into search-ready passages.
 
-3. The number of unique image materials corresponding to the subject is uncertain. If you believe no suitable image exists, you may output nothing. Otherwise, output at most 4 passages.
+3. The number of unique image materials corresponding to the subject is uncertain. If you believe no suitable image exists, you may output nothing.
 
 4. We will directly use your rewritten text for image search. Please strictly follow the format below:
 
@@ -491,7 +491,11 @@ def _smoke_test() -> None:
 <reason>The passage points to one specific event, Kobe Bryant's final NBA game in 2016. Photos of that game are widely available online, and different matching images still depict the same uniquely identified event.</reason>"""
             )
 
-    planner = LLMVisualSearchPlanner(model_client=MockModel(), model_alias="mock_planner")
+    planner = LLMVisualSearchPlanner(
+        model_client=MockModel(),
+        model_alias="mock_planner",
+        min_content_chars_for_images=0,
+    )
     plans = planner.plan(
         node={"node_id": "text_1", "title": "Kobe Bryant", "attributes": {"team": "Lakers"}},
         page_text="Kobe Bryant played his final game in 2016.",
@@ -506,6 +510,7 @@ def _smoke_test() -> None:
     prompt_input = planner._prompt_input(
         {"node_id": "text_1", "title": "Kobe Bryant", "attributes": {}},
         "First paragraph.\n\nSecond paragraph.",
+        1,
     )
     assert "Complete the following person." in prompt_input
     assert "P1: First paragraph." in prompt_input
