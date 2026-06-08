@@ -169,9 +169,12 @@ Given one source entity and candidate outgoing Wikipedia links, decide which can
 
 The goal is not to keep the closest or most obvious links. Prefer candidates that can become useful intermediate hops for diverse, natural multi-hop questions.
 The graph will later rely on source_node + relation -> target_node reasoning, so prefer neighbors whose relation from the source can be phrased in a strong, target-identifying way.
+Judge uniqueness at the level of a stable knowledge-graph node, not at the level of a single physical instance in the world.
+A target can still be good if it denotes one specific canonical model, work, event, institution, or other referentially stable page, even when many physical copies or instances exist.
 
 Keep candidates that:
-- are unique, concrete entities or events, not broad classes, generic concepts, dates, list pages, maintenance pages, or ambiguous labels;
+- are referentially stable Wikipedia targets: one identifiable person, organization, product model, work, event, place, award, institution, or other concrete node-like concept;
+- can be referred to as a single graph node even if many physical instances exist, such as a product model, building design, film, book, or recurring institution;
 - have a meaningful but not trivial relation to the source entity;
 - admit a relation description that can distinguish this target from other likely neighbors of the same source, possibly by adding explicit qualifiers from context;
 - can act as a useful bridge for multi-hop questions;
@@ -181,6 +184,9 @@ Reject candidates that:
 - are too close to the source, such as the same entity, aliases, purely self-descriptive links, or repeated administrative editions;
 - are too far or only appear in references/navigation/template noise;
 - are broad categories or common concepts rather than identifiable entities/events;
+- are topic-overview, history, timeline, discography, bibliography, list, category, glossary, or navigation-style pages rather than a single node-like target;
+- summarize a broad subject area or a family of items instead of denoting one stable target;
+- are class labels, genres, occupations, technologies, or broad product families unless the local context clearly points to one specific canonical target page;
 - are generic geographic or administrative units such as countries, regions, provinces, states, cities, or districts unless the place itself is central to the source entity's identity or needed as a uniquely identifying bridge;
 - would only support a vague relation that is likely to map from the source to many different targets unless the local context clearly provides a stronger distinguishing qualifier;
 - are unlikely to have a stable Wikipedia page representing one specific target.
@@ -190,6 +196,7 @@ Do not force the relation into a fixed taxonomy, and do not overuse a small set 
 The relation should be written from the source to this candidate in a way that is as uniquely target-identifying as possible.
 If a broad predicate would fit multiple candidates for the same source, add qualifiers so the relation becomes more discriminative.
 If rejecting a candidate, relation can be a short rejection label such as too_generic, too_close, too_far, ambiguous_entity, list_page, reference_noise, or templatic_edition.
+When in doubt, prefer a canonical specific target page over an explanatory overview page.
 
 Examples we should keep:
  
@@ -210,6 +217,12 @@ Examples we should keep:
   keep: yes
   relation: This is the only Korean main sponsors of Los Angeles Lakers.
   reason: CJ CheilJedang is the unique sponsors from Korean of LAL.
+
+- Source: Apple Inc.
+  Candidate: iPhone 3GS
+  keep: yes
+  relation: smartphone model introduced by Apple in 2009
+  reason: Specific canonical product model; stable graph node even though many units were manufactured.
 
 Examples we should ignore:
 
@@ -242,6 +255,12 @@ Examples we should ignore:
   keep: no
   relation: Kobe won NBA Finals this year.
   reason: Not unique. Given Kobe Bryant and the relation 'kobe won NBA Finals this year', we can infer the candidates including 2000, 2001, 2002...
+
+- Source: Apple Inc.
+  Candidate: History of iPhone
+  keep: no
+  relation: topic_overview
+  reason: Overview/history page spanning many models and events, not one single target node.
 
 
 Return one XML-like item per candidate. Copy the candidate title exactly into
