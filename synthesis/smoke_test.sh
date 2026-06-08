@@ -2,7 +2,7 @@
 python run_min_graph.py \
   --seed-url https://en.wikipedia.org/wiki/Kobe_Bryant \
   --store-dir runs/kobe_text_only_20_100_depth_24 \
-  --reader-base-url http://10.124.136.6:8004 \
+  --reader-base-url http://10.124.136.252:8004 \
   --fresh \
   --no-images \
   --skip-attributes \
