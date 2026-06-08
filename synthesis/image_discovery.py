@@ -932,6 +932,10 @@ class ImageDiscoveryBuilder:
         grounding_context = self._build_image_grounding_context(search_result)
         image_node.metadata = dict(image_node.metadata or {})
         image_node.metadata["image_grounding_context"] = grounding_context.to_dict()
+        image_node.metadata["image_grounding_prompt"] = {
+            "system": PROMPT_IMAGE_GROUND,
+            "user_text": grounding_context.prompt_text,
+        }
 
         try:
             model_image_url = resolved_asset.model_url if resolved_asset is not None else search_result.image_url
@@ -985,6 +989,8 @@ class ImageDiscoveryBuilder:
                 "raw_model_output": error,
                 "run_id": run_id,
                 "context": grounding_context.to_dict(),
+                "debug_prompt_system": PROMPT_IMAGE_GROUND,
+                "debug_prompt_user_text": grounding_context.prompt_text,
             }
             image_node.metadata = dict(image_node.metadata or {})
             image_node.metadata["image_ground_error"] = error
@@ -998,6 +1004,8 @@ class ImageDiscoveryBuilder:
             usage=response.usage,
         )
         grounding["context"] = grounding_context.to_dict()
+        grounding["debug_prompt_system"] = PROMPT_IMAGE_GROUND
+        grounding["debug_prompt_user_text"] = grounding_context.prompt_text
         self._apply_grounding_to_image_node(image_node, grounding)
         return grounding
 
@@ -1167,6 +1175,8 @@ class ImageDiscoveryBuilder:
             "raw_model_output": grounding.get("raw_model_output"),
             "run_id": grounding.get("run_id"),
             "context": context,
+            "debug_prompt_system": grounding.get("debug_prompt_system"),
+            "debug_prompt_user_text": grounding.get("debug_prompt_user_text"),
         }
 
     def image_check(
