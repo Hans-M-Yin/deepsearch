@@ -12,7 +12,6 @@ https://en.wikipedia.org/wiki/Taylor_Swift
 https://en.wikipedia.org/wiki/Shou_Chew
 
 # Artifact
-https://en.wikipedia.org/wiki/IPhone_(1st_generation)
 https://en.wikipedia.org/wiki/Mona_Lisa
 https://en.wikipedia.org/wiki/Thriller_(album)
 
@@ -29,3 +28,10 @@ https://en.wikipedia.org/wiki/Chien-Shiung_Wu
 https://en.wikipedia.org/wiki/Bird_in_Space
 https://en.wikipedia.org/wiki/Book_of_Kells
 https://en.wikipedia.org/wiki/Kinora
+
+https://en.wikipedia.org/wiki/Nakagin_Capsule_Tower
+
+https://en.wikipedia.org/wiki/Budd_RDC
+https://en.wikipedia.org/wiki/Astrolabe
+https://en.wikipedia.org/wiki/Man_with_a_Movie_Camera
+https://en.wikipedia.org/wiki/Barcelona_chair
