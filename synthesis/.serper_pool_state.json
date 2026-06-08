@@ -39,9 +39,9 @@
     "7e058618c4997cef": {
       "disabled": false,
       "initial_credits": 2500,
-      "last_used_at": "2026-06-08T09:17:42Z",
+      "last_used_at": "2026-06-08T09:20:58Z",
       "masked_key": "2801...0624",
-      "remaining_credits": 2313
+      "remaining_credits": 2291
     },
     "877d025b08155613": {
       "disabled": false,
@@ -69,5 +69,5 @@
     }
   },
   "min_remaining": 100,
-  "updated_at": "2026-06-08T09:17:42Z"
+  "updated_at": "2026-06-08T09:20:58Z"
 }
