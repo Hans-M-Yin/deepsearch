@@ -10,6 +10,7 @@ endpoint and prints a compact result list.
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 import sys
 
@@ -24,6 +25,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--limit", type=int, default=5, help="Maximum image results to print.")
     parser.add_argument("--env-file", default=str(DEFAULT_ENV_PATH), help="Path to synthesis env file.")
     parser.add_argument("--override-env", action="store_true", help="Let --env-file override existing env vars.")
+    parser.add_argument("--print-raw-response", action="store_true", help="Print the full raw API response JSON.")
+    parser.add_argument("--print-raw-items", action="store_true", help="Print each parsed result's raw payload JSON.")
     return parser
 
 
@@ -59,7 +62,14 @@ def main(argv: list[str] | None = None) -> int:
         print(f"    size={item.width or '?'}x{item.height or '?'}")
         if item.snippet:
             print(f"    snippet={item.snippet}")
+        if args.print_raw_items:
+            print("    raw=")
+            print(json.dumps(item.raw, ensure_ascii=False, indent=2))
         print()
+
+    if args.print_raw_response:
+        print("raw_response=")
+        print(json.dumps(response.raw_response, ensure_ascii=False, indent=2))
 
     return 0
 

@@ -1034,37 +1034,32 @@ class ImageDiscoveryBuilder:
         if not source_page_url:
             return self._build_title_only_grounding_context(search_result, fallback_reason="missing_source_page_url")
 
+        page_title = ""
+        page_content = ""
         try:
             document = self.reader.read(source_page_url)
         except Exception as exc:
-            return self._build_title_only_grounding_context(
-                search_result,
-                fallback_reason=f"reader_error:{exc.__class__.__name__}",
-            )
+            fallback_reason = f"reader_error:{exc.__class__.__name__}"
+        else:
+            page_title = (document.title or "").strip()
+            page_content = self._trim_grounding_context_text(document.content)
+            fallback_reason = None if (page_title or page_content) else "reader_empty"
 
-        page_title = (document.title or "").strip()
-        page_content = self._trim_grounding_context_text(document.content)
-        if not page_title and not page_content:
-            return self._build_title_only_grounding_context(search_result, fallback_reason="reader_empty")
-
-        prompt_parts = [
-            "Webpage context for this image:",
-            f"source_page_url: {source_page_url}",
-            f"page_title: {page_title}",
-            "",
-            "Use this page context only to help identify entities that are actually visible in the image.",
-            "If the page discusses entities not shown in the image, do not output them.",
-            "",
-            "Reader content:",
-            page_content,
-        ]
         return ImageGroundingContext(
             provider="source_page_reader",
-            prompt_text="\n".join(part for part in prompt_parts if part is not None),
+            prompt_text=self._format_image_grounding_prompt_text(
+                image_title=search_result.title,
+                image_snippet=search_result.snippet,
+                source_page_title=page_title,
+                source_page_content=page_content,
+            ),
             metadata={
                 "source_page_url": source_page_url,
+                "image_title": (search_result.title or "").strip() or None,
+                "image_snippet": (search_result.snippet or "").strip() or None,
                 "page_title": page_title or None,
                 "content_chars": len(page_content),
+                "fallback_reason": fallback_reason,
             },
         )
 
@@ -1075,26 +1070,39 @@ class ImageDiscoveryBuilder:
         fallback_reason: str | None = None,
     ) -> ImageGroundingContext:
         title = (search_result.title or "").strip()
-        if title:
-            prompt_text = (
-                "Fallback context for this image:\n"
-                f"title: {title}\n\n"
-                "Use the title only to disambiguate entities that are actually visible in the image.\n"
-                "If the title is insufficient or conflicts with the image, trust the image and omit uncertain entities."
-            )
-        else:
-            prompt_text = (
-                "No external context is available for this image.\n"
-                "Ground only entities that you can identify confidently from the image itself.\n"
-                "If identity is uncertain, omit the entity."
-            )
+        snippet = (search_result.snippet or "").strip()
         return ImageGroundingContext(
             provider="title_only",
-            prompt_text=prompt_text,
+            prompt_text=self._format_image_grounding_prompt_text(
+                image_title=title,
+                image_snippet=snippet,
+                source_page_title="",
+                source_page_content="",
+            ),
             metadata={
                 "title": title or None,
+                "image_snippet": snippet or None,
                 "fallback_reason": fallback_reason,
             },
+        )
+
+    @staticmethod
+    def _format_image_grounding_prompt_text(
+        *,
+        image_title: str | None,
+        image_snippet: str | None,
+        source_page_title: str | None,
+        source_page_content: str | None,
+    ) -> str:
+        return (
+            "Use the text fields below only to help identify entities that are actually visible in the image.\n"
+            "If the text mentions entities not shown in the image, do not output them.\n"
+            "If the image and text are insufficient to identify an entity confidently, omit it.\n\n"
+            f"Image Title: {(image_title or '').strip()}\n"
+            f"Image Snippet: {(image_snippet or '').strip()}\n"
+            f"Source Page Title: {(source_page_title or '').strip()}\n"
+            "Source Page Content:\n"
+            f"{(source_page_content or '').strip()}"
         )
 
     def _trim_grounding_context_text(self, text: str | None) -> str:
