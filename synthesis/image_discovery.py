@@ -96,11 +96,14 @@ Describe the image and ground only unique, searchable entities visible in or cle
 
 Keep entities only if they are named or uniquely identifiable, such as a person, landmark, movie, book, album, artwork, product, brand, team, organization, event, document, map, or logo. Do not output generic objects such as person, woman, car, building, crowd, red shirt, tree.
 
-You may receive webpage context associated with the image. Use that context only to disambiguate what is visible. Do not invent entities that are not visually supported by the image. If the image and context are insufficient to identify an entity confidently, omit it rather than guessing.
+You may receive webpage context associated with the image. Use that context only to disambiguate what is visible. Do not invent entities that are not visually supported by the image.
 
 Important grounding rules:
 1. Include indirect but clearly visible searchable entities when they are visually grounded.
    - Examples: an Adidas or Nike logo on clothing, a team crest on a jersey, a visible brand mark on an object. These marks point to a unique brand.
+2. For every output entity, ensure the entity name is unambiguous and can be used directly to look up the correct Wikipedia page.
+   - Prefer full canonical names over short or ambiguous surface forms.
+   - Prefer "Kobe Bryant" over "Kobe", "Los Angeles Lakers" over "Lakers", and "Eiffel Tower" over "the tower".
    
 Output guidance:
 1. `relation_to_image` is a visual locator, not an abstract semantic relation.
@@ -1097,7 +1100,7 @@ class ImageDiscoveryBuilder:
         return (
             "Use the text fields below only to help identify entities that are actually visible in the image.\n"
             "If the text mentions entities not shown in the image, do not output them.\n"
-            "If the image and text are insufficient to identify an entity confidently, omit it.\n\n"
+            "For every output entity, ensure the entity name is unambiguous and can be used directly to look up the correct Wikipedia page.\n\n"
             f"Image Title: {(image_title or '').strip()}\n"
             f"Image Snippet: {(image_snippet or '').strip()}\n"
             f"Source Page Title: {(source_page_title or '').strip()}\n"
