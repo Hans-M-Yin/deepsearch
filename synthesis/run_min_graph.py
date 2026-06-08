@@ -412,6 +412,7 @@ def main(argv: list[str] | None = None) -> int:
                 max_images_per_plan=args.max_images_per_plan,
                 persist_search_snapshots=args.persist_snapshots,
                 force_accept_images=args.force_accept_images,
+                image_grounding_reader_base_url=args.reader_base_url,
             ),
             model_client=LLM_WORKER,
         )

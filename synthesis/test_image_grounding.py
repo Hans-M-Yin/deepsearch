@@ -83,6 +83,12 @@ def parse_args() -> argparse.Namespace:
         help="Path to synthesis env file.",
     )
     parser.add_argument(
+        "--reader-base-url",
+        type=str,
+        default="http://127.0.0.1:8004",
+        help="Enhanced Reader base URL used to fetch source-page context for grounding.",
+    )
+    parser.add_argument(
         "--skip-check",
         action="store_true",
         help="Skip image_check and force image_ground on the provided image.",
@@ -269,6 +275,7 @@ def main() -> int:
         config=ImageDiscoveryConfig(
             precheck_image_urls=not bool(args.image_path),
             try_source_page_recovery=False,
+            image_grounding_reader_base_url=args.reader_base_url,
         ),
         image_check_model_alias=os.environ.get("IMAGE_CHECK_MODEL"),
     )

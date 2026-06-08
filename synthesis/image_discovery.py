@@ -43,6 +43,7 @@ from .nodes import ImageNode, ImageVariant, NodeType, TextNode
 from .search_client import ImageSearchResult, SearchClient, SearchResponse
 from .store import JsonlGraphStore
 from .visual_planner import SearchQuerySpec, VisualSearchPlan
+from .wiki_text_builder import EnhancedReaderClient
 
 
 def _trace_timing_enabled() -> bool:
@@ -95,7 +96,7 @@ Describe the image and ground only unique, searchable entities visible in or cle
 
 Keep entities only if they are named or uniquely identifiable, such as a person, landmark, movie, book, album, artwork, product, brand, team, organization, event, document, map, or logo. Do not output generic objects such as person, woman, car, building, crowd, red shirt, tree.
 
-Use candidate metadata only to disambiguate what is visible. The preferred textual description may help identify a visible person or entity when the image alone is insufficient, but do not invent entities that are not visually supported.
+You may receive webpage context associated with the image. Use that context only to disambiguate what is visible. Do not invent entities that are not visually supported by the image. If the image and context are insufficient to identify an entity confidently, omit it rather than guessing.
 
 Important grounding rules:
 1. Include indirect but clearly visible searchable entities when they are visually grounded.
@@ -204,6 +205,10 @@ class ImageDiscoveryConfig:
     cache_dir: str | None = None
     try_source_page_recovery: bool = True
     source_page_timeout_s: float = 20.0
+    image_grounding_context_backend: str = "source_page_reader"
+    image_grounding_reader_base_url: str = "http://127.0.0.1:8004"
+    image_grounding_reader_timeout_s: float = 40.0
+    image_grounding_max_context_chars: int = 6000
     expandable_entity_types: set[str] = field(
         default_factory=lambda: {
             "person",
@@ -347,6 +352,18 @@ class ImageDiscoveryResult:
         }
 
 
+@dataclass(slots=True)
+class ImageGroundingContext:
+    """Prompt-side context provider output for image grounding."""
+
+    provider: str
+    prompt_text: str
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return _jsonify(asdict(self))
+
+
 class ImageDiscoveryBuilder:
     """Run image discovery for a visual target and persist graph records."""
 
@@ -368,7 +385,12 @@ class ImageDiscoveryBuilder:
         self.model_client = model_client or LLM_WORKER
         self.image_check_model_alias = image_check_model_alias
         self.wiki_resolver = wiki_resolver or WikiEntityResolver()
+        self.reader = EnhancedReaderClient(
+            base_url=self.config.image_grounding_reader_base_url,
+            timeout_s=self.config.image_grounding_reader_timeout_s,
+        )
         self._resolved_image_cache: dict[str, ResolvedImageAsset] = {}
+        self._grounding_context_cache: dict[str, ImageGroundingContext] = {}
         self._host_not_before: dict[str, float] = {}
         self._host_locks: dict[str, threading.Lock] = {}
         self._download_lock = threading.Lock()
@@ -878,6 +900,7 @@ class ImageDiscoveryBuilder:
                 "caption": image_node.caption,
                 "grounded_entities": [],
                 "check": "not_configured",
+                "context": None,
             }
             self._apply_grounding_to_image_node(image_node, grounding)
             return grounding
@@ -895,6 +918,7 @@ class ImageDiscoveryBuilder:
                 "check": "image_url_precheck_failed",
                 "raw_model_output": None,
                 "run_id": run_id,
+                "context": None,
             }
             image_node.metadata = dict(image_node.metadata or {})
             image_node.metadata["image_ground_error"] = precheck_error
@@ -904,6 +928,10 @@ class ImageDiscoveryBuilder:
         if self.config.precheck_image_urls and resolved_asset is not None:
             image_node.metadata = dict(image_node.metadata or {})
             image_node.metadata["resolved_image"] = resolved_asset.to_metadata()
+
+        grounding_context = self._build_image_grounding_context(search_result)
+        image_node.metadata = dict(image_node.metadata or {})
+        image_node.metadata["image_grounding_context"] = grounding_context.to_dict()
 
         try:
             model_image_url = resolved_asset.model_url if resolved_asset is not None else search_result.image_url
@@ -925,11 +953,7 @@ class ImageDiscoveryBuilder:
                             content=[
                                 {
                                     "type": "text",
-                                    "text": self._image_ground_prompt_input(
-                                        plan=plan,
-                                        search_result=search_result,
-                                        validation=validation,
-                                    ),
+                                    "text": grounding_context.prompt_text,
                                 },
                                 {
                                     "type": "image_url",
@@ -960,6 +984,7 @@ class ImageDiscoveryBuilder:
                 "check": "mllm_grounding_failed",
                 "raw_model_output": error,
                 "run_id": run_id,
+                "context": grounding_context.to_dict(),
             }
             image_node.metadata = dict(image_node.metadata or {})
             image_node.metadata["image_ground_error"] = error
@@ -972,37 +997,110 @@ class ImageDiscoveryBuilder:
             model_alias=model_alias,
             usage=response.usage,
         )
+        grounding["context"] = grounding_context.to_dict()
         self._apply_grounding_to_image_node(image_node, grounding)
         return grounding
 
-    @staticmethod
-    def _image_ground_prompt_input(
-        *,
-        plan: VisualSearchPlan,
-        search_result: ImageSearchResult,
-        validation: ImageValidationResult,
-    ) -> str:
-        preferred_description = ImageDiscoveryBuilder._preferred_search_result_description(search_result)
-        return (
-            f"Target:\n{plan.target.content or ''}\n\n"
-            "Candidate metadata:\n"
-            f"preferred_textual_description: {preferred_description}\n"
-            f"title: {search_result.title or ''}\n"
-            f"caption/snippet: {search_result.snippet or ''}\n"
-            f"source_page_url: {search_result.source_page_url or ''}\n\n"
-            "Prior image_check:\n"
-            f"reason: {validation.reason or ''}\n"
+    def _build_image_grounding_context(self, search_result: ImageSearchResult) -> ImageGroundingContext:
+        backend = (self.config.image_grounding_context_backend or "source_page_reader").strip().lower()
+        cache_key = f"{backend}::{search_result.source_page_url or ''}::{search_result.title or ''}"
+        cached = self._grounding_context_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        if backend == "source_page_reader":
+            context = self._build_source_page_reader_grounding_context(search_result)
+        elif backend == "title_only":
+            context = self._build_title_only_grounding_context(search_result)
+        else:
+            context = self._build_title_only_grounding_context(
+                search_result,
+                fallback_reason=f"unsupported_backend:{backend}",
+            )
+
+        self._grounding_context_cache[cache_key] = context
+        return context
+
+    def _build_source_page_reader_grounding_context(self, search_result: ImageSearchResult) -> ImageGroundingContext:
+        source_page_url = (search_result.source_page_url or "").strip()
+        if not source_page_url:
+            return self._build_title_only_grounding_context(search_result, fallback_reason="missing_source_page_url")
+
+        try:
+            document = self.reader.read(source_page_url)
+        except Exception as exc:
+            return self._build_title_only_grounding_context(
+                search_result,
+                fallback_reason=f"reader_error:{exc.__class__.__name__}",
+            )
+
+        page_title = (document.title or "").strip()
+        page_content = self._trim_grounding_context_text(document.content)
+        if not page_title and not page_content:
+            return self._build_title_only_grounding_context(search_result, fallback_reason="reader_empty")
+
+        prompt_parts = [
+            "Webpage context for this image:",
+            f"source_page_url: {source_page_url}",
+            f"page_title: {page_title}",
+            "",
+            "Use this page context only to help identify entities that are actually visible in the image.",
+            "If the page discusses entities not shown in the image, do not output them.",
+            "",
+            "Reader content:",
+            page_content,
+        ]
+        return ImageGroundingContext(
+            provider="source_page_reader",
+            prompt_text="\n".join(part for part in prompt_parts if part is not None),
+            metadata={
+                "source_page_url": source_page_url,
+                "page_title": page_title or None,
+                "content_chars": len(page_content),
+            },
         )
 
-    @staticmethod
-    def _preferred_search_result_description(search_result: ImageSearchResult) -> str:
+    def _build_title_only_grounding_context(
+        self,
+        search_result: ImageSearchResult,
+        *,
+        fallback_reason: str | None = None,
+    ) -> ImageGroundingContext:
         title = (search_result.title or "").strip()
-        snippet = (search_result.snippet or "").strip()
-        if snippet and len(snippet) >= len(title):
-            return snippet
         if title:
-            return title
-        return snippet
+            prompt_text = (
+                "Fallback context for this image:\n"
+                f"title: {title}\n\n"
+                "Use the title only to disambiguate entities that are actually visible in the image.\n"
+                "If the title is insufficient or conflicts with the image, trust the image and omit uncertain entities."
+            )
+        else:
+            prompt_text = (
+                "No external context is available for this image.\n"
+                "Ground only entities that you can identify confidently from the image itself.\n"
+                "If identity is uncertain, omit the entity."
+            )
+        return ImageGroundingContext(
+            provider="title_only",
+            prompt_text=prompt_text,
+            metadata={
+                "title": title or None,
+                "fallback_reason": fallback_reason,
+            },
+        )
+
+    def _trim_grounding_context_text(self, text: str | None) -> str:
+        normalized = re.sub(r"\n{3,}", "\n\n", re.sub(r"[ \t]+", " ", (text or "").strip()))
+        if not normalized:
+            return ""
+        limit = max(256, int(self.config.image_grounding_max_context_chars))
+        if len(normalized) <= limit:
+            return normalized
+        trimmed = normalized[:limit]
+        last_break = max(trimmed.rfind("\n\n"), trimmed.rfind(". "))
+        if last_break >= 256:
+            trimmed = trimmed[: last_break + 1]
+        return trimmed.rstrip()
 
     @staticmethod
     def _parse_image_ground_response(
@@ -1059,12 +1157,16 @@ class ImageDiscoveryBuilder:
             image_node.summary = caption
         image_node.metadata = dict(image_node.metadata or {})
         image_node.metadata["grounded_entities"] = grounding.get("grounded_entities", [])
+        context = grounding.get("context") or image_node.metadata.get("image_grounding_context")
+        if context is not None:
+            image_node.metadata["image_grounding_context"] = context
         image_node.metadata["image_grounding"] = {
             "check": grounding.get("check"),
             "model_alias": grounding.get("model_alias"),
             "usage": grounding.get("usage"),
             "raw_model_output": grounding.get("raw_model_output"),
             "run_id": grounding.get("run_id"),
+            "context": context,
         }
 
     def image_check(
@@ -2381,7 +2483,7 @@ visual_fact: Kobe Bryant is visible
                 content="""<ground>
 caption: Kobe Bryant in his final game
 visual_fact: basketball uniform
-entity: Kobe | person | depicts | visible player
+entity: Los Angeles Lakers | jersey logo | visible team branding on the uniform
 </ground>"""
             )
 
@@ -2398,7 +2500,14 @@ entity: Kobe | person | depicts | visible player
                 aliases=["Kobe"],
                 source_url="https://en.wikipedia.org/wiki/Kobe_Bryant",
             )
+            lakers_node = TextNode.from_wiki_entity(
+                "Q121783",
+                "Los Angeles Lakers",
+                aliases=["Lakers"],
+                source_url="https://en.wikipedia.org/wiki/Los_Angeles_Lakers",
+            )
             store.upsert_node(text_node)
+            store.upsert_node(lakers_node)
             target = Evidence.create(
                 EvidenceType.VISUAL_TARGET,
                 content="Kobe Bryant final game uniform",
@@ -2434,7 +2543,8 @@ entity: Kobe | person | depicts | visible player
             assert result.image_node.caption == "Kobe Bryant in his final game"
             assert result.edge is not None
             assert result.grounded_edges
-            assert store.stats()["nodes"] == 2
+            assert result.image_node.metadata.get("image_grounding", {}).get("context") is not None
+            assert store.stats()["nodes"] == 3
     finally:
         if old_check is None:
             os.environ.pop("IMAGE_CHECK_MODEL", None)
