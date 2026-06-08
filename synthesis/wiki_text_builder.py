@@ -168,6 +168,7 @@ PROMPT_FILTER_WIKI_NEIGHBORS = """You are selecting useful neighboring Wikipedia
 Given one source entity and candidate outgoing Wikipedia links, decide which candidates should be kept as expansion targets.
 
 The goal is not to keep the closest or most obvious links. Prefer candidates that can become useful intermediate hops for diverse, natural multi-hop questions.
+Prefer candidates that add new information rather than simply restating the source entity's most obvious identity.
 The graph will later rely on source_node + relation -> target_node reasoning, so prefer neighbors whose relation from the source can be phrased in a strong, target-identifying way.
 Judge uniqueness at the level of a stable knowledge-graph node, not at the level of a single physical instance in the world.
 A target can still be good if it denotes one specific canonical model, work, event, institution, or other referentially stable page, even when many physical copies or instances exist.
