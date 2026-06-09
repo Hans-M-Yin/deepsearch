@@ -259,9 +259,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--reader-base-url", default="http://127.0.0.1:8004", help="Enhanced Reader base URL.")
     parser.add_argument("--reader-check-timeout", type=float, default=60.0, help="Enhanced Reader preflight timeout in seconds.")
     parser.add_argument("--skip-reader-check", action="store_true", help="Skip preflight reader reachability check.")
-    parser.add_argument("--max-steps", type=int, default=5, help="Maximum text pages to expand.")
-    parser.add_argument("--max-nodes", type=int, default=10, help="Stop after this many graph nodes.")
-    parser.add_argument("--parallel-workers", type=int, default=1, help="Number of text-node expansion workers.")
+    parser.add_argument(
+        "--max-steps",
+        type=int,
+        default=5,
+        help="Maximum total expansion tasks, including text and image tasks.",
+    )
+    parser.add_argument(
+        "--max-nodes",
+        type=int,
+        default=10,
+        help="Maximum number of text nodes to expand. Pending image tasks continue after this limit is reached.",
+    )
+    parser.add_argument(
+        "--parallel-workers",
+        type=int,
+        default=1,
+        help="Number of workers shared by text and image expansion tasks.",
+    )
     parser.add_argument("--batch-size", type=int, default=None, help="Tasks popped from the queue per parallel expansion round.")
     parser.add_argument("--max-depth", type=int, default=1, help="Maximum text-neighbor BFS depth.")
     parser.add_argument("--max-neighbors", type=int, default=2, help="Text neighbors queued per text node.")

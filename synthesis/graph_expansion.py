@@ -260,28 +260,60 @@ class GraphExpansionStrategy:
             self._queue.append(task)
             return True
 
-    def queue_size(self) -> int:
+    def queue_size(self, task_type: ExpansionTaskType | None = None) -> int:
         with self._lock:
+            if task_type is not None:
+                return sum(1 for task in self._queue if task.task_type == task_type)
             return len(self._queue)
 
-    def expand_next(self, *, run_id: str | None = None) -> NodeExpansionResult | None:
-        task = self.pop_next_task()
+    def expand_next(
+        self,
+        *,
+        run_id: str | None = None,
+        allowed_task_types: set[ExpansionTaskType] | None = None,
+    ) -> NodeExpansionResult | None:
+        task = self.pop_next_task(allowed_task_types=allowed_task_types)
         if task is None:
             return None
         return self.expand_task(task, run_id=run_id)
 
-    def pop_next_task(self) -> ExpansionTask | None:
+    def pop_next_task(
+        self,
+        *,
+        allowed_task_types: set[ExpansionTaskType] | None = None,
+    ) -> ExpansionTask | None:
         with self._lock:
             if not self._queue:
                 return None
-            return self._queue.popleft()
+            if allowed_task_types is None:
+                return self._queue.popleft()
+            for index, task in enumerate(self._queue):
+                if task.task_type in allowed_task_types:
+                    del self._queue[index]
+                    return task
+            return None
 
-    def pop_next_batch(self, batch_size: int) -> list[ExpansionTask]:
+    def pop_next_batch(
+        self,
+        batch_size: int,
+        *,
+        allowed_task_types: set[ExpansionTaskType] | None = None,
+    ) -> list[ExpansionTask]:
         with self._lock:
             tasks: list[ExpansionTask] = []
             limit = max(1, int(batch_size))
-            while self._queue and len(tasks) < limit:
-                tasks.append(self._queue.popleft())
+            if allowed_task_types is None:
+                while self._queue and len(tasks) < limit:
+                    tasks.append(self._queue.popleft())
+                return tasks
+            index = 0
+            while index < len(self._queue) and len(tasks) < limit:
+                task = self._queue[index]
+                if task.task_type in allowed_task_types:
+                    tasks.append(task)
+                    del self._queue[index]
+                    continue
+                index += 1
             return tasks
 
     def queue_records(self) -> list[dict[str, Any]]:

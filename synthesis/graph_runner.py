@@ -211,7 +211,10 @@ class GraphRunner:
         )
 
     def _run_one(self) -> list[NodeExpansionResult]:
-        result = self.strategy.expand_next(run_id=self.state.run_id)
+        task = self._pop_next_schedulable_task(in_flight_text_count=0)
+        if task is None:
+            return []
+        result = self.strategy.expand_task(task, run_id=self.state.run_id)
         return [result] if result is not None else []
 
     def _run_parallel_batch(self) -> list[NodeExpansionResult]:
@@ -221,14 +224,15 @@ class GraphRunner:
         max_inflight = self.config.batch_size or self.config.parallel_workers
         max_inflight = max(1, min(int(max_inflight), int(self.config.parallel_workers), remaining_steps))
 
-        def can_submit_more(completed_count: int, in_flight_count: int) -> bool:
-            if completed_count + in_flight_count >= remaining_steps:
-                return False
-            if self.config.max_nodes is not None and self.store.stats().get("nodes", 0) >= self.config.max_nodes:
-                return False
-            return self.strategy.queue_size() > 0
-
-        initial_tasks = self.strategy.pop_next_batch(max_inflight)
+        initial_tasks: list[ExpansionTask] = []
+        initial_text_count = 0
+        while len(initial_tasks) < max_inflight:
+            task = self._pop_next_schedulable_task(in_flight_text_count=initial_text_count)
+            if task is None:
+                break
+            initial_tasks.append(task)
+            if task.task_type == ExpansionTaskType.TEXT_EXPAND:
+                initial_text_count += 1
         if not initial_tasks:
             return []
 
@@ -237,11 +241,14 @@ class GraphRunner:
             future_to_task = {}
             for task in initial_tasks:
                 future_to_task[executor.submit(self.strategy.expand_task, task, run_id=self.state.run_id)] = task
+            in_flight_text_count = initial_text_count
 
             while future_to_task:
                 done, _ = wait(tuple(future_to_task.keys()), return_when=FIRST_COMPLETED)
                 for future in done:
                     task = future_to_task.pop(future)
+                    if task.task_type == ExpansionTaskType.TEXT_EXPAND:
+                        in_flight_text_count -= 1
                     try:
                         results.append(future.result())
                     except Exception as exc:
@@ -253,8 +260,13 @@ class GraphRunner:
                             )
                         )
 
-                    while can_submit_more(len(results), len(future_to_task)):
-                        next_task = self.strategy.pop_next_task()
+                    while (
+                        len(results) + len(future_to_task) < remaining_steps
+                        and len(future_to_task) < max_inflight
+                    ):
+                        next_task = self._pop_next_schedulable_task(
+                            in_flight_text_count=in_flight_text_count,
+                        )
                         if next_task is None:
                             break
                         next_future = executor.submit(
@@ -263,7 +275,39 @@ class GraphRunner:
                             run_id=self.state.run_id,
                         )
                         future_to_task[next_future] = next_task
+                        if next_task.task_type == ExpansionTaskType.TEXT_EXPAND:
+                            in_flight_text_count += 1
         return results
+
+    def _text_node_count(self) -> int:
+        return sum(1 for node in self.store.list_nodes() if node.get("node_type") == "text")
+
+    def _remaining_text_slots(self, *, in_flight_text_count: int = 0) -> int | None:
+        if self.config.max_nodes is None:
+            return None
+        return max(0, self.config.max_nodes - self._text_node_count() - in_flight_text_count)
+
+    def _pop_next_schedulable_task(
+        self,
+        *,
+        in_flight_text_count: int,
+    ) -> ExpansionTask | None:
+        remaining_text_slots = self._remaining_text_slots(
+            in_flight_text_count=in_flight_text_count,
+        )
+        allowed_types = {ExpansionTaskType.IMAGE_EXPAND}
+        if remaining_text_slots is None or remaining_text_slots > 0:
+            allowed_types.add(ExpansionTaskType.TEXT_EXPAND)
+        return self.strategy.pop_next_task(allowed_task_types=allowed_types)
+
+    def _has_schedulable_tasks(self) -> bool:
+        if self.strategy.queue_size(ExpansionTaskType.IMAGE_EXPAND) > 0:
+            return True
+        remaining_text_slots = self._remaining_text_slots()
+        return (
+            (remaining_text_slots is None or remaining_text_slots > 0)
+            and self.strategy.queue_size(ExpansionTaskType.TEXT_EXPAND) > 0
+        )
 
     def save_state(self) -> None:
         self.state.updated_at = _utc_now()
@@ -401,12 +445,14 @@ class GraphRunner:
         max_nodes = self.config.max_nodes
         steps_text = f"{self.state.step}/{max_steps}" if max_steps else str(self.state.step)
         node_count = int(stats.get("nodes", 0))
-        nodes_text = f"{node_count}/{max_nodes}" if max_nodes is not None else str(node_count)
+        text_node_count = self._text_node_count()
+        nodes_text = f"{text_node_count}/{max_nodes}" if max_nodes is not None else str(text_node_count)
         line = (
             "[progress] "
             f"steps={steps_text} "
             f"queue={queue_size} "
-            f"nodes={nodes_text} "
+            f"text_nodes={nodes_text} "
+            f"nodes={node_count} "
             f"edges={int(stats.get('edges', 0))} "
             f"completed={len(self.state.completed_tasks)} "
             f"failed={len(self.state.failed_tasks)} "
@@ -498,13 +544,9 @@ class GraphRunner:
             )
 
     def _should_continue(self) -> bool:
-        if self.strategy.queue_size() <= 0:
-            return False
         if self.state.step >= self.config.max_steps:
             return False
-        if self.config.max_nodes is not None and self.store.stats().get("nodes", 0) >= self.config.max_nodes:
-            return False
-        return True
+        return self._has_schedulable_tasks()
 
     def _timing_summary(self) -> dict[str, Any]:
         records = self.state.completed_tasks + self.state.failed_tasks
@@ -679,6 +721,70 @@ def _smoke_test() -> None:
         assert result.steps == 1
         assert result.store_stats["nodes"] == 1
         assert (Path(tmpdir) / "graph_runner_state.json").exists()
+
+    class MockSchedulingStrategy(GraphExpansionStrategy):
+        def __init__(self, store: JsonlGraphStore) -> None:
+            super().__init__(
+                store=store,
+                wiki_builder=MockWikiBuilder(store),
+                config=GraphExpansionConfig(max_depth=0, enable_image_expansion=False),
+            )
+            self.executed_task_types: list[ExpansionTaskType] = []
+
+        def expand_task(
+            self,
+            task: ExpansionTask,
+            *,
+            run_id: str | None = None,
+        ) -> NodeExpansionResult:
+            del run_id
+            self.executed_task_types.append(task.task_type)
+            if task.task_type == ExpansionTaskType.TEXT_EXPAND:
+                node = TextNode.from_webpage(task.url, title=task.title or task.url)
+                self.store.upsert_node(node)
+            task.status = ExpansionTaskStatus.DONE
+            return NodeExpansionResult(task=task)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = JsonlGraphStore(tmpdir)
+        strategy = MockSchedulingStrategy(store)
+        runner = GraphRunner(
+            strategy=strategy,
+            store=store,
+            config=GraphRunnerConfig(
+                max_steps=10,
+                max_nodes=2,
+                parallel_workers=4,
+                batch_size=4,
+                show_progress=False,
+            ),
+            run_id="run_text_budget_smoke",
+            resume=False,
+        )
+        for index in range(4):
+            strategy.enqueue(
+                ExpansionTask(
+                    url=f"https://en.wikipedia.org/wiki/Text_{index}",
+                    title=f"Text {index}",
+                )
+            )
+        for index in range(2):
+            strategy.enqueue(
+                ExpansionTask.from_image_expansion(
+                    url=f"https://en.wikipedia.org/wiki/Image_Source_{index}",
+                    title=f"Image Source {index}",
+                    depth=0,
+                    source_text_node_id=f"text_source_{index}",
+                    source_evidence_id=f"evidence_{index}",
+                )
+            )
+        result = runner.run()
+        assert result.status == "paused"
+        assert strategy.executed_task_types.count(ExpansionTaskType.TEXT_EXPAND) == 2
+        assert strategy.executed_task_types.count(ExpansionTaskType.IMAGE_EXPAND) == 2
+        assert strategy.queue_size(ExpansionTaskType.TEXT_EXPAND) == 2
+        assert strategy.queue_size(ExpansionTaskType.IMAGE_EXPAND) == 0
+        assert runner._text_node_count() == 2
     print("graph_runner smoke test passed")
 
 
