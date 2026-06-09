@@ -76,5 +76,6 @@ vllm_reader_lm.pid
 enhanced_reader_log
 enhanced_reader.pid
 synthesis/.image_cache
+synthesis/ignore/
 synthesis/.serper_pool_state.json
 synthesis/.serper_pool_state.json.lock

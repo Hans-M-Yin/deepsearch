@@ -101,8 +101,12 @@ class SerperApiKeyPool:
         self.keys = cleaned
         self.default_credits = max(1, int(default_credits))
         self.min_remaining = max(0, int(min_remaining))
-        configured_path = state_path or os.environ.get("SERPER_API_POOL_STATE_FILE") or "synthesis/.serper_pool_state.json"
-        self.state_path = Path(configured_path)
+        configured_path = state_path or os.environ.get("SERPER_API_POOL_STATE_FILE")
+        self.state_path = (
+            Path(configured_path)
+            if configured_path
+            else Path(__file__).resolve().parent / "ignore" / "serper_pool_state.json"
+        )
         if not self.state_path.is_absolute():
             self.state_path = Path.cwd() / self.state_path
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
