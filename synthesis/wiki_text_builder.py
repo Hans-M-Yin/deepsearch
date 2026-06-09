@@ -377,6 +377,7 @@ class WikiTextBuildResult:
     snapshot: SearchSnapshot
     linked_entities: list[WikiLinkCandidate] = field(default_factory=list)
     edges: list[Edge] = field(default_factory=list)
+    link_markdown: str | None = None
     from_cache: bool = False
     timing: dict[str, float] = field(default_factory=dict)
 
@@ -557,6 +558,7 @@ class WikiTextBuilder:
             snapshot=snapshot,
             linked_entities=linked_entities,
             edges=[],
+            link_markdown=link_markdown,
         )
         if persist:
             started = time.perf_counter()

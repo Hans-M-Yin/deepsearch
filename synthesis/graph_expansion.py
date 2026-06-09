@@ -534,6 +534,18 @@ class GraphExpansionStrategy:
             pending_links.extend(self._pending_parent_links_by_url.pop(task.url, []))
         materialized: list[Edge] = []
         failures: list[dict[str, Any]] = []
+        backlink_candidates = self._find_pending_parent_backlinks(
+            pending_links,
+            source_result=target_result,
+        )
+        existing_backlink_targets = (
+            {
+                edge.get("dst_node_id")
+                for edge in self.store.edges_from(target_result.node.node_id)
+            }
+            if backlink_candidates
+            else set()
+        )
         for pending in pending_links:
             edge = self._materialize_pending_parent_link(
                 pending,
@@ -542,14 +554,85 @@ class GraphExpansionStrategy:
             )
             if edge is not None:
                 materialized.append(edge)
+            else:
+                diagnostic = self._diagnose_pending_parent_link_failure(
+                    pending,
+                    target_result=target_result,
+                )
+                if diagnostic is not None:
+                    failures.append(diagnostic)
+
+            parent_node_id = pending.get("parent_node_id")
+            candidate = backlink_candidates.get(parent_node_id)
+            if candidate is None:
                 continue
-            diagnostic = self._diagnose_pending_parent_link_failure(
-                pending,
-                target_result=target_result,
+            if candidate.node_id in existing_backlink_targets:
+                continue
+            backlink = self.wiki_builder._edge_to_linked_entity(
+                target_result.node,
+                candidate,
+                target_result.text_evidence,
+                run_id=run_id,
             )
-            if diagnostic is not None:
-                failures.append(diagnostic)
+            if self.config.persist:
+                self.store.upsert_edge(backlink)
+            materialized.append(backlink)
+            existing_backlink_targets.add(candidate.node_id)
         return materialized, failures
+
+    def _find_pending_parent_backlinks(
+        self,
+        pending_links: list[dict[str, Any]],
+        *,
+        source_result: WikiTextBuildResult,
+    ) -> dict[str, WikiLinkCandidate]:
+        markdown = source_result.link_markdown or ""
+        source_url = source_result.node.source.url if source_result.node.source else None
+        if not markdown or not source_url:
+            return {}
+
+        parent_by_url: dict[str, tuple[str, dict[str, Any]]] = {}
+        for pending in pending_links:
+            if (pending.get("link_type") or "wiki_link") != "wiki_link":
+                continue
+            parent_node_id = pending.get("parent_node_id")
+            if not parent_node_id:
+                continue
+            parent_node = self.store.get_node(parent_node_id)
+            parent_source = parent_node.get("source") if parent_node else None
+            parent_url = parent_source.get("url") if isinstance(parent_source, dict) else None
+            normalized_url = WikiTextBuilder._normalize_wikipedia_url(parent_url) if parent_url else None
+            if normalized_url and parent_node is not None:
+                parent_by_url[normalized_url] = (parent_node_id, parent_node)
+        if not parent_by_url:
+            return {}
+
+        matches: dict[str, WikiLinkCandidate] = {}
+        for rank, (anchor_text, href, start, end) in enumerate(
+            WikiTextBuilder._iter_markdown_links(markdown),
+            start=1,
+        ):
+            target_url = WikiTextBuilder._wiki_url_from_href(href, source_url=source_url)
+            if not target_url:
+                continue
+            normalized_url = WikiTextBuilder._normalize_wikipedia_url(target_url)
+            parent = parent_by_url.get(normalized_url)
+            if parent is None:
+                continue
+            parent_node_id, parent_node = parent
+            matches[parent_node_id] = WikiLinkCandidate(
+                title=parent_node.get("title") or WikiTextBuilder._title_from_url(normalized_url) or "",
+                url=normalized_url,
+                anchor_text=anchor_text.strip(),
+                source_url=source_url,
+                context=WikiTextBuilder._context(markdown, start, end),
+                rank=rank,
+                start_char=start,
+                end_char=end,
+            )
+            if len(matches) == len(parent_by_url):
+                break
+        return matches
 
     def _diagnose_pending_parent_link_failure(
         self,
@@ -1056,6 +1139,11 @@ def _smoke_test() -> None:
                 snapshot=snapshot,
                 linked_entities=linked_entities,
                 edges=[],
+                link_markdown=(
+                    "Neighbor has a documented connection to [the original seed](https://en.wikipedia.org/wiki/Seed)."
+                    if url.endswith("/Neighbor")
+                    else None
+                ),
             )
 
         def _cached_build_result(self, page_url: str) -> WikiTextBuildResult | None:
@@ -1175,8 +1263,18 @@ def _smoke_test() -> None:
         assert store.stats()["edges"] == 0
         child_result = strategy.expand_next(run_id="run_smoke")
         assert child_result is not None
-        assert len(child_result.materialized_edges) == 1
-        assert store.stats()["edges"] == 1
+        assert len(child_result.materialized_edges) == 2
+        stored_edges = store.list_edges()
+        assert len(stored_edges) == 2
+        seed_node_id = TextNode.make_id("wikipedia_page", "https://en.wikipedia.org/wiki/Seed")
+        neighbor_node_id = TextNode.make_id("wikipedia_page", "https://en.wikipedia.org/wiki/Neighbor")
+        assert {
+            (edge["src_node_id"], edge["dst_node_id"], edge["relation"])
+            for edge in stored_edges
+        } == {
+            (seed_node_id, neighbor_node_id, "Neighbor"),
+            (neighbor_node_id, seed_node_id, "the original seed"),
+        }
 
     with tempfile.TemporaryDirectory() as tmpdir:
         store = JsonlGraphStore(tmpdir)

@@ -80,16 +80,39 @@ Return valid JSON with exactly these fields:
 """
 
 
-PROMPT_SELECT_TARGET = """You are selecting a good final ask from the target node of a multi-hop search problem.
+PROMPT_SELECT_TARGET = """Design one evidence-grounded question from the complete target-node material.
 
-Choose one answerable target from the final node. Prefer a question whose answer is clearly supported by reliable evidence associated with the node, but is not merely a piece of broad common knowledge. When possible, avoid asking for the node name itself or for overly obvious attributes. Instead, select a specific, verifiable detail that requires consulting the relevant evidence while remaining unambiguous and well-supported.
+Choose the relevant facts or passages yourself. The question is not limited to
+asking for the node's identity or one Wikipedia-style attribute. It may require:
+- extracting one or two related facts
+- comparing values, dates, roles, or events
+- calculating a duration, difference, count, or other deterministic result
+- ordering events or identifying what came before or after
+- filtering several facts by a stated condition
+- combining related details into one coherent answer
+
+Prefer a somewhat niche question that would be difficult without finding the
+relevant material, but straightforward once that material is available.
+
+Grounding requirements:
+- Use only information explicitly present in the supplied target-node material.
+- Every compared or combined item must appear in that material.
+- Allow only direct extraction or simple, deterministic reasoning.
+- Do not rely on outside knowledge, subjective judgment, or unsupported inference.
+- The question must be unambiguous and have one fully supported answer.
+- Complexity must come from using the evidence, not from awkward wording.
+
+Write ask_target as a complete, directly answerable question that may name the
+target node. The answer must fully answer every part of the question.
 
 Return valid JSON with exactly these fields:
 {
-  "answer_type": "entity|attribute|image_content|ocr|other",
-  "ask_target": "what the final question should ask about",
-  "answer": "the gold answer",
-  "support": "short explanation of why this is a good final ask"
+  "answer_type": "entity|attribute|image_content|ocr|comparison|calculation|ordering|other",
+  "ask_target": "a complete question about the target node",
+  "answer": "a complete gold answer to every part of ask_target",
+  "supporting_facts": ["the exact supplied facts needed to answer the question"],
+  "reasoning": "a concise derivation from supporting_facts to answer",
+  "support": "short explanation of why the question is grounded and unambiguous"
 }
 """
 
@@ -100,7 +123,9 @@ Treat the directed hop facts as hidden reasoning, not text to narrate.
 
 Rules:
 - Use only the supplied facts and preserve every hop's source-to-target direction.
-- Ask for target_ask clearly, without revealing its answer.
+- Treat target_ask as the direct question about the final node. Rewrite it so
+  the final node is identified through the preceding hop clues rather than named.
+- Preserve every part of target_ask without revealing its answer.
 - Keep only the clues needed to make the question coherent and solvable.
 - Do not list the steps or use phrases such as "starting with", "then",
   "after that", "following that clue", or "using that clue".
@@ -114,45 +139,59 @@ Rules:
 Few-shot example:
 Input:
 {
-  "opening_mode": "image_start",
+  "opening_mode": "text_start",
   "hop_facts": [
     {
-      "source": "the leftmost player in a championship celebration image",
-      "target": "Kobe Bryant",
-      "statement": "The leftmost player in the image is Kobe Bryant.",
+      "hop_index": 0,
+      "source": "Constantin Brâncuși",
+      "target": "image of Constantin Brâncuși's studio in Paris in 1920",
+      "statement": "A well-known photograph was taken in his Paris studio in 1920.",
+      "retrieval_query": "Constantin Brâncuși in his Paris studio photographed by Edward Steichen in 1920"
+    },
+    {
+      "hop_index": 1,
+      "source": "image of Constantin Brâncuși's studio in Paris in 1920",
+      "target": "Bird in Space",
+      "statement": "The slender sculpture positioned at the center of the room in the background is Bird in Space.",
       "retrieval_query": ""
     },
     {
-      "source": "Kobe Bryant",
-      "target": "NBA All-Star Game Kobe Bryant MVP Award",
-      "statement": "Kobe Bryant won the award four times before it was named after him.",
+      "hop_index": 2,
+      "source": "Bird in Space",
+      "target": "National Gallery of Art",
+      "statement": "The museum that houses the 1925 marble version and the 1927 bronze version of Bird in Space is the National Gallery of Art.",
       "retrieval_query": ""
     },
     {
-      "source": "NBA All-Star Game Kobe Bryant MVP Award",
-      "target": "Bob Pettit",
-      "statement": "Bob Pettit also won the award four times.",
+      "hop_index": 3,
+      "source": "National Gallery of Art",
+      "target": "David E. Finley, Jr.",
+      "statement": "The director of the museum from 1938 to 1956 was David E. Finley, Jr.",
       "retrieval_query": ""
     }
   ],
   "target_ask": {
-    "ask_target": "the other player who won the award four times",
-    "answer": "Bob Pettit",
-    "answer_type": "entity"
+    "ask_target": "Where did David E. Finley, Jr. earn his professional degree, and in what field was that degree?"
   }
 }
 Output:
 {
-  "question": "In the given championship celebration image, the leftmost player later had an award named after him after winning it four times. Other than him, which player also won that award four times?",
-  "answer": "Bob Pettit",
-  "answer_type": "entity"
+  "question": "Constantin Brâncuși's photographs of his Paris studio in the 1920s are well known. The slender sculpture standing in the center background of that photograph exists in a 1925 marble version and a 1927 bronze version, both now held in a single museum. Where did the director of that museum, who served from 1938 to 1956, earn his professional degree, and in what field was that degree?"
 }
+
+Follow the example's pattern:
+- The first source may be named in the question.
+- Do not name intermediate targets; refer to them through the clues needed to
+  carry the reasoning forward.
+- Represent every hop, but do not expose extra facts beyond what connects one
+  clue to the next.
+- Add a disambiguating detail, such as a date range, when a description alone
+  could refer to multiple entities.
+- Keep the result grammatical and natural.
 
 Return valid JSON with exactly these fields:
 {
-  "question": "...",
-  "answer": "...",
-  "answer_type": "..."
+  "question": "..."
 }
 """
 
@@ -297,9 +336,14 @@ class QuestionWriter:
             user_payload={"target_node": context.target_node},
             trace_label="select_target_ask",
         )
-        ask_target = str(parsed.get("ask_target") or "").strip()
+        ask_target = self._ensure_question(str(parsed.get("ask_target") or "").strip())
         answer = str(parsed.get("answer") or "").strip()
         answer_type = str(parsed.get("answer_type") or "other").strip()
+        supporting_facts = parsed.get("supporting_facts") or []
+        if not isinstance(supporting_facts, list):
+            supporting_facts = []
+        supporting_facts = [str(item).strip() for item in supporting_facts if str(item).strip()]
+        reasoning = str(parsed.get("reasoning") or "").strip()
         support = str(parsed.get("support") or "").strip()
         if not ask_target or not answer:
             return self._fallback_select_target(context.target_node)
@@ -307,6 +351,8 @@ class QuestionWriter:
             "answer_type": answer_type,
             "ask_target": ask_target,
             "answer": answer,
+            "supporting_facts": supporting_facts,
+            "reasoning": reasoning,
             "support": support,
         }
 
@@ -342,13 +388,15 @@ class QuestionWriter:
                     }
                     for item in hop_summaries
                 ],
-                "target_ask": target_ask,
+                "target_ask": {
+                    "ask_target": target_ask.get("ask_target"),
+                },
             },
             trace_label="compose_question",
         )
         question = self._clean_composed_question(str(parsed.get("question") or "").strip())
-        answer = str(parsed.get("answer") or target_ask.get("answer") or "").strip()
-        answer_type = str(parsed.get("answer_type") or target_ask.get("answer_type") or "other").strip()
+        answer = str(target_ask.get("answer") or "").strip()
+        answer_type = str(target_ask.get("answer_type") or "other").strip()
         if (
             not question
             or not answer
@@ -461,6 +509,12 @@ class QuestionWriter:
         return normalized[: limit - 3].rstrip() + "..."
 
     @staticmethod
+    def _ensure_question(text: str) -> str:
+        if not text or text.endswith("?"):
+            return text
+        return text.rstrip(".!") + "?"
+
+    @staticmethod
     def _hop_anchor_label(content: dict[str, Any], *, fallback: str) -> str:
         return str(content.get("title") or content.get("caption") or fallback)
 
@@ -528,8 +582,10 @@ class QuestionWriter:
                 answer = str(target_node["caption"])
             return {
                 "answer_type": "image_content",
-                "ask_target": "the key visual content in the final image",
+                "ask_target": "What is the key visual content in the final image?",
                 "answer": answer or "unknown visual content",
+                "supporting_facts": [answer] if answer else [],
+                "reasoning": "The answer is directly extracted from the final image evidence.",
                 "support": "Selected from the final image caption/visual facts.",
             }
 
@@ -539,22 +595,28 @@ class QuestionWriter:
                 if isinstance(value, (str, int, float)) and str(value).strip():
                     return {
                         "answer_type": "attribute",
-                        "ask_target": f"the {key} of the final entity",
+                        "ask_target": f"What is the {key} of the final entity?",
                         "answer": str(value),
+                        "supporting_facts": [f"{key}: {value}"],
+                        "reasoning": "The answer is directly extracted from the selected attribute.",
                         "support": f"Selected attribute {key}.",
                     }
         description = target_node.get("description") or target_node.get("summary")
         if description:
             return {
                 "answer_type": "attribute",
-                "ask_target": "a key detail described for the final entity",
+                "ask_target": "What key detail is described for the final entity?",
                 "answer": self._shorten_text(description, limit=120) or "",
+                "supporting_facts": [str(description)],
+                "reasoning": "The answer is directly extracted from the description or summary.",
                 "support": "Fell back to description/summary.",
             }
         return {
             "answer_type": "entity",
-            "ask_target": "the identity of the final entity",
+            "ask_target": "What is the identity of the final entity?",
             "answer": str(target_node.get("title") or "unknown"),
+            "supporting_facts": [str(target_node.get("title"))] if target_node.get("title") else [],
+            "reasoning": "The answer is the title of the final entity.",
             "support": "Fell back to target title.",
         }
 
@@ -567,19 +629,19 @@ class QuestionWriter:
         opening_mode: str,
     ) -> QuestionDraft:
         hop_text = " Then ".join(item.get("statement", "") for item in hop_summaries if item.get("statement"))
-        ask_target = str(target_ask.get("ask_target") or "the final answer")
+        ask_target = str(target_ask.get("ask_target") or "What is the final answer?")
         answer = str(target_ask.get("answer") or "unknown")
         answer_type = str(target_ask.get("answer_type") or "other")
         if opening_mode == "image_start":
             question = (
-                f"In the given image, follow the relevant visual and factual clues needed to identify {ask_target}. "
-                f"{hop_text} What is it?"
+                "Use the relevant visual and factual clues in the given image to identify the final subject. "
+                f"{hop_text} {ask_target}"
             )
         else:
             first_source = str(hop_summaries[0].get("source") or "this subject") if hop_summaries else "this subject"
             question = (
-                f"Using {first_source} as the starting clue, search through the relevant facts needed to determine "
-                f"{ask_target}. What is it?"
+                f"Use {first_source} and the relevant connected facts to identify the final subject. "
+                f"{ask_target}"
             )
         question = QuestionWriter._clean_composed_question(question)
         return QuestionDraft(
@@ -642,7 +704,9 @@ class QuestionWriter:
                     }
                     for item in hop_summaries
                 ],
-                "target_ask": target_ask,
+                "target_ask": {
+                    "ask_target": target_ask.get("ask_target"),
+                },
             },
             trace_label="rewrite_chain_narration",
         )

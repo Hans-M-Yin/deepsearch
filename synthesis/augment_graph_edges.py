@@ -2,9 +2,9 @@
 
 This script copies an existing graph store into a new output directory, then:
 
-1. Completes bidirectional text-text links by re-reading each existing
-   Wikipedia text node and checking whether its markdown links to other text
-   nodes already present in the graph. Each connected pair is stored once.
+1. Completes directed text-text links by re-reading each existing Wikipedia
+   text node and checking whether its markdown links to other text nodes already
+   present in the graph. No synthetic reverse edges are created.
 2. Completes local image->text links by asking a vision model whether an image
    contains candidate text entities from the image's source-text neighborhood.
 
@@ -180,21 +180,6 @@ def _existing_edge_pairs(store: JsonlGraphStore) -> set[tuple[str, str]]:
     return {(edge.get("src_node_id"), edge.get("dst_node_id")) for edge in store.list_edges()}
 
 
-def _existing_undirected_text_pairs(store: JsonlGraphStore) -> set[frozenset[str]]:
-    text_node_ids = {
-        node["node_id"]
-        for node in store.list_nodes()
-        if node.get("node_type") == NodeType.TEXT.value
-    }
-    pairs: set[frozenset[str]] = set()
-    for edge in store.list_edges():
-        src = edge.get("src_node_id")
-        dst = edge.get("dst_node_id")
-        if src in text_node_ids and dst in text_node_ids and src != dst:
-            pairs.add(frozenset((src, dst)))
-    return pairs
-
-
 def _text_nodes_by_url(store: JsonlGraphStore) -> dict[str, dict[str, Any]]:
     mapping: dict[str, dict[str, Any]] = {}
     for node in store.list_nodes():
@@ -232,13 +217,13 @@ def _build_text_link_evidence(
 def _upsert_text_edge(
     *,
     store: JsonlGraphStore,
-    existing_pairs: set[frozenset[str]],
+    existing_pairs: set[tuple[str, str]],
     src_node: dict[str, Any],
     dst_node: dict[str, Any],
     relation: str,
     evidence: Evidence,
 ) -> bool:
-    pair = frozenset((src_node["node_id"], dst_node["node_id"]))
+    pair = (src_node["node_id"], dst_node["node_id"])
     if pair in existing_pairs:
         return False
     store.upsert_evidence(evidence)
@@ -266,7 +251,6 @@ def _upsert_text_edge(
         metadata={
             "augmented": True,
             "augmentation_mode": "text_text_wiki_link",
-            "bidirectional": True,
         },
         evidence_key=evidence.evidence_id,
     )
@@ -286,7 +270,7 @@ def augment_text_text_edges(
     if limit_text_nodes > 0:
         text_nodes = text_nodes[:limit_text_nodes]
 
-    existing_pairs = _existing_undirected_text_pairs(store)
+    existing_pairs = _existing_edge_pairs(store)
     relation_builder = WikiTextBuilder(reader=reader, model_client=LLM_WORKER)
     stats = {
         "text_nodes_processed": 0,
@@ -319,7 +303,7 @@ def augment_text_text_edges(
             dst_node = nodes_by_url.get(normalized_target_url)
             if dst_node is None or dst_node["node_id"] == src_node["node_id"]:
                 continue
-            pair = frozenset((src_node["node_id"], dst_node["node_id"]))
+            pair = (src_node["node_id"], dst_node["node_id"])
             if pair in existing_pairs:
                 stats["existing_pairs_skipped"] += 1
                 continue
