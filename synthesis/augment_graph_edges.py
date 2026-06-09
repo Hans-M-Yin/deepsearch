@@ -332,7 +332,7 @@ def augment_text_text_edges(
                 context=context,
             )
             relation_info = relation_builder._extract_relation_for_link(source_text_node, candidate)
-            relation = relation_info.get("predicate") or candidate.anchor_text or (dst_node.get("title") or "related article")
+            relation = relation_info.get("relation") or candidate.anchor_text or (dst_node.get("title") or "related article")
             forward_evidence = _build_text_link_evidence(
                 src_node=src_node,
                 dst_node=dst_node,

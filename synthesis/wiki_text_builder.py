@@ -138,8 +138,10 @@ infer the short relation phrase connecting the source to the target.
 Rules:
 1. Output a short natural-language relation phrase, not snake_case.
 2. The relation is for multi-hop graph reasoning, so it should be strongly target-identifying from the source side. Formly, given source side and the coressponding relation, the UNIQUE target can be inferred.
-    For example, source: Lionel Messi, relation: the team he play for. The satisfied targets include FC Barcelona, Saint Pairs, FC Miami. So this relation leads to multiple answers and is unacceptable.
-    so if a generic relation could apply to multiple targets for the same source, add distinguishing qualifiers directly into the relation phrase.
+    Bad Examples:
+        (a) source: Lionel Messi, relation: the team he play for. The satisfied targets include FC Barcelona, Saint Pairs, FC Miami. So this relation leads to multiple answers and is unacceptable.
+        (b) source: United States House Committee on Ways and Means, relation: committee that existed during the 119th United States Congress, target: 119th United States Congress. This relation describes the source rather than the target, and many committees existed during that Congress, so it neither points in the source-to-target direction nor uniquely identifies the target.
+    If a generic relation could apply to multiple targets for the same source, add distinguishing qualifiers directly into the relation phrase. The relation must describe the target from the source's perspective, not describe the source from the target's perspective.
 3. Good qualifiers include time period, role, outcome, ordinal/superlative, event, award, location, work, team, or other locally explicit constraints.
 4. Prefer relation phrases that read naturally in a graph, such as:
   source -> club where he won multiple Champions League titles -> target
@@ -149,12 +151,14 @@ Rules:
 6. Keep direction as source_to_target unless the local context clearly says the target acts on the source.
 7. Do not output explanations or markdown.
 8. The local context may contain multiple facts and entities. Identify the text that specifically connects the source entity to the target entity. You may combine multiple explicitly supported details from the local context to form a uniquely identifying relation. Do not use facts that refer to other entities, and never invent qualifiers.
+9. Do not include the target entity's name, aliases, abbreviations, or other answer-revealing identifiers in the relation. The target will be used as the answer in downstream multi-hop questions, so the relation must describe the target without naming it.
 
 Output exactly:
 <relation>
-predicate: club where he won multiple Champions League titles
+source: Lionel Messi
+target: FC Barcelona
+relation: club where he plays for during his 20s.
 direction: source_to_target
-confidence: 0.0
 evidence: short quote from context
 </relation>
 """
@@ -1379,7 +1383,7 @@ class WikiTextBuilder:
         run_id: str | None,
     ) -> Edge:
         relation_info = self._extract_relation_for_link(source_node, candidate)
-        relation = relation_info.get("predicate") or candidate.anchor_text
+        relation = relation_info.get("relation") or candidate.anchor_text
         return Edge.create(
             source_node.node_id,
             candidate.node_id,
@@ -1435,9 +1439,10 @@ class WikiTextBuilder:
         model_alias = os.environ.get("WIKI_RELATION_MODEL")
         if not model_alias:
             return {
-                "predicate": candidate.anchor_text,
+                "source": source_node.title or source_node.node_id,
+                "target": candidate.title,
+                "relation": candidate.anchor_text,
                 "direction": "source_to_target",
-                "confidence": None,
                 "evidence": candidate.context,
                 "method": "anchor_fallback",
             }
@@ -1459,9 +1464,10 @@ class WikiTextBuilder:
             parsed = self._parse_relation_response(response.content)
         except ValueError:
             return {
-                "predicate": candidate.anchor_text,
+                "source": source_node.title or source_node.node_id,
+                "target": candidate.title,
+                "relation": candidate.anchor_text,
                 "direction": "source_to_target",
-                "confidence": None,
                 "evidence": candidate.context,
                 "method": "anchor_fallback_parse_failed",
                 "raw_model_output": response.content,
@@ -1492,27 +1498,22 @@ class WikiTextBuilder:
                 continue
             key, value = line.split(":", 1)
             fields[key.strip().lower()] = value.strip()
-        predicate = WikiTextBuilder._normalize_relation_predicate(fields.get("predicate") or "related to")
+        relation = WikiTextBuilder._normalize_relation_text(
+            fields.get("relation") or fields.get("predicate") or "related to"
+        )
         return {
-            "predicate": predicate,
+            "source": fields.get("source"),
+            "target": fields.get("target"),
+            "relation": relation,
             "direction": fields.get("direction") or "source_to_target",
-            "confidence": WikiTextBuilder._parse_confidence(fields.get("confidence")),
             "evidence": fields.get("evidence"),
         }
 
     @staticmethod
-    def _normalize_relation_predicate(predicate: str) -> str:
-        text = re.sub(r"\s+", " ", str(predicate or "").strip())
+    def _normalize_relation_text(relation: str) -> str:
+        text = re.sub(r"\s+", " ", str(relation or "").strip())
         text = text.strip("\"'`.,;:()[]{}")
         return text or "related to"
-
-    @staticmethod
-    def _parse_confidence(value: Any) -> float | None:
-        try:
-            confidence = float(value)
-        except (TypeError, ValueError):
-            return None
-        return max(0.0, min(1.0, confidence))
 
     @staticmethod
     def _score_link_candidate(

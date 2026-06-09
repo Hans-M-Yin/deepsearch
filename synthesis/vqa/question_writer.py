@@ -94,87 +94,59 @@ Return valid JSON with exactly these fields:
 """
 
 
-PROMPT_COMPOSE_QUESTION = """You are writing a multi-hop SEARCH QUESTION from compressed trajectory evidence.
+PROMPT_COMPOSE_QUESTION = """Write one natural multi-hop search question from the supplied hop facts.
 
-You are given:
-- a directed list of hop facts
-- the selected final ask target and answer
-- the question opening mode
+Treat the directed hop facts as hidden reasoning, not text to narrate.
 
-The hop facts are LATENT reasoning support. They are not meant to be narrated
-step by step to the user.
+Rules:
+- Use only the supplied facts and preserve every hop's source-to-target direction.
+- Ask for target_ask clearly, without revealing its answer.
+- Keep only the clues needed to make the question coherent and solvable.
+- Do not list the steps or use phrases such as "starting with", "then",
+  "after that", "following that clue", or "using that clue".
+- Avoid naming intermediate entities when descriptive clues are sufficient.
+- Keep references unambiguous and write one main question.
+- For text_start, begin naturally from the first source.
+- For image_start, assume the image is provided and begin from a visible clue in it.
+- A retrieval_query is a precise visual clue: preserve its distinctive details,
+  but rewrite it as natural language rather than a search query.
 
-Some text -> image hops may include a retrieval_query field. When present,
-that retrieval query is a high-precision visual anchor for the image and is
-often more specific than the natural-language statement. Preserve its key
-distinguishing details, but do not copy it verbatim in a search-engine style.
-
-Your job is to write one natural search or deep-research question that:
-- sounds like a realistic user request
-- hides most of the intermediate reasoning chain
-- preserves the true hop direction internally
-- keeps only the clues necessary for the question to remain coherent and solvable
-- does not directly reveal the answer
-- is easy to read as a SINGLE clear question
-- has a clearly understandable final ask
-
-Do NOT do the following:
-- do not narrate the chain step by step
-- do not explicitly say phrases like:
-  - "starting with"
-  - "then"
-  - "after that"
-  - "following that clue"
-  - "using that clue"
-  - "first ... then ..."
-- do not expose every intermediate entity if the question can stay solvable without it
-- do not turn the output into a summary of the reasoning path
-
-Important direction rule:
-- each hop has an explicit source and target
-- keep the semantic direction of each hop
-- do not reverse a hop when forming the hidden sub-questions
-- for example, if a hop is:
-  source = Kobe Bryant
-  relation = played_for
-  target = Los Angeles Lakers
-  then a direction-preserving hidden step is:
-  "Kobe Bryant played for which team?"
-  and a direction-reversing wrong version is:
-  "Who played for the Los Angeles Lakers?"
-
-Question-writing goal:
-- produce one final user-facing question, not a narrated derivation
-- the user should need to search or reason through the hops, but should not see
-  the full chain spelled out
-- intermediate facts may be paraphrased, partially hidden, or omitted
-- preserve the first-hop-to-last-hop logic as latent support
-
-Clarity rules:
-- write one main question, not a loose pile of clues
-- the reader should be able to understand what is being asked after one careful read
-- keep referents clear: avoid too many vague "this", "that", or "the one"
-- prefer layered constraints that narrow the target step by step
-- end with a very explicit final ask, such as:
-  - "which player ... ?"
-  - "what is the name of ... ?"
-  - "which team ... ?"
-  - "how many ... ?"
-- do not let the final ask get buried inside a long sentence
-
-Good style example:
-- "In this championship celebration image of a certain NBA team, the leftmost player later had an award named after him after winning it four times. Other than him, which player also won that award four times?"
-
-Bad style example:
-- "From the image ..., then ..., and following that clue ..., what ... ?"
-- a long sentence where the reader cannot tell what the final question is asking
-
-Opening mode rules:
-- if opening_mode is "text_start", begin naturally from the first hop's source
-  entity/event/concept
-- if opening_mode is "image_start", assume the starting image is already given
-  to the user as part of the input; begin from a visual clue in that image and
-  do not rewrite the opening as if the first source were already known text
+Few-shot example:
+Input:
+{
+  "opening_mode": "image_start",
+  "hop_facts": [
+    {
+      "source": "the leftmost player in a championship celebration image",
+      "target": "Kobe Bryant",
+      "statement": "The leftmost player in the image is Kobe Bryant.",
+      "retrieval_query": ""
+    },
+    {
+      "source": "Kobe Bryant",
+      "target": "NBA All-Star Game Kobe Bryant MVP Award",
+      "statement": "Kobe Bryant won the award four times before it was named after him.",
+      "retrieval_query": ""
+    },
+    {
+      "source": "NBA All-Star Game Kobe Bryant MVP Award",
+      "target": "Bob Pettit",
+      "statement": "Bob Pettit also won the award four times.",
+      "retrieval_query": ""
+    }
+  ],
+  "target_ask": {
+    "ask_target": "the other player who won the award four times",
+    "answer": "Bob Pettit",
+    "answer_type": "entity"
+  }
+}
+Output:
+{
+  "question": "In the given championship celebration image, the leftmost player later had an award named after him after winning it four times. Other than him, which player also won that award four times?",
+  "answer": "Bob Pettit",
+  "answer_type": "entity"
+}
 
 Return valid JSON with exactly these fields:
 {
@@ -364,7 +336,6 @@ class QuestionWriter:
                     {
                         "hop_index": item.get("hop_index"),
                         "source": item.get("source"),
-                        "relation": item.get("relation"),
                         "target": item.get("target"),
                         "statement": item.get("statement"),
                         "retrieval_query": item.get("retrieval_query"),
@@ -665,7 +636,6 @@ class QuestionWriter:
                 "hop_facts": [
                     {
                         "source": item.get("source"),
-                        "relation": item.get("relation"),
                         "target": item.get("target"),
                         "statement": item.get("statement"),
                         "retrieval_query": item.get("retrieval_query"),
