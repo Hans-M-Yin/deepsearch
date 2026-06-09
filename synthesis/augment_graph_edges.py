@@ -2,9 +2,9 @@
 
 This script copies an existing graph store into a new output directory, then:
 
-1. Completes text->text links by re-reading each existing Wikipedia text node
-   and checking whether its markdown contains outgoing links to other text nodes
-   already present in the graph.
+1. Completes bidirectional text-text links by re-reading each existing
+   Wikipedia text node and checking whether its markdown links to other text
+   nodes already present in the graph. Each connected pair is stored once.
 2. Completes local image->text links by asking a vision model whether an image
    contains candidate text entities from the image's source-text neighborhood.
 
@@ -180,6 +180,21 @@ def _existing_edge_pairs(store: JsonlGraphStore) -> set[tuple[str, str]]:
     return {(edge.get("src_node_id"), edge.get("dst_node_id")) for edge in store.list_edges()}
 
 
+def _existing_undirected_text_pairs(store: JsonlGraphStore) -> set[frozenset[str]]:
+    text_node_ids = {
+        node["node_id"]
+        for node in store.list_nodes()
+        if node.get("node_type") == NodeType.TEXT.value
+    }
+    pairs: set[frozenset[str]] = set()
+    for edge in store.list_edges():
+        src = edge.get("src_node_id")
+        dst = edge.get("dst_node_id")
+        if src in text_node_ids and dst in text_node_ids and src != dst:
+            pairs.add(frozenset((src, dst)))
+    return pairs
+
+
 def _text_nodes_by_url(store: JsonlGraphStore) -> dict[str, dict[str, Any]]:
     mapping: dict[str, dict[str, Any]] = {}
     for node in store.list_nodes():
@@ -217,21 +232,20 @@ def _build_text_link_evidence(
 def _upsert_text_edge(
     *,
     store: JsonlGraphStore,
-    existing_pairs: set[tuple[str, str]],
+    existing_pairs: set[frozenset[str]],
     src_node: dict[str, Any],
     dst_node: dict[str, Any],
     relation: str,
     evidence: Evidence,
-    reverse: bool = False,
 ) -> bool:
-    pair = (src_node["node_id"], dst_node["node_id"])
+    pair = frozenset((src_node["node_id"], dst_node["node_id"]))
     if pair in existing_pairs:
         return False
     store.upsert_evidence(evidence)
     edge = Edge.create(
         src_node["node_id"],
         dst_node["node_id"],
-        edge_type=EdgeType.DERIVED if reverse else EdgeType.WIKI_LINK,
+        edge_type=EdgeType.WIKI_LINK,
         relation=relation,
         src_node_type=NodeType.TEXT.value,
         dst_node_type=NodeType.TEXT.value,
@@ -240,7 +254,7 @@ def _upsert_text_edge(
                 evidence_id=evidence.evidence_id,
                 quote=evidence.content,
                 url=evidence.url,
-                metadata={"augmentation_mode": "text_text_wiki_link_reverse" if reverse else "text_text_wiki_link"},
+                metadata={"augmentation_mode": "text_text_wiki_link"},
             )
         ],
         source=EdgeSource(
@@ -251,9 +265,10 @@ def _upsert_text_edge(
         extractor="augment_graph_edges",
         metadata={
             "augmented": True,
-            "augmentation_mode": "text_text_wiki_link_reverse" if reverse else "text_text_wiki_link",
+            "augmentation_mode": "text_text_wiki_link",
+            "bidirectional": True,
         },
-        evidence_key=f"{evidence.evidence_id}:{'reverse' if reverse else 'forward'}",
+        evidence_key=evidence.evidence_id,
     )
     store.upsert_edge(edge)
     existing_pairs.add(pair)
@@ -271,13 +286,13 @@ def augment_text_text_edges(
     if limit_text_nodes > 0:
         text_nodes = text_nodes[:limit_text_nodes]
 
-    existing_pairs = _existing_edge_pairs(store)
+    existing_pairs = _existing_undirected_text_pairs(store)
     relation_builder = WikiTextBuilder(reader=reader, model_client=LLM_WORKER)
     stats = {
         "text_nodes_processed": 0,
         "reader_failures": 0,
-        "forward_edges_added": 0,
-        "reverse_edges_added": 0,
+        "edges_added": 0,
+        "existing_pairs_skipped": 0,
     }
 
     for src_node in text_nodes:
@@ -304,6 +319,10 @@ def augment_text_text_edges(
             dst_node = nodes_by_url.get(normalized_target_url)
             if dst_node is None or dst_node["node_id"] == src_node["node_id"]:
                 continue
+            pair = frozenset((src_node["node_id"], dst_node["node_id"]))
+            if pair in existing_pairs:
+                stats["existing_pairs_skipped"] += 1
+                continue
             context = WikiTextBuilder._context(markdown, start, end)
             candidate = WikiLinkCandidate(
                 title=dst_node.get("title") or WikiTextBuilder._title_from_url(normalized_target_url) or "",
@@ -320,42 +339,16 @@ def augment_text_text_edges(
                 anchor_text=anchor_text.strip() or (dst_node.get("title") or "related article"),
                 context=context,
             )
-            forward_added = _upsert_text_edge(
+            edge_added = _upsert_text_edge(
                 store=store,
                 existing_pairs=existing_pairs,
                 src_node=src_node,
                 dst_node=dst_node,
                 relation=relation,
                 evidence=forward_evidence,
-                reverse=False,
             )
-            if forward_added:
-                stats["forward_edges_added"] += 1
-
-            reverse_evidence = Evidence.create(
-                EvidenceType.WEB_TEXT,
-                content=context or anchor_text,
-                node_ids=[dst_node["node_id"], src_node["node_id"]],
-                url=(src_node.get("source") or {}).get("url"),
-                extractor="graph_edge_augmenter",
-                metadata={
-                    "augmentation_mode": "text_text_wiki_link_reverse",
-                    "forward_anchor_text": anchor_text.strip(),
-                    "forward_source_title": src_node.get("title"),
-                },
-                evidence_key=f"augment_text_reverse:{dst_node['node_id']}:{src_node['node_id']}:{anchor_text}",
-            )
-            reverse_added = _upsert_text_edge(
-                store=store,
-                existing_pairs=existing_pairs,
-                src_node=dst_node,
-                dst_node=src_node,
-                relation=f"reverse of {relation}",
-                evidence=reverse_evidence,
-                reverse=True,
-            )
-            if reverse_added:
-                stats["reverse_edges_added"] += 1
+            if edge_added:
+                stats["edges_added"] += 1
 
     store.flush()
     return stats

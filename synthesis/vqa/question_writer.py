@@ -163,7 +163,7 @@ Clarity rules:
 - do not let the final ask get buried inside a long sentence
 
 Good style example:
-- "In the championship celebration image of a certain NBA team, one player later had an award named after him after winning it four times. Other than him, which player also won that award four times?"
+- "In this championship celebration image of a certain NBA team, the leftmost player later had an award named after him after winning it four times. Other than him, which player also won that award four times?"
 
 Bad style example:
 - "From the image ..., then ..., and following that clue ..., what ... ?"

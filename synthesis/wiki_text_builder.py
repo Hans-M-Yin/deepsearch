@@ -136,22 +136,19 @@ Given a source entity, target entity, anchor text, and local hyperlink context,
 infer the short relation phrase connecting the source to the target.
 
 Rules:
-- Use only the local context.
-- Output a short natural-language relation phrase, not snake_case.
-- The relation is for multi-hop graph reasoning, so it should be strongly target-identifying from the source side.
-- Prefer a relation that would point to this target uniquely, or as close to uniquely as the local context allows.
-- If a generic relation could apply to multiple targets for the same source, add distinguishing qualifiers directly into the relation phrase.
-- Good qualifiers include time period, role, outcome, ordinal/superlative, event, award, location, work, team, or other locally explicit constraints.
-- Do not use an underspecified generic relation such as played for, lived in, won, member of, or born in if that would leave multiple plausible targets for the same source.
-- Prefer relation phrases that read naturally in a graph, such as:
+1. Output a short natural-language relation phrase, not snake_case.
+2. The relation is for multi-hop graph reasoning, so it should be strongly target-identifying from the source side. Formly, given source side and the coressponding relation, the UNIQUE target can be inferred.
+    For example, source: Lionel Messi, relation: the team he play for. The satisfied targets include FC Barcelona, Saint Pairs, FC Miami. So this relation leads to multiple answers and is unacceptable.
+    so if a generic relation could apply to multiple targets for the same source, add distinguishing qualifiers directly into the relation phrase.
+3. Good qualifiers include time period, role, outcome, ordinal/superlative, event, award, location, work, team, or other locally explicit constraints.
+4. Prefer relation phrases that read naturally in a graph, such as:
   source -> club where he won multiple Champions League titles -> target
   source -> award he received for this work -> target
   source -> city where he was born -> target
-- The relation phrase can be a short noun phrase or verb phrase, but it should be interpretable without seeing the target name.
-- If the local context does not support a unique relation, still make the relation as specific as possible rather than falling back to a broad label.
-- Use related to only as a last resort when the relation is truly unclear.
-- Keep direction as source_to_target unless the local context clearly says the target acts on the source.
-- Do not output explanations or markdown.
+5. If the local context does not support a unique relation, still make the relation as specific as possible rather than falling back to a broad label.
+6. Keep direction as source_to_target unless the local context clearly says the target acts on the source.
+7. Do not output explanations or markdown.
+8. The local context may contain multiple facts and entities. Identify the text that specifically connects the source entity to the target entity. You may combine multiple explicitly supported details from the local context to form a uniquely identifying relation. Do not use facts that refer to other entities, and never invent qualifiers.
 
 Output exactly:
 <relation>
@@ -1683,7 +1680,7 @@ class WikiTextBuilder:
         return None
 
     @staticmethod
-    def _context(text: str, start: int, end: int, *, window: int = 180) -> str:
+    def _context(text: str, start: int, end: int, *, window: int = 500) -> str:
         left = max(0, start - window)
         right = min(len(text), end + window)
         return re.sub(r"\s+", " ", text[left:right]).strip()
