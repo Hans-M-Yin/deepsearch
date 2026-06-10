@@ -1,11 +1,12 @@
 """LLM-backed question writer for graph trajectories.
 
 The writer now works directly from ``PathCandidate + GraphView`` instead of a
-separate evidence-builder stage. Internally it follows a three-step process:
+separate evidence-builder stage. Internally it follows a four-step process:
 
 1. compress each hop into a short statement
-2. select an askable target from the final node
-3. compose the final multi-hop question
+2. derive an opening package for the first source + first hop
+3. select an askable target from the final node
+4. compose the final multi-hop question
 """
 
 from __future__ import annotations
@@ -117,6 +118,88 @@ Return valid JSON with exactly these fields:
 """
 
 
+PROMPT_SELECT_OPENING_PACKAGE = """Next, the user will provide you with a declarative sentence describing the relationship between different objects; specifically, it describes the relationship between the source entity and the target entity. The user will then provide you with the Wikipedia page of the source entity. Please extract information about the source entity from the Wikipedia page and organize it into a phrase or short descriptive sentence to replace the source entity in the statement, so that the relationship between the source entity and the corresponding target entity can still be inferred from the revised sentence without causing ambiguity.
+
+Rules:
+You may extract any type of relevant information from the Wikipedia page, as long as it ensures that the final description can be used to identify the correct source entity through web search.
+The description must not be overly simple, overly generic, or based only on the most obvious and universally known characteristic of the source entity. Prefer a more detailed, less salient, and somewhat niche characteristic when it still ensures uniqueness. In particular, based on this description and the statement in which it is used, it should be possible to recover the source entity through web search without ambiguity.
+Use only information that is explicitly present in the provided Wikipedia page material.
+Do not output the source title, aliases, abbreviations, initials, canonical ids, or near-copy surface forms of the source name.
+The description should be a phrase or a short descriptive sentence, not a full biography.
+
+Input format:
+You will receive one JSON object with exactly these fields:
+{
+  "statement": "one declarative sentence describing the relationship between source and target",
+  "source": "source entity title",
+  "target": "target entity title or target description",
+  "forbidden_labels": ["source title and aliases that must not appear in the output"],
+  "wikipedia_page": {
+    "title": "source page title",
+    "aliases": ["source aliases"],
+    "summary": "short Wikipedia summary",
+    "description": "longer Wikipedia page content or introduction",
+    "attributes": {"optional": "structured attributes"}
+  }
+}
+
+Output format:
+Return valid JSON with exactly these fields:
+{
+  "source_clue": "a phrase or short descriptive sentence replacing the source entity",
+  "rewritten_statement": "the original statement rewritten with source_clue replacing the source entity",
+  "source_supporting_facts": ["the exact source-page facts used to form source_clue"],
+  "why_relevant": "why the description is specific enough and still keeps the relationship inferable"
+}
+
+Example:
+Input:
+{
+  "statement": "Lionel Messi’s first professional football club was Newell’s Old Boys of Argentina.",
+  "source": "Lionel Messi",
+  "target": "Newell’s Old Boys",
+  "forbidden_labels": ["Lionel Messi", "Messi"],
+  "wikipedia_page": {
+    "title": "Lionel Messi",
+    "aliases": ["Messi"],
+    "summary": "Wikipedia page content omitted.",
+    "description": "Wikipedia page content omitted.",
+    "attributes": {}
+  }
+}
+
+A suitable obfuscation would be:
+"the first-team captain of FC Barcelona in the 2018–19 season"
+
+Rewritten statement:
+"The first-team captain of FC Barcelona in the 2018–19 season first played for Argentina’s Newell’s Old Boys."
+"""
+
+
+PROMPT_REWRITE_IMAGE_FIRST_HOP = """You will receive one declarative sentence for the first hop of an image-start trajectory.
+
+Rewrite the sentence so that any specific description or title-like reference to the source image is replaced with the deictic phrase "this image".
+
+Rules:
+- Preserve the original meaning of the hop.
+- Keep the sentence declarative and natural.
+- Do not add facts that are not already present.
+- Use "this image" when referring to the source image, even if the original sentence says "the image", "the photo", "the picture", or uses a longer image description.
+- If the sentence refers to content inside the image, phrases like "in this image" are allowed.
+- Return only valid JSON.
+
+Input format:
+{
+  "statement": "first-hop declarative sentence"
+}
+
+Output format:
+{
+  "rewritten_statement": "sentence rewritten to refer to the source image as 'this image'"
+}
+"""
+
+
 PROMPT_COMPOSE_QUESTION = """Write one natural multi-hop search question from the supplied hop facts.
 
 Treat the directed hop facts as hidden reasoning, not text to narrate.
@@ -131,8 +214,9 @@ Rules:
   "after that", "following that clue", or "using that clue".
 - Avoid naming intermediate entities when descriptive clues are sufficient.
 - Keep references unambiguous and write one main question.
-- For text_start, begin naturally from the first source.
-- For image_start, assume the image is provided and begin from a visible clue in it.
+- For text_start, begin from opening_package.packaged_first_hop instead of naming the first source.
+- Never output any string listed in opening_package.forbidden_labels.
+- For image_start, if opening_package.packaged_first_hop is provided, use it as the opening bridge and refer to the source image deictically, such as "this image" or "the provided image", rather than by its title.
 - A retrieval_query is a precise visual clue: preserve its distinctive details,
   but rewrite it as natural language rather than a search query.
 
@@ -140,14 +224,12 @@ Few-shot example:
 Input:
 {
   "opening_mode": "text_start",
+  "opening_package": {
+    "clue": "a pioneering modernist sculptor photographed in his Paris studio in 1920",
+    "packaged_first_hop": "A pioneering modernist sculptor was photographed in his Paris studio in 1920.",
+    "forbidden_labels": ["Constantin Brâncuși", "Brâncuși"]
+  },
   "hop_facts": [
-    {
-      "hop_index": 0,
-      "source": "Constantin Brâncuși",
-      "target": "image of Constantin Brâncuși's studio in Paris in 1920",
-      "statement": "A well-known photograph was taken in his Paris studio in 1920.",
-      "retrieval_query": "Constantin Brâncuși in his Paris studio photographed by Edward Steichen in 1920"
-    },
     {
       "hop_index": 1,
       "source": "image of Constantin Brâncuși's studio in Paris in 1920",
@@ -176,11 +258,12 @@ Input:
 }
 Output:
 {
-  "question": "Constantin Brâncuși's photographs of his Paris studio in the 1920s are well known. The slender sculpture standing in the center background of that photograph exists in a 1925 marble version and a 1927 bronze version, both now held in a single museum. Where did the director of that museum, who served from 1938 to 1956, earn his professional degree, and in what field was that degree?"
+  "question": "A pioneering modernist sculptor was photographed in his Paris studio in 1920. The slender sculpture standing in the center background of that photograph exists in a 1925 marble version and a 1927 bronze version, both now held in a single museum. Where did the director of that museum, who served from 1938 to 1956, earn his professional degree, and in what field was that degree?"
 }
 
 Follow the example's pattern:
-- The first source may be named in the question.
+- For text_start, the first source should be described rather than named.
+- Use opening_package.packaged_first_hop as the opening bridge for the question.
 - Do not name intermediate targets; refer to them through the clues needed to
   carry the reasoning forward.
 - Represent every hop, but do not expose extra facts beyond what connects one
@@ -356,6 +439,96 @@ class QuestionWriter:
             "support": support,
         }
 
+    def select_opening_package(self, *, context: WriterContext, hop_summaries: list[dict[str, Any]]) -> dict[str, Any]:
+        if not context.hops:
+            return {
+                "source_clue": "this subject",
+                "source_supporting_facts": [],
+                "packaged_first_hop": "",
+                "first_hop_support": "",
+                "why_relevant": "No hops available.",
+                "forbidden_labels": [],
+            }
+
+        first_hop = context.hops[0]
+        source_node = first_hop.src_content
+        forbidden_labels = self._forbidden_source_labels(source_node)
+        first_hop_summary = hop_summaries[0] if hop_summaries else self._fallback_compress_hop(first_hop)
+        if first_hop.src_modality != "text":
+            packaged_first_hop = self._select_image_opening_first_hop(first_hop_summary)
+            return {
+                "source_clue": "",
+                "source_supporting_facts": [],
+                "packaged_first_hop": packaged_first_hop,
+                "first_hop_support": "Image-start trajectory; source-image references are normalized to deictic expressions such as 'this image'.",
+                "why_relevant": "Image-start trajectory; no text source anchor required.",
+                "forbidden_labels": forbidden_labels,
+            }
+
+        if self.model_client is None:
+            clue = self._fallback_select_source(source_node, forbidden_labels=forbidden_labels)
+            packaged_first_hop = self._fallback_package_first_hop(
+                source_clue=clue,
+                first_hop_summary=first_hop_summary,
+                forbidden_labels=forbidden_labels,
+            )
+            return {
+                "source_clue": clue,
+                "source_supporting_facts": [clue] if clue else [],
+                "packaged_first_hop": packaged_first_hop,
+                "first_hop_support": "Fallback first-hop packaging generated from the first-hop summary.",
+                "why_relevant": "Fallback source clue generated from the source node summary/attributes.",
+                "forbidden_labels": forbidden_labels,
+            }
+
+        parsed = self._generate_json(
+            system=PROMPT_SELECT_OPENING_PACKAGE,
+            user_payload={
+                "statement": first_hop_summary.get("statement") or "",
+                "source": source_node.get("title") or first_hop_summary.get("source") or "",
+                "target": first_hop_summary.get("target") or "",
+                "forbidden_labels": forbidden_labels,
+                "wikipedia_page": {
+                    "title": source_node.get("title"),
+                    "aliases": list(source_node.get("aliases") or []),
+                    "summary": source_node.get("summary"),
+                    "description": source_node.get("description"),
+                    "attributes": dict(source_node.get("attributes") or {}),
+                },
+            },
+            trace_label="select_opening_package",
+        )
+        clue = str(parsed.get("source_clue") or "").strip()
+        supporting_facts = parsed.get("source_supporting_facts") or []
+        if not isinstance(supporting_facts, list):
+            supporting_facts = []
+        supporting_facts = [str(item).strip() for item in supporting_facts if str(item).strip()]
+        packaged_first_hop = str(parsed.get("rewritten_statement") or "").strip()
+        first_hop_support = str(parsed.get("why_relevant") or "").strip()
+        why_relevant = str(parsed.get("why_relevant") or "").strip()
+        if not clue or self._contains_forbidden_label(clue, forbidden_labels):
+            clue = self._fallback_select_source(source_node, forbidden_labels=forbidden_labels)
+            if not supporting_facts and clue:
+                supporting_facts = [clue]
+            if not why_relevant:
+                why_relevant = "Fallback source clue generated because the model clue leaked the source name or was empty."
+        if not packaged_first_hop or self._contains_forbidden_label(packaged_first_hop, forbidden_labels):
+            packaged_first_hop = self._fallback_package_first_hop(
+                source_clue=clue,
+                first_hop_summary=first_hop_summary,
+                forbidden_labels=forbidden_labels,
+            )
+            if not first_hop_support:
+                first_hop_support = "Fallback first-hop packaging generated because the model output leaked the source name or was empty."
+        return {
+            "source_clue": clue,
+            "source_supporting_facts": supporting_facts,
+            "packaged_first_hop": packaged_first_hop,
+            "first_hop_support": first_hop_support,
+            "why_relevant": why_relevant,
+            "forbidden_labels": forbidden_labels,
+        }
+
     def compose_question(
         self,
         *,
@@ -365,19 +538,27 @@ class QuestionWriter:
     ) -> QuestionDraft:
         context = context or self.build_writer_context(path=path, graph=graph)
         hop_summaries = [self.compress_hop(hop=hop) for hop in context.hops]
+        opening_package = self.select_opening_package(context=context, hop_summaries=hop_summaries)
         target_ask = self.select_target_ask(context=context)
         opening_mode = "image_start" if path.trajectory.starts_with_image else "text_start"
         if self.model_client is None:
             return self._fallback_compose_question(
                 path=path,
                 hop_summaries=hop_summaries,
+                opening_package=opening_package,
                 target_ask=target_ask,
                 opening_mode=opening_mode,
             )
+        compose_hops = hop_summaries[1:] if opening_package.get("packaged_first_hop") else hop_summaries
         parsed = self._generate_json(
             system=PROMPT_COMPOSE_QUESTION,
             user_payload={
                 "opening_mode": opening_mode,
+                "opening_package": {
+                    "clue": opening_package.get("source_clue"),
+                    "packaged_first_hop": opening_package.get("packaged_first_hop"),
+                    "forbidden_labels": opening_package.get("forbidden_labels") or [],
+                },
                 "hop_facts": [
                     {
                         "hop_index": item.get("hop_index"),
@@ -386,7 +567,7 @@ class QuestionWriter:
                         "statement": item.get("statement"),
                         "retrieval_query": item.get("retrieval_query"),
                     }
-                    for item in hop_summaries
+                    for item in compose_hops
                 ],
                 "target_ask": {
                     "ask_target": target_ask.get("ask_target"),
@@ -401,18 +582,25 @@ class QuestionWriter:
             not question
             or not answer
             or self._looks_like_chain_narration(question)
+            or self._contains_forbidden_label(question, opening_package.get("forbidden_labels") or [])
         ):
             rewritten = self._rewrite_chain_narration(
                 opening_mode=opening_mode,
-                hop_summaries=hop_summaries,
+                hop_summaries=compose_hops,
+                opening_package=opening_package,
                 target_ask=target_ask,
             )
             if rewritten is not None:
                 question = rewritten
-        if not question or not answer:
+        if (
+            not question
+            or not answer
+            or self._contains_forbidden_label(question, opening_package.get("forbidden_labels") or [])
+        ):
             return self._fallback_compose_question(
                 path=path,
                 hop_summaries=hop_summaries,
+                opening_package=opening_package,
                 target_ask=target_ask,
                 opening_mode=opening_mode,
             )
@@ -424,6 +612,7 @@ class QuestionWriter:
             used_evidence_ids=[hop.edge_id for hop in context.hops],
             metadata={
                 "path_id": path.path_id,
+                "opening_package": opening_package,
                 "target_ask": target_ask,
                 "writer_context": context.to_dict(),
             },
@@ -517,6 +706,132 @@ class QuestionWriter:
     @staticmethod
     def _hop_anchor_label(content: dict[str, Any], *, fallback: str) -> str:
         return str(content.get("title") or content.get("caption") or fallback)
+
+    @staticmethod
+    def _forbidden_source_labels(source_node: dict[str, Any]) -> list[str]:
+        labels: list[str] = []
+        for candidate in [source_node.get("title"), *(source_node.get("aliases") or [])]:
+            text = str(candidate or "").strip()
+            if text and text.lower() not in {item.lower() for item in labels}:
+                labels.append(text)
+        return labels
+
+    @staticmethod
+    def _contains_forbidden_label(text: str, labels: list[str]) -> bool:
+        normalized_text = QuestionWriter._normalize_label(text)
+        if not normalized_text:
+            return False
+        for label in labels:
+            normalized_label = QuestionWriter._normalize_label(label)
+            if not normalized_label:
+                continue
+            if re.search(rf"(?<!\w){re.escape(normalized_label)}(?!\w)", normalized_text):
+                return True
+        return False
+
+    @staticmethod
+    def _normalize_label(text: Any) -> str:
+        return re.sub(r"\s+", " ", re.sub(r"[^0-9a-zA-Z\u00C0-\u024F\u4e00-\u9fff]+", " ", str(text or "").lower())).strip()
+
+    @classmethod
+    def _remove_forbidden_labels(cls, text: str, labels: list[str], *, replacement: str = "") -> str:
+        rewritten = str(text or "")
+        for label in sorted(labels, key=len, reverse=True):
+            if not label:
+                continue
+            rewritten = re.sub(re.escape(label), replacement, rewritten, flags=re.IGNORECASE)
+        rewritten = re.sub(r"\s+", " ", rewritten)
+        rewritten = re.sub(r"\s+([,.;:!?])", r"\1", rewritten)
+        return rewritten.strip(" ,.;:-")
+
+    def _fallback_select_source(self, source_node: dict[str, Any], *, forbidden_labels: list[str]) -> str:
+        candidate_texts: list[str] = []
+        for candidate in [source_node.get("summary"), source_node.get("description")]:
+            if candidate:
+                candidate_texts.append(str(candidate))
+        attributes = source_node.get("attributes") or {}
+        if isinstance(attributes, dict):
+            for key, value in attributes.items():
+                if isinstance(value, dict):
+                    value = value.get("value")
+                if isinstance(value, (str, int, float)) and str(value).strip():
+                    normalized_key = self._normalize_label(key)
+                    if normalized_key in {"occupation", "job", "profession", "role"}:
+                        candidate_texts.append(f"the {value}")
+                    else:
+                        candidate_texts.append(f"the one whose {key} is {value}")
+        for candidate in candidate_texts:
+            cleaned = self._remove_forbidden_labels(candidate, forbidden_labels)
+            cleaned = self._shorten_text(cleaned, limit=180) or ""
+            if cleaned and not self._contains_forbidden_label(cleaned, forbidden_labels):
+                return cleaned.rstrip(".")
+        return "the starting subject"
+
+    @classmethod
+    def _fallback_package_first_hop(
+        cls,
+        *,
+        source_clue: str,
+        first_hop_summary: dict[str, Any],
+        forbidden_labels: list[str],
+    ) -> str:
+        retrieval_query = str(first_hop_summary.get("retrieval_query") or "").strip()
+        statement = str(first_hop_summary.get("statement") or "").strip()
+        if retrieval_query:
+            cleaned_query = cls._remove_forbidden_labels(retrieval_query, forbidden_labels)
+            if cleaned_query:
+                return f"A well-known image related to {source_clue} provides the next clue."
+        if not statement:
+            return f"{source_clue}."
+        packaged = cls._remove_forbidden_labels(statement, forbidden_labels, replacement=source_clue)
+        packaged = re.sub(r"\s+", " ", packaged).strip()
+        if not packaged:
+            packaged = source_clue
+        if not re.search(r"[.?!]$", packaged):
+            packaged = packaged.rstrip(" ,;:") + "."
+        return packaged
+
+    @classmethod
+    def _fallback_package_image_first_hop(cls, first_hop_summary: dict[str, Any]) -> str:
+        statement = str(first_hop_summary.get("statement") or "").strip()
+        if not statement:
+            return "This image provides the next clue."
+        packaged = cls._normalize_image_reference(statement)
+        if not re.search(r"[.?!]$", packaged):
+            packaged = packaged.rstrip(" ,;:") + "."
+        return packaged
+
+    @staticmethod
+    def _normalize_image_reference(text: str) -> str:
+        rewritten = str(text or "")
+        rewritten = re.sub(r"\b(image|photo|picture) of [^.?!,;:]+", "this image", rewritten, flags=re.IGNORECASE)
+        rewritten = re.sub(r"\bin (?:the )?(image|photo|picture)\b", "in this image", rewritten, flags=re.IGNORECASE)
+        rewritten = re.sub(r"\bthe (image|photo|picture)\b", "this image", rewritten, flags=re.IGNORECASE)
+        rewritten = re.sub(r"\s+", " ", rewritten).strip()
+        if rewritten:
+            rewritten = rewritten[0].upper() + rewritten[1:]
+        return rewritten or "This image provides the next clue."
+
+    def _select_image_opening_first_hop(self, first_hop_summary: dict[str, Any]) -> str:
+        fallback = self._fallback_package_image_first_hop(first_hop_summary)
+        statement = str(first_hop_summary.get("statement") or "").strip()
+        if self.model_client is None or not statement:
+            return fallback
+
+        try:
+            parsed = self._generate_json(
+                system=PROMPT_REWRITE_IMAGE_FIRST_HOP,
+                user_payload={"statement": statement},
+                trace_label="rewrite_image_first_hop",
+            )
+        except Exception:
+            return fallback
+
+        rewritten = str(parsed.get("rewritten_statement") or "").strip()
+        if not rewritten:
+            return fallback
+        rewritten = self._normalize_image_reference(rewritten)
+        return rewritten or fallback
 
     @staticmethod
     def _fallback_compress_hop(
@@ -625,24 +940,30 @@ class QuestionWriter:
         *,
         path: PathCandidate,
         hop_summaries: list[dict[str, Any]],
+        opening_package: dict[str, Any],
         target_ask: dict[str, Any],
         opening_mode: str,
     ) -> QuestionDraft:
-        hop_text = " Then ".join(item.get("statement", "") for item in hop_summaries if item.get("statement"))
+        remaining_hops = hop_summaries[1:] if opening_package.get("packaged_first_hop") else hop_summaries
+        hop_text = " ".join(item.get("statement", "") for item in remaining_hops if item.get("statement"))
         ask_target = str(target_ask.get("ask_target") or "What is the final answer?")
         answer = str(target_ask.get("answer") or "unknown")
         answer_type = str(target_ask.get("answer_type") or "other")
+        opening_bridge = str(opening_package.get("packaged_first_hop") or "").strip()
         if opening_mode == "image_start":
             question = (
-                "Use the relevant visual and factual clues in the given image to identify the final subject. "
+                f"{opening_bridge} {hop_text} {ask_target}"
+                if opening_bridge
+                else "Use the relevant visual and factual clues in the given image to identify the final subject. "
                 f"{hop_text} {ask_target}"
             )
         else:
-            first_source = str(hop_summaries[0].get("source") or "this subject") if hop_summaries else "this subject"
-            question = (
-                f"Use {first_source} and the relevant connected facts to identify the final subject. "
-                f"{ask_target}"
-            )
+            forbidden = list(opening_package.get("forbidden_labels") or [])
+            if not opening_bridge:
+                source_clue = str(opening_package.get("source_clue") or "this subject").strip()
+                opening_bridge = source_clue.rstrip(".") + "."
+            masked_hop_text = QuestionWriter._remove_forbidden_labels(hop_text, forbidden)
+            question = f"{opening_bridge} {masked_hop_text} {ask_target}"
         question = QuestionWriter._clean_composed_question(question)
         return QuestionDraft(
             question=question,
@@ -650,7 +971,7 @@ class QuestionWriter:
             answer_type=answer_type,
             reasoning_steps=hop_summaries,
             used_evidence_ids=[item.get("edge_id", "") for item in hop_summaries if item.get("edge_id")],
-            metadata={"target_ask": target_ask},
+            metadata={"opening_package": opening_package, "target_ask": target_ask},
         )
 
     @staticmethod
@@ -674,6 +995,7 @@ class QuestionWriter:
         *,
         opening_mode: str,
         hop_summaries: list[dict[str, Any]],
+        opening_package: dict[str, Any],
         target_ask: dict[str, Any],
     ) -> str | None:
         if self.model_client is None:
@@ -688,6 +1010,8 @@ class QuestionWriter:
                 "Keep the latent reasoning structure, but hide the step-by-step derivation.\n"
                 "Make the question easy to read, with a clear final ask.\n"
                 "Prefer one main question with layered constraints, not a loose string of facts.\n\n"
+                "If opening_package.forbidden_labels is provided, never output those labels.\n"
+                "For text_start, use opening_package.packaged_first_hop as the opening bridge instead of naming the first source.\n\n"
                 "Return valid JSON with exactly these fields:\n"
                 "{\n"
                 '  "question": "..."\n'
@@ -695,6 +1019,7 @@ class QuestionWriter:
             ),
             user_payload={
                 "opening_mode": opening_mode,
+                "opening_package": opening_package,
                 "hop_facts": [
                     {
                         "source": item.get("source"),
@@ -711,7 +1036,11 @@ class QuestionWriter:
             trace_label="rewrite_chain_narration",
         )
         question = self._clean_composed_question(str(parsed.get("question") or "").strip())
-        if not question or self._looks_like_chain_narration(question):
+        if (
+            not question
+            or self._looks_like_chain_narration(question)
+            or self._contains_forbidden_label(question, opening_package.get("forbidden_labels") or [])
+        ):
             return None
         return question
 
@@ -780,12 +1109,15 @@ def _debug_main() -> None:
     )
     context = writer.build_writer_context(path=path, graph=graph)
     hop_summaries = [writer.compress_hop(hop=hop) for hop in context.hops]
+    opening_package = writer.select_opening_package(context=context, hop_summaries=hop_summaries)
     draft = writer.compose_question(path=path, graph=graph, context=context)
 
     print("path:")
     print(json.dumps(path.to_dict(), ensure_ascii=False, indent=2))
     print("hop_summaries:")
     print(json.dumps(hop_summaries, ensure_ascii=False, indent=2))
+    print("opening_package:")
+    print(json.dumps(opening_package, ensure_ascii=False, indent=2))
     print("question:")
     print(json.dumps(
         {

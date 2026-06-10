@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+import os
 
+from synthesis.model_worker import LLM_WORKER
 from synthesis.store import JsonlGraphStore
 
 from .graph_view import GraphView
@@ -24,13 +26,18 @@ class VqaGenerationPipeline:
     obfuscator: ObfuscationProcessor | None = None
     writer: QuestionWriter | None = None
     verifier: SampleVerifier | None = None
+    graph: GraphView = field(init=False)
 
     def __post_init__(self) -> None:
         graph = GraphView(self.store, allowed_edge_types=set(self.config.allowed_edge_types))
         self.graph = graph
         self.sampler = self.sampler or RandomPathSampler(graph=graph, config=self.config)
         self.obfuscator = self.obfuscator or ObfuscationProcessor()
-        self.writer = self.writer or QuestionWriter()
+        writer_model = os.environ.get("VQA_WRITER_MODEL")
+        self.writer = self.writer or QuestionWriter(
+            model_client=LLM_WORKER if writer_model else None,
+            model=writer_model,
+        )
         self.verifier = self.verifier or SampleVerifier()
 
     def generate(self, *, limit: int | None = None) -> list[VqaSample]:
