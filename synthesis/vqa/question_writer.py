@@ -247,16 +247,13 @@ Output format:
 }
 """
 
-PROMPT_COMPOSE_QUESTION = """When referencing an external source within a sentence, cite it inline as [[title]](url) immediately before the period. Only apply this to factual claims or quoted content drawn from that source. Do not use this format in opening/framing sentences (e.g. "Here is a summary of..."), navigation text, or anywhere the URL itself is the direct answer.
-
+PROMPT_COMPOSE_QUESTION = """
 You are an expert at composing multi-hop search questions. Below, you will be given the specific structure of each hop in the data, and your task is to assemble these separated pieces into a continuous reasoning question that hides the intermediate steps and is meant for a user to answer.
 
 Each hop contains at least three parts:
 - source: the starting point of this hop
 - target: the endpoint of this hop, which must be identified through search and reasoning from the known source based on the given relational statement
 - statement: a statement describing the relationship between the target and the source
-
-In addition, some hops include an extra field, `retrieval_query`, which indicates that the target of this hop is an image.
 
 The source of each hop is the target of the previous hop, so you need to integrate all hops into one complete multi-hop question whose reasoning chain can be described as A -> B -> C ..., where A -> B is the first hop and the user must infer B from A, B -> C is the second hop, and so on.
 
