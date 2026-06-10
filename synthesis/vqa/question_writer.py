@@ -81,7 +81,7 @@ Return valid JSON with exactly these fields:
 """
 
 
-PROMPT_SELECT_TARGET = """Design one evidence-grounded question from the complete target-node material.
+PROMPT_SELECT_TEXT_TARGET = """Design one evidence-grounded question from the complete target-node material.
 
 Choose the relevant facts or passages yourself. The question is not limited to
 asking for the node's identity or one Wikipedia-style attribute. It may require:
@@ -114,6 +114,54 @@ Return valid JSON with exactly these fields:
   "supporting_facts": ["the exact supplied facts needed to answer the question"],
   "reasoning": "a concise derivation from supporting_facts to answer",
   "support": "short explanation of why the question is grounded and unambiguous"
+}
+"""
+
+
+PROMPT_SELECT_IMAGE_TARGET = """You are an expert question writer designing a high-quality image-grounded web-search question.
+
+Task setting:
+- A solver will be given a textual description of a target image.
+- The solver must use that description to search the internet, find the corresponding image (or a visually equivalent version of it), and then answer a question about the image.
+- The image itself has already been provided to you, and the textual description has already been decided.
+- Your job is to write one strong question about the image, together with its gold answer.
+
+Core objective:
+Write a question that can only be answered reliably by finding and inspecting the image. The question must be grounded in the visual content of the image, not merely in background knowledge about the subject.
+
+Important constraints:
+1. The question must require looking at the image.
+   - Do not ask for facts that can be answered from general knowledge, the image description alone, or a Wikipedia page about the subject.
+   - Prefer questions about visible objects, spatial relations, counts, relative positions, gestures, clothing, text appearing in the image, composition, or other stable visual properties.
+
+2. Handle image ambiguity carefully.
+   - Some image descriptions may retrieve multiple different images referring to the same entity, scene, object, or landmark.
+   - If the description is not highly unique, ask only about visual properties that are stable across the plausible retrieved images.
+   - Example: for aerial views of a famous building, different retrieved images may differ in angle, orientation, rendering style, or lighting, but core architectural features may remain stable. In such cases, ask about those shared stable features.
+   - Avoid questions whose answer may change across plausible search results.
+
+3. Use wider freedom only when the image is highly specific.
+   - If the image description points very strongly to one exact image or to one nearly unique photo, artwork, cover, poster, or historically specific shot, you may ask a more specific question about fine-grained visual details.
+   - This is appropriate for cases such as a famous artwork, an album cover, a historically iconic photograph, or a well-known image from a specific event and moment.
+
+4. The question must be high quality.
+   - It should be clear, natural, and unambiguous.
+   - It should have one answer fully supported by the image.
+   - It should not be trivial, but it also should not require subjective interpretation.
+   - Prefer concrete visual reasoning over vague aesthetic judgment.
+
+5. Use only the provided image evidence.
+   - Base the question and answer only on the supplied image material.
+   - Do not invent details that are not visibly supported.
+
+Return valid JSON with exactly these fields:
+{
+  "answer_type": "image_content|ocr|comparison|counting|spatial|attribute|other",
+  "ask_target": "one complete question about the target image",
+  "answer": "the gold answer",
+  "supporting_facts": ["the exact visual facts from the image that support the answer"],
+  "reasoning": "a concise explanation of how the answer follows from the image",
+  "support": "why this question is image-dependent and why its answer is stable across plausible search results"
 }
 """
 
@@ -414,10 +462,12 @@ class QuestionWriter:
     def select_target_ask(self, *, context: WriterContext) -> dict[str, Any]:
         if self.model_client is None:
             return self._fallback_select_target(context.target_node)
+        target_node_type = str(context.target_node.get("node_type") or "")
+        system_prompt = PROMPT_SELECT_IMAGE_TARGET if target_node_type == "image" else PROMPT_SELECT_TEXT_TARGET
         parsed = self._generate_json(
-            system=PROMPT_SELECT_TARGET,
+            system=system_prompt,
             user_payload={"target_node": context.target_node},
-            trace_label="select_target_ask",
+            trace_label=f"select_target_ask_{target_node_type or 'unknown'}",
         )
         ask_target = self._ensure_question(str(parsed.get("ask_target") or "").strip())
         answer = str(parsed.get("answer") or "").strip()
@@ -1109,13 +1159,21 @@ def _debug_main() -> None:
     )
     context = writer.build_writer_context(path=path, graph=graph)
     hop_summaries = [writer.compress_hop(hop=hop) for hop in context.hops]
+    debug_hop_summaries = [
+        {
+            key: value
+            for key, value in item.items()
+            if key not in {"edge_id", "src_node_id", "dst_node_id"}
+        }
+        for item in hop_summaries
+    ]
     opening_package = writer.select_opening_package(context=context, hop_summaries=hop_summaries)
     draft = writer.compose_question(path=path, graph=graph, context=context)
 
     print("path:")
     print(json.dumps(path.to_dict(), ensure_ascii=False, indent=2))
     print("hop_summaries:")
-    print(json.dumps(hop_summaries, ensure_ascii=False, indent=2))
+    print(json.dumps(debug_hop_summaries, ensure_ascii=False, indent=2))
     print("opening_package:")
     print(json.dumps(opening_package, ensure_ascii=False, indent=2))
     print("question:")
