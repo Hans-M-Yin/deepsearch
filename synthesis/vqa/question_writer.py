@@ -320,6 +320,39 @@ Return valid JSON with exactly these fields:
   "question": "..."
 }
 """
+
+PROMPT_POLISH_QUESTION = """When referencing an external source within a sentence, cite it inline as [[title]](url) immediately before the period. Only apply this to factual claims or quoted content drawn from that source. Do not use this format in opening/framing sentences (e.g. "Here is a summary of..."), navigation text, or anywhere the URL itself is the direct answer.
+
+You need to check whether a question should be revised from the following aspects:
+
+1. Potential shortcuts: If, when inferring the target of any hop, it is actually unnecessary to first infer that hop’s source, and the target can instead be obtained directly from clues in the question, then a shortcut exists. For example:
+“This player (Gemma Font, source) joined the women’s team of a major European club (FC Barcelona Femení, target) as a goalkeeper. In what year did this team move into the Johan Cruyff Stadium?”
+Reason: Mentioning the Johan Cruyff Stadium reveals that the team is FC Barcelona Femení, so the source does not need to be inferred.
+Revision method: Replace “Johan Cruyff Stadium” with “the team’s current main home stadium.” This removes the shortcut without changing the reasoning path.
+
+2. Ambiguity: If, starting from the source of a hop, multiple targets fit the description in the question, then the question is not actually answerable. In that case, you need to disambiguate by adding a restriction. For example:
+“This player (Lionel Messi, source) joined a club (FC Barcelona, target), and that club later won the UEFA Champions League. Who was the club’s first captain in the 2018–19 season?”
+Reason: Both FC Barcelona and Paris Saint-Germain fit the description that they are clubs Messi played for and that later won the UEFA Champions League, so the question is ambiguous and requires an added restriction.
+Revision method: Add a relatively vague restriction before “club” that does not directly introduce a shortcut, such as: “the youth academy of a club that this player joined.” Note that you must not add a restriction like “the club that later won the 2011 UEFA Champions League,” because that would introduce a shortcut, since only FC Barcelona won the 2011 UEFA Champions League.
+
+3. Remove redundancy: If the target can already be inferred from some clues, then any additional clues about that target can be deleted to make the question shorter and more natural. For example:
+“That nonprofit railroad museum in Lenox, reporting mark BRMX, moved its excursion train operations to the Hoosac Valley and began service to North Adams in 2016; the museum displays Budd RDC diesel multiple units...”
+Reason: The first sentence is already sufficient to identify the museum, so the part from “moved its excursion train operations...” through “began service to North Adams in 2016” is redundant.
+Revision method: Delete that entire redundant portion directly.
+
+4. Polish the wording: Make the question sound more natural to human readers, and check whether there is any referential ambiguity and revise it if needed. For example:
+“A collector who donated about 400 German Expressionist works to that museum in 1953 is depicted in a photo of a Richard Neutra-designed house in the Hollywood Hills of Los Angeles. According to the image caption for that photo, what setting is the house shown in?”
+Reason: This is an artifact of dataset construction. The image found online may not actually have a caption, and the final question is about the setting of the house, so it is unnecessary to explicitly tell the user which image to look at; the user should locate the relevant image based on the description.
+Revision method: “A collector who donated about 400 German Expressionist works to that museum in 1953 is depicted in a photo of a Richard Neutra-designed house in the Hollywood Hills of Los Angeles. What setting is the corresponding house shown in?”
+
+Now, based on the above requirements and examples, revise the upcoming question and output it in the following format:
+Reason: xxx
+Revision method: xxx
+JSON:
+{
+  "question": "..."
+}
+"""
 # PROMPT_COMPOSE_QUESTION = """Write one natural multi-hop search question from the supplied hop facts.
 #
 # Treat the directed hop facts as hidden reasoning, not text to narrate.
@@ -736,7 +769,48 @@ class QuestionWriter:
 
     def polish(self, *, draft: QuestionDraft, path: PathCandidate, graph: GraphView) -> QuestionDraft:
         del path, graph
-        return draft
+        if self.model_client is None:
+            return draft
+        polish_payload = self._polish_question_payload(
+            question=draft.question,
+            hops=draft.reasoning_steps,
+        )
+        try:
+            response = self.model_client.generate(
+                ModelRequest(
+                    model=self.model,
+                    temperature=self.temperature,
+                    max_tokens=self.max_tokens,
+                    messages=[
+                        ModelMessage(role="system", content=PROMPT_POLISH_QUESTION),
+                        ModelMessage(role="user", content=json.dumps(polish_payload, ensure_ascii=False, indent=2)),
+                    ],
+                    metadata={"trace_label": "polish_question"},
+                )
+            )
+        except Exception:
+            return draft
+        try:
+            parsed = self._extract_json_object(response.content)
+        except Exception:
+            return draft
+        polished_question = self._clean_composed_question(str(parsed.get("question") or "").strip())
+        if not polished_question:
+            return draft
+        metadata = dict(draft.metadata)
+        metadata["polish_payload"] = polish_payload
+        metadata["polish_result"] = {
+            "raw_response": response.content,
+            "question": polished_question,
+        }
+        return QuestionDraft(
+            question=polished_question,
+            answer=draft.answer,
+            answer_type=draft.answer_type,
+            reasoning_steps=list(draft.reasoning_steps),
+            used_evidence_ids=list(draft.used_evidence_ids),
+            metadata=metadata,
+        )
 
     def _generate_json(self, *, system: str, user_payload: dict[str, Any], trace_label: str) -> dict[str, Any]:
         if self.model_client is None:
@@ -895,6 +969,21 @@ class QuestionWriter:
             "target_ask": {
                 "ask_target": target_ask.get("ask_target"),
             },
+        }
+
+    @staticmethod
+    def _polish_question_payload(*, question: str, hops: list[dict[str, Any]]) -> dict[str, Any]:
+        return {
+            "question": question,
+            "hops": [
+                {
+                    "hop_index": item.get("hop_index"),
+                    "source": item.get("source"),
+                    "target": item.get("target"),
+                    "statement": item.get("statement"),
+                }
+                for item in hops
+            ],
         }
 
     def _fallback_select_source(self, source_node: dict[str, Any], *, forbidden_labels: list[str]) -> str:
@@ -1262,14 +1351,17 @@ def _debug_main() -> None:
     ]
     opening_package = writer.select_opening_package(context=context, hop_summaries=hop_summaries)
     draft = writer.compose_question(path=path, graph=graph, context=context)
+    polished = writer.polish(draft=draft, path=path, graph=graph)
+    polish_result = polished.metadata.get("polish_result") if isinstance(polished.metadata, dict) else None
 
     print("path:")
     print(json.dumps(path.to_dict(), ensure_ascii=False, indent=2))
+    print(f"writer_model: {args.model_alias or 'fallback(no llm)'}")
     print("hop_summaries:")
     print(json.dumps(debug_hop_summaries, ensure_ascii=False, indent=2))
     print("opening_package:")
     print(json.dumps(opening_package, ensure_ascii=False, indent=2))
-    print("question:")
+    print("draft_question:")
     print(json.dumps(
         {
             "question": draft.question,
@@ -1279,6 +1371,18 @@ def _debug_main() -> None:
         ensure_ascii=False,
         indent=2,
     ))
+    print("polished_question:")
+    print(json.dumps(
+        {
+            "question": polished.question,
+            "answer": polished.answer,
+            "answer_type": polished.answer_type,
+        },
+        ensure_ascii=False,
+        indent=2,
+    ))
+    print("polish_raw_output:")
+    print((polish_result or {}).get("raw_response") if isinstance(polish_result, dict) else None)
 
 
 if __name__ == "__main__":
