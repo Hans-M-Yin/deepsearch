@@ -1,5 +1,6 @@
 mkdir -p runs/multi_seed_visual_smoke_5
 echo "Start Generate."
+source synthesis/.env
 python synthesis/run_min_graph.py \
   --seed-urls-file synthesis/seeds.txt \
   --store-dir runs/multi_seed_visual_smoke_5 \
@@ -10,6 +11,6 @@ python synthesis/run_min_graph.py \
   --max-steps 12345678 \
   --max-nodes 400 \
   --max-depth 64 \
-  --parallel-workers 48 \
-  --batch-size 48 \
+  --parallel-workers 32 \
+  --batch-size 32 \
   --image-backend serper 
