@@ -81,7 +81,7 @@ Return valid JSON with exactly these fields:
 """
 
 
-PROMPT_SELECT_TARGET = """Design one evidence-grounded question from the complete target-node material.
+PROMPT_SELECT_TEXT_TARGET = """Design one evidence-grounded question from the complete target-node material.
 
 Choose the relevant facts or passages yourself. The question is not limited to
 asking for the node's identity or one Wikipedia-style attribute. It may require:
@@ -114,6 +114,54 @@ Return valid JSON with exactly these fields:
   "supporting_facts": ["the exact supplied facts needed to answer the question"],
   "reasoning": "a concise derivation from supporting_facts to answer",
   "support": "short explanation of why the question is grounded and unambiguous"
+}
+"""
+
+
+PROMPT_SELECT_IMAGE_TARGET = """You are an expert question writer designing a high-quality image-grounded web-search question.
+
+Task setting:
+- A solver will be given a textual description of a target image.
+- The solver must use that description to search the internet, find the corresponding image (or a visually equivalent version of it), and then answer a question about the image.
+- The image itself has already been provided to you, and the textual description has already been decided.
+- Your job is to write one strong question about the image, together with its gold answer.
+
+Core objective:
+Write a question that can only be answered reliably by finding and inspecting the image. The question must be grounded in the visual content of the image, not merely in background knowledge about the subject.
+
+Important constraints:
+1. The question must require looking at the image.
+   - Do not ask for facts that can be answered from general knowledge, the image description alone, or a Wikipedia page about the subject.
+   - Prefer questions about visible objects, spatial relations, counts, relative positions, gestures, clothing, text appearing in the image, composition, or other stable visual properties.
+
+2. Handle image ambiguity carefully.
+   - Some image descriptions may retrieve multiple different images referring to the same entity, scene, object, or landmark.
+   - If the description is not highly unique, ask only about visual properties that are stable across the plausible retrieved images.
+   - Example: for aerial views of a famous building, different retrieved images may differ in angle, orientation, rendering style, or lighting, but core architectural features may remain stable. In such cases, ask about those shared stable features.
+   - Avoid questions whose answer may change across plausible search results.
+
+3. Use wider freedom only when the image is highly specific.
+   - If the image description points very strongly to one exact image or to one nearly unique photo, artwork, cover, poster, or historically specific shot, you may ask a more specific question about fine-grained visual details.
+   - This is appropriate for cases such as a famous artwork, an album cover, a historically iconic photograph, or a well-known image from a specific event and moment.
+
+4. The question must be high quality.
+   - It should be clear, natural, and unambiguous.
+   - It should have one answer fully supported by the image.
+   - It should not be trivial, but it also should not require subjective interpretation.
+   - Prefer concrete visual reasoning over vague aesthetic judgment.
+
+5. Use only the provided image evidence.
+   - Base the question and answer only on the supplied image material.
+   - Do not invent details that are not visibly supported.
+
+Return valid JSON with exactly these fields:
+{
+  "answer_type": "image_content|ocr|comparison|counting|spatial|attribute|other",
+  "ask_target": "one complete question about the target image",
+  "answer": "the gold answer",
+  "supporting_facts": ["the exact visual facts from the image that support the answer"],
+  "reasoning": "a concise explanation of how the answer follows from the image",
+  "support": "why this question is image-dependent and why its answer is stable across plausible search results"
 }
 """
 
@@ -217,78 +265,142 @@ For the first hop's source, since there is no preceding entity, we additionally 
 
 For the final hop's target, we additionally provide `target_ask`. Once the user has inferred the final target entity step by step, they must answer a knowledge question about that entity.
 
-
 Rules:
-- Use only the supplied facts and preserve every hop's source-to-target direction.
-- Treat target_ask as the direct question about the final node. Rewrite it so the final node is identified through the preceding hop clues rather than named.
-- Preserve every part of target_ask without revealing its answer.
-- Keep only the clues needed to make the question coherent and solvable.
-- Do not list the steps or use phrases such as "starting with", "then", "after that", "following that clue", or "using that clue".
-- Avoid naming intermediate entities when descriptive clues are sufficient.
-- Keep references unambiguous and write one main question.
-- For text_start, begin from opening_package.packaged_first_hop instead of naming the first source.
-- Never output any string listed in opening_package.forbidden_labels.
-- For image_start, if opening_package.packaged_first_hop is provided, use it as the opening bridge and refer to the source image deictically, such as "this image" or "the provided image", rather than by its title.
-- A retrieval_query is a precise visual clue: preserve its distinctive details,
-  but rewrite it as natural language rather than a search query.
+1. After composing the question, check that none of the source or target names appear in the question. However, if a source or target is an image, its textual description may appear, as long as it does not introduce a shortcut.
+2. The wording must be natural and references must be clear. The question may be very long, so make sure it is unambiguous, especially with pronouns, and avoid referential confusion.
+3. Do not list explicit reasoning steps, and do not use expressions such as "starting from...", "then...", "next...", or "based on this clue...".
+4. If the first source is an image, it will be shown to the user, so refer to it in the question as "this image".
+5. Check for redundant clues yourself and remove them to ensure there are no shortcuts.
+6. If any hop is ambiguous, you should flexibly add a restricting modifier. For example, if the true reasoning result is a certain player who once played for a certain club, and you ask who the first captain of that club was in 2023, the club might be ambiguous. In that case, the restriction should be derived from the true target in a way that still depends on the source. For instance, if the true target is FC Barcelona, a better phrasing would be: "the first international club this player played for." Do not use a restriction like "the club that won the 2011 UEFA Champions League," because that would allow the club to be inferred without depending on the previous source, which creates a shortcut.
 
-Few-shot example:
+Example:
 Input:
 {
   "opening_mode": "text_start",
-  "opening_package": {
-    "clue": "a pioneering modernist sculptor photographed in his Paris studio in 1920",
-    "packaged_first_hop": "A pioneering modernist sculptor was photographed in his Paris studio in 1920.",
-    "forbidden_labels": ["Constantin Brâncuși", "Brâncuși"]
-  },
+  "first_clue": "A 20th-century Romanian pioneering sculptor created a war memorial ensemble in Targu Jiu.",
+  "forbidden_labels": ["Constantin Brancusi", "Brancusi"],
   "hop_facts": [
+    {
+      "hop_index": 0,
+      "source": "Constantin Brâncuși",
+      "target": "image of Constantin Brâncuși's studio in Paris in 1920",
+      "statement": "There is a famous photo of Constantin Brâncuși in his Paris studio photographed by Edward Steichen in 1920"
+    },
     {
       "hop_index": 1,
       "source": "image of Constantin Brâncuși's studio in Paris in 1920",
       "target": "Bird in Space",
-      "statement": "The slender sculpture positioned at the center of the room in the background is Bird in Space.",
-      "retrieval_query": ""
+      "statement": "The slender sculpture positioned at the center of the room in the background is Bird in Space."
     },
     {
       "hop_index": 2,
       "source": "Bird in Space",
       "target": "National Gallery of Art",
-      "statement": "The museum that houses the 1925 marble version and the 1927 bronze version of Bird in Space is the National Gallery of Art.",
-      "retrieval_query": ""
+      "statement": "National Gallery of Art houses the 1925 marble version and the 1927 bronze version of Bird in Space"
     },
     {
       "hop_index": 3,
       "source": "National Gallery of Art",
       "target": "David E. Finley, Jr.",
-      "statement": "The director of the museum from 1938 to 1956 was David E. Finley, Jr.",
-      "retrieval_query": ""
+      "statement": "The director of the museum from 1938 to 1956 was David E. Finley, Jr."
     }
   ],
   "target_ask": {
     "ask_target": "Where did David E. Finley, Jr. earn his professional degree, and in what field was that degree?"
   }
 }
-Output:
-{
-  "question": "A pioneering modernist sculptor was photographed in his Paris studio in 1920. The slender sculpture standing in the center background of that photograph exists in a 1925 marble version and a 1927 bronze version, both now held in a single museum. Where did the director of that museum, who served from 1938 to 1956, earn his professional degree, and in what field was that degree?"
-}
 
-Follow the example's pattern:
-- For text_start, the first source should be described rather than named.
-- Use opening_package.packaged_first_hop as the opening bridge for the question.
-- Do not name intermediate targets; refer to them through the clues needed to
-  carry the reasoning forward.
-- Represent every hop, but do not expose extra facts beyond what connects one
-  clue to the next.
-- Add a disambiguating detail, such as a date range, when a description alone
-  could refer to multiple entities.
-- Keep the result grammatical and natural.
+Output question:
+"A 20th-century pioneering sculptor was photographed in his Paris studio by Edward Steichen in 1920. The slender sculpture standing in the center background of that photograph exists in a 1925 marble version and a 1927 bronze version, both now held in a single museum. Where did the director of that museum, who served from 1938 to 1956, earn his professional degree, and in what field was that degree?"
+
+Explanation: This question removes potentially redundant clues from the input, reveals none of the intermediate entities, and remains grammatically natural.
 
 Return valid JSON with exactly these fields:
 {
   "question": "..."
 }
 """
+# PROMPT_COMPOSE_QUESTION = """Write one natural multi-hop search question from the supplied hop facts.
+#
+# Treat the directed hop facts as hidden reasoning, not text to narrate.
+#
+# Rules:
+# - Use only the supplied facts and preserve every hop's source-to-target direction.
+# - Treat target_ask as the direct question about the final node. Rewrite it so
+#   the final node is identified through the preceding hop clues rather than named.
+# - Preserve every part of target_ask without revealing its answer.
+# - Keep only the clues needed to make the question coherent and solvable.
+# - Do not list the steps or use phrases such as "starting with", "then",
+#   "after that", "following that clue", or "using that clue".
+# - Avoid naming intermediate entities when descriptive clues are sufficient.
+# - Keep references unambiguous and write one main question.
+# - hop_facts includes hop 0 for reasoning purposes, but you must not restate hop 0 literally.
+# - Treat opening_package.packaged_first_hop as the rewritten natural-language realization of hop 0.
+# - For text_start, express hop 0 through opening_package.packaged_first_hop instead of naming the original first source.
+# - Never output any string listed in opening_package.forbidden_labels.
+# - For image_start, if opening_package.packaged_first_hop is provided, use it as the opening bridge and refer to the source image deictically, such as "this image" or "the provided image", rather than by its title.
+# - Do not duplicate hop 0: once opening_package.packaged_first_hop has been used, continue with later clues naturally.
+# - A retrieval_query is a precise visual clue: preserve its distinctive details,
+#   but rewrite it as natural language rather than a search query.
+#
+# Few-shot example:
+# Input:
+# {
+#   "opening_mode": "text_start",
+#   "opening_package": {
+#     "clue": "a pioneering modernist sculptor photographed in his Paris studio in 1920",
+#     "packaged_first_hop": "A pioneering modernist sculptor was photographed in his Paris studio in 1920.",
+#     "forbidden_labels": ["Constantin Brâncuși", "Brâncuși"]
+#   },
+#   "hop_facts": [
+#     {
+#       "hop_index": 1,
+#       "source": "image of Constantin Brâncuși's studio in Paris in 1920",
+#       "target": "Bird in Space",
+#       "statement": "The slender sculpture positioned at the center of the room in the background is Bird in Space.",
+#       "retrieval_query": ""
+#     },
+#     {
+#       "hop_index": 2,
+#       "source": "Bird in Space",
+#       "target": "National Gallery of Art",
+#       "statement": "The museum that houses the 1925 marble version and the 1927 bronze version of Bird in Space is the National Gallery of Art.",
+#       "retrieval_query": ""
+#     },
+#     {
+#       "hop_index": 3,
+#       "source": "National Gallery of Art",
+#       "target": "David E. Finley, Jr.",
+#       "statement": "The director of the museum from 1938 to 1956 was David E. Finley, Jr.",
+#       "retrieval_query": ""
+#     }
+#   ],
+#   "target_ask": {
+#     "ask_target": "Where did David E. Finley, Jr. earn his professional degree, and in what field was that degree?"
+#   }
+# }
+# Output:
+# {
+#   "question": "A pioneering modernist sculptor was photographed in his Paris studio in 1920. The slender sculpture standing in the center background of that photograph exists in a 1925 marble version and a 1927 bronze version, both now held in a single museum. Where did the director of that museum, who served from 1938 to 1956, earn his professional degree, and in what field was that degree?"
+# }
+#
+# Follow the example's pattern:
+# - For text_start, the first source should be described rather than named.
+# - Use opening_package.packaged_first_hop as the opening bridge for the question.
+# - hop_facts may still include hop 0, but the question should realize that hop through opening_package.packaged_first_hop rather than restating the original source label.
+# - Do not name intermediate targets; refer to them through the clues needed to
+#   carry the reasoning forward.
+# - Represent every hop, but do not expose extra facts beyond what connects one
+#   clue to the next.
+# - Add a disambiguating detail, such as a date range, when a description alone
+#   could refer to multiple entities.
+# - Keep the result grammatical and natural.
+#
+# Return valid JSON with exactly these fields:
+# {
+#   "question": "..."
+# }
+# """
 
 
 PROMPT_POLISH_QUESTION = """When referencing an external source within a sentence, cite it inline as [[title]](url) immediately before the period. Only apply this to factual claims or quoted content drawn from that source. Do not use this format in opening/framing sentences (e.g. "Here is a summary of..."), navigation text, or anywhere the URL itself is the direct answer.
@@ -541,10 +653,12 @@ class QuestionWriter:
     def select_target_ask(self, *, context: WriterContext) -> dict[str, Any]:
         if self.model_client is None:
             return self._fallback_select_target(context.target_node)
+        target_node_type = str(context.target_node.get("node_type") or "")
+        system_prompt = PROMPT_SELECT_IMAGE_TARGET if target_node_type == "image" else PROMPT_SELECT_TEXT_TARGET
         parsed = self._generate_json(
-            system=PROMPT_SELECT_TARGET,
+            system=system_prompt,
             user_payload={"target_node": context.target_node},
-            trace_label="select_target_ask",
+            trace_label=f"select_target_ask_{target_node_type or 'unknown'}",
         )
         ask_target = self._ensure_question(str(parsed.get("ask_target") or "").strip())
         answer = str(parsed.get("answer") or "").strip()
@@ -676,30 +790,16 @@ class QuestionWriter:
                 target_ask=target_ask,
                 opening_mode=opening_mode,
             )
-        compose_hops = hop_summaries[1:] if opening_package.get("packaged_first_hop") else hop_summaries
+        compose_hops = hop_summaries
+        compose_payload = self._compose_question_payload(
+            opening_mode=opening_mode,
+            opening_package=opening_package,
+            hop_summaries=compose_hops,
+            target_ask=target_ask,
+        )
         parsed = self._generate_json(
             system=PROMPT_COMPOSE_QUESTION,
-            user_payload={
-                "opening_mode": opening_mode,
-                "opening_package": {
-                    "clue": opening_package.get("source_clue"),
-                    "packaged_first_hop": opening_package.get("packaged_first_hop"),
-                    "forbidden_labels": opening_package.get("forbidden_labels") or [],
-                },
-                "hop_facts": [
-                    {
-                        "hop_index": item.get("hop_index"),
-                        "source": item.get("source"),
-                        "target": item.get("target"),
-                        "statement": item.get("statement"),
-                        "retrieval_query": item.get("retrieval_query"),
-                    }
-                    for item in compose_hops
-                ],
-                "target_ask": {
-                    "ask_target": target_ask.get("ask_target"),
-                },
-            },
+            user_payload=compose_payload,
             trace_label="compose_question",
         )
         question = self._clean_composed_question(str(parsed.get("question") or "").strip())
@@ -740,6 +840,7 @@ class QuestionWriter:
             metadata={
                 "path_id": path.path_id,
                 "opening_package": opening_package,
+                "compose_payload": compose_payload,
                 "target_ask": target_ask,
                 "writer_context": context.to_dict(),
             },
@@ -840,6 +941,7 @@ class QuestionWriter:
         if node_type == "image":
             metadata = node.get("metadata") or {}
             payload["caption"] = node.get("caption") or node.get("summary")
+            payload["search_query"] = metadata.get("search_query") if isinstance(metadata, dict) else None
             payload["visual_facts"] = list((metadata.get("visual_facts") or [])[: (999 if full else 2)]) if isinstance(metadata, dict) else []
             payload["ocr_texts"] = list((metadata.get("ocr_texts") or [])[: (999 if full else 2)]) if isinstance(metadata, dict) else []
             payload["grounded_entities"] = list((metadata.get("grounded_entities") or [])[: (999 if full else 3)]) if isinstance(metadata, dict) else []
@@ -871,8 +973,15 @@ class QuestionWriter:
             return text
         return text.rstrip(".!") + "?"
 
-    @staticmethod
-    def _hop_anchor_label(content: dict[str, Any], *, fallback: str) -> str:
+    @classmethod
+    def _hop_anchor_label(cls, content: dict[str, Any], *, fallback: str) -> str:
+        if content.get("node_type") == "image":
+            search_query = cls._shorten_text(content.get("search_query"), limit=180)
+            if search_query:
+                return f"the image that {search_query}"
+            caption = cls._shorten_text(content.get("caption"), limit=180)
+            if caption:
+                return f"the image showing {caption}"
         return str(content.get("title") or content.get("caption") or fallback)
 
     @staticmethod
@@ -958,6 +1067,7 @@ class QuestionWriter:
                 for item in hops
             ],
         }
+
 
 
     def _fallback_select_source(self, source_node: dict[str, Any], *, forbidden_labels: list[str]) -> str:
@@ -1226,29 +1336,19 @@ class QuestionWriter:
                 "Keep the latent reasoning structure, but hide the step-by-step derivation.\n"
                 "Make the question easy to read, with a clear final ask.\n"
                 "Prefer one main question with layered constraints, not a loose string of facts.\n\n"
-                "If opening_package.forbidden_labels is provided, never output those labels.\n"
-                "For text_start, use opening_package.packaged_first_hop as the opening bridge instead of naming the first source.\n\n"
+                "Use first_clue to refer to the first source instead of naming it directly.\n"
+                "If forbidden_labels is provided, never output those labels.\n\n"
                 "Return valid JSON with exactly these fields:\n"
                 "{\n"
                 '  "question": "..."\n'
                 "}\n"
             ),
-            user_payload={
-                "opening_mode": opening_mode,
-                "opening_package": opening_package,
-                "hop_facts": [
-                    {
-                        "source": item.get("source"),
-                        "target": item.get("target"),
-                        "statement": item.get("statement"),
-                        "retrieval_query": item.get("retrieval_query"),
-                    }
-                    for item in hop_summaries
-                ],
-                "target_ask": {
-                    "ask_target": target_ask.get("ask_target"),
-                },
-            },
+            user_payload=self._compose_question_payload(
+                opening_mode=opening_mode,
+                opening_package=opening_package,
+                hop_summaries=hop_summaries,
+                target_ask=target_ask,
+            ),
             trace_label="rewrite_chain_narration",
         )
         question = self._clean_composed_question(str(parsed.get("question") or "").strip())
@@ -1325,6 +1425,14 @@ def _debug_main() -> None:
     )
     context = writer.build_writer_context(path=path, graph=graph)
     hop_summaries = [writer.compress_hop(hop=hop) for hop in context.hops]
+    debug_hop_summaries = [
+        {
+            key: value
+            for key, value in item.items()
+            if key not in {"edge_id", "src_node_id", "dst_node_id"}
+        }
+        for item in hop_summaries
+    ]
     opening_package = writer.select_opening_package(context=context, hop_summaries=hop_summaries)
     draft = writer.compose_question(path=path, graph=graph, context=context)
     polished = writer.polish(draft=draft, path=path, graph=graph)
@@ -1334,7 +1442,7 @@ def _debug_main() -> None:
     print(json.dumps(path.to_dict(), ensure_ascii=False, indent=2))
     print(f"writer_model: {args.model_alias or 'fallback(no llm)'}")
     print("hop_summaries:")
-    print(json.dumps(hop_summaries, ensure_ascii=False, indent=2))
+    print(json.dumps(debug_hop_summaries, ensure_ascii=False, indent=2))
     print("opening_package:")
     print(json.dumps(opening_package, ensure_ascii=False, indent=2))
     print("draft_question:")
