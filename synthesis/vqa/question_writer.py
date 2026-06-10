@@ -320,6 +320,44 @@ Return valid JSON with exactly these fields:
   "question": "..."
 }
 """
+
+PROMPT_POLISH_QUESTION = """When referencing an external source within a sentence, cite it inline as [[title]](url) immediately before the period. Only apply this to factual claims or quoted content drawn from that source. Do not use this format in opening/framing sentences (e.g. "Here is a summary of..."), navigation text, or anywhere the URL itself is the direct answer.
+
+You need to check whether a question should be revised from the following aspects:
+
+0. Entity Obfuscation: If any intermediate result is mentioned in the question (an intermediate result means any source or target in the hops), you need to replace it with a vague description. This description must not be sufficient to identify that entity on its own, but it should still allow the entity to be determined within the context of the question. Example:
+"After her club, Stabæk, won the Toppserien title in 2010, it qualified for the UEFA Women's Champions League," where the UEFA Women's Champions League is the source of the next hop.
+Reason: The UEFA Women's Champions League has already been explicitly mentioned, but it is an intermediate reasoning result.
+Revision method: Replace "qualified for the UEFA Women's Champions League" with "qualified for a European women's club competition."
+
+1. Potential shortcuts: If, when inferring the target of any hop, it is actually unnecessary to first infer that hop’s source, and the target can instead be obtained directly from clues in the question, then a shortcut exists. For example:
+“This player (Gemma Font, source) joined the women’s team of a major European club (FC Barcelona Femení, target) as a goalkeeper. In what year did this team move into the Johan Cruyff Stadium?”
+Reason: Mentioning the Johan Cruyff Stadium reveals that the team is FC Barcelona Femení, so the source does not need to be inferred.
+Revision method: Replace “Johan Cruyff Stadium” with “the team’s current main home stadium.” This removes the shortcut without changing the reasoning path.
+
+2. Ambiguity: If, starting from the source of a hop, multiple targets fit the description in the question, then the question is not actually answerable. In that case, you need to disambiguate by adding a restriction. For example:
+“This player (Lionel Messi, source) joined a club (FC Barcelona, target), and that club later won the UEFA Champions League. Who was the club’s first captain in the 2018–19 season?”
+Reason: Both FC Barcelona and Paris Saint-Germain fit the description that they are clubs Messi played for and that later won the UEFA Champions League, so the question is ambiguous and requires an added restriction.
+Revision method: Add a relatively vague restriction before “club” that does not directly introduce a shortcut, such as: “the youth academy of a club that this player joined.” Note that you must not add a restriction like “the club that later won the 2011 UEFA Champions League,” because that would introduce a shortcut, since only FC Barcelona won the 2011 UEFA Champions League.
+
+3. Remove redundancy: If the target can already be inferred from some clues, then any additional clues about that target can be deleted to make the question shorter and more natural. For example:
+“That nonprofit railroad museum in Lenox, reporting mark BRMX, moved its excursion train operations to the Hoosac Valley and began service to North Adams in 2016; the museum displays Budd RDC diesel multiple units...”
+Reason: The first sentence is already sufficient to identify the museum, so the part from “moved its excursion train operations...” through “began service to North Adams in 2016” is redundant.
+Revision method: Delete that entire redundant portion directly.
+
+4. Polish the wording: Make the question sound more natural to human readers, and check whether there is any referential ambiguity and revise it if needed. For example:
+“A collector who donated about 400 German Expressionist works to that museum in 1953 is depicted in a photo of a Richard Neutra-designed house in the Hollywood Hills of Los Angeles. According to the image caption for that photo, what setting is the house shown in?”
+Reason: This is an artifact of dataset construction. The image found online may not actually have a caption, and the final question is about the setting of the house, so it is unnecessary to explicitly tell the user which image to look at; the user should locate the relevant image based on the description.
+Revision method: “A collector who donated about 400 German Expressionist works to that museum in 1953 is depicted in a photo of a Richard Neutra-designed house in the Hollywood Hills of Los Angeles. What setting is the corresponding house shown in?”
+
+Now, based on the above requirements and examples, revise the upcoming question and output it in the following format:
+Reason: xxx
+Revision method: xxx
+JSON:
+{
+  "question": "..."
+}
+"""
 # PROMPT_COMPOSE_QUESTION = """Write one natural multi-hop search question from the supplied hop facts.
 #
 # Treat the directed hop facts as hidden reasoning, not text to narrate.
@@ -1067,6 +1105,7 @@ class QuestionWriter:
                 for item in hops
             ],
         }
+
 
 
 
