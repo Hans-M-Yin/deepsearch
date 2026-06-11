@@ -162,33 +162,30 @@ class GraphRunner:
         while self._should_continue():
             if self.config.parallel_workers <= 1:
                 results = self._run_one()
-            else:
-                results = self._run_parallel_batch()
-            if not results:
-                self.state.status = "completed"
-                break
+                if not results:
+                    self.state.status = "completed"
+                    break
 
-            for result in results:
-                self.state.step += 1
-                self._record_result(result)
-                self._emit_created_node_events(result)
-                self._emit_node_status(result)
-                self._emit_progress()
-                self._emit_warning(result)
-                if result.error:
-                    last_error = result.error
-                    if self.config.stop_on_error:
-                        self.state.status = "failed"
+                for result in results:
+                    last_error = self._handle_result(result, last_error)
+                    if self.state.status == "failed":
                         break
-
-            if self.state.status == "failed":
-                self._sync_state_from_strategy()
-                self.save_state()
-                break
-
-            if self.config.checkpoint_every <= 1 or self.state.step % self.config.checkpoint_every == 0:
-                self._sync_state_from_strategy()
-                self.save_state()
+                if self.state.status == "failed":
+                    self._sync_state_from_strategy()
+                    self.save_state()
+                    break
+                if self.config.checkpoint_every <= 1 or self.state.step % self.config.checkpoint_every == 0:
+                    self._sync_state_from_strategy()
+                    self.save_state()
+            else:
+                processed_count, last_error = self._run_parallel_batch(last_error=last_error)
+                if processed_count == 0:
+                    self.state.status = "completed"
+                    break
+                if self.state.status == "failed":
+                    self._sync_state_from_strategy()
+                    self.save_state()
+                    break
 
         if self.state.status == "running":
             self.state.status = "completed" if self.strategy.queue_size() == 0 else "paused"
@@ -218,10 +215,26 @@ class GraphRunner:
         result = self.strategy.expand_task(task, run_id=self.state.run_id)
         return [result] if result is not None else []
 
-    def _run_parallel_batch(self) -> list[NodeExpansionResult]:
+    def _handle_result(self, result: NodeExpansionResult, last_error: str | None) -> str | None:
+        self.state.step += 1
+        self._record_result(result)
+        self._emit_created_node_events(result)
+        self._emit_node_status(result)
+        self._emit_progress()
+        self._emit_warning(result)
+        if result.error:
+            last_error = result.error
+            if self.config.stop_on_error:
+                self.state.status = "failed"
+        if self.config.checkpoint_every <= 1 or self.state.step % self.config.checkpoint_every == 0:
+            self._sync_state_from_strategy()
+            self.save_state()
+        return last_error
+
+    def _run_parallel_batch(self, *, last_error: str | None) -> tuple[int, str | None]:
         remaining_steps = self.config.max_steps - self.state.step
         if remaining_steps <= 0:
-            return []
+            return 0, last_error
         max_inflight = self.config.batch_size or self.config.parallel_workers
         max_inflight = max(1, min(int(max_inflight), int(self.config.parallel_workers), remaining_steps))
 
@@ -235,9 +248,9 @@ class GraphRunner:
             if task.task_type == ExpansionTaskType.TEXT_EXPAND:
                 initial_text_count += 1
         if not initial_tasks:
-            return []
+            return 0, last_error
 
-        results: list[NodeExpansionResult] = []
+        processed_count = 0
         with ThreadPoolExecutor(max_workers=self.config.parallel_workers) as executor:
             future_to_task = {}
             for task in initial_tasks:
@@ -251,18 +264,20 @@ class GraphRunner:
                     if task.task_type == ExpansionTaskType.TEXT_EXPAND:
                         in_flight_text_count -= 1
                     try:
-                        results.append(future.result())
+                        result = future.result()
                     except Exception as exc:
                         task.status = ExpansionTaskStatus.FAILED
-                        results.append(
-                            NodeExpansionResult(
-                                task=task,
-                                error=f"{exc.__class__.__name__}: {exc}",
-                            )
+                        result = NodeExpansionResult(
+                            task=task,
+                            error=f"{exc.__class__.__name__}: {exc}",
                         )
+                    processed_count += 1
+                    last_error = self._handle_result(result, last_error)
+                    if self.state.status == "failed":
+                        return processed_count, last_error
 
                     while (
-                        len(results) + len(future_to_task) < remaining_steps
+                        processed_count + len(future_to_task) < remaining_steps
                         and len(future_to_task) < max_inflight
                     ):
                         next_task = self._pop_next_schedulable_task(
@@ -278,7 +293,7 @@ class GraphRunner:
                         future_to_task[next_future] = next_task
                         if next_task.task_type == ExpansionTaskType.TEXT_EXPAND:
                             in_flight_text_count += 1
-        return results
+        return processed_count, last_error
 
     def _text_node_count(self) -> int:
         return sum(1 for node in self.store.list_nodes() if node.get("node_type") == "text")
