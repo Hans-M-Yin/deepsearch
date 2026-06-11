@@ -171,6 +171,7 @@ class GraphRunner:
             for result in results:
                 self.state.step += 1
                 self._record_result(result)
+                self._emit_created_node_events(result)
                 self._emit_node_status(result)
                 self._emit_progress()
                 self._emit_warning(result)
@@ -498,6 +499,57 @@ class GraphRunner:
             print(f"\r{padded}", end="", file=sys.stdout, flush=True)
             return
         print(line, file=sys.stdout, flush=True)
+
+    def _emit_created_node_events(self, result: NodeExpansionResult) -> None:
+        stats = self.store.stats()
+        queue_breakdown = self._queue_breakdown()
+        text_count = 0
+        image_count = 0
+        for node in self.store.list_nodes():
+            node_type = node.get("node_type")
+            if node_type == "text":
+                text_count += 1
+            elif node_type == "image":
+                image_count += 1
+
+        created_nodes: list[dict[str, Any]] = []
+        if result.text_result is not None:
+            created_nodes.append(
+                {
+                    "node_type": "text",
+                    "node_id": result.text_result.node.node_id,
+                    "title": result.text_result.node.title or result.text_result.node.node_id,
+                }
+            )
+        for image_result in result.image_results:
+            if image_result.image_node is None:
+                continue
+            created_nodes.append(
+                {
+                    "node_type": "image",
+                    "node_id": image_result.image_node.node_id,
+                    "title": image_result.image_node.title or image_result.image_node.node_id,
+                }
+            )
+
+        for node in created_nodes:
+            print(
+                "[node-created] "
+                f"type={node['node_type']} "
+                f"node_id={node['node_id']!r} "
+                f"title={node['title']!r} "
+                f"queue={queue_breakdown['text_queue'] + queue_breakdown['image_queue']} "
+                f"text_queue={queue_breakdown['text_queue']} "
+                f"text_neighbor_queue={queue_breakdown['text_neighbor_queue']} "
+                f"image_entity_queue={queue_breakdown['image_entity_queue']} "
+                f"image_queue={queue_breakdown['image_queue']} "
+                f"nodes={int(stats.get('nodes', 0))} "
+                f"text_nodes={text_count} "
+                f"image_nodes={image_count} "
+                f"edges={int(stats.get('edges', 0))}",
+                file=sys.stdout,
+                flush=True,
+            )
 
     def _emit_node_status(self, result: NodeExpansionResult) -> None:
         stats = self.store.stats()
