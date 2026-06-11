@@ -82,39 +82,24 @@ Return valid JSON with exactly these fields:
 """
 
 
-PROMPT_SELECT_TEXT_TARGET = """Design one evidence-grounded question from the complete target-node material.
+PROMPT_SELECT_TEXT_TARGET = """Now you are an expert question designer for knowledge-based Q&A. You will create a knowledge competition question for students, designed to challenge their knowledge of a person’s life and background.
 
-Choose the relevant facts or passages yourself. The question is not limited to
-asking for the node's identity or one Wikipedia-style attribute. It may require:
-- extracting one or two related facts
-- comparing values, dates, roles, or events
-- calculating a duration, difference, count, or other deterministic result
-- ordering events or identifying what came before or after
-- filtering several facts by a stated condition
-- combining related details into one coherent answer
+You will design the question based on the complete profile of a given object. From the full material, you need to select one or more detailed, non-common-sense factual pieces of information, then organize the information you extract into a complete question. The information you extract will serve as the corresponding answer. The question may cover any aspect, including the object’s identity, life experience, major events, detailed knowledge, relevant numbers, or dates. However, you must ensure that the question is non-trivial and requires reasoning and knowledge retrieval to answer correctly.
 
-Prefer a somewhat niche question that would be difficult without finding the
-relevant material, but straightforward once that material is available.
+Requirements:
 
-Grounding requirements:
-- Use only information explicitly present in the supplied target-node material.
-- Every compared or combined item must appear in that material.
-- Allow only direct extraction or simple, deterministic reasoning.
-- Do not rely on outside knowledge, subjective judgment, or unsupported inference.
-- The question must be unambiguous and have one fully supported answer.
-- Complexity must come from using the evidence, not from awkward wording.
+1. Use only the information provided to you about the object.
+2. The question must have a clear, unambiguous answer supported by evidence.
+3. The factual information you select must not be revealed in the question, and the question must not tell students that any material exists.
 
-Write ask_target as a complete, directly answerable question that may name the
-target node. The answer must fully answer every part of the question.
+Output format: JSON, containing the following fields:
 
-Return valid JSON with exactly these fields:
 {
-  "answer_type": "entity|attribute|image_content|ocr|comparison|calculation|ordering|other",
-  "ask_target": "a complete question about the target node",
-  "answer": "a complete gold answer to every part of ask_target",
-  "supporting_facts": ["the exact supplied facts needed to answer the question"],
-  "reasoning": "a concise derivation from supporting_facts to answer",
-  "support": "short explanation of why the question is grounded and unambiguous"
+  "ask_target": "A complete question about the target node",
+  "answer": "A standard answer that fully answers every part of ask_target",
+  "supporting_facts": ["The exact original facts needed to answer the question"],
+  "reasoning": "A concise derivation from supporting_facts to the answer",
+  "support": "A brief explanation of why the question is evidence-supported and unambiguous"
 }
 """
 
@@ -122,13 +107,13 @@ Return valid JSON with exactly these fields:
 PROMPT_SELECT_IMAGE_TARGET = """You are an expert question writer designing a high-quality image-grounded web-search question.
 
 Task setting:
-- A solver will be given a textual description of a target image.
-- The solver must use that description to search the internet, find the corresponding image (or a visually equivalent version of it), and then answer a question about the image.
+- A solver will be given the same image you get.
+- The solver must use the image and answer the question you propose.
 - The image itself has already been provided to you, and the textual description has already been decided.
 - Your job is to write one strong question about the image, together with its gold answer.
 
 Core objective:
-Write a question that can only be answered reliably by finding and inspecting the image. The question must be grounded in the visual content of the image, not merely in background knowledge about the subject.
+Write a question that can only be answered reliably by finding and inspecting the details of the image. The question must be grounded in the visual content of the image, not merely in background knowledge about the subject.
 
 Important constraints:
 1. The question must require looking at the image.
@@ -157,7 +142,6 @@ Important constraints:
 
 Return valid JSON with exactly these fields:
 {
-  "answer_type": "image_content|ocr|comparison|counting|spatial|attribute|other",
   "ask_target": "one complete question about the target image",
   "answer": "the gold answer",
   "supporting_facts": ["the exact visual facts from the image that support the answer"],
@@ -521,14 +505,15 @@ class QuestionWriter:
             return self._fallback_select_target(context.target_node)
         target_node_type = str(context.target_node.get("node_type") or "")
         system_prompt = PROMPT_SELECT_IMAGE_TARGET if target_node_type == "image" else PROMPT_SELECT_TEXT_TARGET
+        target_image_url = self._target_image_url(context.target_node)
         parsed = self._generate_json(
             system=system_prompt,
             user_payload={"target_node": context.target_node},
             trace_label=f"select_target_ask_{target_node_type or 'unknown'}",
+            image_url=target_image_url,
         )
         ask_target = self._ensure_question(str(parsed.get("ask_target") or "").strip())
         answer = str(parsed.get("answer") or "").strip()
-        answer_type = str(parsed.get("answer_type") or "other").strip()
         supporting_facts = parsed.get("supporting_facts") or []
         if not isinstance(supporting_facts, list):
             supporting_facts = []
@@ -538,7 +523,6 @@ class QuestionWriter:
         if not ask_target or not answer:
             return self._fallback_select_target(context.target_node)
         return {
-            "answer_type": answer_type,
             "ask_target": ask_target,
             "answer": answer,
             "supporting_facts": supporting_facts,
@@ -648,6 +632,7 @@ class QuestionWriter:
         opening_package = self.select_opening_package(context=context, hop_summaries=hop_summaries)
         target_ask = self.select_target_ask(context=context)
         opening_mode = "image_start" if path.trajectory.starts_with_image else "text_start"
+        answer_type = self._default_answer_type(context.target_node)
         if self.model_client is None:
             return self._fallback_compose_question(
                 path=path,
@@ -655,6 +640,7 @@ class QuestionWriter:
                 opening_package=opening_package,
                 target_ask=target_ask,
                 opening_mode=opening_mode,
+                answer_type=answer_type,
             )
         compose_hops = hop_summaries
         compose_payload = self._compose_question_payload(
@@ -672,7 +658,6 @@ class QuestionWriter:
         )
         question = self._clean_composed_question(str(parsed.get("question") or "").strip())
         answer = str(target_ask.get("answer") or "").strip()
-        answer_type = str(target_ask.get("answer_type") or "other").strip()
         if (
             not question
             or not answer
@@ -698,6 +683,7 @@ class QuestionWriter:
                 opening_package=opening_package,
                 target_ask=target_ask,
                 opening_mode=opening_mode,
+                answer_type=answer_type,
             )
         return QuestionDraft(
             question=question,
@@ -917,6 +903,24 @@ class QuestionWriter:
         return None
 
     @staticmethod
+    def _target_image_url(target_node: dict[str, Any]) -> str | None:
+        if target_node.get("node_type") != "image":
+            return None
+        for candidate in (
+            target_node.get("image_url"),
+            target_node.get("oss_uri"),
+            target_node.get("thumb_oss_uri"),
+        ):
+            image_url = str(candidate or "").strip()
+            if image_url:
+                return image_url
+        return None
+
+    @staticmethod
+    def _default_answer_type(target_node: dict[str, Any]) -> str:
+        return "image_content" if target_node.get("node_type") == "image" else "other"
+
+    @staticmethod
     def _user_message_content(
         user_payload: dict[str, Any],
         *,
@@ -977,6 +981,7 @@ class QuestionWriter:
             payload["caption"] = node.get("caption") or node.get("summary")
             payload["image_url"] = node.get("image_url")
             payload["oss_uri"] = node.get("oss_uri")
+            payload["thumb_oss_uri"] = node.get("thumb_oss_uri")
             payload["search_query"] = metadata.get("search_query") if isinstance(metadata, dict) else None
             payload["visual_facts"] = list((metadata.get("visual_facts") or [])[: (999 if full else 2)]) if isinstance(metadata, dict) else []
             payload["ocr_texts"] = list((metadata.get("ocr_texts") or [])[: (999 if full else 2)]) if isinstance(metadata, dict) else []
@@ -1280,7 +1285,6 @@ class QuestionWriter:
             elif target_node.get("caption"):
                 answer = str(target_node["caption"])
             return {
-                "answer_type": "image_content",
                 "ask_target": "What is the key visual content in the final image?",
                 "answer": answer or "unknown visual content",
                 "supporting_facts": [answer] if answer else [],
@@ -1293,7 +1297,6 @@ class QuestionWriter:
             for key, value in attributes.items():
                 if isinstance(value, (str, int, float)) and str(value).strip():
                     return {
-                        "answer_type": "attribute",
                         "ask_target": f"What is the {key} of the final entity?",
                         "answer": str(value),
                         "supporting_facts": [f"{key}: {value}"],
@@ -1303,7 +1306,6 @@ class QuestionWriter:
         description = target_node.get("description") or target_node.get("summary")
         if description:
             return {
-                "answer_type": "attribute",
                 "ask_target": "What key detail is described for the final entity?",
                 "answer": self._shorten_text(description, limit=120) or "",
                 "supporting_facts": [str(description)],
@@ -1311,7 +1313,6 @@ class QuestionWriter:
                 "support": "Fell back to description/summary.",
             }
         return {
-            "answer_type": "entity",
             "ask_target": "What is the identity of the final entity?",
             "answer": str(target_node.get("title") or "unknown"),
             "supporting_facts": [str(target_node.get("title"))] if target_node.get("title") else [],
@@ -1327,12 +1328,12 @@ class QuestionWriter:
         opening_package: dict[str, Any],
         target_ask: dict[str, Any],
         opening_mode: str,
+        answer_type: str,
     ) -> QuestionDraft:
         remaining_hops = hop_summaries[1:] if opening_package.get("packaged_first_hop") else hop_summaries
         hop_text = " ".join(item.get("statement", "") for item in remaining_hops if item.get("statement"))
         ask_target = str(target_ask.get("ask_target") or "What is the final answer?")
         answer = str(target_ask.get("answer") or "unknown")
-        answer_type = str(target_ask.get("answer_type") or "other")
         opening_bridge = str(opening_package.get("packaged_first_hop") or "").strip()
         if opening_mode == "image_start":
             question = (
