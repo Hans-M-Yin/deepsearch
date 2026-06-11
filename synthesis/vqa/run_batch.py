@@ -73,6 +73,7 @@ def main(argv: list[str] | None = None) -> int:
     summary = runner.run(limit=args.samples)
     print(json.dumps(summary.to_dict(), ensure_ascii=False, indent=2))
     print(f"samples: {runner.samples_path}")
+    print(f"questions: {runner.questions_path}")
     print(f"errors: {runner.errors_path}")
     print(f"warnings: {runner.warnings_path}")
     print(f"summary: {runner.summary_path}")

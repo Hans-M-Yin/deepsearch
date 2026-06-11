@@ -48,6 +48,10 @@ class VqaBatchRunner:
         return self.output_dir / "samples.jsonl"
 
     @property
+    def questions_path(self) -> Path:
+        return self.output_dir / "questions.jsonl"
+
+    @property
     def errors_path(self) -> Path:
         return self.output_dir / "errors.jsonl"
 
@@ -69,6 +73,7 @@ class VqaBatchRunner:
         if not self.resume:
             self._reset_outputs()
         existing = self._load_existing_samples() if self.resume else {}
+        self._rebuild_questions_file(existing.values())
         if self.resume and existing:
             self.pipeline.sampler.used_exact_signatures.update(
                 record["path"]["exact_signature"]
@@ -92,6 +97,7 @@ class VqaBatchRunner:
         mode = "a" if self.resume else "w"
         with (
             self.samples_path.open(mode, encoding="utf-8") as samples_file,
+            self.questions_path.open("a", encoding="utf-8") as questions_file,
             self.errors_path.open(mode, encoding="utf-8") as errors_file,
             self.warnings_path.open(mode, encoding="utf-8") as warnings_file,
             ThreadPoolExecutor(max_workers=self.workers) as executor,
@@ -117,6 +123,7 @@ class VqaBatchRunner:
                         path=path,
                         summary=summary,
                         samples_file=samples_file,
+                        questions_file=questions_file,
                         errors_file=errors_file,
                         warnings_file=warnings_file,
                     )
@@ -139,6 +146,7 @@ class VqaBatchRunner:
         path: PathCandidate,
         summary: VqaBatchSummary,
         samples_file,
+        questions_file,
         errors_file,
         warnings_file,
     ) -> None:
@@ -168,6 +176,13 @@ class VqaBatchRunner:
         else:
             summary.rejected += 1
         self._append_jsonl(samples_file, sample.to_dict())
+        self._append_jsonl(
+            questions_file,
+            self._compact_question_record(
+                sample.to_dict(),
+                question_number=summary.existing_samples + summary.completed,
+            ),
+        )
 
         for warning in sample.metadata.get("writer_warnings") or []:
             summary.warnings += 1
@@ -200,8 +215,46 @@ class VqaBatchRunner:
         return records
 
     def _reset_outputs(self) -> None:
-        for path in (self.samples_path, self.errors_path, self.warnings_path):
+        for path in (
+            self.samples_path,
+            self.questions_path,
+            self.errors_path,
+            self.warnings_path,
+        ):
             path.write_text("", encoding="utf-8")
+
+    def _rebuild_questions_file(self, records) -> None:
+        with self.questions_path.open("w", encoding="utf-8") as handle:
+            for question_number, record in enumerate(records, start=1):
+                self._append_jsonl(
+                    handle,
+                    self._compact_question_record(
+                        record,
+                        question_number=question_number,
+                    ),
+                )
+
+    @staticmethod
+    def _compact_question_record(
+        sample: dict[str, Any],
+        *,
+        question_number: int,
+    ) -> dict[str, Any]:
+        final_question = (
+            sample.get("obfuscated")
+            or sample.get("polished")
+            or sample.get("draft")
+            or {}
+        )
+        path = sample.get("path") or {}
+        return {
+            "question_id": f"q_{question_number:06d}",
+            "sample_id": sample.get("sample_id"),
+            "path_id": path.get("path_id"),
+            "status": sample.get("status"),
+            "question": final_question.get("question"),
+            "answer": final_question.get("answer"),
+        }
 
     def _write_summary(self, summary: VqaBatchSummary, *, elapsed: float | None = None) -> None:
         payload = summary.to_dict()
