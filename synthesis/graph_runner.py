@@ -440,7 +440,9 @@ class GraphRunner:
         if not self.config.show_progress:
             return
         stats = self.store.stats()
-        queue_size = self.strategy.queue_size()
+        text_queue_size = self.strategy.queue_size(ExpansionTaskType.TEXT_EXPAND)
+        image_queue_size = self.strategy.queue_size(ExpansionTaskType.IMAGE_EXPAND)
+        queue_size = text_queue_size + image_queue_size
         max_steps = self.config.max_steps
         max_nodes = self.config.max_nodes
         steps_text = f"{self.state.step}/{max_steps}" if max_steps else str(self.state.step)
@@ -451,6 +453,8 @@ class GraphRunner:
             "[progress] "
             f"steps={steps_text} "
             f"queue={queue_size} "
+            f"text_queue={text_queue_size} "
+            f"image_queue={image_queue_size} "
             f"text_nodes={nodes_text} "
             f"nodes={node_count} "
             f"edges={int(stats.get('edges', 0))} "
@@ -459,11 +463,11 @@ class GraphRunner:
             f"skipped={len(self.state.skipped_tasks)}"
         )
         self._progress_width = max(self._progress_width, len(line))
-        if sys.stderr.isatty():
+        if sys.stdout.isatty():
             padded = line.ljust(self._progress_width)
-            print(f"\r{padded}", end="", file=sys.stderr, flush=True)
+            print(f"\r{padded}", end="", file=sys.stdout, flush=True)
             return
-        print(line, file=sys.stderr, flush=True)
+        print(line, file=sys.stdout, flush=True)
 
     def _emit_node_status(self, result: NodeExpansionResult) -> None:
         stats = self.store.stats()
@@ -472,6 +476,8 @@ class GraphRunner:
         image_count = 0
         latest_title: str | None = None
         latest_created_at: str = ""
+        text_queue_size = self.strategy.queue_size(ExpansionTaskType.TEXT_EXPAND)
+        image_queue_size = self.strategy.queue_size(ExpansionTaskType.IMAGE_EXPAND)
         for node in nodes:
             node_type = node.get("node_type")
             if node_type == "text":
@@ -489,16 +495,18 @@ class GraphRunner:
             f"nodes={int(stats.get('nodes', 0))} "
             f"text={text_count} "
             f"image={image_count} "
+            f"text_queue={text_queue_size} "
+            f"image_queue={image_queue_size} "
             f"latest={latest_title!r}",
-            file=sys.stderr,
+            file=sys.stdout,
             flush=True,
         )
 
     def _finish_progress(self) -> None:
         if not self.config.show_progress:
             return
-        if sys.stderr.isatty() and self._progress_width > 0:
-            print(file=sys.stderr, flush=True)
+        if sys.stdout.isatty() and self._progress_width > 0:
+            print(file=sys.stdout, flush=True)
 
     @staticmethod
     def _emit_warning(result: NodeExpansionResult) -> None:
@@ -510,7 +518,7 @@ class GraphRunner:
                 f"title={task.title!r} "
                 f"depth={task.depth} "
                 f"error={result.error}",
-                file=sys.stderr,
+                file=sys.stdout,
                 flush=True,
             )
             return
@@ -528,7 +536,7 @@ class GraphRunner:
                 f"source_evidence_id={failure.get('source_evidence_id')!r} "
                 f"target_node_id={failure.get('target_node_id')!r} "
                 f"entity_name={failure.get('entity_name')!r}",
-                file=sys.stderr,
+                file=sys.stdout,
                 flush=True,
             )
         if result.attribute_error:
@@ -539,7 +547,7 @@ class GraphRunner:
                 f"title={task.title!r} "
                 f"depth={task.depth} "
                 f"error={result.attribute_error}",
-                file=sys.stderr,
+                file=sys.stdout,
                 flush=True,
             )
 

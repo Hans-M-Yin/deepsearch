@@ -187,6 +187,70 @@ def print_timing_summary(summary: dict[str, Any]) -> None:
         )
 
 
+def _redact_env_value(name: str, value: str | None) -> str:
+    if not value:
+        return "<unset>"
+    secret_markers = ("KEY", "TOKEN", "SECRET", "PASSWORD", "AK")
+    if any(marker in name.upper() for marker in secret_markers):
+        if len(value) <= 8:
+            return "<set>"
+        return f"{value[:4]}...{value[-4:]}"
+    return value
+
+
+def print_startup_config(
+    *,
+    args: argparse.Namespace,
+    env_path: Path,
+    loaded_env: dict[str, str],
+    store_dir: Path,
+    seed_urls: list[str],
+    runner_queue_size: int,
+    text_queue_size: int,
+    image_queue_size: int,
+) -> None:
+    relevant_env_vars = [
+        "SYNTHESIS_MODEL_CONFIG",
+        "OPENAI_API_KEY",
+        "SERPAPI_AK",
+        "AIDP_SERP_AK",
+        "SERPAPI_API_KEY",
+        "SERP_API_KEY",
+        "SERPER_API_KEY",
+        "SERPER_API_KEYS",
+        "SERPER_API_KEYS_FILE",
+        "IMAGE_GROUND_MODEL",
+        "IMAGE_QUERY_ENTITY_FILTER_MODEL",
+        "SYNTHESIS_TRACE_TIMING",
+        "VQA_WRITER_MODEL",
+    ]
+    print("=== min graph startup ===")
+    print(f"env_file: {env_path} ({len(loaded_env)} vars loaded)")
+    print(f"store_dir: {store_dir}")
+    print(f"seed_count: {len(seed_urls)}")
+    print(f"seed_preview: {seed_urls[:5]}")
+    print(
+        "runner_config: "
+        f"max_steps={args.max_steps} "
+        f"max_nodes={args.max_nodes} "
+        f"parallel_workers={args.parallel_workers} "
+        f"batch_size={args.batch_size} "
+        f"max_depth={args.max_depth} "
+        f"max_neighbors={args.max_neighbors} "
+        f"images_enabled={not args.no_images} "
+        f"image_backend={args.image_backend}"
+    )
+    print(
+        "queue_state: "
+        f"queue={runner_queue_size} "
+        f"text_queue={text_queue_size} "
+        f"image_queue={image_queue_size}"
+    )
+    print("environment:")
+    for name in relevant_env_vars:
+        print(f"  {name}={_redact_env_value(name, os.environ.get(name))}")
+
+
 def load_failed_task_preview(store_dir: Path, *, limit: int = 1) -> list[dict[str, Any]]:
     state_path = store_dir / "graph_runner_state.json"
     if not state_path.exists():
@@ -342,7 +406,7 @@ def main(argv: list[str] | None = None) -> int:
     if str(PROJECT_ROOT) not in sys.path:
         sys.path.insert(0, str(PROJECT_ROOT))
 
-    from synthesis.graph_expansion import GraphExpansionConfig, GraphExpansionStrategy
+    from synthesis.graph_expansion import ExpansionTaskType, GraphExpansionConfig, GraphExpansionStrategy
     from synthesis.graph_runner import GraphRunner, GraphRunnerConfig
     from synthesis.image_discovery import ImageDiscoveryBuilder, ImageDiscoveryConfig
     from synthesis.model_worker import LLM_WORKER
@@ -474,6 +538,16 @@ def main(argv: list[str] | None = None) -> int:
     )
     if runner.strategy.queue_size() == 0:
         runner.add_seeds(seed_urls)
+    print_startup_config(
+        args=args,
+        env_path=env_path,
+        loaded_env=loaded_env,
+        store_dir=store_dir,
+        seed_urls=seed_urls,
+        runner_queue_size=runner.strategy.queue_size(),
+        text_queue_size=runner.strategy.queue_size(ExpansionTaskType.TEXT_EXPAND),
+        image_queue_size=runner.strategy.queue_size(ExpansionTaskType.IMAGE_EXPAND),
+    )
 
     started_at = time.perf_counter()
     result = runner.run()
@@ -496,6 +570,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f"status: {result.status}")
     print(f"steps: {result.steps}")
     print(f"queue_size: {result.queue_size}")
+    print(f"text_queue_size: {runner.strategy.queue_size(ExpansionTaskType.TEXT_EXPAND)}")
+    print(f"image_queue_size: {runner.strategy.queue_size(ExpansionTaskType.IMAGE_EXPAND)}")
     print(f"completed: {result.completed_count}")
     print(f"failed: {result.failed_count}")
     print(f"skipped: {result.skipped_count}")
