@@ -137,6 +137,7 @@ class GraphRunner:
         self._restore_strategy_state()
         self._saved_visual_plan_ids = self._load_saved_visual_plan_ids()
         self._progress_width = 0
+        self._text_dispatch_since_image_entity = 0
 
     def add_seed(
         self,
@@ -336,10 +337,30 @@ class GraphRunner:
         remaining_text_slots = self._remaining_text_slots(
             in_flight_text_count=in_flight_text_count,
         )
+        if remaining_text_slots is None or remaining_text_slots > 0:
+            queue_breakdown = self._queue_breakdown()
+            if (
+                queue_breakdown["image_entity_queue"] > 0
+                and self._text_dispatch_since_image_entity >= 3
+            ):
+                task = self.strategy.pop_next_task(
+                    allowed_task_types={ExpansionTaskType.TEXT_EXPAND},
+                    text_task_origin="image_entity",
+                )
+                if task is not None:
+                    self._text_dispatch_since_image_entity = 0
+                    return task
         allowed_types = {ExpansionTaskType.IMAGE_EXPAND}
         if remaining_text_slots is None or remaining_text_slots > 0:
             allowed_types.add(ExpansionTaskType.TEXT_EXPAND)
-        return self.strategy.pop_next_task(allowed_task_types=allowed_types)
+        task = self.strategy.pop_next_task(allowed_task_types=allowed_types)
+        if task is not None and task.task_type == ExpansionTaskType.TEXT_EXPAND:
+            task_origin = (task.metadata or {}).get("task_origin")
+            if task_origin == "image_entity":
+                self._text_dispatch_since_image_entity = 0
+            else:
+                self._text_dispatch_since_image_entity += 1
+        return task
 
     def _has_schedulable_tasks(self) -> bool:
         if self.strategy.queue_size(ExpansionTaskType.IMAGE_EXPAND) > 0:

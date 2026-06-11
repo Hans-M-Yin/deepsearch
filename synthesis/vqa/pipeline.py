@@ -110,7 +110,8 @@ class VqaGenerationPipeline:
             path=path,
             evidence=evidence,
             draft=draft,
-            polished=obfuscated,
+            polished=polished,
+            obfuscated=obfuscated,
             verification=verification,
             progress=progress,
             metadata={

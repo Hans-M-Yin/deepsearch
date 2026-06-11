@@ -2086,13 +2086,19 @@ class ImageDiscoveryBuilder:
             source_node_title=source_node_title,
             grounded_entities=grounded_entities,
         )
+        query_overlap_entities: list[dict[str, Any]] = []
         for entity in grounded_entities:
             if not self._should_expand_entity(entity):
                 unresolved.append({**entity, "status": "filtered_out"})
                 continue
-            if self._is_query_implied_entity(entity, blocked_query_entities):
-                unresolved.append({**entity, "status": "filtered_by_query_entity_overlap"})
-                continue
+            query_overlap_entity = self._is_query_implied_entity(entity, blocked_query_entities)
+            if query_overlap_entity:
+                query_overlap_entities.append(
+                    {
+                        **entity,
+                        "status": "query_overlap_entity",
+                    }
+                )
             matched_node = self._match_text_node(entity.get("name"))
             if matched_node is None:
                 resolved_target = self._resolve_grounded_entity(
@@ -2117,6 +2123,7 @@ class ImageDiscoveryBuilder:
                                 "source_evidence_id": image_evidence.evidence_id,
                                 "entity": entity,
                                 "resolved_target": resolved_target,
+                                "query_overlap_entity": query_overlap_entity,
                             },
                         }
                     )
@@ -2136,6 +2143,7 @@ class ImageDiscoveryBuilder:
                         metadata={
                             "grounded_entity": entity,
                             "matched_title": matched_node.get("title"),
+                            "query_overlap_entity": query_overlap_entity,
                         },
                     )
                 ],
@@ -2150,14 +2158,18 @@ class ImageDiscoveryBuilder:
                     "entity_name": entity.get("name"),
                     "entity_type": entity.get("type"),
                     "match_method": matched_node.get("_match_method"),
+                    "query_overlap_entity": query_overlap_entity,
                 },
                 evidence_key=f"{image_evidence.evidence_id}:{entity.get('name')}:{matched_node['node_id']}",
             )
             edges.append(edge)
 
-        if unresolved:
+        if unresolved or query_overlap_entities:
             image_node.metadata = dict(image_node.metadata or {})
-            image_node.metadata["unresolved_grounded_entities"] = unresolved
+            if unresolved:
+                image_node.metadata["unresolved_grounded_entities"] = unresolved
+            if query_overlap_entities:
+                image_node.metadata["query_overlap_grounded_entities"] = query_overlap_entities
         return edges, queued_tasks
 
     def _query_implied_entity_labels(

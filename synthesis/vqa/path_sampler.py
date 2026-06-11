@@ -218,7 +218,7 @@ class RandomPathSampler(PathSampler):
         hop_count = hop_count if hop_count is not None else self._sample_hop_count(rng)
 
         for _ in range(hop_count):
-            neighbors = self._traversable_neighbors(current)
+            neighbors = self._traversable_neighbors(current, node_ids=node_ids)
             if self.config.require_simple_path:
                 neighbors = [edge for edge in neighbors if edge.get("dst_node_id") not in node_ids]
             neighbors = [edge for edge in neighbors if edge.get("edge_id") not in used_edge_ids]
@@ -269,11 +269,20 @@ class RandomPathSampler(PathSampler):
         )
         return candidate, None
 
-    def _traversable_neighbors(self, node_id: str) -> list[dict[str, Any]]:
+    def _traversable_neighbors(self, node_id: str, *, node_ids: list[str]) -> list[dict[str, Any]]:
         node_type = self.graph.node_type(node_id)
         neighbors = self.graph.neighbors(node_id)
         if node_type == "text":
             return [edge for edge in neighbors if edge.get("edge_type") != "image_depicts"]
+        if node_type == "image" and len(node_ids) >= 2 and self.graph.node_type(node_ids[-2]) == "text":
+            return [
+                edge
+                for edge in neighbors
+                if not (
+                    edge.get("edge_type") == "image_depicts"
+                    and bool((edge.get("metadata") or {}).get("query_overlap_entity"))
+                )
+            ]
         return neighbors
 
     def _candidate_start_nodes(self) -> list[str]:

@@ -281,14 +281,24 @@ class GraphExpansionStrategy:
         self,
         *,
         allowed_task_types: set[ExpansionTaskType] | None = None,
+        text_task_origin: str | None = None,
+        exclude_text_task_origin: str | None = None,
     ) -> ExpansionTask | None:
         with self._lock:
             if not self._queue:
                 return None
             if allowed_task_types is None:
-                return self._queue.popleft()
+                allowed_task_types = {ExpansionTaskType.TEXT_EXPAND, ExpansionTaskType.IMAGE_EXPAND}
             for index, task in enumerate(self._queue):
                 if task.task_type in allowed_task_types:
+                    metadata = task.metadata or {}
+                    task_origin = metadata.get("task_origin")
+                    if text_task_origin is not None:
+                        if task.task_type != ExpansionTaskType.TEXT_EXPAND or task_origin != text_task_origin:
+                            continue
+                    if exclude_text_task_origin is not None:
+                        if task.task_type == ExpansionTaskType.TEXT_EXPAND and task_origin == exclude_text_task_origin:
+                            continue
                     del self._queue[index]
                     return task
             return None
@@ -840,6 +850,7 @@ class GraphExpansionStrategy:
         if source_node_record is None or source_evidence_record is None:
             return None
         relation = entity.get("relation_to_image") or "depicts"
+        query_overlap_entity = bool(pending.get("query_overlap_entity"))
         return Edge.create(
             parent_node_id,
             target_node_record["node_id"],
@@ -854,6 +865,7 @@ class GraphExpansionStrategy:
                     metadata={
                         "grounded_entity": entity,
                         "resolved_target": pending.get("resolved_target"),
+                        "query_overlap_entity": query_overlap_entity,
                     },
                 )
             ],
@@ -867,6 +879,7 @@ class GraphExpansionStrategy:
                 "entity_name": entity.get("name"),
                 "entity_type": entity.get("type"),
                 "link_type": "image_entity",
+                "query_overlap_entity": query_overlap_entity,
             },
             evidence_key=f"{source_evidence_id}:{entity.get('name')}:{target_node_record['node_id']}",
         )

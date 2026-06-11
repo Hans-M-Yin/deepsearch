@@ -172,6 +172,7 @@ class VqaSample:
     evidence: EvidenceBundle
     draft: QuestionDraft | None = None
     polished: QuestionDraft | None = None
+    obfuscated: QuestionDraft | None = None
     verification: VerificationResult | None = None
     progress: SampleProgress = field(default_factory=SampleProgress)
     metadata: dict[str, Any] = field(default_factory=dict)
