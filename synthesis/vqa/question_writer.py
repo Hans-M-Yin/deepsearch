@@ -257,7 +257,7 @@ Each hop contains at least three parts:
 
 The source of each hop is the target of the previous hop, so you need to integrate all hops into one complete multi-hop question whose reasoning chain can be described as A -> B -> C ..., where A -> B is the first hop and the user must infer B from A, B -> C is the second hop, and so on.
 
-The entities in the intermediate process, including every hop's source and target, must not appear directly in the question. They must instead be recoverable only through clues, so that the user is forced to reason forward step by step.
+The entities in the intermediate process, including every hop's source and target, must not appear directly in the question. They must instead be recoverable only through clues, so that the user is forced to reason forward step by step.  NOTICE: if there is an image, that means the image will serve as a part of the question, which will be provided along with the question.
 
 For each hop's target, your question design must ensure that the user can infer it only on the premise that they have already inferred that hop's source from the previous step. There must be no shortcut clues or extra clues.
 
@@ -321,8 +321,7 @@ Return valid JSON with exactly these fields:
 }
 """
 
-PROMPT_POLISH_QUESTION = """When referencing an external source within a sentence, cite it inline as [[title]](url) immediately before the period. Only apply this to factual claims or quoted content drawn from that source. Do not use this format in opening/framing sentences (e.g. "Here is a summary of..."), navigation text, or anywhere the URL itself is the direct answer.
-
+PROMPT_POLISH_QUESTION = """
 You need to check whether a question should be revised from the following aspects:
 
 0. Entity Obfuscation: If any intermediate result is mentioned in the question (an intermediate result means any source or target in the hops), you need to replace it with a vague description. This description must not be sufficient to identify that entity on its own, but it should still allow the entity to be determined within the context of the question. Example:
@@ -350,120 +349,7 @@ Revision method: Delete that entire redundant portion directly.
 Reason: This is an artifact of dataset construction. The image found online may not actually have a caption, and the final question is about the setting of the house, so it is unnecessary to explicitly tell the user which image to look at; the user should locate the relevant image based on the description.
 Revision method: “A collector who donated about 400 German Expressionist works to that museum in 1953 is depicted in a photo of a Richard Neutra-designed house in the Hollywood Hills of Los Angeles. What setting is the corresponding house shown in?”
 
-Now, based on the above requirements and examples, revise the upcoming question and output it in the following format:
-Reason: xxx
-Revision method: xxx
-JSON:
-{
-  "question": "..."
-}
-"""
-# PROMPT_COMPOSE_QUESTION = """Write one natural multi-hop search question from the supplied hop facts.
-#
-# Treat the directed hop facts as hidden reasoning, not text to narrate.
-#
-# Rules:
-# - Use only the supplied facts and preserve every hop's source-to-target direction.
-# - Treat target_ask as the direct question about the final node. Rewrite it so
-#   the final node is identified through the preceding hop clues rather than named.
-# - Preserve every part of target_ask without revealing its answer.
-# - Keep only the clues needed to make the question coherent and solvable.
-# - Do not list the steps or use phrases such as "starting with", "then",
-#   "after that", "following that clue", or "using that clue".
-# - Avoid naming intermediate entities when descriptive clues are sufficient.
-# - Keep references unambiguous and write one main question.
-# - hop_facts includes hop 0 for reasoning purposes, but you must not restate hop 0 literally.
-# - Treat opening_package.packaged_first_hop as the rewritten natural-language realization of hop 0.
-# - For text_start, express hop 0 through opening_package.packaged_first_hop instead of naming the original first source.
-# - Never output any string listed in opening_package.forbidden_labels.
-# - For image_start, if opening_package.packaged_first_hop is provided, use it as the opening bridge and refer to the source image deictically, such as "this image" or "the provided image", rather than by its title.
-# - Do not duplicate hop 0: once opening_package.packaged_first_hop has been used, continue with later clues naturally.
-# - A retrieval_query is a precise visual clue: preserve its distinctive details,
-#   but rewrite it as natural language rather than a search query.
-#
-# Few-shot example:
-# Input:
-# {
-#   "opening_mode": "text_start",
-#   "opening_package": {
-#     "clue": "a pioneering modernist sculptor photographed in his Paris studio in 1920",
-#     "packaged_first_hop": "A pioneering modernist sculptor was photographed in his Paris studio in 1920.",
-#     "forbidden_labels": ["Constantin Brâncuși", "Brâncuși"]
-#   },
-#   "hop_facts": [
-#     {
-#       "hop_index": 1,
-#       "source": "image of Constantin Brâncuși's studio in Paris in 1920",
-#       "target": "Bird in Space",
-#       "statement": "The slender sculpture positioned at the center of the room in the background is Bird in Space.",
-#       "retrieval_query": ""
-#     },
-#     {
-#       "hop_index": 2,
-#       "source": "Bird in Space",
-#       "target": "National Gallery of Art",
-#       "statement": "The museum that houses the 1925 marble version and the 1927 bronze version of Bird in Space is the National Gallery of Art.",
-#       "retrieval_query": ""
-#     },
-#     {
-#       "hop_index": 3,
-#       "source": "National Gallery of Art",
-#       "target": "David E. Finley, Jr.",
-#       "statement": "The director of the museum from 1938 to 1956 was David E. Finley, Jr.",
-#       "retrieval_query": ""
-#     }
-#   ],
-#   "target_ask": {
-#     "ask_target": "Where did David E. Finley, Jr. earn his professional degree, and in what field was that degree?"
-#   }
-# }
-# Output:
-# {
-#   "question": "A pioneering modernist sculptor was photographed in his Paris studio in 1920. The slender sculpture standing in the center background of that photograph exists in a 1925 marble version and a 1927 bronze version, both now held in a single museum. Where did the director of that museum, who served from 1938 to 1956, earn his professional degree, and in what field was that degree?"
-# }
-#
-# Follow the example's pattern:
-# - For text_start, the first source should be described rather than named.
-# - Use opening_package.packaged_first_hop as the opening bridge for the question.
-# - hop_facts may still include hop 0, but the question should realize that hop through opening_package.packaged_first_hop rather than restating the original source label.
-# - Do not name intermediate targets; refer to them through the clues needed to
-#   carry the reasoning forward.
-# - Represent every hop, but do not expose extra facts beyond what connects one
-#   clue to the next.
-# - Add a disambiguating detail, such as a date range, when a description alone
-#   could refer to multiple entities.
-# - Keep the result grammatical and natural.
-#
-# Return valid JSON with exactly these fields:
-# {
-#   "question": "..."
-# }
-# """
-
-
-PROMPT_POLISH_QUESTION = """When referencing an external source within a sentence, cite it inline as [[title]](url) immediately before the period. Only apply this to factual claims or quoted content drawn from that source. Do not use this format in opening/framing sentences (e.g. "Here is a summary of..."), navigation text, or anywhere the URL itself is the direct answer.
-
-You need to check whether a question should be revised from the following aspects:
-
-1. Potential shortcuts: If, when inferring the target of any hop, it is actually unnecessary to first infer that hop’s source, and the target can instead be obtained directly from clues in the question, then a shortcut exists. For example:
-“This player (Gemma Font, source) joined the women’s team of a major European club (FC Barcelona Femení, target) as a goalkeeper. In what year did this team move into the Johan Cruyff Stadium?”
-Reason: Mentioning the Johan Cruyff Stadium reveals that the team is FC Barcelona Femení, so the source does not need to be inferred.
-Revision method: Replace “Johan Cruyff Stadium” with “the team’s current main home stadium.” This removes the shortcut without changing the reasoning path.
-
-2. Ambiguity: If, starting from the source of a hop, multiple targets fit the description in the question, then the question is not actually answerable. In that case, you need to disambiguate by adding a restriction. For example:
-“This player (Lionel Messi, source) joined a club (FC Barcelona, target), and that club later won the UEFA Champions League. Who was the club’s first captain in the 2018–19 season?”
-Reason: Both FC Barcelona and Paris Saint-Germain fit the description that they are clubs Messi played for and that later won the UEFA Champions League, so the question is ambiguous and requires an added restriction.
-Revision method: Add a relatively vague restriction before “club” that does not directly introduce a shortcut, such as: “the youth academy of a club that this player joined.” Note that you must not add a restriction like “the club that later won the 2011 UEFA Champions League,” because that would introduce a shortcut, since only FC Barcelona won the 2011 UEFA Champions League.
-
-3. Remove redundancy: If the target can already be inferred from some clues, then any additional clues about that target can be deleted to make the question shorter and more natural. For example:
-“That nonprofit railroad museum in Lenox, reporting mark BRMX, moved its excursion train operations to the Hoosac Valley and began service to North Adams in 2016; the museum displays Budd RDC diesel multiple units...”
-Reason: The first sentence is already sufficient to identify the museum, so the part from “moved its excursion train operations...” through “began service to North Adams in 2016” is redundant.
-Revision method: Delete that entire redundant portion directly.
-
-4. Polish the wording: Make the question sound more natural to human readers, and check whether there is any referential ambiguity and revise it if needed. For example:
-“A collector who donated about 400 German Expressionist works to that museum in 1953 is depicted in a photo of a Richard Neutra-designed house in the Hollywood Hills of Los Angeles. According to the image caption for that photo, what setting is the house shown in?”
-Reason: This is an artifact of dataset construction. The image found online may not actually have a caption, and the final question is about the setting of the house, so it is unnecessary to explicitly tell the user which image to look at; the user should locate the relevant image based on the description.
-Revision method: “A collector who donated about 400 German Expressionist works to that museum in 1953 is depicted in a photo of a Richard Neutra-designed house in the Hollywood Hills of Los Angeles. What setting is the corresponding house shown in?”
+NOTICE: if there is an image, that means the image will serve as a part of the question, which will be provided along with the question.
 
 Now, based on the above requirements and examples, revise the upcoming question and output it in the following format:
 Reason: xxx
@@ -473,88 +359,6 @@ JSON:
   "question": "..."
 }
 """
-# PROMPT_COMPOSE_QUESTION = """Write one natural multi-hop search question from the supplied hop facts.
-#
-# Treat the directed hop facts as hidden reasoning, not text to narrate.
-#
-# Rules:
-# - Use only the supplied facts and preserve every hop's source-to-target direction.
-# - Treat target_ask as the direct question about the final node. Rewrite it so
-#   the final node is identified through the preceding hop clues rather than named.
-# - Preserve every part of target_ask without revealing its answer.
-# - Keep only the clues needed to make the question coherent and solvable.
-# - Do not list the steps or use phrases such as "starting with", "then",
-#   "after that", "following that clue", or "using that clue".
-# - Avoid naming intermediate entities when descriptive clues are sufficient.
-# - Keep references unambiguous and write one main question.
-# - hop_facts includes hop 0 for reasoning purposes, but you must not restate hop 0 literally.
-# - Treat opening_package.packaged_first_hop as the rewritten natural-language realization of hop 0.
-# - For text_start, express hop 0 through opening_package.packaged_first_hop instead of naming the original first source.
-# - Never output any string listed in opening_package.forbidden_labels.
-# - For image_start, if opening_package.packaged_first_hop is provided, use it as the opening bridge and refer to the source image deictically, such as "this image" or "the provided image", rather than by its title.
-# - Do not duplicate hop 0: once opening_package.packaged_first_hop has been used, continue with later clues naturally.
-# - A retrieval_query is a precise visual clue: preserve its distinctive details,
-#   but rewrite it as natural language rather than a search query.
-#
-# Few-shot example:
-# Input:
-# {
-#   "opening_mode": "text_start",
-#   "opening_package": {
-#     "clue": "a pioneering modernist sculptor photographed in his Paris studio in 1920",
-#     "packaged_first_hop": "A pioneering modernist sculptor was photographed in his Paris studio in 1920.",
-#     "forbidden_labels": ["Constantin Brâncuși", "Brâncuși"]
-#   },
-#   "hop_facts": [
-#     {
-#       "hop_index": 1,
-#       "source": "image of Constantin Brâncuși's studio in Paris in 1920",
-#       "target": "Bird in Space",
-#       "statement": "The slender sculpture positioned at the center of the room in the background is Bird in Space.",
-#       "retrieval_query": ""
-#     },
-#     {
-#       "hop_index": 2,
-#       "source": "Bird in Space",
-#       "target": "National Gallery of Art",
-#       "statement": "The museum that houses the 1925 marble version and the 1927 bronze version of Bird in Space is the National Gallery of Art.",
-#       "retrieval_query": ""
-#     },
-#     {
-#       "hop_index": 3,
-#       "source": "National Gallery of Art",
-#       "target": "David E. Finley, Jr.",
-#       "statement": "The director of the museum from 1938 to 1956 was David E. Finley, Jr.",
-#       "retrieval_query": ""
-#     }
-#   ],
-#   "target_ask": {
-#     "ask_target": "Where did David E. Finley, Jr. earn his professional degree, and in what field was that degree?"
-#   }
-# }
-# Output:
-# {
-#   "question": "A pioneering modernist sculptor was photographed in his Paris studio in 1920. The slender sculpture standing in the center background of that photograph exists in a 1925 marble version and a 1927 bronze version, both now held in a single museum. Where did the director of that museum, who served from 1938 to 1956, earn his professional degree, and in what field was that degree?"
-# }
-#
-# Follow the example's pattern:
-# - For text_start, the first source should be described rather than named.
-# - Use opening_package.packaged_first_hop as the opening bridge for the question.
-# - hop_facts may still include hop 0, but the question should realize that hop through opening_package.packaged_first_hop rather than restating the original source label.
-# - Do not name intermediate targets; refer to them through the clues needed to
-#   carry the reasoning forward.
-# - Represent every hop, but do not expose extra facts beyond what connects one
-#   clue to the next.
-# - Add a disambiguating detail, such as a date range, when a description alone
-#   could refer to multiple entities.
-# - Keep the result grammatical and natural.
-#
-# Return valid JSON with exactly these fields:
-# {
-#   "question": "..."
-# }
-# """
-
 
 @dataclass(slots=True)
 class HopContext:
@@ -835,10 +639,12 @@ class QuestionWriter:
             hop_summaries=compose_hops,
             target_ask=target_ask,
         )
+        starting_image_url = self._starting_image_url(path=path, graph=graph)
         parsed = self._generate_json(
             system=PROMPT_COMPOSE_QUESTION,
             user_payload=compose_payload,
             trace_label="compose_question",
+            image_url=starting_image_url,
         )
         question = self._clean_composed_question(str(parsed.get("question") or "").strip())
         answer = str(target_ask.get("answer") or "").strip()
@@ -879,6 +685,7 @@ class QuestionWriter:
                 "path_id": path.path_id,
                 "opening_package": opening_package,
                 "compose_payload": compose_payload,
+                "starting_image_url": starting_image_url,
                 "target_ask": target_ask,
                 "writer_context": context.to_dict(),
             },
@@ -888,13 +695,13 @@ class QuestionWriter:
         return self.compose_question(path=path, graph=graph)
 
     def polish(self, *, draft: QuestionDraft, path: PathCandidate, graph: GraphView) -> QuestionDraft:
-        del path, graph
         if self.model_client is None:
             return draft
         polish_payload = self._polish_question_payload(
             question=draft.question,
             hops=draft.reasoning_steps,
         )
+        starting_image_url = self._starting_image_url(path=path, graph=graph)
         try:
             response = self.model_client.generate(
                 ModelRequest(
@@ -903,7 +710,13 @@ class QuestionWriter:
                     max_tokens=self.max_tokens,
                     messages=[
                         ModelMessage(role="system", content=PROMPT_POLISH_QUESTION),
-                        ModelMessage(role="user", content=json.dumps(polish_payload, ensure_ascii=False, indent=2)),
+                        ModelMessage(
+                            role="user",
+                            content=self._user_message_content(
+                                polish_payload,
+                                image_url=starting_image_url,
+                            ),
+                        ),
                     ],
                     metadata={"trace_label": "polish_question"},
                 )
@@ -919,6 +732,7 @@ class QuestionWriter:
             return draft
         metadata = dict(draft.metadata)
         metadata["polish_payload"] = polish_payload
+        metadata["polish_starting_image_url"] = starting_image_url
         metadata["polish_result"] = {
             "raw_response": response.content,
             "question": polished_question,
@@ -932,7 +746,14 @@ class QuestionWriter:
             metadata=metadata,
         )
 
-    def _generate_json(self, *, system: str, user_payload: dict[str, Any], trace_label: str) -> dict[str, Any]:
+    def _generate_json(
+        self,
+        *,
+        system: str,
+        user_payload: dict[str, Any],
+        trace_label: str,
+        image_url: str | None = None,
+    ) -> dict[str, Any]:
         if self.model_client is None:
             raise RuntimeError("model_client is required for _generate_json")
         request = ModelRequest(
@@ -942,7 +763,10 @@ class QuestionWriter:
             response_format={"type": "json_object"},
             messages=[
                 ModelMessage(role="system", content=system),
-                ModelMessage(role="user", content=json.dumps(user_payload, ensure_ascii=False, indent=2)),
+                ModelMessage(
+                    role="user",
+                    content=self._user_message_content(user_payload, image_url=image_url),
+                ),
             ],
             metadata={"trace_label": trace_label},
         )
@@ -955,6 +779,37 @@ class QuestionWriter:
         if not isinstance(parsed, dict):
             raise ValueError(f"Expected JSON object for {trace_label}, got: {type(parsed)!r}")
         return parsed
+
+    @staticmethod
+    def _starting_image_url(*, path: PathCandidate, graph: GraphView) -> str | None:
+        if not path.node_ids or not path.trajectory.starts_with_image:
+            return None
+        source_node = graph.get_node(path.node_ids[0]) or {}
+        if source_node.get("node_type") != "image":
+            return None
+        for candidate in (
+            source_node.get("image_url"),
+            source_node.get("oss_uri"),
+            source_node.get("thumb_oss_uri"),
+        ):
+            image_url = str(candidate or "").strip()
+            if image_url:
+                return image_url
+        return None
+
+    @staticmethod
+    def _user_message_content(
+        user_payload: dict[str, Any],
+        *,
+        image_url: str | None = None,
+    ) -> str | list[dict[str, Any]]:
+        prompt_text = json.dumps(user_payload, ensure_ascii=False, indent=2)
+        if not image_url:
+            return prompt_text
+        return [
+            {"type": "text", "text": prompt_text},
+            {"type": "image_url", "image_url": {"url": image_url}},
+        ]
 
     @staticmethod
     def _extract_json_object(text: str) -> dict[str, Any]:
@@ -980,6 +835,8 @@ class QuestionWriter:
         if node_type == "image":
             metadata = node.get("metadata") or {}
             payload["caption"] = node.get("caption") or node.get("summary")
+            payload["image_url"] = node.get("image_url")
+            payload["oss_uri"] = node.get("oss_uri")
             payload["search_query"] = metadata.get("search_query") if isinstance(metadata, dict) else None
             payload["visual_facts"] = list((metadata.get("visual_facts") or [])[: (999 if full else 2)]) if isinstance(metadata, dict) else []
             payload["ocr_texts"] = list((metadata.get("ocr_texts") or [])[: (999 if full else 2)]) if isinstance(metadata, dict) else []

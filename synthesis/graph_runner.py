@@ -282,6 +282,31 @@ class GraphRunner:
     def _text_node_count(self) -> int:
         return sum(1 for node in self.store.list_nodes() if node.get("node_type") == "text")
 
+    def _queue_breakdown(self) -> dict[str, int]:
+        text_neighbor_queue = 0
+        image_entity_queue = 0
+        text_queue_size = 0
+        image_queue_size = 0
+        for record in self.strategy.queue_records():
+            task_type = record.get("task_type")
+            if task_type == ExpansionTaskType.IMAGE_EXPAND.value:
+                image_queue_size += 1
+                continue
+            if task_type != ExpansionTaskType.TEXT_EXPAND.value:
+                continue
+            text_queue_size += 1
+            metadata = record.get("metadata") or {}
+            if metadata.get("task_origin") == "image_entity":
+                image_entity_queue += 1
+            else:
+                text_neighbor_queue += 1
+        return {
+            "text_queue": text_queue_size,
+            "image_queue": image_queue_size,
+            "text_neighbor_queue": text_neighbor_queue,
+            "image_entity_queue": image_entity_queue,
+        }
+
     def _remaining_text_slots(self, *, in_flight_text_count: int = 0) -> int | None:
         if self.config.max_nodes is None:
             return None
@@ -440,8 +465,11 @@ class GraphRunner:
         if not self.config.show_progress:
             return
         stats = self.store.stats()
-        text_queue_size = self.strategy.queue_size(ExpansionTaskType.TEXT_EXPAND)
-        image_queue_size = self.strategy.queue_size(ExpansionTaskType.IMAGE_EXPAND)
+        queue_breakdown = self._queue_breakdown()
+        text_queue_size = queue_breakdown["text_queue"]
+        image_queue_size = queue_breakdown["image_queue"]
+        text_neighbor_queue = queue_breakdown["text_neighbor_queue"]
+        image_entity_queue = queue_breakdown["image_entity_queue"]
         queue_size = text_queue_size + image_queue_size
         max_steps = self.config.max_steps
         max_nodes = self.config.max_nodes
@@ -454,6 +482,8 @@ class GraphRunner:
             f"steps={steps_text} "
             f"queue={queue_size} "
             f"text_queue={text_queue_size} "
+            f"text_neighbor_queue={text_neighbor_queue} "
+            f"image_entity_queue={image_entity_queue} "
             f"image_queue={image_queue_size} "
             f"text_nodes={nodes_text} "
             f"nodes={node_count} "
@@ -476,8 +506,11 @@ class GraphRunner:
         image_count = 0
         latest_title: str | None = None
         latest_created_at: str = ""
-        text_queue_size = self.strategy.queue_size(ExpansionTaskType.TEXT_EXPAND)
-        image_queue_size = self.strategy.queue_size(ExpansionTaskType.IMAGE_EXPAND)
+        queue_breakdown = self._queue_breakdown()
+        text_queue_size = queue_breakdown["text_queue"]
+        image_queue_size = queue_breakdown["image_queue"]
+        text_neighbor_queue = queue_breakdown["text_neighbor_queue"]
+        image_entity_queue = queue_breakdown["image_entity_queue"]
         for node in nodes:
             node_type = node.get("node_type")
             if node_type == "text":
@@ -496,6 +529,8 @@ class GraphRunner:
             f"text={text_count} "
             f"image={image_count} "
             f"text_queue={text_queue_size} "
+            f"text_neighbor_queue={text_neighbor_queue} "
+            f"image_entity_queue={image_entity_queue} "
             f"image_queue={image_queue_size} "
             f"latest={latest_title!r}",
             file=sys.stdout,
