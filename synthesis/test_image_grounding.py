@@ -242,7 +242,7 @@ def _filter_grounded_entities(
             filtered_out.append({**entity, "status": "filtered_by_query_entity_overlap"})
             continue
         kept.append(entity)
-
+    print(f"################### before:{grounded_entities} ({len(grounded_entities)}), after:{kept} ({len(kept)}),")
     return {
         "query_text": query_text,
         "source_node_title": source_node_title,
