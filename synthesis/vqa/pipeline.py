@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 import os
 
 from synthesis.model_worker import LLM_WORKER
@@ -12,8 +13,22 @@ from .graph_view import GraphView
 from .obfuscation import ObfuscationProcessor
 from .path_sampler import RandomPathSampler, SamplerConfiguration
 from .question_writer import QuestionWriter
-from .schemas import EvidenceBundle, SampleStatus, VqaSample
+from .schemas import EvidenceBundle, PathCandidate, SampleProgress, SampleStatus, VqaSample
 from .verifier import SampleVerifier
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+class VqaGenerationError(RuntimeError):
+    """A hard failure while processing one sampled path."""
+
+    def __init__(self, *, path_id: str, stage: str, cause: Exception) -> None:
+        self.path_id = path_id
+        self.stage = stage
+        self.cause = cause
+        super().__init__(f"{stage} failed for {path_id}: {cause.__class__.__name__}: {cause}")
 
 
 @dataclass(slots=True)
@@ -40,33 +55,75 @@ class VqaGenerationPipeline:
         )
         self.verifier = self.verifier or SampleVerifier()
 
-    def generate(self, *, limit: int | None = None) -> list[VqaSample]:
+    def sample_paths(self, *, limit: int | None = None) -> list[PathCandidate]:
+        """Sample paths serially so sampler diversity state remains consistent."""
         sample_limit = self.config.max_samples if limit is None else limit
-        samples: list[VqaSample] = []
-        for path in self.sampler.generate(limit=sample_limit):
-            target_node = self.graph.get_node(path.target_node_id) or {}
-            target_title = target_node.get("title")
-            evidence = EvidenceBundle(
-                bundle_id=f"bundle_{path.path_id}",
-                path_id=path.path_id,
-                metadata={"placeholder": True, "source": "pipeline_without_evidence_builder"},
-            )
-            draft = self.writer.draft(path=path, graph=self.graph)
-            polished = self.writer.polish(draft=draft, path=path, graph=self.graph)
-            obfuscated = self.writer.obfuscate(draft=polished, path=path, graph=self.graph)
-            obfuscated = self.obfuscator.post_obfuscate(obfuscated, target_title=target_title)
-            verification = self.verifier.verify(question=obfuscated)
-            status = SampleStatus.VERIFIED if verification.final_keep else SampleStatus.REJECTED
-            samples.append(
-                VqaSample(
-                    sample_id=f"sample_{path.path_id}",
-                    status=status,
-                    path=path,
-                    evidence=evidence,
-                    draft=draft,
-                    polished=obfuscated,
-                    verification=verification,
-                    metadata={},
-                )
-            )
-        return samples
+        return self.sampler.generate(limit=sample_limit)
+
+    def generate_path(self, path: PathCandidate) -> VqaSample:
+        """Generate and verify one question from an already sampled path."""
+        progress = SampleProgress()
+        target_node = self.graph.get_node(path.target_node_id) or {}
+        target_title = target_node.get("title")
+        evidence = EvidenceBundle(
+            bundle_id=f"bundle_{path.path_id}",
+            path_id=path.path_id,
+            metadata={"placeholder": True, "source": "pipeline_without_evidence_builder"},
+        )
+
+        draft = self._run_stage(
+            path=path,
+            stage="draft",
+            operation=lambda: self.writer.draft(path=path, graph=self.graph),
+        )
+        progress.drafted_at = _utc_now()
+        polished = self._run_stage(
+            path=path,
+            stage="polish",
+            operation=lambda: self.writer.polish(draft=draft, path=path, graph=self.graph),
+        )
+        progress.polished_at = _utc_now()
+        obfuscated = self._run_stage(
+            path=path,
+            stage="llm_obfuscation",
+            operation=lambda: self.writer.obfuscate(draft=polished, path=path, graph=self.graph),
+        )
+        obfuscated = self._run_stage(
+            path=path,
+            stage="post_obfuscation",
+            operation=lambda: self.obfuscator.post_obfuscate(
+                obfuscated,
+                target_title=target_title,
+            ),
+        )
+        progress.post_obfuscated_at = _utc_now()
+        verification = self._run_stage(
+            path=path,
+            stage="verification",
+            operation=lambda: self.verifier.verify(question=obfuscated),
+        )
+        progress.verified_at = _utc_now()
+        status = SampleStatus.VERIFIED if verification.final_keep else SampleStatus.REJECTED
+        return VqaSample(
+            sample_id=f"sample_{path.path_id}",
+            status=status,
+            path=path,
+            evidence=evidence,
+            draft=draft,
+            polished=obfuscated,
+            verification=verification,
+            progress=progress,
+            metadata={
+                "writer_warnings": list(obfuscated.metadata.get("writer_warnings") or []),
+            },
+        )
+
+    def generate(self, *, limit: int | None = None) -> list[VqaSample]:
+        return [self.generate_path(path) for path in self.sample_paths(limit=limit)]
+
+    @staticmethod
+    def _run_stage(*, path: PathCandidate, stage: str, operation):
+        try:
+            return operation()
+        except Exception as exc:
+            raise VqaGenerationError(path_id=path.path_id, stage=stage, cause=exc) from exc

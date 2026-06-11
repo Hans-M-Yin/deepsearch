@@ -745,15 +745,19 @@ class QuestionWriter:
                     metadata={"trace_label": "polish_question"},
                 )
             )
-        except Exception:
-            return draft
+        except Exception as exc:
+            return self._record_writer_warning(draft, stage="polish_request", error=exc)
         try:
             parsed = self._extract_json_object(response.content)
-        except Exception:
-            return draft
+        except Exception as exc:
+            return self._record_writer_warning(draft, stage="polish_parse", error=exc)
         polished_question = self._clean_composed_question(str(parsed.get("question") or "").strip())
         if not polished_question:
-            return draft
+            return self._record_writer_warning(
+                draft,
+                stage="polish_parse",
+                error=ValueError("Model returned an empty question."),
+            )
         metadata = dict(draft.metadata)
         metadata["polish_payload"] = polish_payload
         metadata["polish_starting_image_url"] = starting_image_url
@@ -799,16 +803,24 @@ class QuestionWriter:
                     metadata={"trace_label": "obfuscate_question"},
                 )
             )
-        except Exception:
-            return draft
+        except Exception as exc:
+            return self._record_writer_warning(draft, stage="obfuscation_request", error=exc)
 
         obfuscated_question = self._extract_labeled_section(response.content, label="Question")
         if not obfuscated_question:
-            return draft
+            return self._record_writer_warning(
+                draft,
+                stage="obfuscation_parse",
+                error=ValueError("Model response did not contain a Question section."),
+            )
         reason = self._extract_labeled_section(response.content, label="Reason", next_label="Question")
         obfuscated_question = self._clean_composed_question(obfuscated_question)
         if not obfuscated_question:
-            return draft
+            return self._record_writer_warning(
+                draft,
+                stage="obfuscation_parse",
+                error=ValueError("Model returned an empty obfuscated question."),
+            )
 
         metadata = dict(draft.metadata)
         metadata["obfuscation_payload"] = obfuscation_payload
@@ -820,6 +832,32 @@ class QuestionWriter:
         }
         return QuestionDraft(
             question=obfuscated_question,
+            answer=draft.answer,
+            answer_type=draft.answer_type,
+            reasoning_steps=list(draft.reasoning_steps),
+            used_evidence_ids=list(draft.used_evidence_ids),
+            metadata=metadata,
+        )
+
+    @staticmethod
+    def _record_writer_warning(
+        draft: QuestionDraft,
+        *,
+        stage: str,
+        error: Exception,
+    ) -> QuestionDraft:
+        metadata = dict(draft.metadata)
+        warnings = list(metadata.get("writer_warnings") or [])
+        warnings.append(
+            {
+                "stage": stage,
+                "error_type": error.__class__.__name__,
+                "error": str(error),
+            }
+        )
+        metadata["writer_warnings"] = warnings
+        return QuestionDraft(
+            question=draft.question,
             answer=draft.answer,
             answer_type=draft.answer_type,
             reasoning_steps=list(draft.reasoning_steps),
@@ -1456,7 +1494,13 @@ def _debug_main() -> None:
     opening_package = writer.select_opening_package(context=context, hop_summaries=hop_summaries)
     draft = writer.compose_question(path=path, graph=graph, context=context)
     polished = writer.polish(draft=draft, path=path, graph=graph)
+    obfuscated = writer.obfuscate(draft=polished, path=path, graph=graph)
     polish_result = polished.metadata.get("polish_result") if isinstance(polished.metadata, dict) else None
+    obfuscation_result = (
+        obfuscated.metadata.get("obfuscation_result")
+        if isinstance(obfuscated.metadata, dict)
+        else None
+    )
 
     print("path:")
     print(json.dumps(path.to_dict(), ensure_ascii=False, indent=2))
@@ -1487,6 +1531,22 @@ def _debug_main() -> None:
     ))
     print("polish_raw_output:")
     print((polish_result or {}).get("raw_response") if isinstance(polish_result, dict) else None)
+    print("obfuscated_question:")
+    print(json.dumps(
+        {
+            "question": obfuscated.question,
+            "answer": obfuscated.answer,
+            "answer_type": obfuscated.answer_type,
+        },
+        ensure_ascii=False,
+        indent=2,
+    ))
+    print("obfuscation_raw_output:")
+    print(
+        (obfuscation_result or {}).get("raw_response")
+        if isinstance(obfuscation_result, dict)
+        else None
+    )
 
 
 if __name__ == "__main__":

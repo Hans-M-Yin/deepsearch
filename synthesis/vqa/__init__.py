@@ -32,7 +32,8 @@ from .evidence_builder import EvidenceBuilder
 from .obfuscation import ObfuscationProcessor
 from .question_writer import QuestionWriter
 from .verifier import SampleVerifier
-from .pipeline import VqaGenerationPipeline
+from .pipeline import VqaGenerationError, VqaGenerationPipeline
+from .batch_runner import VqaBatchRunner, VqaBatchSummary
 
 __all__ = [
     "EvidenceBundle",
@@ -55,5 +56,8 @@ __all__ = [
     "ObfuscationProcessor",
     "QuestionWriter",
     "SampleVerifier",
+    "VqaGenerationError",
     "VqaGenerationPipeline",
+    "VqaBatchRunner",
+    "VqaBatchSummary",
 ]
