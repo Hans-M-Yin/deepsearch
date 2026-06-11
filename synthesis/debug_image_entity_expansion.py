@@ -38,6 +38,7 @@ if __package__ in (None, ""):
     __package__ = "synthesis"
 
 from synthesis.evidence import Evidence, EvidenceType
+from synthesis.edges import Edge, EdgeSource, EdgeType, EvidenceRef
 from synthesis.image_discovery import (
     ImageCandidateStatus,
     ImageDiscoveryBuilder,
@@ -50,6 +51,7 @@ from synthesis.run_min_graph import DEFAULT_ENV_PATH, load_env_file
 from synthesis.search_client import ImageSearchResult
 from synthesis.store import JsonlGraphStore
 from synthesis.visual_planner import SearchQuerySpec, VisualSearchPlan
+from synthesis.wiki_text_builder import EnhancedReaderClient, InvalidWikiPageError, WikiTextBuilder
 
 
 class _UnusedSearchClient:
@@ -220,6 +222,108 @@ def _filter_grounded_entities(
     }
 
 
+def _simulate_queued_text_expansions(
+    *,
+    store: JsonlGraphStore,
+    queued_tasks: list[dict[str, Any]],
+    image_node: ImageNode,
+    image_evidence: Evidence,
+    reader_base_url: str,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    reader = EnhancedReaderClient(base_url=reader_base_url)
+    wiki_builder = WikiTextBuilder(
+        reader=reader,
+        store=store,
+    )
+
+    simulated_nodes: list[dict[str, Any]] = []
+    simulated_edges: list[dict[str, Any]] = []
+    for pending in queued_tasks:
+        url = pending.get("url")
+        title = pending.get("title")
+        pending_link = pending.get("pending_link") or {}
+        entity = pending_link.get("entity") or {}
+        if not url or not isinstance(pending_link, dict) or not isinstance(entity, dict):
+            continue
+        try:
+            text_result = wiki_builder.build_from_url(
+                url,
+                title=title,
+                run_id="debug_image_entity_expansion",
+                persist=False,
+            )
+            simulated_nodes.append(
+                {
+                    "url": url,
+                    "requested_title": title,
+                    "node_id": text_result.node.node_id,
+                    "node_title": text_result.node.title,
+                    "source_url": text_result.node.source.url if text_result.node.source else None,
+                    "from_cache": text_result.from_cache,
+                }
+            )
+            edge = Edge.create(
+                image_node.node_id,
+                text_result.node.node_id,
+                edge_type=EdgeType.IMAGE_DEPICTS,
+                relation=entity.get("relation_to_image") or "depicts",
+                src_node_type="image",
+                dst_node_type="text",
+                evidence_refs=[
+                    EvidenceRef(
+                        evidence_id=image_evidence.evidence_id,
+                        quote=entity.get("evidence"),
+                        metadata={
+                            "grounded_entity": entity,
+                            "resolved_target": pending_link.get("resolved_target"),
+                        },
+                    )
+                ],
+                source=EdgeSource(
+                    source_type="image_grounding_delayed_debug",
+                    url=image_node.image_url,
+                    run_id="debug_image_entity_expansion",
+                    builder="debug_image_entity_expansion",
+                ),
+                extractor="debug_image_entity_expansion",
+                metadata={
+                    "entity_name": entity.get("name"),
+                    "entity_type": entity.get("type"),
+                    "link_type": "image_entity",
+                    "debug_materialized": True,
+                },
+                evidence_key=f"{image_evidence.evidence_id}:{entity.get('name')}:{text_result.node.node_id}",
+            )
+            simulated_edges.append(
+                {
+                    "status": "would_materialize",
+                    "entity_name": entity.get("name"),
+                    "target_node_id": text_result.node.node_id,
+                    "target_title": text_result.node.title,
+                    "edge": edge.to_dict(),
+                }
+            )
+        except InvalidWikiPageError as exc:
+            simulated_nodes.append(
+                {
+                    "url": url,
+                    "requested_title": title,
+                    "status": "skipped_invalid_page",
+                    "error": f"{exc.__class__.__name__}: {exc}",
+                }
+            )
+        except Exception as exc:
+            simulated_nodes.append(
+                {
+                    "url": url,
+                    "requested_title": title,
+                    "status": "failed_to_build",
+                    "error": f"{exc.__class__.__name__}: {exc}",
+                }
+            )
+    return simulated_nodes, simulated_edges
+
+
 def _build_image_node(args: argparse.Namespace, store: JsonlGraphStore) -> ImageNode:
     if args.image_node_id:
         record = store.get_node(args.image_node_id)
@@ -330,6 +434,7 @@ def main() -> None:
     parser.add_argument("--target-text", type=str, default="")
     parser.add_argument("--skip-check", action="store_true")
     parser.add_argument("--pretty", action="store_true")
+    parser.add_argument("--reader-base-url", type=str, default="http://127.0.0.1:8004")
     group = parser.add_mutually_exclusive_group(required=False)
     group.add_argument("--grounded-entities-json", type=str)
     group.add_argument("--grounded-entities-file", type=str)
@@ -404,6 +509,13 @@ def main() -> None:
         source_node_title=_source_node_title(args) or None,
         source_query_text=args.source_query_text,
     )
+    simulated_nodes, simulated_edges = _simulate_queued_text_expansions(
+        store=store,
+        queued_tasks=queued_tasks,
+        image_node=image_node,
+        image_evidence=image_evidence,
+        reader_base_url=args.reader_base_url,
+    )
 
     output = {
         "image": {
@@ -434,12 +546,21 @@ def main() -> None:
         "entity_statuses": statuses,
         "created_edges": [edge.to_dict() for edge in edges],
         "queued_tasks": queued_tasks,
+        "simulated_expanded_text_nodes": simulated_nodes,
+        "simulated_materialized_edges": simulated_edges,
         "expansion_summary": {
             "grounded_entity_count": len(grounded_entities),
             "created_edge_count": len(edges),
             "queued_task_count": len(queued_tasks),
+            "simulated_expanded_text_node_count": sum(
+                1 for node in simulated_nodes if node.get("node_id")
+            ),
+            "simulated_materialized_edge_count": len(simulated_edges),
             "connected_target_node_ids": [edge.dst_node_id for edge in edges],
             "queued_target_titles": [task.get("title") for task in queued_tasks],
+            "simulated_connected_target_node_ids": [
+                item.get("target_node_id") for item in simulated_edges
+            ],
         },
         "timing": {
             "image_check_s": validation_elapsed_s,
