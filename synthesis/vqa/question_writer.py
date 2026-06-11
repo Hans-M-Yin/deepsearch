@@ -1,12 +1,13 @@
 """LLM-backed question writer for graph trajectories.
 
 The writer now works directly from ``PathCandidate + GraphView`` instead of a
-separate evidence-builder stage. Internally it follows a four-step process:
+separate evidence-builder stage. Internally it follows a five-step process:
 
 1. compress each hop into a short statement
 2. derive an opening package for the first source + first hop
 3. select an askable target from the final node
-4. compose the final multi-hop question
+4. compose and polish the final multi-hop question
+5. obfuscate shortcut clues while preserving the reasoning path
 """
 
 from __future__ import annotations
@@ -358,6 +359,29 @@ JSON:
 {
   "question": "..."
 }
+"""
+
+PROMPT_OBFUSCATE_QUESTION = """You are revising a multi-hop question to prevent reasoning shortcuts. You will be given: a multi-hop knowledge reasoning question, which may also include an image associated with the question; the ordered source -> target hop chain supporting the question; and the final ask. For each hop, including the direction of the final ask, inspect how the target is described in the question.
+
+For each hop, if the user can identify the target directly from the clues in the question without first identifying that hop’s source, then a shortcut exists. This usually happens because the relationship between the source and target is described too explicitly, or because highly distinctive events, organizations, objects, or places make the target directly identifiable.
+
+For example: “This player once used the ‘Hand of God’ in a World Cup he played in, and in the semifinal of that World Cup, ...” In this example, even without identifying the player (the source), the phrase “Hand of God” already makes it possible to infer that the target is the 1986 World Cup. An appropriate revision would be: “This player once won a crucial match in a World Cup he played in with a goal that should not have counted, and in the semifinal of that World Cup, ...” This ensures that only after inferring Diego Maradona (the source) can one further infer the 1986 World Cup.
+
+Another example: “The attacking midfielder (Fran Kirby) became Chelsea Women’s all-time leading goalscorer in December 2020 and was part of England’s UEFA Women’s Euro 2022-winning squad. She is linked to a photo of England’s women celebrating with the trophy after the Euro 2022 final at Wembley.” Here, even without first inferring the midfielder (the source, Fran Kirby), one can directly search for the target, namely a championship celebration photo, based on England Women winning the tournament. An appropriate revision would be: “...and was part of her national women’s team’s title-winning squad in a continental tournament in 2022. She is linked to a photo of that team celebrating with the trophy after the final of the tournament just mentioned.”
+
+Requirements:
+1. Preserve the order and direction of every hop exactly.
+2. Once the source of a hop is known, each target must still be uniquely identifiable. Your obfuscation must not introduce ambiguity such that multiple targets would satisfy the description.
+3. Do not mechanically remove all explicit proper nouns. Ensure that the revised question remains answerable without ambiguity while eliminating unnecessary shortcuts.
+4. Apply the same obfuscation principle to the final question in the sentence, but do not change what is being asked and do not change the answer.
+5. Keep pronoun references clear.
+6. If there is no safe and necessary room for improvement, return the original question unchanged.
+
+Before rewriting, first conduct careful analysis, understand the intent of the question, and think through the reasoning path. Make sure that for every hop: when the source is unknown, the target cannot be inferred from the clues in the question alone; and when the source is known, there is exactly one target consistent with both the source and the question.
+
+Output format:
+Reason: your detailed reasoning process
+Question: the revised question
 """
 
 @dataclass(slots=True)
@@ -746,6 +770,63 @@ class QuestionWriter:
             metadata=metadata,
         )
 
+    def obfuscate(self, *, draft: QuestionDraft, path: PathCandidate, graph: GraphView) -> QuestionDraft:
+        if self.model_client is None:
+            return draft
+        target_ask = draft.metadata.get("target_ask") or {}
+        obfuscation_payload = self._obfuscation_question_payload(
+            question=draft.question,
+            hops=draft.reasoning_steps,
+            final_ask=str(target_ask.get("ask_target") or "").strip(),
+        )
+        starting_image_url = self._starting_image_url(path=path, graph=graph)
+        try:
+            response = self.model_client.generate(
+                ModelRequest(
+                    model=self.model,
+                    temperature=self.temperature,
+                    max_tokens=self.max_tokens,
+                    messages=[
+                        ModelMessage(role="system", content=PROMPT_OBFUSCATE_QUESTION),
+                        ModelMessage(
+                            role="user",
+                            content=self._user_message_content(
+                                obfuscation_payload,
+                                image_url=starting_image_url,
+                            ),
+                        ),
+                    ],
+                    metadata={"trace_label": "obfuscate_question"},
+                )
+            )
+        except Exception:
+            return draft
+
+        obfuscated_question = self._extract_labeled_section(response.content, label="Question")
+        if not obfuscated_question:
+            return draft
+        reason = self._extract_labeled_section(response.content, label="Reason", next_label="Question")
+        obfuscated_question = self._clean_composed_question(obfuscated_question)
+        if not obfuscated_question:
+            return draft
+
+        metadata = dict(draft.metadata)
+        metadata["obfuscation_payload"] = obfuscation_payload
+        metadata["obfuscation_starting_image_url"] = starting_image_url
+        metadata["obfuscation_result"] = {
+            "raw_response": response.content,
+            "reason": reason,
+            "question": obfuscated_question,
+        }
+        return QuestionDraft(
+            question=obfuscated_question,
+            answer=draft.answer,
+            answer_type=draft.answer_type,
+            reasoning_steps=list(draft.reasoning_steps),
+            used_evidence_ids=list(draft.used_evidence_ids),
+            metadata=metadata,
+        )
+
     def _generate_json(
         self,
         *,
@@ -820,6 +901,27 @@ class QuestionWriter:
         if not isinstance(parsed, dict):
             raise ValueError("Parsed JSON is not an object.")
         return parsed
+
+    @staticmethod
+    def _extract_labeled_section(
+        text: str,
+        *,
+        label: str,
+        next_label: str | None = None,
+    ) -> str:
+        if not text:
+            return ""
+        if next_label:
+            pattern = rf"(?:^|\n)\s*{re.escape(label)}\s*:\s*(.*?)(?=\n\s*{re.escape(next_label)}\s*:)"
+        else:
+            pattern = rf"(?:^|\n)\s*{re.escape(label)}\s*:\s*(.*)\Z"
+        match = re.search(pattern, text, flags=re.IGNORECASE | re.DOTALL)
+        if not match:
+            return ""
+        value = match.group(1).strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+            value = value[1:-1].strip()
+        return value
 
     @staticmethod
     def _node_modality(node: dict[str, Any]) -> str:
@@ -962,6 +1064,27 @@ class QuestionWriter:
                 }
                 for item in hops
             ],
+        }
+
+    @staticmethod
+    def _obfuscation_question_payload(
+        *,
+        question: str,
+        hops: list[dict[str, Any]],
+        final_ask: str,
+    ) -> dict[str, Any]:
+        return {
+            "question": question,
+            "hops": [
+                {
+                    "hop_index": item.get("hop_index"),
+                    "source": item.get("source"),
+                    "target": item.get("target"),
+                    "statement": item.get("statement"),
+                }
+                for item in hops
+            ],
+            "final_ask": final_ask,
         }
 
 

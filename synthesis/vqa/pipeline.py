@@ -53,8 +53,9 @@ class VqaGenerationPipeline:
             )
             draft = self.writer.draft(path=path, graph=self.graph)
             polished = self.writer.polish(draft=draft, path=path, graph=self.graph)
-            polished = self.obfuscator.post_obfuscate(polished, target_title=target_title)
-            verification = self.verifier.verify(question=polished)
+            obfuscated = self.writer.obfuscate(draft=polished, path=path, graph=self.graph)
+            obfuscated = self.obfuscator.post_obfuscate(obfuscated, target_title=target_title)
+            verification = self.verifier.verify(question=obfuscated)
             status = SampleStatus.VERIFIED if verification.final_keep else SampleStatus.REJECTED
             samples.append(
                 VqaSample(
@@ -63,7 +64,7 @@ class VqaGenerationPipeline:
                     path=path,
                     evidence=evidence,
                     draft=draft,
-                    polished=polished,
+                    polished=obfuscated,
                     verification=verification,
                     metadata={},
                 )
