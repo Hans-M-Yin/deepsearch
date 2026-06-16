@@ -1,37 +1,26 @@
-# Initial multi-seed set for synthesis.
-# One full Wikipedia URL per line.
-# Mix of head (popular/mainstream) and tail (niche/long-tail) entities.
-
-# ====================
 # Head / mainstream
-# ====================
 
 # Person
-https://en.wikipedia.org/wiki/Kobe_Bryant
-https://en.wikipedia.org/wiki/Taylor_Swift
-https://en.wikipedia.org/wiki/Shou_Chew
+https://en.wikipedia.org/wiki/Serena_Williams
+https://en.wikipedia.org/wiki/Marie_Curie
+https://en.wikipedia.org/wiki/Alan_Turing
 
 # Artifact
-https://en.wikipedia.org/wiki/Mona_Lisa
-https://en.wikipedia.org/wiki/Thriller_(album)
+https://en.wikipedia.org/wiki/Hubble_Space_Telescope
+https://en.wikipedia.org/wiki/Boeing_747
+https://en.wikipedia.org/wiki/The_Great_Wave_off_Kanagawa
+https://en.wikipedia.org/wiki/CRISPR
 
-
-# ====================
 # Tail / niche
-# ====================
 
 # Person
-https://en.wikipedia.org/wiki/Ada_Hegerberg
-https://en.wikipedia.org/wiki/Chien-Shiung_Wu
+https://en.wikipedia.org/wiki/Katherine_Johnson
+https://en.wikipedia.org/wiki/Abebe_Bikila
 
 # Artifact
-https://en.wikipedia.org/wiki/Bird_in_Space
-https://en.wikipedia.org/wiki/Book_of_Kells
-https://en.wikipedia.org/wiki/Kinora
-
-https://en.wikipedia.org/wiki/Nakagin_Capsule_Tower
-
-https://en.wikipedia.org/wiki/Budd_RDC
-https://en.wikipedia.org/wiki/Astrolabe
-https://en.wikipedia.org/wiki/Man_with_a_Movie_Camera
-https://en.wikipedia.org/wiki/Barcelona_chair
+https://en.wikipedia.org/wiki/Antikythera_mechanism
+https://en.wikipedia.org/wiki/Arpanet
+https://en.wikipedia.org/wiki/Iron_lung
+https://en.wikipedia.org/wiki/Shinkansen_0_series
+https://en.wikipedia.org/wiki/Arecibo_Observatory
+https://en.wikipedia.org/wiki/Eames_Lounge_Chair
