@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime
 import json
 import os
 from pathlib import Path
@@ -15,6 +16,11 @@ from .graph_view import GraphView
 from .path_sampler import RandomPathSampler, SamplerConfiguration
 from .pipeline import VqaGenerationPipeline
 from .question_writer import QuestionWriter
+
+
+def _default_output_dir(graph_dir: Path) -> Path:
+    timestamp = datetime.now().strftime("%m%d_%H%M%S")
+    return (graph_dir / "vqa" / timestamp).resolve()
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -57,7 +63,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
     graph_dir = args.graph_dir.resolve()
-    output_dir = (args.output_dir or graph_dir / "vqa").resolve()
+    output_dir = args.output_dir.resolve() if args.output_dir else _default_output_dir(graph_dir)
     model_alias = args.model_alias or os.environ.get("VQA_WRITER_MODEL")
     sampler_model_alias = args.sampler_model_alias or os.environ.get("VQA_SAMPLER_MODEL")
     config = SamplerConfiguration(

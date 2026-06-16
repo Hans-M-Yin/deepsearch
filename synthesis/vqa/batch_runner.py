@@ -175,11 +175,15 @@ class VqaBatchRunner:
             summary.verified += 1
         else:
             summary.rejected += 1
-        self._append_jsonl(samples_file, sample.to_dict())
+        sample_dict = sample.to_dict()
+        self._append_jsonl(
+            samples_file,
+            self._compact_sample_record(sample_dict),
+        )
         self._append_jsonl(
             questions_file,
             self._compact_question_record(
-                sample.to_dict(),
+                sample_dict,
                 question_number=summary.existing_samples + summary.completed,
             ),
         )
@@ -254,6 +258,57 @@ class VqaBatchRunner:
             "status": sample.get("status"),
             "question": final_question.get("question"),
             "answer": final_question.get("answer"),
+        }
+
+    @staticmethod
+    def _compact_sample_record(sample: dict[str, Any]) -> dict[str, Any]:
+        path = sample.get("path") or {}
+        final_question = (
+            sample.get("obfuscated")
+            or sample.get("polished")
+            or sample.get("draft")
+            or {}
+        )
+        return {
+            "sample_id": sample.get("sample_id"),
+            "status": sample.get("status"),
+            "path": {
+                "path_id": path.get("path_id"),
+                "start_node_id": path.get("start_node_id"),
+                "target_node_id": path.get("target_node_id"),
+                "node_ids": path.get("node_ids") or [],
+                "edge_ids": path.get("edge_ids") or [],
+                "node_types": path.get("node_types") or [],
+                "edge_types": path.get("edge_types") or [],
+                "relations": path.get("relations") or [],
+                "trajectory": path.get("trajectory") or {},
+                "exact_signature": path.get("exact_signature"),
+                "skeleton_signature": path.get("skeleton_signature"),
+                "core_signature": path.get("core_signature"),
+                "metadata": path.get("metadata") or {},
+            },
+            "hop_chain": [
+                {
+                    "hop_index": item.get("hop_index"),
+                    "source": item.get("source"),
+                    "target": item.get("target"),
+                    "statement": item.get("statement"),
+                    "relation": item.get("relation"),
+                    "retrieval_query": item.get("retrieval_query"),
+                    "edge_id": item.get("edge_id"),
+                    "src_node_id": item.get("src_node_id"),
+                    "dst_node_id": item.get("dst_node_id"),
+                }
+                for item in (final_question.get("reasoning_steps") or [])
+                if isinstance(item, dict)
+            ],
+            "verification": sample.get("verification") or {},
+            "progress": sample.get("progress") or {},
+            "metadata": {
+                "writer_warnings": list((sample.get("metadata") or {}).get("writer_warnings") or []),
+            },
+            "created_at": sample.get("created_at"),
+            "updated_at": sample.get("updated_at"),
         }
 
     def _write_summary(self, summary: VqaBatchSummary, *, elapsed: float | None = None) -> None:
