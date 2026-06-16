@@ -332,17 +332,14 @@ class VqaBatchRunner:
         if elapsed is not None:
             payload["elapsed_seconds"] = elapsed
         payload["updated_at"] = _utc_now()
-        tmp_path = self.summary_path.with_suffix(".json.tmp")
-        with tmp_path.open("w", encoding="utf-8") as handle:
+        with self.summary_path.open("w", encoding="utf-8") as handle:
             json.dump(payload, handle, ensure_ascii=False, sort_keys=True, indent=2)
             handle.write("\n")
-        tmp_path.replace(self.summary_path)
 
     @staticmethod
     def _append_jsonl(handle, record: dict[str, Any]) -> None:
         handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True))
         handle.write("\n")
-        handle.flush()
 
     def _fill_inflight(
         self,
