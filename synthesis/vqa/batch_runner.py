@@ -302,6 +302,11 @@ class VqaBatchRunner:
                 for item in (final_question.get("reasoning_steps") or [])
                 if isinstance(item, dict)
             ],
+            "writer_outputs": {
+                "draft": VqaBatchRunner._compact_writer_stage(sample.get("draft") or {}),
+                "polished": VqaBatchRunner._compact_writer_stage(sample.get("polished") or {}),
+                "obfuscated": VqaBatchRunner._compact_writer_stage(sample.get("obfuscated") or {}),
+            },
             "verification": sample.get("verification") or {},
             "progress": sample.get("progress") or {},
             "metadata": {
@@ -309,6 +314,17 @@ class VqaBatchRunner:
             },
             "created_at": sample.get("created_at"),
             "updated_at": sample.get("updated_at"),
+        }
+
+    @staticmethod
+    def _compact_writer_stage(stage: dict[str, Any]) -> dict[str, Any] | None:
+        if not stage:
+            return None
+        return {
+            "question": stage.get("question"),
+            "answer": stage.get("answer"),
+            "answer_type": stage.get("answer_type"),
+            "used_evidence_ids": stage.get("used_evidence_ids") or [],
         }
 
     def _write_summary(self, summary: VqaBatchSummary, *, elapsed: float | None = None) -> None:
