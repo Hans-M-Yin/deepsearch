@@ -44,6 +44,12 @@ class GraphView:
     def neighbors(self, node_id: str) -> list[dict[str, Any]]:
         return list(self.out_edges.get(node_id, []))
 
+    def get_edge_id_between(self, src_node_id: str, dst_node_id: str) -> dict[str, Any] | None:
+        for edge in self.out_edges.get(src_node_id, []):
+            if edge.get("dst_node_id") == dst_node_id:
+                return edge
+        return None
+
     def node_type(self, node_id: str) -> str | None:
         node = self.get_node(node_id)
         return None if node is None else node.get("node_type")

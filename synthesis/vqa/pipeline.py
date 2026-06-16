@@ -46,7 +46,15 @@ class VqaGenerationPipeline:
     def __post_init__(self) -> None:
         graph = GraphView(self.store, allowed_edge_types=set(self.config.allowed_edge_types))
         self.graph = graph
-        self.sampler = self.sampler or RandomPathSampler(graph=graph, config=self.config)
+        sampler_model = os.environ.get("VQA_SAMPLER_MODEL")
+        self.sampler = self.sampler or RandomPathSampler(
+            graph=graph,
+            config=self.config,
+            model_client=LLM_WORKER if sampler_model and self.config.neighbor_selection_strategy == "llm_guided" else None,
+            model=sampler_model,
+        )
+        self.sampler.graph = graph
+        self.sampler.config = self.config
         self.obfuscator = self.obfuscator or ObfuscationProcessor()
         writer_model = os.environ.get("VQA_WRITER_MODEL")
         self.writer = self.writer or QuestionWriter(

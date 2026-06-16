@@ -11,7 +11,8 @@ from synthesis.model_worker import LLM_WORKER
 from synthesis.store import JsonlGraphStore
 
 from .batch_runner import VqaBatchRunner
-from .path_sampler import SamplerConfiguration
+from .graph_view import GraphView
+from .path_sampler import RandomPathSampler, SamplerConfiguration
 from .pipeline import VqaGenerationPipeline
 from .question_writer import QuestionWriter
 
@@ -37,6 +38,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="Model alias registered in synthesis/models.json. Defaults to VQA_WRITER_MODEL.",
     )
+    parser.add_argument(
+        "--sampler-model-alias",
+        default=None,
+        help="Optional model alias for LLM-guided next-hop selection. Defaults to VQA_SAMPLER_MODEL.",
+    )
+    parser.add_argument(
+        "--neighbor-selection-strategy",
+        choices=("random", "llm_guided"),
+        default="random",
+    )
+    parser.add_argument("--llm-candidate-count", type=int, default=6)
+    parser.add_argument("--llm-score-temperature", type=float, default=0.35)
     parser.add_argument("--no-resume", action="store_true")
     return parser
 
@@ -46,6 +59,7 @@ def main(argv: list[str] | None = None) -> int:
     graph_dir = args.graph_dir.resolve()
     output_dir = (args.output_dir or graph_dir / "vqa").resolve()
     model_alias = args.model_alias or os.environ.get("VQA_WRITER_MODEL")
+    sampler_model_alias = args.sampler_model_alias or os.environ.get("VQA_SAMPLER_MODEL")
     config = SamplerConfiguration(
         min_hops=args.min_hops,
         max_hops=args.max_hops,
@@ -53,14 +67,26 @@ def main(argv: list[str] | None = None) -> int:
         random_seed=args.seed,
         edge_penalty_alpha=args.edge_penalty_alpha,
         hop_sampling_strategy=args.hop_sampling_strategy,
+        neighbor_selection_strategy=args.neighbor_selection_strategy,
+        llm_candidate_count=args.llm_candidate_count,
+        llm_score_temperature=args.llm_score_temperature,
+    )
+    store = JsonlGraphStore(graph_dir)
+    graph = GraphView(store, allowed_edge_types=set(config.allowed_edge_types))
+    sampler = RandomPathSampler(
+        graph=graph,
+        config=config,
+        model_client=LLM_WORKER if sampler_model_alias and args.neighbor_selection_strategy == "llm_guided" else None,
+        model=sampler_model_alias,
     )
     writer = QuestionWriter(
         model_client=LLM_WORKER if model_alias else None,
         model=model_alias,
     )
     pipeline = VqaGenerationPipeline(
-        store=JsonlGraphStore(graph_dir),
+        store=store,
         config=config,
+        sampler=sampler,
         writer=writer,
     )
     runner = VqaBatchRunner(

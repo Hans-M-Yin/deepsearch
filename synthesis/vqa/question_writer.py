@@ -296,7 +296,7 @@ Input:
 }
 
 Output question:
-"A 20th-century pioneering sculptor was photographed in his Paris studio by Edward Steichen in 1920. The slender sculpture standing in the center background of that photograph exists in a 1925 marble version and a 1927 bronze version, both now held in a single museum. Where did the director of that museum, who served from 1938 to 1956, earn his professional degree, and in what field was that degree?"
+"A 20th-century Romanian avant-garde sculptor was photographed by Edward Steichen in his Paris studio in 1920. The slender sculpture standing at the center of the studio background existed in multiple versions. Where did the director who served from 1938 to 1956 at the museum that holds its 1925 marble version and its 1927 bronze version receive their professional degree, and in what field was that degree?"
 
 Explanation: This question removes potentially redundant clues from the input, reveals none of the intermediate entities, and remains grammatically natural.
 
