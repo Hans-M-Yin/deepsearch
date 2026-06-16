@@ -306,66 +306,188 @@ Return valid JSON with exactly these fields:
 }
 """
 
-PROMPT_POLISH_QUESTION = """
-You need to check whether a question should be revised from the following aspects:
+PROMPT_POLISH_ENTITY_OBFUSCATION = """
+You are auditing a multi-hop reasoning question for which the intended reasoning chain has already been provided. In this chain, the source of each hop statement is an intermediate answer. An ideal multi-hop reasoning question must require the solver to infer each intermediate result step by step from the beginning, so intermediate answers must not be exposed in advance. It must also ensure that an intermediate answer cannot be inferred without first obtaining the result of the previous step; in other words, shortcuts must be avoided, so that a solver cannot infer an intermediate answer without relying on the earlier part of the question.
 
-0. Entity Obfuscation: If any intermediate result is mentioned in the question (an intermediate result means any source or target in the hops), you need to replace it with a vague description. This description must not be sufficient to identify that entity on its own, but it should still allow the entity to be determined within the context of the question. Example:
-"After her club, Stabæk, won the Toppserien title in 2010, it qualified for the UEFA Women's Champions League," where the UEFA Women's Champions League is the source of the next hop.
-Reason: The UEFA Women's Champions League has already been explicitly mentioned, but it is an intermediate reasoning result.
-Revision method: Replace "qualified for the UEFA Women's Champions League" with "qualified for a European women's club competition."
+You need to compare the question against the reasoning chain sentence by sentence and check whether either of the following problems appears:
+1. The question explicitly reveals an intermediate answer.
+2. The question does not explicitly mention an intermediate answer, but based on common knowledge, the description in the question allows the real referent of an entity to be directly inferred.
 
-1. Potential shortcuts: If, when inferring the target of any hop, it is actually unnecessary to first infer that hop’s source, and the target can instead be obtained directly from clues in the question, then a shortcut exists. For example:
-“This player (Gemma Font, source) joined the women’s team of a major European club (FC Barcelona Femení, target) as a goalkeeper. In what year did this team move into the Johan Cruyff Stadium?”
-Reason: Mentioning the Johan Cruyff Stadium reveals that the team is FC Barcelona Femení, so the source does not need to be inferred.
-Revision method: Replace “Johan Cruyff Stadium” with “the team’s current main home stadium.” This removes the shortcut without changing the reasoning path.
+For issue 1, the solution is to replace the intermediate answer with a vague description or a referring expression, while making sure not to introduce ambiguity, that is, not to create multiple possible matches because the reference becomes too vague. For issue 2, the solution is to revise the wording so that the description can only lead to that intermediate result if the previous entity is already known.
 
-2. Ambiguity: If, starting from the source of a hop, multiple targets fit the description in the question, then the question is not actually answerable. In that case, you need to disambiguate by adding a restriction. For example:
-“This player (Lionel Messi, source) joined a club (FC Barcelona, target), and that club later won the UEFA Champions League. Who was the club’s first captain in the 2018–19 season?”
-Reason: Both FC Barcelona and Paris Saint-Germain fit the description that they are clubs Messi played for and that later won the UEFA Champions League, so the question is ambiguous and requires an added restriction.
-Revision method: Add a relatively vague restriction before “club” that does not directly introduce a shortcut, such as: “the youth academy of a club that this player joined.” Note that you must not add a restriction like “the club that later won the 2011 UEFA Champions League,” because that would introduce a shortcut, since only FC Barcelona won the 2011 UEFA Champions League.
+If there are multiple issues, list them one by one, without duplication or omission. Please output the result in JSON format:
 
-3. Remove redundancy: If the target can already be inferred from some clues, then any additional clues about that target can be deleted to make the question shorter and more natural. For example:
-“That nonprofit railroad museum in Lenox, reporting mark BRMX, moved its excursion train operations to the Hoosac Valley and began service to North Adams in 2016; the museum displays Budd RDC diesel multiple units...”
-Reason: The first sentence is already sufficient to identify the museum, so the part from “moved its excursion train operations...” through “began service to North Adams in 2016” is redundant.
-Revision method: Delete that entire redundant portion directly.
-
-4. Polish the wording: Make the question sound more natural to human readers, and check whether there is any referential ambiguity and revise it if needed. For example:
-“A collector who donated about 400 German Expressionist works to that museum in 1953 is depicted in a photo of a Richard Neutra-designed house in the Hollywood Hills of Los Angeles. According to the image caption for that photo, what setting is the house shown in?”
-Reason: This is an artifact of dataset construction. The image found online may not actually have a caption, and the final question is about the setting of the house, so it is unnecessary to explicitly tell the user which image to look at; the user should locate the relevant image based on the description.
-Revision method: “A collector who donated about 400 German Expressionist works to that museum in 1953 is depicted in a photo of a Richard Neutra-designed house in the Hollywood Hills of Los Angeles. What setting is the corresponding house shown in?”
-
-NOTICE: if there is an image, that means the image will serve as a part of the question, which will be provided along with the question.
-
-Now, based on the above requirements and examples, revise the upcoming question and output it in the following format:
-Reason: xxx
-Revision method: xxx
-JSON:
 {
-  "question": "..."
+  "issues": "1. ... (2. ...)",
+  "advice": "1. ... (2. ...)"
+}
+If no issue is found, output:
+{
+  "issues": "None.",
+  "advice": "No change needed."
+}
+
+Example 1:
+(reasoning chain omitted)
+"question": This image shows a celebration scene, and the logo on the green banner on the left indicates that it is related to the German national football association. This association belongs to the continental governing body of European football.
+
+Output:
+{
+    "issues": "According to the provided reasoning trajectory, the German national football association is the reasoning result of the first hop, that is, an intermediate result, but the question mentions it directly and therefore exposes it.",
+    "advice": "Replace that intermediate result and remove the specific description of it, for example: '...the football organization indicated by the logo on the banner belongs to the continental governing body of European football.' "
+}
+Example 2:
+"question": ...This player once used the ‘Hand of God’ in a World Cup he played in, and in the semifinal of that World Cup, ...
+
+Output:
+{
+    "issues": "Although the intermediate result is not explicitly exposed, the phrase 'Hand of God' is mentioned, which refers to one of the most iconic goals in football history. This description allows 'This player' and 'that World Cup' to be directly inferred, creating a shortcut relative to the earlier part of the question.",
+    "advice": "Obscure 'Hand of God', for example by changing it to 'a goal that should not have counted', so that only after identifying This player as Diego Maradona can one further infer the year of that World Cup from the description."
 }
 """
 
-PROMPT_OBFUSCATE_QUESTION = """You are revising a multi-hop question to prevent reasoning shortcuts. You will be given: a multi-hop knowledge reasoning question, which may also include an image associated with the question; the ordered source -> target hop chain supporting the question; and the final ask. For each hop, including the direction of the final ask, inspect how the target is described in the question.
 
-For each hop, if the user can identify the target directly from the clues in the question without first identifying that hop’s source, then a shortcut exists. This usually happens because the relationship between the source and target is described too explicitly, or because highly distinctive events, organizations, objects, or places make the target directly identifiable.
+PROMPT_POLISH_SHORTCUT = """
+You are reviewing a multi-hop search reasoning question for which the ideal search chain has already been provided. In this chain, the source of each hop’s statement is the intermediate answer from the previous hop. A well-constructed multi-hop reasoning question must require step-by-step inference from the beginning, so you need to ensure that no intermediate answer can be derived without the result of the previous step. In other words, avoid shortcuts: the next intermediate answer should not be inferable without considering the earlier part of the question.
 
-For example: “This player once used the ‘Hand of God’ in a World Cup he played in, and in the semifinal of that World Cup, ...” In this example, even without identifying the player (the source), the phrase “Hand of God” already makes it possible to infer that the target is the 1986 World Cup. An appropriate revision would be: “This player once won a crucial match in a World Cup he played in with a goal that should not have counted, and in the semifinal of that World Cup, ...” This ensures that only after inferring Diego Maradona (the source) can one further infer the 1986 World Cup.
+Shortcuts usually arise when the question describes an entity too explicitly, making it possible to infer the next intermediate answer directly from common knowledge or from the description itself, without needing the previous intermediate result. You should compare the question against the search chain sentence by sentence and analyze whether each intermediate result can be directly inferred from the question description, paying special attention to overly specific wording or to related entities that are explicitly exposed in the question.
 
-Another example: “The attacking midfielder (Fran Kirby) became Chelsea Women’s all-time leading goalscorer in December 2020 and was part of England’s UEFA Women’s Euro 2022-winning squad. She is linked to a photo of England’s women celebrating with the trophy after the Euro 2022 final at Wembley.” Here, even without first inferring the midfielder (the source, Fran Kirby), one can directly search for the target, namely a championship celebration photo, based on England Women winning the tournament. An appropriate revision would be: “...and was part of her national women’s team’s title-winning squad in a continental tournament in 2022. She is linked to a photo of that team celebrating with the trophy after the final of the tournament just mentioned.”
+If there is a shortcut, provide your analysis and a suggestion for revision. If there are multiple problems, list them all without omission.
+
+If there are multiple issues, list them one by one, without duplication or omission. Please output the result in JSON format:
+
+{
+  "issues": "1. ... (2. ...)",
+  "advice": "1. ... (2. ...)"
+}
+If no issue is found, output:
+{
+  "issues": "None.",
+  "advice": "No change needed."
+}
+
+Example:
+(the search chain is omitted)
+"question": "...this player later used the ‘Hand of God’ in a World Cup he played in, and in the semifinal of that World Cup, ..."
+
+Output:
+{
+    "issues": "Although the intermediate result is not explicitly exposed, the phrase 'Hand of God' is mentioned, which refers to one of the most iconic goals in football history. This description allows 'This player' and 'that World Cup' to be directly inferred, creating a shortcut relative to the earlier part of the question.",
+    "advice": "Obscure 'Hand of God', for example by changing it to 'a goal that should not have counted', so that only after identifying This player as Diego Maradona can one further infer the year of that World Cup from the description."
+}
+"""
+
+PROMPT_POLISH_AMBIGUITY = """
+Here is the English translation of the prompt:
+
+You are auditing a multi-hop search-and-reasoning question. The intended search chain for the question has already been provided, and in each hop, the source of the statement is the intermediate answer from the previous hop. An ideal multi-hop reasoning question must not contain ambiguity — that is, cases where a description is too broad, so that multiple intermediate results could plausibly satisfy the question.
+
+If ambiguity exists, you should explain where the ambiguity appears and propose an additional restricting modifier so that only the given intermediate answer fits the question. However, this modifier must remain vague enough that it does not become an independent shortcut. In other words, the solver must still derive the previous intermediate answer first before using the new description to obtain the next one.
+
+If there are multiple issues, list them one by one, without duplication or omission. Please output the result in JSON format:
+
+{
+  "issues": "1. ... (2. ...)",
+  "advice": "1. ... (2. ...)"
+}
+If no issue is found, output:
+{
+  "issues": "None.",
+  "advice": "No change needed."
+}
+
+Example 1:
+(search chain omitted)
+
+question: This university association includes an Australian university among its members. Where is the main campus of that university?
+
+Output:
+{
+  "issues": "After identifying the university association, there may still be multiple Australian universities among its members, so the question does not uniquely determine which university is being referred to.",
+  "advice": "According to the search chain, the university is actually Charles Sturt University. You can add a vague but restricting description, such as 'a university whose coat of arms contains river-like wavy lines.'"
+}
+
+Bad revision example:
+question: In the team of this player (Lionel Messi) (FC Barcelona), who was the first captain in the 2017–18 season?
+Reason it is bad: this player may have played for multiple teams before.
+
+Low-quality advice: change “the team of this player” to “the team that won the 2011 UEFA Champions League.”
+Reason: the 2011 UEFA Champions League winner directly points to FCB, so it no longer requires deriving Lionel Messi first, which creates a shortcut.
+
+High-quality advice: “the player’s first club team in Europe.”
+Reason: this is restrictive, but it still requires first deriving Lionel Messi.
+"""
+
+PROMPT_POLISH_REDUNDANCY = """
+You are auditing a multi-hop search-and-reasoning question. The intended search chain for the question has already been provided, and in each hop, the source of each statement is the intermediate answer from the previous hop. In this kind of reasoning question, the more intermediate descriptions are included, the more likely they are to directly expose the intermediate answer, so you need to examine the question and identify redundant descriptions.
+
+A redundant description means an overly detailed description of an entity in the question such that removing it would make the question harder, but would not create ambiguity in the reasoning process. (Note that some descriptions are necessary, because removing them would make multiple entities fit the description and thus introduce ambiguity.)
+
+If there are multiple issues, list them one by one, without duplication or omission. Please output the result in JSON format:
+
+{
+  "issues": "1. ... (2. ...)",
+  "advice": "1. ... (2. ...)"
+}
+If no issue is found, output:
+{
+  "issues": "None.",
+  "advice": "No change needed."
+}
+Example:
+question: The winner of that tournament came from Germany’s highest women’s league, which began in 1990 with two regional divisions before later becoming a single nationwide competition. For the 1997–98 season, what structural change was introduced in that league?
+
+Output:
+{
+  "issues": "Under the intended reasoning chain, the logic is: tournament winner -> the German league they came from. So the added description of the league is unnecessary and may create a shortcut.",
+  "advice": "Delete 'which began in 1990 with two regional divisions before later becoming a single nationwide competition.'"
+}
+"""
+
+PROMPT_POLISH_WORDING = """
+You are auditing a generated multi-hop question and focusing on only one issue: wording and fluency.
+
+Judge only whether the question sounds unnatural, awkward, overly like a stitched-together search chain, or contains unclear references. Focus especially on the following aspects:
+
+1. Unclear pronoun references. Based on the search-and-reasoning chain, verify whether every pronoun in the question clearly refers to a unique target.
+2. Rigid and overly fragmented phrasing. Sometimes a question is written in an unnecessarily long and scattered way, and we want a more compact structure. For example:
+   "In this continental organization, the member association representing France is that country's football governing body. That French member association was created in 1919 by transforming an earlier organization. What was the name of that earlier organization? On what exact date did this transformation occur? Who became the first president after the change?"
+   can be improved to:
+   "The French representative member of this continental organization was reorganized in 1919. What was the organization’s name before the reorganization, on what exact date did it occur, and who became the first president afterward?"
+3. Rigid image descriptions. If the question includes an image, it should refer to it as "this image" rather than giving a stiff literal description of the picture. Also, if solving the question requires searching for another image, the question can hide that operation somewhat to make it sound more natural. For example:
+   "...and there is also a draft-night photo of the player that team had selected first overall the previous year alongside the league commissioner. In that draft photo, what is the player wearing on his head?"
+   The second sentence explicitly instructs the solver to locate a particular image. This can be made more natural by hiding that operation, such as:
+   "What was worn on the head of the player whom that team had selected first overall the previous year when he appeared alongside the league commissioner on draft night?"
+   This revised version sounds more natural.
+
+Note: if there is an image, it means the image will be shown to the respondent together with the question. Check the coherence and correctness of the question against the image.
+
+Please identify all such issues in the question, completely and without omission or duplication. Return valid JSON containing only the following fields:
+{
+  "issues": "1. ... 2. ...",
+  "advice": "1. ... 2. ..."
+}
+If no issue is found, output:
+{
+  "issues": "None.",
+  "advice": "No change needed."
+}
+"""
+
+PROMPT_POLISH_REWRITE = """
+You are revising an existing multi-hop question based on a set of diagnostic reports. This multi-hop search question may have issues related to object obfuscation, shortcuts, ambiguity, grammatical correctness, or fluency. You will be given a question, the hop chain that supports its search and reasoning process, and a set of diagnostic issue descriptions and revision suggestions. Your task is to address all valid diagnostic feedback together and produce one revised question.
 
 Requirements:
-1. Preserve the order and direction of every hop exactly.
-2. Once the source of a hop is known, each target must still be uniquely identifiable. Your obfuscation must not introduce ambiguity such that multiple targets would satisfy the description.
-3. Do not mechanically remove all explicit proper nouns. Ensure that the revised question remains answerable without ambiguity while eliminating unnecessary shortcuts.
-4. Apply the same obfuscation principle to the final question in the sentence, but do not change what is being asked and do not change the answer.
-5. Keep pronoun references clear.
-6. If there is no safe and necessary room for improvement, return the original question unchanged.
+1. Preserve the order and reasoning direction of the underlying hops.
+2. Preserve the final answer exactly.
+3. Ensure that the revised question is natural and fluent, with no referential errors and no ambiguity.
 
-Before rewriting, first conduct careful analysis, understand the intent of the question, and think through the reasoning path. Make sure that for every hop: when the source is unknown, the target cannot be inferred from the clues in the question alone; and when the source is known, there is exactly one target consistent with both the source and the question.
+Note: if there is an image, it means the image will be shown to the respondent together with the question. Check the coherence and correctness of the question against the image.
 
-Output format:
-Reason: your detailed reasoning process
-Question: the revised question
+Please return valid JSON with exactly the following field:
+{
+  "question": "..."
+}
 """
 
 @dataclass(slots=True)
@@ -711,44 +833,137 @@ class QuestionWriter:
             question=draft.question,
             hops=draft.reasoning_steps,
         )
+        target_ask = draft.metadata.get("target_ask") or {}
+        obfuscation_payload = self._obfuscation_question_payload(
+            question=draft.question,
+            hops=draft.reasoning_steps,
+            final_ask=str(target_ask.get("ask_target") or "").strip(),
+        )
         starting_image_url = self._starting_image_url(path=path, graph=graph)
-        try:
-            response = self.model_client.generate(
-                ModelRequest(
-                    model=self.model,
-                    temperature=self.temperature,
-                    max_tokens=self.max_tokens,
-                    messages=[
-                        ModelMessage(role="system", content=PROMPT_POLISH_QUESTION),
-                        ModelMessage(
-                            role="user",
-                            content=self._user_message_content(
-                                polish_payload,
-                                image_url=starting_image_url,
-                            ),
-                        ),
-                    ],
-                    metadata={"trace_label": "polish_question"},
+        diagnostics: dict[str, dict[str, Any]] = {}
+        warnings: list[dict[str, Any]] = []
+        subtask_specs = [
+            ("entity_obfuscation", PROMPT_POLISH_ENTITY_OBFUSCATION, obfuscation_payload, False),
+            ("shortcut", PROMPT_POLISH_SHORTCUT, polish_payload, False),
+            ("ambiguity", PROMPT_POLISH_AMBIGUITY, polish_payload, False),
+            ("redundancy", PROMPT_POLISH_REDUNDANCY, polish_payload, False),
+            ("wording", PROMPT_POLISH_WORDING, polish_payload, True),
+        ]
+        for task_name, system_prompt, payload, use_starting_image in subtask_specs:
+            try:
+                parsed = self._generate_json(
+                    system=system_prompt,
+                    user_payload=payload,
+                    trace_label=f"polish_{task_name}",
+                    image_url=starting_image_url if use_starting_image else None,
                 )
-            )
-        except Exception as exc:
-            return self._record_writer_warning(draft, stage="polish_request", error=exc)
-        try:
-            parsed = self._extract_json_object(response.content)
-        except Exception as exc:
-            return self._record_writer_warning(draft, stage="polish_parse", error=exc)
-        polished_question = self._clean_composed_question(str(parsed.get("question") or "").strip())
-        if not polished_question:
-            return self._record_writer_warning(
-                draft,
-                stage="polish_parse",
-                error=ValueError("Model returned an empty question."),
-            )
+            except Exception as exc:
+                warnings.append(
+                    {
+                        "stage": f"polish_{task_name}",
+                        "error_type": exc.__class__.__name__,
+                        "error": str(exc),
+                    }
+                )
+                continue
+            issues = str(parsed.get("issues") or "").strip()
+            advice = str(parsed.get("advice") or parsed.get("adjust") or "").strip()
+            has_feedback = self._has_effective_feedback(issues=issues, advice=advice)
+            diagnostics[task_name] = {
+                "issues": issues,
+                "advice": advice,
+                "has_feedback": has_feedback,
+                "raw": parsed,
+            }
+        effective_diagnostics = {
+            name: item
+            for name, item in diagnostics.items()
+            if bool(item.get("has_feedback"))
+        }
         metadata = dict(draft.metadata)
+        existing_warnings = list(metadata.get("writer_warnings") or [])
+        existing_warnings.extend(warnings)
+        if existing_warnings:
+            metadata["writer_warnings"] = existing_warnings
         metadata["polish_payload"] = polish_payload
         metadata["polish_starting_image_url"] = starting_image_url
+        metadata["polish_subtasks"] = diagnostics
+        if not effective_diagnostics:
+            metadata["polish_rewrite_skipped"] = True
+            metadata["polish_rewrite_skip_reason"] = "no_subtask_feedback"
+            metadata["polish_result"] = {
+                "raw_response": None,
+                "question": draft.question,
+                "rewrite_skipped": True,
+            }
+            return QuestionDraft(
+                question=draft.question,
+                answer=draft.answer,
+                answer_type=draft.answer_type,
+                reasoning_steps=list(draft.reasoning_steps),
+                used_evidence_ids=list(draft.used_evidence_ids),
+                metadata=metadata,
+            )
+        rewrite_payload = {
+            "question": draft.question,
+            "hops": polish_payload.get("hops") or [],
+            "starting_image_attached": bool(starting_image_url),
+            "diagnostics": {
+                name: {
+                    "issues": item.get("issues") or "",
+                    "advice": item.get("advice") or "",
+                }
+                for name, item in effective_diagnostics.items()
+            },
+        }
+        try:
+            parsed = self._generate_json(
+                system=PROMPT_POLISH_REWRITE,
+                user_payload=rewrite_payload,
+                trace_label="polish_rewrite",
+                image_url=starting_image_url,
+            )
+        except Exception as exc:
+            warning_draft = self._record_writer_warning(draft, stage="polish_rewrite_request", error=exc)
+            if warnings:
+                warning_metadata = dict(warning_draft.metadata)
+                combined_warnings = list(warning_metadata.get("writer_warnings") or [])
+                combined_warnings.extend(warnings)
+                warning_metadata["writer_warnings"] = combined_warnings
+                warning_draft = QuestionDraft(
+                    question=warning_draft.question,
+                    answer=warning_draft.answer,
+                    answer_type=warning_draft.answer_type,
+                    reasoning_steps=list(warning_draft.reasoning_steps),
+                    used_evidence_ids=list(warning_draft.used_evidence_ids),
+                    metadata=warning_metadata,
+                )
+            return warning_draft
+        polished_question = self._clean_composed_question(str(parsed.get("question") or "").strip())
+        if not polished_question:
+            warning_draft = self._record_writer_warning(
+                draft,
+                stage="polish_rewrite_parse",
+                error=ValueError("Model returned an empty rewritten question."),
+            )
+            if warnings:
+                warning_metadata = dict(warning_draft.metadata)
+                combined_warnings = list(warning_metadata.get("writer_warnings") or [])
+                combined_warnings.extend(warnings)
+                warning_metadata["writer_warnings"] = combined_warnings
+                warning_draft = QuestionDraft(
+                    question=warning_draft.question,
+                    answer=warning_draft.answer,
+                    answer_type=warning_draft.answer_type,
+                    reasoning_steps=list(warning_draft.reasoning_steps),
+                    used_evidence_ids=list(warning_draft.used_evidence_ids),
+                    metadata=warning_metadata,
+                )
+            return warning_draft
+        metadata["polish_rewrite_payload"] = rewrite_payload
+        metadata["polish_rewrite_skipped"] = False
         metadata["polish_result"] = {
-            "raw_response": response.content,
+            "raw_response": parsed,
             "question": polished_question,
         }
         return QuestionDraft(
@@ -761,63 +976,15 @@ class QuestionWriter:
         )
 
     def obfuscate(self, *, draft: QuestionDraft, path: PathCandidate, graph: GraphView) -> QuestionDraft:
-        if self.model_client is None:
-            return draft
-        target_ask = draft.metadata.get("target_ask") or {}
-        obfuscation_payload = self._obfuscation_question_payload(
-            question=draft.question,
-            hops=draft.reasoning_steps,
-            final_ask=str(target_ask.get("ask_target") or "").strip(),
-        )
-        starting_image_url = self._starting_image_url(path=path, graph=graph)
-        try:
-            response = self.model_client.generate(
-                ModelRequest(
-                    model=self.model,
-                    temperature=self.temperature,
-                    max_tokens=self.max_tokens,
-                    messages=[
-                        ModelMessage(role="system", content=PROMPT_OBFUSCATE_QUESTION),
-                        ModelMessage(
-                            role="user",
-                            content=self._user_message_content(
-                                obfuscation_payload,
-                                image_url=starting_image_url,
-                            ),
-                        ),
-                    ],
-                    metadata={"trace_label": "obfuscate_question"},
-                )
-            )
-        except Exception as exc:
-            return self._record_writer_warning(draft, stage="obfuscation_request", error=exc)
-
-        obfuscated_question = self._extract_labeled_section(response.content, label="Question")
-        if not obfuscated_question:
-            return self._record_writer_warning(
-                draft,
-                stage="obfuscation_parse",
-                error=ValueError("Model response did not contain a Question section."),
-            )
-        reason = self._extract_labeled_section(response.content, label="Reason", next_label="Question")
-        obfuscated_question = self._clean_composed_question(obfuscated_question)
-        if not obfuscated_question:
-            return self._record_writer_warning(
-                draft,
-                stage="obfuscation_parse",
-                error=ValueError("Model returned an empty obfuscated question."),
-            )
-
         metadata = dict(draft.metadata)
-        metadata["obfuscation_payload"] = obfuscation_payload
-        metadata["obfuscation_starting_image_url"] = starting_image_url
         metadata["obfuscation_result"] = {
-            "raw_response": response.content,
-            "reason": reason,
-            "question": obfuscated_question,
+            "raw_response": None,
+            "reason": "Integrated into polish subtasks and aggregate rewrite.",
+            "question": draft.question,
+            "integrated_in_polish": True,
         }
         return QuestionDraft(
-            question=obfuscated_question,
+            question=draft.question,
             answer=draft.answer,
             answer_type=draft.answer_type,
             reasoning_steps=list(draft.reasoning_steps),
@@ -849,6 +1016,17 @@ class QuestionWriter:
             reasoning_steps=list(draft.reasoning_steps),
             used_evidence_ids=list(draft.used_evidence_ids),
             metadata=metadata,
+        )
+
+    @staticmethod
+    def _has_effective_feedback(*, issues: str, advice: str) -> bool:
+        normalized_issues = str(issues or "").strip().lower()
+        normalized_advice = str(advice or "").strip().lower()
+        no_issue_tokens = {"", "none.", "none"}
+        no_advice_tokens = {"", "no change needed.", "no change needed"}
+        return not (
+            normalized_issues in no_issue_tokens
+            and normalized_advice in no_advice_tokens
         )
 
     def _generate_json(
