@@ -1451,24 +1451,42 @@ def _debug_main() -> None:
         help="Optional model alias registered in synthesis/models.json. If omitted, fallback logic is used.",
     )
     parser.add_argument(
+        "--sampler-model-alias",
+        default=None,
+        help="Optional model alias registered in synthesis/models.json for LLM-guided next-hop selection.",
+    )
+    parser.add_argument(
         "--hop-sampling-strategy",
         choices=("uniform", "middle_biased"),
         default="middle_biased",
     )
+    parser.add_argument(
+        "--neighbor-selection-strategy",
+        choices=("random", "llm_guided"),
+        default="random",
+    )
+    parser.add_argument("--llm-candidate-count", type=int, default=6)
+    parser.add_argument("--llm-score-temperature", type=float, default=0.35)
     args = parser.parse_args()
 
     store = JsonlGraphStore(args.graph_dir)
-    graph = GraphView(store, allowed_edge_types=set(SamplerConfiguration().allowed_edge_types))
+    config = SamplerConfiguration(
+        min_hops=args.min_hops,
+        max_hops=args.max_hops,
+        random_seed=args.seed,
+        edge_penalty_alpha=args.edge_penalty_alpha,
+        hop_sampling_strategy=args.hop_sampling_strategy,
+        neighbor_selection_strategy=args.neighbor_selection_strategy,
+        llm_candidate_count=args.llm_candidate_count,
+        llm_score_temperature=args.llm_score_temperature,
+        max_samples=1,
+    )
+    graph = GraphView(store, allowed_edge_types=set(config.allowed_edge_types))
     sampler = RandomPathSampler(
         graph=graph,
-        config=SamplerConfiguration(
-            min_hops=args.min_hops,
-            max_hops=args.max_hops,
-            random_seed=args.seed,
-            edge_penalty_alpha=args.edge_penalty_alpha,
-            hop_sampling_strategy=args.hop_sampling_strategy,
-            max_samples=1,
-        ),
+        config=config,
+        model_client=LLM_WORKER if args.sampler_model_alias and args.neighbor_selection_strategy == "llm_guided" else None,
+        model=args.sampler_model_alias,
     )
     path = sampler.generate_one()
     print(f"graph_dir: {args.graph_dir}")
@@ -1506,6 +1524,8 @@ def _debug_main() -> None:
     print("path:")
     print(json.dumps(path.to_dict(), ensure_ascii=False, indent=2))
     print(f"writer_model: {args.model_alias or 'fallback(no llm)'}")
+    print(f"sampler_model: {args.sampler_model_alias or 'fallback(no llm)'}")
+    print(f"neighbor_selection_strategy: {args.neighbor_selection_strategy}")
     print("hop_summaries:")
     print(json.dumps(debug_hop_summaries, ensure_ascii=False, indent=2))
     print("opening_package:")
