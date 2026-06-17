@@ -452,7 +452,7 @@ class ImageDiscoveryBuilder:
             }
         )
         if persist and self.store is not None:
-            self.store.flush()
+            self.store.maybe_flush()
         _trace_timing(
             f"[image-discovery] phase=done plan_id={plan.plan_id} elapsed_s={time.perf_counter() - total_started:.3f} accepted={len(result.accepted_images())} kept={'yes' if result.image_node is not None else 'no'}"
         )

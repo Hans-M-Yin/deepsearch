@@ -172,29 +172,22 @@ class GraphRunner:
                     if self.state.status == "failed":
                         break
                 if self.state.status == "failed":
-                    self._sync_state_from_strategy()
-                    self.save_state()
+                    self._checkpoint_progress(force=True)
                     break
-                if self.config.checkpoint_every <= 1 or self.state.step % self.config.checkpoint_every == 0:
-                    self._sync_state_from_strategy()
-                    self.save_state()
             else:
                 processed_count, last_error = self._run_parallel_batch(last_error=last_error)
                 if processed_count == 0:
                     self.state.status = "completed"
                     break
                 if self.state.status == "failed":
-                    self._sync_state_from_strategy()
-                    self.save_state()
+                    self._checkpoint_progress(force=True)
                     break
 
         if self.state.status == "running":
             self.state.status = "completed" if self.strategy.queue_size() == 0 else "paused"
 
         self._finish_progress()
-        self._sync_state_from_strategy()
-        self.save_state()
-        self.store.flush()
+        self._checkpoint_progress(force=True)
         return GraphRunnerResult(
             run_id=self.state.run_id,
             status=self.state.status,
@@ -227,10 +220,20 @@ class GraphRunner:
             last_error = result.error
             if self.config.stop_on_error:
                 self.state.status = "failed"
+        self._checkpoint_progress(force=False)
+        return last_error
+
+    def _checkpoint_progress(self, *, force: bool) -> None:
+        if force:
+            self.store.flush()
+            self._sync_state_from_strategy()
+            self.save_state()
+            return
+        if self.store.has_pending_writes():
+            return
         if self.config.checkpoint_every <= 1 or self.state.step % self.config.checkpoint_every == 0:
             self._sync_state_from_strategy()
             self.save_state()
-        return last_error
 
     def _run_parallel_batch(self, *, last_error: str | None) -> tuple[int, str | None]:
         remaining_steps = self.config.max_steps - self.state.step

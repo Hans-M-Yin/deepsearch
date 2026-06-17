@@ -757,7 +757,7 @@ class WikiTextBuilder:
         if persist and self.store is not None:
             self.store.upsert_node(node)
             self.store.upsert_evidence(evidence)
-            self.store.flush()
+            self.store.maybe_flush()
         return evidence
 
     def _extract_attributes_with_llm(self, node: TextNode) -> dict[str, Any] | list[dict[str, Any]]:
@@ -1585,7 +1585,7 @@ class WikiTextBuilder:
             self.store.upsert_search_snapshot(result.snapshot)
         self.store.upsert_node(result.node)
         self.store.upsert_evidence(result.text_evidence)
-        self.store.flush()
+        self.store.maybe_flush()
 
     @staticmethod
     def _validate_article_page(

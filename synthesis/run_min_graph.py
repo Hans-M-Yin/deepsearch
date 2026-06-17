@@ -238,7 +238,9 @@ def print_startup_config(
         f"max_depth={args.max_depth} "
         f"max_neighbors={args.max_neighbors} "
         f"images_enabled={not args.no_images} "
-        f"image_backend={args.image_backend}"
+        f"image_backend={args.image_backend} "
+        f"store_flush_record_threshold={args.store_flush_record_threshold} "
+        f"store_flush_interval_s={args.store_flush_interval_s}"
     )
     print(
         "queue_state: "
@@ -378,6 +380,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--run-id", default=None, help="Optional stable run id.")
     parser.add_argument("--fresh", action="store_true", help="Ignore existing runner checkpoint state.")
+    parser.add_argument(
+        "--store-flush-record-threshold",
+        type=int,
+        default=100,
+        help="Flush graph tables after at least this many record upserts have accumulated.",
+    )
+    parser.add_argument(
+        "--store-flush-interval-s",
+        type=float,
+        default=30.0,
+        help="Flush graph tables if this many seconds pass since the last flush, even if the record threshold is not reached.",
+    )
     return parser
 
 
@@ -437,7 +451,11 @@ def main(argv: list[str] | None = None) -> int:
     store_dir = Path(args.store_dir)
     if not store_dir.is_absolute():
         store_dir = PROJECT_ROOT / store_dir
-    store = JsonlGraphStore(store_dir)
+    store = JsonlGraphStore(
+        store_dir,
+        flush_record_threshold=args.store_flush_record_threshold,
+        flush_interval_s=args.store_flush_interval_s,
+    )
     git_metadata = current_git_metadata(PROJECT_ROOT)
 
     reader = EnhancedReaderClient(base_url=args.reader_base_url)

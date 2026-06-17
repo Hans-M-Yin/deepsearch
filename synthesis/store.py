@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import time
 import sys
 from threading import RLock
 from typing import Any, Callable, Iterable
@@ -45,9 +46,18 @@ class JsonlGraphStore:
         "search_snapshots": "snapshot_id",
     }
 
-    def __init__(self, root_dir: str | Path, *, auto_flush: bool = False) -> None:
+    def __init__(
+        self,
+        root_dir: str | Path,
+        *,
+        auto_flush: bool = False,
+        flush_record_threshold: int = 1,
+        flush_interval_s: float = 0.0,
+    ) -> None:
         self.root_dir = Path(root_dir)
         self.auto_flush = auto_flush
+        self.flush_record_threshold = max(1, int(flush_record_threshold))
+        self.flush_interval_s = max(0.0, float(flush_interval_s))
         self.root_dir.mkdir(parents=True, exist_ok=True)
 
         self._tables: dict[str, dict[str, JsonRecord]] = {
@@ -55,6 +65,8 @@ class JsonlGraphStore:
         }
         self._dirty: set[str] = set()
         self._lock = RLock()
+        self._pending_write_count = 0
+        self._last_flush_monotonic = time.monotonic()
         self.load()
 
     def load(self) -> None:
@@ -62,12 +74,32 @@ class JsonlGraphStore:
             for table, file_name in self.TABLE_FILES.items():
                 self._tables[table] = self._read_table(table, self.root_dir / file_name)
             self._dirty.clear()
+            self._pending_write_count = 0
+            self._last_flush_monotonic = time.monotonic()
 
     def flush(self) -> None:
+        self.maybe_flush(force=True)
+
+    def maybe_flush(self, *, force: bool = False) -> bool:
         with self._lock:
+            if not self._dirty:
+                return False
+            if not force and not self._should_flush_locked():
+                return False
             for table in list(self._dirty):
                 self._write_table(table, self.root_dir / self.TABLE_FILES[table])
             self._dirty.clear()
+            self._pending_write_count = 0
+            self._last_flush_monotonic = time.monotonic()
+            return True
+
+    def has_pending_writes(self) -> bool:
+        with self._lock:
+            return bool(self._dirty)
+
+    def pending_write_count(self) -> int:
+        with self._lock:
+            return self._pending_write_count
 
     def upsert_node(self, node: Node | JsonRecord) -> JsonRecord:
         return self._upsert("nodes", node)
@@ -161,9 +193,17 @@ class JsonlGraphStore:
 
             self._tables[table][record_id] = record
             self._dirty.add(table)
+            self._pending_write_count += 1
             if self.auto_flush:
                 self.flush()
             return dict(record)
+
+    def _should_flush_locked(self) -> bool:
+        if self._pending_write_count >= self.flush_record_threshold:
+            return True
+        if self.flush_interval_s > 0 and (time.monotonic() - self._last_flush_monotonic) >= self.flush_interval_s:
+            return True
+        return False
 
     @staticmethod
     def _to_record(record_or_obj: Any) -> JsonRecord:
