@@ -40,3 +40,12 @@ export ENHANCED_READER_URL="http://10.124.136.252:8004"
 export SFT_SUMMARIZER_API_BASE="http://127.0.0.1:6658/v1"
 export SFT_SUMMARIZER_MODEL="Qwen3-VL-32B"
 export SFT_SUMMARIZER_API_KEY="EMPTY"
+
+
+export SERPER_API_KEY="7f1dbdcbe6f551e113a1a394fdd60b5b186ae0f3"
+export SERPER_SEARCH_URL="https://google.serper.dev/search"
+export SERPER_IMAGES_URL="https://google.serper.dev/images"
+export SERPER_API_KEYS_FILE="synthesis/serper_keys.txt"
+export SERPER_API_POOL_STATE_FILE="synthesis/.serper_pool_state.json"
+export SERPER_API_POOL_DEFAULT_CREDITS="2500"
+export SERPER_API_POOL_MIN_REMAINING="100"
