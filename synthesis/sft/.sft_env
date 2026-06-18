@@ -23,7 +23,8 @@ export SFT_OPENAI_API_VERSION="2024-03-01-preview"
 # Request headers / body knobs.
 # Fill in a real logid before running if needed.
 export SFT_OPENAI_HEADERS_JSON='{"X-TT-LOGID":"${your_logid}"}'
-export SFT_OPENAI_EXTRA_BODY_JSON='{"thinking":{"include_thoughts":true,"budget_tokens":2000}}'
+export SFT_OPENAI_EXTRA_BODY_JSON='{"thinking":{"include_thoughts":true,"budget_tokens":8192}}'
+export SFT_OPENAI_MAX_TOKENS=16000
 
 
 # ---------------------------------------------------------------------------
