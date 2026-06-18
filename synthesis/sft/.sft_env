@@ -19,12 +19,27 @@ export SFT_OPENAI_AZURE_ENDPOINT="https://aidp-i18ntt-sg.byteintl.net/api/modelh
 # Backward-compatible alias.
 export SFT_OPENAI_BASE_URL="${SFT_OPENAI_AZURE_ENDPOINT}"
 export SFT_OPENAI_API_VERSION="2024-03-01-preview"
+export SFT_OPENAI_API_MODE="chat_completions"
 
 # Request headers / body knobs.
 # Fill in a real logid before running if needed.
 export SFT_OPENAI_HEADERS_JSON='{"X-TT-LOGID":"${your_logid}"}'
 export SFT_OPENAI_EXTRA_BODY_JSON='{"thinking":{"include_thoughts":true,"budget_tokens":8192}}'
 export SFT_OPENAI_MAX_TOKENS=16000
+
+
+# ---------------------------------------------------------------------------
+# GPT-5.4 Responses-API branch
+# ---------------------------------------------------------------------------
+
+export SFT_GPT54_MODEL="gpt-5.4-2026-03-05"
+export SFT_GPT54_API_KEY="YB9OeapWfFYKOmfRRroZHzTuKGT0Vt7p_GPT_AK"
+export SFT_GPT54_AZURE_ENDPOINT="https://aidp-i18ntt-sg.byteintl.net/api/modelhub/online/responses"
+
+# Office network:
+# export SFT_GPT54_AZURE_ENDPOINT="https://aidp-i18ntt-sg.tiktok-row.net/api/modelhub/online/responses"
+
+export SFT_GPT54_API_VERSION="2024-03-01-preview"
 
 
 # ---------------------------------------------------------------------------

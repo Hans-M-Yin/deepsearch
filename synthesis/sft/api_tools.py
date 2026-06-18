@@ -102,6 +102,7 @@ class OpenAIToolAgentConfig:
     api_key: str | None = None
     azure_endpoint: str | None = None
     api_version: str = "2024-03-01-preview"
+    api_mode: str = "chat_completions"
     max_tokens: int = 1024
     temperature: float = 0.2
     timeout_s: float = 120.0
@@ -404,6 +405,20 @@ def _assistant_message_for_followup(message: Any) -> dict[str, Any]:
     return assistant_message
 
 
+def _assistant_message_for_followup_from_dict(
+    *,
+    content: str,
+    tool_calls: list[dict[str, Any]],
+) -> dict[str, Any]:
+    assistant_message: dict[str, Any] = {
+        "role": "assistant",
+        "tool_calls": tool_calls,
+    }
+    if content:
+        assistant_message["content"] = content
+    return assistant_message
+
+
 def _json_text(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, indent=2)
 
@@ -430,6 +445,106 @@ def _print_round_output(turn_index: int, assistant_message: Any) -> None:
                     }
                 )
             )
+
+
+def _print_round_output_from_responses(
+    turn_index: int,
+    *,
+    content: str,
+    tool_calls: list[dict[str, Any]],
+) -> None:
+    print(f"\n=== Model Round {turn_index + 1} ===")
+    if content:
+        print(content)
+    if tool_calls:
+        print("tool_calls:")
+        for tool_call in tool_calls:
+            print(_json_text(tool_call))
+
+
+def _message_content_to_responses_content(content: Any) -> list[dict[str, Any]]:
+    if isinstance(content, str):
+        return [{"type": "input_text", "text": content}]
+    if isinstance(content, list):
+        normalized_parts: list[dict[str, Any]] = []
+        for part in content:
+            if not isinstance(part, dict):
+                normalized_parts.append({"type": "input_text", "text": str(part)})
+                continue
+            part_type = part.get("type")
+            if part_type == "text":
+                normalized_parts.append({"type": "input_text", "text": str(part.get("text", ""))})
+            elif part_type == "input_text":
+                normalized_parts.append({"type": "input_text", "text": str(part.get("text", ""))})
+            elif part_type == "image_url":
+                image_url = part.get("image_url")
+                if isinstance(image_url, dict):
+                    url = image_url.get("url", "")
+                    detail = image_url.get("detail")
+                else:
+                    url = image_url
+                    detail = part.get("detail")
+                item = {"type": "input_image", "image_url": url}
+                if detail:
+                    item["detail"] = detail
+                normalized_parts.append(item)
+            elif part_type == "input_image":
+                normalized_parts.append(dict(part))
+            else:
+                normalized_parts.append(dict(part))
+        return normalized_parts
+    if content is None:
+        return [{"type": "input_text", "text": ""}]
+    return [{"type": "input_text", "text": str(content)}]
+
+
+def _messages_to_responses_input(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    for message in messages:
+        role = str(message.get("role") or "user")
+        if role == "tool":
+            continue
+        items.append(
+            {
+                "role": role,
+                "content": _message_content_to_responses_content(message.get("content")),
+            }
+        )
+    return items
+
+
+def _extract_responses_content_and_tool_calls(raw_response: dict[str, Any]) -> tuple[str, list[dict[str, Any]]]:
+    output_items = raw_response.get("output") or []
+    text_parts: list[str] = []
+    tool_calls: list[dict[str, Any]] = []
+
+    for index, item in enumerate(output_items):
+        if not isinstance(item, dict):
+            continue
+        item_type = item.get("type")
+        if item_type == "message":
+            for content_item in item.get("content") or []:
+                if not isinstance(content_item, dict):
+                    continue
+                if content_item.get("type") in {"output_text", "text"}:
+                    text = content_item.get("text")
+                    if text:
+                        text_parts.append(str(text))
+        elif item_type == "function_call":
+            call_id = item.get("call_id") or item.get("id") or ""
+            tool_calls.append(
+                {
+                    "index": len(tool_calls),
+                    "id": call_id,
+                    "type": "function",
+                    "function": {
+                        "name": item.get("name", ""),
+                        "arguments": item.get("arguments", "{}"),
+                    },
+                }
+            )
+
+    return "\n".join(part for part in text_parts if part).strip(), tool_calls
 
 
 def execute_tool_call(
@@ -569,6 +684,28 @@ class OpenAIToolAgent:
         context: ToolRuntimeContext | None = None,
         system_prompt: str | None = None,
     ) -> AgentRunResult:
+        if self.config.api_mode == "responses":
+            return self._run_responses(
+                prompt=prompt,
+                messages=messages,
+                context=context,
+                system_prompt=system_prompt,
+            )
+        return self._run_chat_completions(
+            prompt=prompt,
+            messages=messages,
+            context=context,
+            system_prompt=system_prompt,
+        )
+
+    def _run_chat_completions(
+        self,
+        *,
+        prompt: str | None = None,
+        messages: list[dict[str, Any]] | None = None,
+        context: ToolRuntimeContext | None = None,
+        system_prompt: str | None = None,
+    ) -> AgentRunResult:
         context = context or ToolRuntimeContext(working_dir=os.getcwd())
         conversation_messages = _build_initial_messages(
             prompt=prompt,
@@ -632,6 +769,97 @@ class OpenAIToolAgent:
             raw_responses=raw_responses,
         )
 
+    def _run_responses(
+        self,
+        *,
+        prompt: str | None = None,
+        messages: list[dict[str, Any]] | None = None,
+        context: ToolRuntimeContext | None = None,
+        system_prompt: str | None = None,
+    ) -> AgentRunResult:
+        context = context or ToolRuntimeContext(working_dir=os.getcwd())
+        conversation_messages = _build_initial_messages(
+            prompt=prompt,
+            messages=messages,
+            context=context,
+            system_prompt=system_prompt,
+            default_system_prompt=self.config.system_prompt,
+        )
+        tool_results: list[ToolExecutionResult] = []
+        raw_responses: list[dict[str, Any]] = []
+        final_text = ""
+        current_input = _messages_to_responses_input(conversation_messages)
+        previous_response_id: str | None = None
+
+        for turn_index in range(self.config.max_turns):
+            kwargs: dict[str, Any] = {
+                "model": self.config.model,
+                "input": current_input,
+                "tools": tools.get_responses_tool_definitions(),
+            }
+            if self.config.max_tokens is not None:
+                kwargs["max_output_tokens"] = self.config.max_tokens
+            if self.config.extra_body:
+                kwargs["extra_body"] = self.config.extra_body
+            if previous_response_id:
+                kwargs["previous_response_id"] = previous_response_id
+
+            response = self.client.responses.create(**kwargs)
+            raw_response = response.model_dump() if hasattr(response, "model_dump") else {"repr": repr(response)}
+            raw_responses.append(raw_response)
+            previous_response_id = raw_response.get("id") or getattr(response, "id", None)
+
+            assistant_content, assistant_tool_calls = _extract_responses_content_and_tool_calls(raw_response)
+            if self.config.print_rounds:
+                _print_round_output_from_responses(
+                    turn_index,
+                    content=assistant_content,
+                    tool_calls=assistant_tool_calls,
+                )
+
+            if not assistant_tool_calls:
+                final_text = assistant_content
+                conversation_messages.append({"role": "assistant", "content": final_text})
+                break
+
+            conversation_messages.append(
+                _assistant_message_for_followup_from_dict(
+                    content=assistant_content,
+                    tool_calls=assistant_tool_calls,
+                )
+            )
+
+            current_input = []
+            for tool_call in assistant_tool_calls:
+                parsed_args = json.loads(tool_call["function"]["arguments"] or "{}")
+                result = execute_tool_call(tool_call["function"]["name"], parsed_args, context)
+                tool_results.append(result)
+                conversation_messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tool_call["id"],
+                        "name": tool_call["function"]["name"],
+                        "content": result.output_text,
+                        "type": "function",
+                    }
+                )
+                current_input.append(
+                    {
+                        "type": "function_call_output",
+                        "call_id": tool_call["id"],
+                        "output": result.output_text,
+                    }
+                )
+        else:
+            final_text = "Max tool-calling turns reached before the model produced a final answer."
+
+        return AgentRunResult(
+            final_text=final_text,
+            messages=conversation_messages,
+            tool_results=tool_results,
+            raw_responses=raw_responses,
+        )
+
 
 def _parse_json_flag(value: str | None) -> dict[str, Any] | None:
     if not value:
@@ -677,6 +905,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model", default=os.environ.get("SFT_OPENAI_MODEL") or os.environ.get("OPENAI_MODEL") or "")
     parser.add_argument("--api-key", default=os.environ.get("OPENAI_API_KEY"))
     parser.add_argument(
+        "--api-mode",
+        choices=("chat_completions", "responses"),
+        default=os.environ.get("SFT_OPENAI_API_MODE") or "chat_completions",
+    )
+    parser.add_argument(
         "--azure-endpoint",
         default=(
             os.environ.get("SFT_OPENAI_AZURE_ENDPOINT")
@@ -700,6 +933,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--case-id", default="sft_session")
     parser.add_argument("--image", action="append", help="Preload a local image path as img_n.")
     parser.add_argument("--image-url", action="append", help="Preload a remote image URL as img_n.")
+    parser.add_argument("--gpt54", action="store_true", help="Use the GPT-5.4 Responses-API branch from .sft_env.")
     parser.add_argument("--verbose", action="store_true")
     return parser
 
@@ -720,11 +954,19 @@ def main(argv: list[str] | None = None) -> int:
     if sum(1 for item in [args.prompt, args.messages_json, args.messages_file] if item) > 1:
         parser.error("Use only one of --prompt, --messages-json, or --messages-file.")
 
+    if args.gpt54:
+        args.api_mode = "responses"
+        args.model = os.environ.get("SFT_GPT54_MODEL") or "gpt-5.4-2026-03-05"
+        args.api_key = os.environ.get("SFT_GPT54_API_KEY") or args.api_key
+        args.azure_endpoint = os.environ.get("SFT_GPT54_AZURE_ENDPOINT") or args.azure_endpoint
+        args.api_version = os.environ.get("SFT_GPT54_API_VERSION") or args.api_version
+
     config = OpenAIToolAgentConfig(
         model=args.model,
         api_key=args.api_key,
         azure_endpoint=args.azure_endpoint,
         api_version=args.api_version,
+        api_mode=args.api_mode,
         max_tokens=args.max_tokens,
         temperature=args.temperature,
         timeout_s=args.timeout_s,

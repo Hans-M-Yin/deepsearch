@@ -16,6 +16,7 @@ Optional:
   --image /abs/path/to/image.png      Preload a local image as img_n
   --image-url https://...             Preload a remote image as img_n
   --workdir /abs/path/to/output_dir   Override runtime working directory
+  --gpt54                             Use the GPT-5.4 Responses-API branch
   --verbose                           Enable verbose logging
   --office-net                        Switch endpoint to tiktok-row office domain
   --help                              Show this help
@@ -68,6 +69,7 @@ MESSAGES_FILE=""
 WORKDIR=""
 VERBOSE=0
 OFFICE_NET=0
+GPT54=0
 
 PY_ARGS=()
 
@@ -91,6 +93,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --verbose)
       VERBOSE=1
+      shift
+      ;;
+    --gpt54)
+      GPT54=1
       shift
       ;;
     --office-net)
@@ -121,14 +127,26 @@ if [[ -z "${PROMPT}" && -z "${MESSAGES_FILE}" ]]; then
 fi
 
 if [[ "${OFFICE_NET}" -eq 1 ]]; then
-  export SFT_OPENAI_AZURE_ENDPOINT="https://aidp-i18ntt-sg.tiktok-row.net/api/modelhub/online/v2/crawl"
-  export SFT_OPENAI_BASE_URL="${SFT_OPENAI_AZURE_ENDPOINT}"
+  if [[ "${GPT54}" -eq 1 ]]; then
+    export SFT_GPT54_AZURE_ENDPOINT="https://aidp-i18ntt-sg.tiktok-row.net/api/modelhub/online/responses"
+  else
+    export SFT_OPENAI_AZURE_ENDPOINT="https://aidp-i18ntt-sg.tiktok-row.net/api/modelhub/online/v2/crawl"
+    export SFT_OPENAI_BASE_URL="${SFT_OPENAI_AZURE_ENDPOINT}"
+  fi
 fi
 
-require_env "SFT_OPENAI_MODEL"
-require_env "SFT_OPENAI_AZURE_ENDPOINT"
-require_env "SFT_OPENAI_API_VERSION"
-require_env "OPENAI_API_KEY"
+if [[ "${GPT54}" -eq 1 ]]; then
+  require_env "SFT_GPT54_MODEL"
+  require_env "SFT_GPT54_AZURE_ENDPOINT"
+  require_env "SFT_GPT54_API_VERSION"
+  require_env "SFT_GPT54_API_KEY"
+  PY_ARGS+=(--gpt54)
+else
+  require_env "SFT_OPENAI_MODEL"
+  require_env "SFT_OPENAI_AZURE_ENDPOINT"
+  require_env "SFT_OPENAI_API_VERSION"
+  require_env "OPENAI_API_KEY"
+fi
 
 if [[ -n "${WORKDIR}" ]]; then
   PY_ARGS+=(--workdir "${WORKDIR}")
@@ -151,9 +169,17 @@ fi
 cd "${PROJECT_ROOT}"
 
 echo "=== SFT Agent Config ==="
-echo "model: ${SFT_OPENAI_MODEL}"
-echo "azure_endpoint: ${SFT_OPENAI_AZURE_ENDPOINT}"
-echo "api_version: ${SFT_OPENAI_API_VERSION}"
+if [[ "${GPT54}" -eq 1 ]]; then
+  echo "api_mode: responses"
+  echo "model: ${SFT_GPT54_MODEL}"
+  echo "azure_endpoint: ${SFT_GPT54_AZURE_ENDPOINT}"
+  echo "api_version: ${SFT_GPT54_API_VERSION}"
+else
+  echo "api_mode: chat_completions"
+  echo "model: ${SFT_OPENAI_MODEL}"
+  echo "azure_endpoint: ${SFT_OPENAI_AZURE_ENDPOINT}"
+  echo "api_version: ${SFT_OPENAI_API_VERSION}"
+fi
 echo "reader: ${ENHANCED_READER_URL:-${JINA_READER_URL:-<unset>}}"
 echo "summarizer_base: ${SFT_SUMMARIZER_API_BASE:-${QWEN_API_BASE:-<unset>}}"
 echo "summarizer_model: ${SFT_SUMMARIZER_MODEL:-${QWEN_MODEL_NAME:-<unset>}}"
