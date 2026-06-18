@@ -19,17 +19,98 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import mimetypes
 import os
 import re
+import tempfile
 import time
-from typing import Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
+from urllib.parse import urlparse
 
 import requests
 
 from . import config
+from . import image_io
 
 
 logger = logging.getLogger(__name__)
+
+
+def _build_serper_client():
+    """Create the shared Serper client from synthesis' backend wrapper."""
+
+    from synthesis.search_client import SerperSearchClient
+
+    return SerperSearchClient(
+        api_key=config.SERPER_API_KEY or None,
+        search_url=config.SERPER_SEARCH_URL,
+        images_url=config.SERPER_IMAGES_URL,
+        timeout_s=60.0,
+    )
+
+
+def _format_search_results(results: list[dict[str, Any]]) -> str:
+    return json.dumps(results, ensure_ascii=False, indent=2)
+
+
+def _guess_image_from_url(url: str) -> bool:
+    guessed_type, _ = mimetypes.guess_type(urlparse(url).path)
+    return bool(guessed_type and guessed_type.startswith("image/"))
+
+
+def _probe_content_type(url: str) -> str:
+    try:
+        response = requests.head(url, allow_redirects=True, timeout=20)
+        content_type = response.headers.get("Content-Type", "")
+        if content_type:
+            return content_type.split(";", 1)[0].strip().lower()
+    except Exception:
+        pass
+
+    try:
+        response = requests.get(url, allow_redirects=True, stream=True, timeout=20)
+        content_type = response.headers.get("Content-Type", "")
+        response.close()
+        if content_type:
+            return content_type.split(";", 1)[0].strip().lower()
+    except Exception:
+        pass
+
+    if _guess_image_from_url(url):
+        guessed_type, _ = mimetypes.guess_type(urlparse(url).path)
+        return guessed_type or "image/*"
+    return ""
+
+
+def _enhanced_reader_read(url: str) -> dict[str, Any]:
+    from synthesis.wiki_text_builder import EnhancedReaderClient
+
+    reader = EnhancedReaderClient(
+        base_url=config.ENHANCED_READER_URL,
+        timeout_s=config.ENHANCED_READER_TIMEOUT_S,
+    )
+    document = reader.read(url)
+    return {
+        "url": document.url,
+        "title": document.title or "",
+        "content": document.content or "",
+        "raw_markdown": document.raw_markdown or "",
+        "raw": document.raw,
+    }
+
+
+def _read_document(url: str) -> dict[str, Any]:
+    reader_base = config.ENHANCED_READER_URL.rstrip("/")
+    if reader_base.endswith("r.jina.ai") or "r.jina.ai" in reader_base:
+        content = _read_via_jina(url)
+        return {
+            "url": url,
+            "title": "",
+            "content": content,
+            "raw_markdown": content,
+            "raw": {"reader": "jina_direct"},
+        }
+    return _enhanced_reader_read(url)
 
 
 # ---------------------------------------------------------------------------
@@ -381,48 +462,77 @@ def _read_via_jina(url: str) -> str:
     return ""
 
 
-def text_search(query: str, lang: str = "en", top_k: int = 5) -> str:
-    """Run a Serper search, fetch each page through Jina and summarise."""
+def read_url(url: str, query: str = "") -> dict[str, Any]:
+    """Read a URL as either text content or a downloadable image."""
 
-    use_gateway = config.gateway_enabled()
+    normalized_url = (url or "").strip()
+    if not normalized_url:
+        return {"error": "URL is required."}
+    if not normalized_url.startswith(("http://", "https://")):
+        normalized_url = f"https://{normalized_url}"
+
+    content_type = _probe_content_type(normalized_url)
+    if content_type.startswith("image/"):
+        temp_dir = tempfile.mkdtemp(prefix="opensearch_vl_read_url_")
+        filename = os.path.basename(urlparse(normalized_url).path) or "downloaded_image"
+        if not os.path.splitext(filename)[1]:
+            extension = mimetypes.guess_extension(content_type) or ".png"
+            filename = f"{filename}{extension}"
+        local_path = image_io.download_to_temp(normalized_url, temp_dir, filename)
+        if not local_path:
+            return {"error": f"Failed to download image from {normalized_url}"}
+        return {
+            "kind": "image",
+            "url": normalized_url,
+            "content_type": content_type,
+            "local_path": local_path,
+        }
+
     try:
-        if use_gateway:
-            organic = _search_via_gateway(query, lang, top_k)
-        else:
-            organic = _search_via_serper(query, lang, top_k)
+        document = _read_document(normalized_url)
+    except Exception as exc:
+        return {"error": f"read_url failed for {normalized_url}: {exc}"}
+
+    content = document.get("content", "") or ""
+    title = document.get("title", "") or ""
+    summary = summarize_with_qwen(content=content, query=query, title=title) if query else ""
+    return {
+        "kind": "text",
+        "url": document.get("url") or normalized_url,
+        "title": title,
+        "content": content,
+        "summary": summary,
+        "raw_markdown": document.get("raw_markdown", "") or "",
+    }
+
+
+def t2t_search(query: str, lang: str = "en", top_k: int = 5) -> str:
+    """Search text pages via synthesis' Serper backend, then read/summarize."""
+
+    try:
+        response = _build_serper_client().search_text(query, limit=top_k, hl=lang)
     except Exception as exc:
         return f"Tool execution error:\nText search failed: {exc}"
 
-    if not organic:
+    if not response.results:
         return "Tool execution result:\nNo relevant web pages found for the query."
 
-    pages = []
-    for idx, item in enumerate(organic[:top_k], start=1):
-        url = item.get("link", "")
-        title = item.get("title", "")
-        snippet = item.get("snippet", "")
-        content = snippet
+    formatted: list[str] = []
+    for idx, item in enumerate(response.results[:top_k], start=1):
+        title = item.title or ""
+        url = item.url or ""
+        snippet = item.snippet or ""
+        summary = snippet
         if url:
-            try:
-                if use_gateway:
-                    fetched = _read_via_gateway(url)
-                else:
-                    fetched = _read_via_jina(url)
-                if fetched:
-                    content = fetched
-            except Exception as exc:
-                logger.debug("Jina fetch failed for %s: %s", url, exc)
-        pages.append({"index": idx, "url": url, "title": title, "content": content})
-
-    formatted = []
-    for page in pages:
-        summary = summarize_with_qwen(
-            content=page["content"], query=query, title=page["title"]
-        )
+            read_result = read_url(url, query=query)
+            if read_result.get("kind") == "text":
+                summary = read_result.get("summary") or read_result.get("content") or snippet
+            elif read_result.get("error"):
+                logger.debug("read_url failed during t2t_search for %s: %s", url, read_result["error"])
         formatted.append(
-            f"[Passage {page['index']}]\n"
-            f"Title: {page['title']}\n"
-            f"URL: {page['url']}\n"
+            f"[Passage {idx}]\n"
+            f"Title: {title}\n"
+            f"URL: {url}\n"
             f"Summary:\n{summary}"
         )
 
@@ -430,21 +540,40 @@ def text_search(query: str, lang: str = "en", top_k: int = 5) -> str:
     return f"Tool execution result:\n{body}"
 
 
-def image_search(
+def t2i_search(query: str, lang: str = "en", top_k: int = 5) -> str:
+    """Search images from text using synthesis' Serper backend."""
+
+    try:
+        response = _build_serper_client().search_image(query, limit=top_k, hl=lang)
+    except Exception as exc:
+        return f"Tool execution error:\nText-to-image search failed: {exc}"
+
+    results = [
+        {
+            "title": item.title,
+            "image_url": item.image_url,
+            "source_page_url": item.source_page_url,
+            "thumbnail_url": item.thumbnail_url,
+            "source": item.source,
+            "snippet": item.snippet,
+            "rank": item.rank,
+        }
+        for item in response.results[:top_k]
+    ]
+    if not results:
+        return "Tool execution result:\nNo relevant images found for the query."
+    return f"Tool execution result:\n{_format_search_results(results)}"
+
+
+def i2i_search(
     image_url: str,
     visual_lookup: Optional[Callable[..., object]] = None,
     max_retries: int = 3,
     base_delay: int = 2,
 ) -> str:
-    """Run an external visual lookup against ``image_url`` and summarise it."""
+    """Reverse-image search using Serper Lens or a caller-provided backend."""
 
     if not visual_lookup:
-        # return (
-        #     "Tool execution error:\n"
-        #     "image_search requires a visual lookup callable. Configure one via "
-        #     "the runner (e.g. an external lens / similar-image API) before "
-        #     "invoking image_search."
-        # )
         visual_lookup = _image_search_via_serper
 
     last_error: Optional[Exception] = None
@@ -464,4 +593,26 @@ def image_search(
             last_error = exc
             if attempt < max_retries:
                 time.sleep(base_delay * (2 ** (attempt - 1)))
-    return f"Tool execution error:\nimage_search failed after {max_retries} retries: {last_error}"
+    return f"Tool execution error:\ni2i_search failed after {max_retries} retries: {last_error}"
+
+
+def text_search(query: str, lang: str = "en", top_k: int = 5) -> str:
+    """Backward-compatible alias for ``t2t_search``."""
+
+    return t2t_search(query=query, lang=lang, top_k=top_k)
+
+
+def image_search(
+    image_url: str,
+    visual_lookup: Optional[Callable[..., object]] = None,
+    max_retries: int = 3,
+    base_delay: int = 2,
+) -> str:
+    """Backward-compatible alias for ``i2i_search``."""
+
+    return i2i_search(
+        image_url=image_url,
+        visual_lookup=visual_lookup,
+        max_retries=max_retries,
+        base_delay=base_delay,
+    )

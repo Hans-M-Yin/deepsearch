@@ -59,6 +59,13 @@ SERPER_LENS_URL: str = os.environ.get(
 )
 JINA_API_KEY: str = os.environ.get("JINA_API_KEY", "")
 JINA_READER_URL: str = os.environ.get("JINA_READER_URL", "https://r.jina.ai/")
+ENHANCED_READER_URL: str = os.environ.get(
+    "ENHANCED_READER_URL",
+    os.environ.get("JINA_READER_URL", "http://127.0.0.1:8004"),
+)
+ENHANCED_READER_TIMEOUT_S: float = float(
+    os.environ.get("ENHANCED_READER_TIMEOUT_S", "180")
+)
 
 
 # ---------------------------------------------------------------------------

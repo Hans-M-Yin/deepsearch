@@ -1,0 +1,42 @@
+# SFT tool-calling framework environment
+# Usage from project root:
+#   source synthesis/sft/.sft_env
+
+
+# ---------------------------------------------------------------------------
+# Main chat model endpoint
+# ---------------------------------------------------------------------------
+
+export SFT_OPENAI_MODEL="gemini-3-pro-preview-new"
+export OPENAI_API_KEY="C3o2Gg54H1dClT7p4cwoVrGnCpF60Wfy_GPT_AK"
+
+# Default network endpoint.
+export SFT_OPENAI_AZURE_ENDPOINT="https://aidp-i18ntt-sg.byteintl.net/api/modelhub/online/v2/crawl"
+
+# Office network: switch to the following domain instead.
+# export SFT_OPENAI_AZURE_ENDPOINT="https://aidp-i18ntt-sg.tiktok-row.net/api/modelhub/online/v2/crawl"
+
+# Backward-compatible alias.
+export SFT_OPENAI_BASE_URL="${SFT_OPENAI_AZURE_ENDPOINT}"
+export SFT_OPENAI_API_VERSION="2024-03-01-preview"
+
+# Request headers / body knobs.
+# Fill in a real logid before running if needed.
+export SFT_OPENAI_HEADERS_JSON='{"X-TT-LOGID":"${your_logid}"}'
+export SFT_OPENAI_EXTRA_BODY_JSON='{"thinking":{"include_thoughts":true,"budget_tokens":2000}}'
+
+
+# ---------------------------------------------------------------------------
+# Reader backend
+# ---------------------------------------------------------------------------
+
+export ENHANCED_READER_URL="http://10.124.136.252:8004"
+
+
+# ---------------------------------------------------------------------------
+# Summarizer backend
+# ---------------------------------------------------------------------------
+
+export SFT_SUMMARIZER_API_BASE="http://127.0.0.1:6658/v1"
+export SFT_SUMMARIZER_MODEL="Qwen3-VL-32B"
+export SFT_SUMMARIZER_API_KEY="EMPTY"

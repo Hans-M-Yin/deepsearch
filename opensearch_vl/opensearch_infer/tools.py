@@ -32,6 +32,125 @@ def get_tools_definition() -> str:
         {
             "type": "function",
             "function": {
+                "name": "t2t_search",
+                "description": (
+                    "Search text/web documents from a text query. Uses the "
+                    "synthesis Serper backend, then reads pages through Jina "
+                    "Reader and summarizes query-relevant content."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string"},
+                        "q": {
+                            "type": "string",
+                            "description": "Alias for 'query'.",
+                        },
+                        "hl": {"type": "string", "default": "en"},
+                        "lang": {
+                            "type": "string",
+                            "description": "Alias for 'hl'.",
+                            "default": "en",
+                        },
+                        "top_k": {"type": "integer", "default": 5},
+                    },
+                    "required": [],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "t2i_search",
+                "description": (
+                    "Search images from a text query via the synthesis "
+                    "Serper image backend."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string"},
+                        "q": {
+                            "type": "string",
+                            "description": "Alias for 'query'.",
+                        },
+                        "hl": {"type": "string", "default": "en"},
+                        "lang": {
+                            "type": "string",
+                            "description": "Alias for 'hl'.",
+                            "default": "en",
+                        },
+                        "top_k": {"type": "integer", "default": 5},
+                    },
+                    "required": [],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "i2i_search",
+                "description": (
+                    "Search for visually similar or matching images from an "
+                    "input image reference or image URL."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "image": {
+                            "type": "string",
+                            "description": "Image reference such as 'img_1'.",
+                        },
+                        "url": {
+                            "type": "string",
+                            "description": "Direct remote image URL.",
+                        },
+                        "region": {
+                            "type": "array",
+                            "description": (
+                                "Optional bounding box to crop before search. "
+                                "Preferred format: [x1, y1, x2, y2]."
+                            ),
+                            "items": {"type": "number"},
+                            "minItems": 4,
+                            "maxItems": 4,
+                        },
+                    },
+                    "required": [],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "read_url",
+                "description": (
+                    "Read a URL. If it returns text/html, fetch content via "
+                    "Jina Reader and optionally summarize the part relevant "
+                    "to the provided query. If it returns an image, download "
+                    "the image for later use."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "URL": {"type": "string"},
+                        "url": {
+                            "type": "string",
+                            "description": "Alias for 'URL'.",
+                        },
+                        "query": {
+                            "type": "string",
+                            "description": "Optional query used for focused summarization.",
+                            "default": "",
+                        },
+                    },
+                    "required": [],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
                 "name": "crop",
                 "description": (
                     "Crop a specific region from an image. The target "
@@ -214,6 +333,22 @@ _FALLBACK_TAGS: Dict[str, Tuple[re.Pattern, str]] = {
         re.compile(r"<web_search>\s*(\{.*?\})\s*</web_search>", re.DOTALL),
         "web_search",
     ),
+    "t2t_search": (
+        re.compile(r"<t2t_search>\s*(\{.*?\})\s*</t2t_search>", re.DOTALL),
+        "t2t_search",
+    ),
+    "t2i_search": (
+        re.compile(r"<t2i_search>\s*(\{.*?\})\s*</t2i_search>", re.DOTALL),
+        "t2i_search",
+    ),
+    "i2i_search": (
+        re.compile(r"<i2i_search>\s*(\{.*?\})\s*</i2i_search>", re.DOTALL),
+        "i2i_search",
+    ),
+    "read_url": (
+        re.compile(r"<read_url>\s*(\{.*?\})\s*</read_url>", re.DOTALL),
+        "read_url",
+    ),
     "image_search": (
         re.compile(
             r"<(?:image_search|local_image_search|lens_scan)>\s*(\{.*?\})"
@@ -253,11 +388,13 @@ _FALLBACK_TAGS: Dict[str, Tuple[re.Pattern, str]] = {
 def _normalize_search_aliases(name: str, params: dict) -> dict:
     """Convert ``query``/``lang`` aliases to canonical ``q``/``hl``."""
 
-    if name in {"text_search", "local_search", "web_search"}:
+    if name in {"text_search", "local_search", "web_search", "t2t_search", "t2i_search"}:
         if "query" in params and "q" not in params:
             params["q"] = params.pop("query")
         if "lang" in params and "hl" not in params:
             params["hl"] = params.pop("lang")
+    if name == "read_url" and "URL" in params and "url" not in params:
+        params["url"] = params.pop("URL")
     return params
 
 
@@ -292,7 +429,7 @@ def extract_tool_call(text: str) -> Optional[str]:
             if not isinstance(params, dict):
                 params = {"value": params}
         except Exception:
-            params = {"q": raw} if canonical in {"text_search", "web_search"} else {"url": raw}
+            params = {"q": raw} if canonical in {"text_search", "web_search", "t2t_search", "t2i_search"} else {"url": raw}
         params = _normalize_search_aliases(canonical, dict(params))
         return json.dumps(
             {"name": canonical, "parameters": params}, ensure_ascii=False
@@ -392,6 +529,96 @@ def _apply_image_op(
     return return_engine.to_pil()
 
 
+def _normalize_region_bbox(region: object) -> Tuple[Optional[Tuple[int, int, int, int]], Optional[str]]:
+    """Return ``(x, y, width, height)`` for a region payload."""
+
+    if region in (None, ""):
+        return None, None
+
+    if isinstance(region, dict):
+        if all(key in region for key in ("x", "y", "width", "height")):
+            try:
+                x = int(region["x"])
+                y = int(region["y"])
+                width = int(region["width"])
+                height = int(region["height"])
+            except (TypeError, ValueError):
+                return None, "Region dict values must be numeric."
+            if width <= 0 or height <= 0:
+                return None, "Region width and height must be positive."
+            return (x, y, width, height), None
+        return None, "Region dict must contain x, y, width, and height."
+
+    if isinstance(region, (list, tuple)):
+        if len(region) != 4:
+            return None, "Region list must contain exactly 4 numbers."
+        try:
+            x1 = int(region[0])
+            y1 = int(region[1])
+            x2 = int(region[2])
+            y2 = int(region[3])
+        except (TypeError, ValueError):
+            return None, "Region list values must be numeric."
+        width = x2 - x1
+        height = y2 - y1
+        if width <= 0 or height <= 0:
+            return None, "Region list must be [x1, y1, x2, y2] with x2 > x1 and y2 > y1."
+        return (x1, y1, width, height), None
+
+    return None, "Region must be a 4-number list or a dict with x/y/width/height."
+
+
+def _crop_region_for_i2i_search(
+    *,
+    image_ref: str,
+    region: object,
+    image_paths_dict: dict,
+    case_id: str,
+    case_idx: int,
+    turn_num: int,
+    intermediate_dir: str,
+    filename_prefix: str,
+) -> Tuple[Optional[str], Dict[str, str], Optional[str]]:
+    """Crop a region and return ``(search_url_or_path, new_images, error)``."""
+
+    bbox, err = _normalize_region_bbox(region)
+    if err:
+        return None, {}, err
+    if bbox is None:
+        return None, {}, None
+
+    if not image_ref:
+        return None, {}, "Region-based i2i_search requires an 'image' reference."
+
+    image_data, _ = image_io.ensure_image_local(
+        image_ref,
+        image_paths_dict,
+        intermediate_dir,
+        case_idx,
+        turn_num,
+        tool_name="i2i_search_region",
+        case_id=case_id,
+        filename_prefix=filename_prefix,
+    )
+    if image_data is None:
+        return None, {}, f"Failed to load image {image_ref!r} for region crop."
+
+    x, y, width, height = bbox
+    engine = ImageToolEngine()
+    engine.load_image(image_data)
+    cropped = engine.crop(x, y, width, height)
+    new_id, location = _persist_new_image(
+        cropped,
+        intermediate_dir,
+        filename_prefix,
+        case_idx,
+        turn_num,
+        "i2i_search_region",
+        image_paths_dict,
+    )
+    return location, {new_id: location}, None
+
+
 def _persist_new_image(
     pil_image: Image.Image,
     intermediate_dir: str,
@@ -445,17 +672,61 @@ def execute_tool(
     name = call.get("name", "")
     params = call.get("parameters", {}) or {}
 
-    if name in {"text_search", "local_search", "web_search"}:
+    if name in {"text_search", "local_search", "web_search", "t2t_search"}:
         query = params.get("q") or params.get("query") or ""
         if not query:
             return "Tool execution error:\n'q' is required for text_search.", {}
+        if name == "t2t_search":
+            return search.t2t_search(
+                query=query,
+                lang=params.get("hl", "en") or params.get("lang", "en"),
+                top_k=int(params.get("top_k", 5)),
+            ), {}
         return search.text_search(
             query=query,
             lang=params.get("hl", "en") or params.get("lang", "en"),
             top_k=int(params.get("top_k", 5)),
         ), {}
 
-    if name in {"image_search", "local_image_search", "lens_scan"}:
+    if name == "t2i_search":
+        query = params.get("q") or params.get("query") or ""
+        if not query:
+            return "Tool execution error:\n'q' is required for t2i_search.", {}
+        return search.t2i_search(
+            query=query,
+            lang=params.get("hl", "en") or params.get("lang", "en"),
+            top_k=int(params.get("top_k", 5)),
+        ), {}
+
+    if name in {"image_search", "local_image_search", "lens_scan", "i2i_search"}:
+        if name == "i2i_search":
+            region = params.get("region")
+            if region not in (None, ""):
+                cropped_location, new_images, crop_err = _crop_region_for_i2i_search(
+                    image_ref=params.get("image", ""),
+                    region=region,
+                    image_paths_dict=image_paths_dict,
+                    case_id=case_id,
+                    case_idx=case_idx,
+                    turn_num=turn_num,
+                    intermediate_dir=intermediate_dir,
+                    filename_prefix=filename_prefix,
+                )
+                if crop_err:
+                    return f"Tool execution error:\n{crop_err}", {}
+                result = search.i2i_search(
+                    image_url=cropped_location or "",
+                    visual_lookup=visual_lookup,
+                )
+                if new_images:
+                    cropped_id = next(iter(new_images.keys()))
+                    result = (
+                        f"{result}\n\n"
+                        f"Cropped region image ID: {cropped_id}\n"
+                        f"Cropped region source: {cropped_location}"
+                    )
+                return result, new_images
+
         url, err = _resolve_image_for_search(
             image_paths_dict,
             image_ref=params.get("image", ""),
@@ -466,7 +737,40 @@ def execute_tool(
         )
         if err:
             return f"Tool execution error:\n{err}", {}
+        if name == "i2i_search":
+            return search.i2i_search(image_url=url, visual_lookup=visual_lookup), {}
         return search.image_search(image_url=url, visual_lookup=visual_lookup), {}
+
+    if name == "read_url":
+        url = params.get("url") or params.get("URL") or ""
+        if not url:
+            return "Tool execution error:\n'url' is required for read_url.", {}
+        result = search.read_url(url=url, query=params.get("query", "") or "")
+        if result.get("error"):
+            return f"Tool execution error:\n{result['error']}", {}
+        if result.get("kind") == "image":
+            local_path = result.get("local_path", "")
+            if not local_path:
+                return "Tool execution error:\nread_url returned an image without a local path.", {}
+            new_id = f"img_{len(image_paths_dict) + 1}"
+            msg = (
+                f"Tool execution result:\nDownloaded image from {result.get('url', url)}.\n"
+                f"New image ID: {new_id}\n"
+                f"Local path: {local_path}"
+            )
+            return msg, {new_id: local_path}
+
+        title = result.get("title", "") or "(untitled)"
+        summary = result.get("summary", "") or ""
+        content = result.get("content", "") or ""
+        body = summary if summary else content
+        report = (
+            "Tool execution result:\n"
+            f"Title: {title}\n"
+            f"URL: {result.get('url', url)}\n"
+            f"{'Summary' if summary else 'Content'}:\n{body}"
+        )
+        return report, {}
 
     if name == "crop":
         image_ref = params.get("image", "")
