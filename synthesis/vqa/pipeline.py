@@ -10,7 +10,6 @@ from synthesis.model_worker import LLM_WORKER
 from synthesis.store import JsonlGraphStore
 
 from .graph_view import GraphView
-from .obfuscation import ObfuscationProcessor
 from .path_sampler import RandomPathSampler, SamplerConfiguration
 from .question_writer import QuestionWriter
 from .schemas import EvidenceBundle, PathCandidate, SampleProgress, SampleStatus, VqaSample
@@ -38,7 +37,6 @@ class VqaGenerationPipeline:
     store: JsonlGraphStore
     config: SamplerConfiguration
     sampler: RandomPathSampler | None = None
-    obfuscator: ObfuscationProcessor | None = None
     writer: QuestionWriter | None = None
     verifier: SampleVerifier | None = None
     graph: GraphView = field(init=False)
@@ -55,7 +53,6 @@ class VqaGenerationPipeline:
         )
         self.sampler.graph = graph
         self.sampler.config = self.config
-        self.obfuscator = self.obfuscator or ObfuscationProcessor()
         writer_model = os.environ.get("VQA_WRITER_MODEL")
         self.writer = self.writer or QuestionWriter(
             model_client=LLM_WORKER if writer_model else None,
@@ -71,8 +68,6 @@ class VqaGenerationPipeline:
     def generate_path(self, path: PathCandidate) -> VqaSample:
         """Generate and verify one question from an already sampled path."""
         progress = SampleProgress()
-        target_node = self.graph.get_node(path.target_node_id) or {}
-        target_title = target_node.get("title")
         evidence = EvidenceBundle(
             bundle_id=f"bundle_{path.path_id}",
             path_id=path.path_id,
@@ -93,16 +88,8 @@ class VqaGenerationPipeline:
         progress.polished_at = _utc_now()
         obfuscated = self._run_stage(
             path=path,
-            stage="llm_obfuscation",
-            operation=lambda: self.writer.obfuscate(draft=polished, path=path, graph=self.graph),
-        )
-        obfuscated = self._run_stage(
-            path=path,
-            stage="post_obfuscation",
-            operation=lambda: self.obfuscator.post_obfuscate(
-                obfuscated,
-                target_title=target_title,
-            ),
+            stage="difficulty_enhancement",
+            operation=lambda: self.writer.enhance_difficulty(draft=polished, path=path, graph=self.graph),
         )
         progress.post_obfuscated_at = _utc_now()
         verification = self._run_stage(

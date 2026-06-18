@@ -29,7 +29,6 @@ from .schemas import (
 from .graph_view import GraphView
 from .path_sampler import PathSampler, RandomPathSampler, SamplerConfiguration, SamplerGenerationStats
 from .evidence_builder import EvidenceBuilder
-from .obfuscation import ObfuscationProcessor
 from .question_writer import QuestionWriter
 from .verifier import SampleVerifier
 from .pipeline import VqaGenerationError, VqaGenerationPipeline
@@ -53,7 +52,6 @@ __all__ = [
     "SamplerConfiguration",
     "SamplerGenerationStats",
     "EvidenceBuilder",
-    "ObfuscationProcessor",
     "QuestionWriter",
     "SampleVerifier",
     "VqaGenerationError",

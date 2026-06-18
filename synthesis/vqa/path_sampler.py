@@ -75,6 +75,7 @@ Return valid JSON with exactly this shape:
 }
 
 Rank higher candidates first. Use higher score for better candidates. Use higher shortcut_risk when a candidate is more dangerous.
+Give priority to less well-known edges and their corresponding neighbor nodes that involve more niche knowledge.
 """
 
 

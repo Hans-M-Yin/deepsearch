@@ -490,6 +490,50 @@ Please return valid JSON with exactly the following field:
 }
 """
 
+PROMPT_DIFFICULTY_ENHANCEMENT = """
+You are strengthening a generated multi-hop VQA question to make it harder, less template-like, and less vulnerable to a rigid left-to-right search procedure.
+
+You will be given:
+- the current question
+- the hop chain that defines the intended underlying reasoning trajectory
+- possibly an image, if the trajectory starts from an image
+
+Your goal:
+- keep the underlying reasoning trajectory compatible with the original hop chain
+- keep the question's final answer unchanged
+- make the surface form harder in a productive way
+
+What "harder" means here:
+- reduce obvious one-hop-at-a-time scaffolding
+- make clue ordering less mechanically aligned with hop ordering
+- compress or reorganize descriptions so the solver must do more interpretation
+- replace overly revealing names, titles, and strongly identifying descriptions with more indirect but still answerable descriptions
+- reduce reliance on rigid repeated patterns
+- increase the need for genuine reasoning, local disambiguation, and search error recovery
+
+What you must NOT do:
+- do not change the final answer
+- do not make the question ambiguous
+- do not add unsupported facts
+- do not remove so much structure that the intended hop chain no longer works
+- do not make the question merely longer or more verbose
+- do not make it artificially obscure if the result becomes unanswerable
+
+You should first analyze the current question:
+- where it is too linear
+- where clue wording is too explicit
+- where descriptions make the correct search trajectory too obvious
+- where a solver can proceed mechanically instead of reasoning
+
+Then rewrite the question into a tighter, more diverse, harder version while keeping the same answer and latent trajectory.
+
+Return valid JSON with exactly these fields:
+{
+  "analysis": "brief analysis of why the original question is too easy or too linear, and what was changed",
+  "question": "the revised harder question"
+}
+"""
+
 @dataclass(slots=True)
 class HopContext:
     """Compact readable representation of one trajectory hop."""
@@ -992,6 +1036,47 @@ class QuestionWriter:
             metadata=metadata,
         )
 
+    def enhance_difficulty(self, *, draft: QuestionDraft, path: PathCandidate, graph: GraphView) -> QuestionDraft:
+        if self.model_client is None:
+            return draft
+        starting_image_url = self._starting_image_url(path=path, graph=graph)
+        payload = self._difficulty_enhancement_payload(
+            question=draft.question,
+            hops=draft.reasoning_steps,
+        )
+        try:
+            parsed = self._generate_json(
+                system=PROMPT_DIFFICULTY_ENHANCEMENT,
+                user_payload=payload,
+                trace_label="difficulty_enhancement",
+                image_url=starting_image_url,
+            )
+        except Exception as exc:
+            return self._record_writer_warning(draft, stage="difficulty_enhancement_request", error=exc)
+        enhanced_question = self._clean_composed_question(str(parsed.get("question") or "").strip())
+        if not enhanced_question:
+            return self._record_writer_warning(
+                draft,
+                stage="difficulty_enhancement_parse",
+                error=ValueError("Model returned an empty difficulty-enhanced question."),
+            )
+        metadata = dict(draft.metadata)
+        metadata["difficulty_enhancement_payload"] = payload
+        metadata["difficulty_enhancement_result"] = {
+            "raw_response": parsed,
+            "analysis": str(parsed.get("analysis") or "").strip(),
+            "question": enhanced_question,
+            "starting_image_url": starting_image_url,
+        }
+        return QuestionDraft(
+            question=enhanced_question,
+            answer=draft.answer,
+            answer_type=draft.answer_type,
+            reasoning_steps=list(draft.reasoning_steps),
+            used_evidence_ids=list(draft.used_evidence_ids),
+            metadata=metadata,
+        )
+
     @staticmethod
     def _record_writer_warning(
         draft: QuestionDraft,
@@ -1306,6 +1391,23 @@ class QuestionWriter:
                 for item in hops
             ],
             "final_ask": final_ask,
+        }
+
+    @staticmethod
+    def _difficulty_enhancement_payload(*, question: str, hops: list[dict[str, Any]]) -> dict[str, Any]:
+        return {
+            "question": question,
+            "hops": [
+                {
+                    "hop_index": item.get("hop_index"),
+                    "source": item.get("source"),
+                    "target": item.get("target"),
+                    "statement": item.get("statement"),
+                    "relation": item.get("relation"),
+                    "retrieval_query": item.get("retrieval_query"),
+                }
+                for item in hops
+            ],
         }
 
 
