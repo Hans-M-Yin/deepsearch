@@ -997,7 +997,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--case-id", default="sft_session")
     parser.add_argument("--image", action="append", help="Preload a local image path as img_n.")
     parser.add_argument("--image-url", action="append", help="Preload a remote image URL as img_n.")
-    parser.add_argument("--gpt54", action="store_true", help="Use the GPT-5.4 Responses-API branch from .sft_env.")
+    parser.add_argument("--gpt54", action="store_true", help="Use the GPT-5.4 chat.completions branch from .sft_env.")
     parser.add_argument("--verbose", action="store_true")
     return parser
 
@@ -1019,7 +1019,7 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("Use only one of --prompt, --messages-json, or --messages-file.")
 
     if args.gpt54:
-        args.api_mode = "responses"
+        args.api_mode = "chat_completions"
         args.model = os.environ.get("SFT_GPT54_MODEL") or "gpt-5.4-2026-03-05"
         args.api_key = os.environ.get("SFT_GPT54_API_KEY") or args.api_key
         args.azure_endpoint = os.environ.get("SFT_GPT54_AZURE_ENDPOINT") or args.azure_endpoint

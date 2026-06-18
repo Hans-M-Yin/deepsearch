@@ -16,7 +16,7 @@ Optional:
   --image /abs/path/to/image.png      Preload a local image as img_n
   --image-url https://...             Preload a remote image as img_n
   --workdir /abs/path/to/output_dir   Override runtime working directory
-  --gpt54                             Use the GPT-5.4 Responses-API branch
+  --gpt54                             Use the GPT-5.4 chat.completions branch
   --verbose                           Enable verbose logging
   --office-net                        Switch endpoint to tiktok-row office domain
   --help                              Show this help
@@ -128,7 +128,7 @@ fi
 
 if [[ "${OFFICE_NET}" -eq 1 ]]; then
   if [[ "${GPT54}" -eq 1 ]]; then
-    export SFT_GPT54_AZURE_ENDPOINT="https://aidp-i18ntt-sg.tiktok-row.net/api/modelhub/online/responses"
+    export SFT_GPT54_AZURE_ENDPOINT="https://aidp-i18ntt-sg.tiktok-row.net/api/modelhub/online/v2/crawl"
   else
     export SFT_OPENAI_AZURE_ENDPOINT="https://aidp-i18ntt-sg.tiktok-row.net/api/modelhub/online/v2/crawl"
     export SFT_OPENAI_BASE_URL="${SFT_OPENAI_AZURE_ENDPOINT}"
@@ -170,7 +170,7 @@ cd "${PROJECT_ROOT}"
 
 echo "=== SFT Agent Config ==="
 if [[ "${GPT54}" -eq 1 ]]; then
-  echo "api_mode: responses"
+  echo "api_mode: chat_completions"
   echo "model: ${SFT_GPT54_MODEL}"
   echo "azure_endpoint: ${SFT_GPT54_AZURE_ENDPOINT}"
   echo "api_version: ${SFT_GPT54_API_VERSION}"
