@@ -17,6 +17,7 @@ Optional:
   --image-url https://...             Preload a remote image as img_n
   --workdir /abs/path/to/output_dir   Override runtime working directory
   --gpt54                             Use the GPT-5.4 chat.completions branch
+  --gemini35-flash                    Use the Gemini 3.5 Flash chat.completions branch
   --verbose                           Enable verbose logging
   --office-net                        Switch endpoint to tiktok-row office domain
   --help                              Show this help
@@ -70,6 +71,7 @@ WORKDIR=""
 VERBOSE=0
 OFFICE_NET=0
 GPT54=0
+GEMINI35_FLASH=0
 
 PY_ARGS=()
 
@@ -99,6 +101,10 @@ while [[ $# -gt 0 ]]; do
       GPT54=1
       shift
       ;;
+    --gemini35-flash)
+      GEMINI35_FLASH=1
+      shift
+      ;;
     --office-net)
       OFFICE_NET=1
       shift
@@ -120,6 +126,11 @@ if [[ -n "${PROMPT}" && -n "${MESSAGES_FILE}" ]]; then
   exit 1
 fi
 
+if [[ "${GPT54}" -eq 1 && "${GEMINI35_FLASH}" -eq 1 ]]; then
+  echo "Use only one model shortcut: --gpt54 or --gemini35-flash." >&2
+  exit 1
+fi
+
 if [[ -z "${PROMPT}" && -z "${MESSAGES_FILE}" ]]; then
   echo "One of --prompt or --messages-file is required." >&2
   usage
@@ -129,6 +140,8 @@ fi
 if [[ "${OFFICE_NET}" -eq 1 ]]; then
   if [[ "${GPT54}" -eq 1 ]]; then
     export SFT_GPT54_AZURE_ENDPOINT="https://aidp-i18ntt-sg.tiktok-row.net/api/modelhub/online/v2/crawl"
+  elif [[ "${GEMINI35_FLASH}" -eq 1 ]]; then
+    export SFT_GEMINI35_FLASH_AZURE_ENDPOINT="https://aidp-i18ntt-sg.tiktok-row.net/api/modelhub/online/v2/crawl"
   else
     export SFT_OPENAI_AZURE_ENDPOINT="https://aidp-i18ntt-sg.tiktok-row.net/api/modelhub/online/v2/crawl"
     export SFT_OPENAI_BASE_URL="${SFT_OPENAI_AZURE_ENDPOINT}"
@@ -141,6 +154,12 @@ if [[ "${GPT54}" -eq 1 ]]; then
   require_env "SFT_GPT54_API_VERSION"
   require_env "SFT_GPT54_API_KEY"
   PY_ARGS+=(--gpt54)
+elif [[ "${GEMINI35_FLASH}" -eq 1 ]]; then
+  require_env "SFT_GEMINI35_FLASH_MODEL"
+  require_env "SFT_GEMINI35_FLASH_AZURE_ENDPOINT"
+  require_env "SFT_GEMINI35_FLASH_API_VERSION"
+  require_env "SFT_GEMINI35_FLASH_API_KEY"
+  PY_ARGS+=(--gemini35-flash)
 else
   require_env "SFT_OPENAI_MODEL"
   require_env "SFT_OPENAI_AZURE_ENDPOINT"
@@ -174,6 +193,11 @@ if [[ "${GPT54}" -eq 1 ]]; then
   echo "model: ${SFT_GPT54_MODEL}"
   echo "azure_endpoint: ${SFT_GPT54_AZURE_ENDPOINT}"
   echo "api_version: ${SFT_GPT54_API_VERSION}"
+elif [[ "${GEMINI35_FLASH}" -eq 1 ]]; then
+  echo "api_mode: chat_completions"
+  echo "model: ${SFT_GEMINI35_FLASH_MODEL}"
+  echo "azure_endpoint: ${SFT_GEMINI35_FLASH_AZURE_ENDPOINT}"
+  echo "api_version: ${SFT_GEMINI35_FLASH_API_VERSION}"
 else
   echo "api_mode: chat_completions"
   echo "model: ${SFT_OPENAI_MODEL}"

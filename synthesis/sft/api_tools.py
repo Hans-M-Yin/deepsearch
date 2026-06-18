@@ -1004,6 +1004,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--image", action="append", help="Preload a local image path as img_n.")
     parser.add_argument("--image-url", action="append", help="Preload a remote image URL as img_n.")
     parser.add_argument("--gpt54", action="store_true", help="Use the GPT-5.4 chat.completions branch from .sft_env.")
+    parser.add_argument(
+        "--gemini35-flash",
+        action="store_true",
+        help="Use the Gemini 3.5 Flash chat.completions branch from .sft_env.",
+    )
     parser.add_argument("--verbose", action="store_true")
     return parser
 
@@ -1023,6 +1028,8 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("One of --prompt, --messages-json, or --messages-file is required.")
     if sum(1 for item in [args.prompt, args.messages_json, args.messages_file] if item) > 1:
         parser.error("Use only one of --prompt, --messages-json, or --messages-file.")
+    if args.gpt54 and args.gemini35_flash:
+        parser.error("Use only one model shortcut: --gpt54 or --gemini35-flash.")
 
     if args.gpt54:
         args.api_mode = "chat_completions"
@@ -1030,6 +1037,12 @@ def main(argv: list[str] | None = None) -> int:
         args.api_key = os.environ.get("SFT_GPT54_API_KEY") or args.api_key
         args.azure_endpoint = os.environ.get("SFT_GPT54_AZURE_ENDPOINT") or args.azure_endpoint
         args.api_version = os.environ.get("SFT_GPT54_API_VERSION") or args.api_version
+    elif args.gemini35_flash:
+        args.api_mode = "chat_completions"
+        args.model = os.environ.get("SFT_GEMINI35_FLASH_MODEL") or "gemini-3.5-flash"
+        args.api_key = os.environ.get("SFT_GEMINI35_FLASH_API_KEY") or args.api_key
+        args.azure_endpoint = os.environ.get("SFT_GEMINI35_FLASH_AZURE_ENDPOINT") or args.azure_endpoint
+        args.api_version = os.environ.get("SFT_GEMINI35_FLASH_API_VERSION") or args.api_version
 
     config = OpenAIToolAgentConfig(
         model=args.model,

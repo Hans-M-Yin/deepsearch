@@ -43,6 +43,20 @@ export SFT_GPT54_API_VERSION="2024-03-01-preview"
 
 
 # ---------------------------------------------------------------------------
+# Gemini 3.5 Flash chat.completions branch
+# ---------------------------------------------------------------------------
+
+export SFT_GEMINI35_FLASH_MODEL="gemini-3.5-flash"
+export SFT_GEMINI35_FLASH_API_KEY="YB9OeapWfFYKOmfRRroZHzTuKGT0Vt7p_GPT_AK"
+export SFT_GEMINI35_FLASH_AZURE_ENDPOINT="https://aidp-i18ntt-sg.byteintl.net/api/modelhub/online/v2/crawl"
+
+# Office network:
+# export SFT_GEMINI35_FLASH_AZURE_ENDPOINT="https://aidp-i18ntt-sg.tiktok-row.net/api/modelhub/online/v2/crawl"
+
+export SFT_GEMINI35_FLASH_API_VERSION="2024-03-01-preview"
+
+
+# ---------------------------------------------------------------------------
 # Reader backend
 # ---------------------------------------------------------------------------
 
