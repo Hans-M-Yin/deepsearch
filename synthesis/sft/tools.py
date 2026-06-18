@@ -36,9 +36,10 @@ def get_tool_definitions() -> list[dict[str, Any]]:
             "function": {
                 "name": "t2t_search",
                 "description": (
-                    "Search text/web documents from a text query. Uses Serper "
-                    "for search, then reads pages and summarizes the content "
-                    "that is relevant to the query."
+                    "Search text/web documents from a text query. Returns "
+                    "search results such as title, url, and snippet. If the "
+                    "agent wants the full content of a result, it should call "
+                    "read_url separately."
                 ),
                 "parameters": {
                     "type": "object",
@@ -423,25 +424,16 @@ def read_url(url: str, query: str = "") -> dict[str, Any]:
 
 
 def t2t_search(query: str, lang: str = "en", top_k: int = 5) -> dict[str, Any]:
-    """Search text pages and summarize query-relevant passages."""
+    """Search text pages and return search results only."""
 
     response = _serper_client().search_text(query, limit=top_k, hl=lang)
     results: list[dict[str, Any]] = []
     for item in response.results[:top_k]:
-        title = item.title or ""
-        url = item.url or ""
-        snippet = item.snippet or ""
-        summary = snippet
-        if url:
-            read_result = read_url(url, query=query)
-            if read_result.get("ok") and read_result.get("kind") == "text":
-                summary = read_result.get("summary") or read_result.get("content") or snippet
         results.append(
             {
-                "title": title,
-                "url": url,
-                "snippet": snippet,
-                "summary": summary,
+                "title": item.title or "",
+                "url": item.url or "",
+                "snippet": item.snippet or "",
                 "source": item.source,
                 "rank": item.rank,
             }
