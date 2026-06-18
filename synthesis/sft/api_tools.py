@@ -513,6 +513,46 @@ def _messages_to_responses_input(messages: list[dict[str, Any]]) -> list[dict[st
     return items
 
 
+def _conversation_messages_to_responses_input(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Convert the local conversation history to Responses API input items."""
+
+    items: list[dict[str, Any]] = []
+    for message in messages:
+        role = str(message.get("role") or "user")
+        if role in {"system", "user", "assistant"}:
+            content = message.get("content")
+            has_textual_content = bool(content not in (None, "", []))
+            if has_textual_content:
+                items.append(
+                    {
+                        "role": role,
+                        "content": _message_content_to_responses_content(content),
+                    }
+                )
+            if role == "assistant":
+                for tool_call in message.get("tool_calls") or []:
+                    if not isinstance(tool_call, dict):
+                        continue
+                    function = tool_call.get("function") or {}
+                    items.append(
+                        {
+                            "type": "function_call",
+                            "call_id": tool_call.get("id", ""),
+                            "name": function.get("name", ""),
+                            "arguments": function.get("arguments", "{}"),
+                        }
+                    )
+        elif role == "tool":
+            items.append(
+                {
+                    "type": "function_call_output",
+                    "call_id": message.get("tool_call_id", ""),
+                    "output": message.get("content", ""),
+                }
+            )
+    return items
+
+
 def _extract_responses_content_and_tool_calls(raw_response: dict[str, Any]) -> tuple[str, list[dict[str, Any]]]:
     output_items = raw_response.get("output") or []
     text_parts: list[str] = []
@@ -545,6 +585,11 @@ def _extract_responses_content_and_tool_calls(raw_response: dict[str, Any]) -> t
             )
 
     return "\n".join(part for part in text_parts if part).strip(), tool_calls
+
+
+def _is_previous_response_not_found_error(exc: Exception) -> bool:
+    message = str(exc)
+    return "previous_response_not_found" in message or "Previous response with id" in message
 
 
 def execute_tool_call(
@@ -790,6 +835,7 @@ class OpenAIToolAgent:
         final_text = ""
         current_input = _messages_to_responses_input(conversation_messages)
         previous_response_id: str | None = None
+        use_previous_response_id = True
 
         for turn_index in range(self.config.max_turns):
             kwargs: dict[str, Any] = {
@@ -801,13 +847,29 @@ class OpenAIToolAgent:
                 kwargs["max_output_tokens"] = self.config.max_tokens
             if self.config.extra_body:
                 kwargs["extra_body"] = self.config.extra_body
-            if previous_response_id:
+            if previous_response_id and use_previous_response_id:
                 kwargs["previous_response_id"] = previous_response_id
 
-            response = self.client.responses.create(**kwargs)
+            try:
+                response = self.client.responses.create(**kwargs)
+            except Exception as exc:
+                if previous_response_id and use_previous_response_id and _is_previous_response_not_found_error(exc):
+                    logger.warning(
+                        "Responses API previous_response_id is unavailable on this backend; "
+                        "falling back to full-context replay."
+                    )
+                    use_previous_response_id = False
+                    kwargs.pop("previous_response_id", None)
+                    kwargs["input"] = _conversation_messages_to_responses_input(conversation_messages)
+                    response = self.client.responses.create(**kwargs)
+                else:
+                    raise
             raw_response = response.model_dump() if hasattr(response, "model_dump") else {"repr": repr(response)}
             raw_responses.append(raw_response)
-            previous_response_id = raw_response.get("id") or getattr(response, "id", None)
+            if use_previous_response_id:
+                previous_response_id = raw_response.get("id") or getattr(response, "id", None)
+            else:
+                previous_response_id = None
 
             assistant_content, assistant_tool_calls = _extract_responses_content_and_tool_calls(raw_response)
             if self.config.print_rounds:
@@ -850,6 +912,8 @@ class OpenAIToolAgent:
                         "output": result.output_text,
                     }
                 )
+            if not use_previous_response_id:
+                current_input = _conversation_messages_to_responses_input(conversation_messages)
         else:
             final_text = "Max tool-calling turns reached before the model produced a final answer."
 
