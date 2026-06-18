@@ -429,6 +429,64 @@ def _json_text(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, indent=2)
 
 
+def _format_message_content(content: Any) -> str:
+    if content in (None, ""):
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        formatted_parts: list[str] = []
+        for index, part in enumerate(content, start=1):
+            if not isinstance(part, dict):
+                formatted_parts.append(f"[part {index}] {part}")
+                continue
+            part_type = str(part.get("type") or "")
+            if part_type in {"text", "input_text"}:
+                formatted_parts.append(str(part.get("text", "")))
+            elif part_type == "image_url":
+                image_url = part.get("image_url")
+                if isinstance(image_url, dict):
+                    url = image_url.get("url", "")
+                else:
+                    url = image_url
+                formatted_parts.append(f"[image_url] {url}")
+            elif part_type in {"image", "input_image", "image_path", "image_ref"}:
+                source = (
+                    part.get("image")
+                    or part.get("path")
+                    or part.get("url")
+                    or part.get("image_url")
+                    or part.get("ref")
+                    or ""
+                )
+                formatted_parts.append(f"[{part_type}] {source}")
+            else:
+                formatted_parts.append(_json_text(part))
+        return "\n".join(item for item in formatted_parts if item)
+    return _json_text(content) if isinstance(content, (dict, tuple)) else str(content)
+
+
+def _print_conversation_trace(messages: list[dict[str, Any]]) -> None:
+    print("\n=== Conversation Trace ===")
+    for index, message in enumerate(messages, start=1):
+        role = str(message.get("role") or "unknown")
+        print(f"\n[{index}] {role}")
+        content_text = _format_message_content(message.get("content"))
+        if content_text:
+            print(content_text)
+        tool_calls = message.get("tool_calls") or []
+        if tool_calls:
+            print("tool_calls:")
+            print(_json_text(tool_calls))
+        if role == "tool":
+            tool_name = message.get("name")
+            tool_call_id = message.get("tool_call_id")
+            if tool_name:
+                print(f"name: {tool_name}")
+            if tool_call_id:
+                print(f"tool_call_id: {tool_call_id}")
+
+
 def _print_round_output(turn_index: int, assistant_message: Any) -> None:
     print(f"\n=== Model Round {turn_index + 1} ===")
     content = getattr(assistant_message, "content", None)
@@ -1064,6 +1122,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.messages_file:
         input_messages = _parse_messages_json(Path(args.messages_file).read_text(encoding="utf-8"))
     result = agent.run(prompt=args.prompt, messages=input_messages, context=context)
+
+    _print_conversation_trace(result.messages)
 
     print("=== Final Answer ===")
     print(result.final_text)
