@@ -244,10 +244,14 @@ class VqaBatchRunner:
         *,
         question_number: int,
     ) -> dict[str, Any]:
+        writer_outputs = sample.get("writer_outputs") or {}
+        draft_question = sample.get("draft") or writer_outputs.get("draft") or {}
+        polished_question = sample.get("polished") or writer_outputs.get("polished") or {}
         final_question = (
             sample.get("obfuscated")
-            or sample.get("polished")
-            or sample.get("draft")
+            or writer_outputs.get("obfuscated")
+            or polished_question
+            or draft_question
             or {}
         )
         path = sample.get("path") or {}
@@ -256,7 +260,9 @@ class VqaBatchRunner:
             "sample_id": sample.get("sample_id"),
             "path_id": path.get("path_id"),
             "status": sample.get("status"),
-            "question": final_question.get("question"),
+            "draft_question": draft_question.get("question"),
+            "polished_question": polished_question.get("question"),
+            "final_question": final_question.get("question"),
             "answer": final_question.get("answer"),
         }
 
