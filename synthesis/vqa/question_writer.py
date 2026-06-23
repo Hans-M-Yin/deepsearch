@@ -506,6 +506,7 @@ Strict requirements:
 3. A replacement expression must satisfy this condition: by itself it should not directly identify the target entity, but within the full question context it should still help uniquely constrain the correct path.
 4. While reducing salience, you must preserve or add enough non-shortcut constraints so that the question remains uniquely solvable.
 5. If the original question is artificially tied to a specific source framing (“according to profile X,” “in source Y’s description,” etc.) but the answer is really a real-world fact rather than a document-specific wording question, remove or naturalize that framing instead of keeping it mechanically.
+6. If there is an image attached to the question, keep the connection between the question and the image content.
 
 Preferred rewriting strategies:
 1. Use relational, structural, or contextual constraints instead of highly distinctive signals including famous titles, people names, signature works, unique achievements, strong year markers, or iconic paper titles.
