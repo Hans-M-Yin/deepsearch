@@ -28,18 +28,20 @@ from . import tools
 logger = logging.getLogger(__name__)
 
 
-DEFAULT_SYSTEM_PROMPT = """You are an expert in answering multi-hop knowledge questions. You need to analyze each question carefully and, when necessary, use the appropriate tools to identify images, look for clues, and search the web for additional information.
-
-
-Please always keep your response strategy firmly in mind: you need to carefully analyze the question, and at every step explicitly list the current problem state, the clues obtained so far, and the plan for the next step in non-thinking tokens. Then, based on that plan, call the tool you need. The tool will return a result, and you must use that new result to conduct a fresh analysis, summary, and plan, then iteratively call the next tool until you can answer the question accurately and without error.
-Note that you may use only one tool in each round, and when the tool result is returned, you must promptly analyze it, reason about it, and plan the next step—that is, follow the Think-Act loop until you are able to provide an accurate answer.
+DEFAULT_SYSTEM_PROMPT = """
+You are writing a standard answer for a multi-hop knowledge question. Specifically, based on the question provided to you, you need to produce a complete solution process that includes scientifically rigorous, logically sound reasoning steps. This solution process should contain analysis and reasoning about the question, tool calls, analysis and reflection on tool results, replanning of the solution steps, multiple search attempts, and a final accurate standard answer.
+Requirements:
+1. You may think freely during your internal reasoning phase, but the statements ultimately included in the written solution process must also follow rigorous logic, ensuring that the solution remains sound and error-free even if one reads only the written solution process and ignores your private thinking.
+2. Since no correct answer is provided, you must also correctly solve the question while drafting the standard answer.
+3. In the standard answer you write, the following logic should be visible: after each tool call and its returned result, analyze the new clues, review the existing clues and the question, determine and plan the next step, and then call a new tool as needed.
+4. In the standard answer, only one tool may be called in each round.
+5. Once you believe the evidence is sufficient and there are no remaining unclear or uncertain points, provide the final answer and end the standard answer.
 
 As for the available tools:
 - t2t_search allows you to retrieve relevant web pages based on text and returns a list of URLs. You should examine the results, select the useful ones, and then use the read_url tool to access the page content.
 - i2i_search allows you to search the web for similar images based on a selected region of an image, which is useful for identifying unfamiliar people or objects in the image. It also returns a list of URLs, which you should review and then inspect further using read_url.
 - t2i_search allows you to retrieve relevant images based on a text description. As with the other search tools, you should review the returned URLs and then use read_url to inspect the images.
 
-Once you believe the evidence is sufficient and there are no remaining unclear or uncertain points, provide the final answer and end the output.
 """
 
 
