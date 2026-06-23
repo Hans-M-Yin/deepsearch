@@ -739,6 +739,7 @@ def execute_tool_call(
             output = tools.i2i_search(
                 image_url=uploaded_url,
                 visual_lookup=context.visual_lookup,
+                top_k=int(params.get("top_k", 5)),
             )
             output = dict(output)
             output["cropped_image_id"] = cropped_id
@@ -753,6 +754,7 @@ def execute_tool_call(
         output = tools.i2i_search(
             image_url=remote_url or "",
             visual_lookup=context.visual_lookup,
+            top_k=int(params.get("top_k", 5)),
         )
         return ToolExecutionResult(name=name, arguments=params, output=output, output_text=_json_text(output))
 
@@ -1068,7 +1070,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=os.environ.get("SFT_OPENAI_API_VERSION") or "2024-03-01-preview",
     )
     parser.add_argument("--max-tokens", type=int, default=int(os.environ.get("SFT_OPENAI_MAX_TOKENS", "1024")))
-    parser.add_argument("--temperature", type=float, default=float(os.environ.get("SFT_OPENAI_TEMPERATURE", "0.2")))
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=(float(os.environ["SFT_OPENAI_TEMPERATURE"]) if os.environ.get("SFT_OPENAI_TEMPERATURE") else None),
+    )
     parser.add_argument("--max-turns", type=int, default=int(os.environ.get("SFT_OPENAI_MAX_TURNS", "8")))
     parser.add_argument("--timeout-s", type=float, default=float(os.environ.get("SFT_OPENAI_TIMEOUT_S", "120")))
     parser.add_argument("--system-prompt", default=DEFAULT_SYSTEM_PROMPT)

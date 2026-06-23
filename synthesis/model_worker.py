@@ -44,7 +44,7 @@ class ModelMessage:
 class ModelRequest:
     messages: list[ModelMessage]
     model: str | None = None
-    temperature: float = 0.0
+    temperature: float | None = None
     max_tokens: int | None = None
     response_format: dict[str, Any] | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
@@ -167,8 +167,9 @@ class OpenAIModelWorkerClient:
         kwargs: dict[str, Any] = {
             "model": request.model or self.model,
             "messages": [message.to_dict() for message in request.messages],
-            "temperature": request.temperature,
         }
+        if request.temperature is not None:
+            kwargs["temperature"] = request.temperature
         if request.max_tokens is not None:
             kwargs["max_tokens"] = request.max_tokens
         if request.response_format is not None:
@@ -292,9 +293,10 @@ class AzureOpenAIModelWorkerClient:
         kwargs: dict[str, Any] = {
             "model": request.model or self.model,
             "messages": [message.to_dict() for message in request.messages],
-            "temperature": request.temperature,
             "stream": False,
         }
+        if request.temperature is not None:
+            kwargs["temperature"] = request.temperature
         if request.max_tokens is not None:
             kwargs["max_tokens"] = request.max_tokens
         if request.response_format is not None:

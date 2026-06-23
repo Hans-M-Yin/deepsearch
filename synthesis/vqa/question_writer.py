@@ -596,7 +596,7 @@ class QuestionWriter:
 
     model_client: ModelWorkerClient | None = None
     model: str | None = None
-    temperature: float = 0.2
+    temperature: float | None = None
     max_tokens: int = 800
 
     def build_writer_context(self, *, path: PathCandidate, graph: GraphView) -> WriterContext:

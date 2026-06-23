@@ -25,6 +25,7 @@ from synthesis.wiki_text_builder import EnhancedReaderClient
 
 
 logger = logging.getLogger(__name__)
+MAX_SEARCH_RESULTS = 5
 
 
 def get_tool_definitions() -> list[dict[str, Any]]:
@@ -55,7 +56,7 @@ def get_tool_definitions() -> list[dict[str, Any]]:
                             "description": "Alias for hl.",
                             "default": "en",
                         },
-                        "top_k": {"type": "integer", "default": 5},
+                        "top_k": {"type": "integer", "default": MAX_SEARCH_RESULTS},
                     },
                     "required": [],
                 },
@@ -80,7 +81,7 @@ def get_tool_definitions() -> list[dict[str, Any]]:
                             "description": "Alias for hl.",
                             "default": "en",
                         },
-                        "top_k": {"type": "integer", "default": 5},
+                        "top_k": {"type": "integer", "default": MAX_SEARCH_RESULTS},
                     },
                     "required": [],
                 },
@@ -115,6 +116,11 @@ def get_tool_definitions() -> list[dict[str, Any]]:
                             "items": {"type": "number"},
                             "minItems": 4,
                             "maxItems": 4,
+                        },
+                        "top_k": {
+                            "type": "integer",
+                            "description": "Maximum number of reverse-image matches to return.",
+                            "default": MAX_SEARCH_RESULTS,
                         },
                     },
                     "required": [],
@@ -442,6 +448,7 @@ def read_url(url: str, query: str = "") -> dict[str, Any]:
 def t2t_search(query: str, lang: str = "en", top_k: int = 5) -> dict[str, Any]:
     """Search text pages and return search results only."""
 
+    top_k = max(1, min(int(top_k), MAX_SEARCH_RESULTS))
     response = _serper_client().search_text(query, limit=top_k, hl=lang)
     results: list[dict[str, Any]] = []
     for item in response.results[:top_k]:
@@ -466,6 +473,7 @@ def t2t_search(query: str, lang: str = "en", top_k: int = 5) -> dict[str, Any]:
 def t2i_search(query: str, lang: str = "en", top_k: int = 5) -> dict[str, Any]:
     """Search images from a text query."""
 
+    top_k = max(1, min(int(top_k), MAX_SEARCH_RESULTS))
     response = _serper_client().search_image(query, limit=top_k, hl=lang)
     results = [
         {
@@ -488,7 +496,7 @@ def t2i_search(query: str, lang: str = "en", top_k: int = 5) -> dict[str, Any]:
     }
 
 
-def _image_search_via_serper(image_url: str) -> object:
+def _image_search_via_serper(image_url: str, top_k: int = MAX_SEARCH_RESULTS) -> object:
     serper_api_key = os.environ.get("SERPER_API_KEY")
     if not serper_api_key:
         raise RuntimeError("SERPER_API_KEY is required for reverse image search.")
@@ -509,7 +517,8 @@ def _image_search_via_serper(image_url: str) -> object:
         return data
 
     results = []
-    for item in organic[:3]:
+    top_k = max(1, min(int(top_k), MAX_SEARCH_RESULTS))
+    for item in organic[:top_k]:
         results.append(
             {
                 "title": item.get("title", ""),
@@ -526,22 +535,27 @@ def _image_search_via_serper(image_url: str) -> object:
 def i2i_search(
     image_url: str,
     visual_lookup: Callable[..., object] | None = None,
+    top_k: int = MAX_SEARCH_RESULTS,
     max_retries: int = 3,
     base_delay: int = 2,
 ) -> dict[str, Any]:
     """Reverse-image search using a provided backend or Serper Lens."""
 
     visual_lookup = visual_lookup or _image_search_via_serper
+    top_k = max(1, min(int(top_k), MAX_SEARCH_RESULTS))
     last_error: Exception | None = None
     for attempt in range(1, max_retries + 1):
         try:
-            result = visual_lookup(image_url=image_url)
+            result = visual_lookup(image_url=image_url, top_k=top_k)
             if isinstance(result, dict) and "error" in result:
                 raise RuntimeError(str(result["error"]))
+            if isinstance(result, list):
+                result = result[:top_k]
             summarized = summarize_image_search(result)
             return {
                 "ok": True,
                 "image_url": image_url,
+                "top_k": top_k,
                 "matches": summarized,
             }
         except Exception as exc:  # pragma: no cover - network bound
@@ -551,5 +565,6 @@ def i2i_search(
     return {
         "ok": False,
         "image_url": image_url,
+        "top_k": top_k,
         "error": f"i2i_search failed after {max_retries} retries: {last_error}",
     }
