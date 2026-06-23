@@ -71,6 +71,8 @@ def _single_question_record(
     question: str,
     gold_answer: str,
     hop_chain_json: str | None,
+    image_paths: list[str] | None = None,
+    image_urls: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     hop_chain = json.loads(hop_chain_json) if hop_chain_json else []
     if not isinstance(hop_chain, list):
@@ -83,6 +85,8 @@ def _single_question_record(
             "question": question,
             "gold_answer": gold_answer,
             "hop_chain": hop_chain,
+            "image_paths": list(image_paths or []),
+            "image_urls": list(image_urls or []),
             "sample_record": {},
             "question_record": {
                 "question": question,
@@ -101,6 +105,9 @@ def _print_record_result(result: dict[str, Any]) -> None:
         print(f"path_id: {result.get('path_id')}")
     print(f"question: {result.get('question')}")
     print(f"gold_answer: {result.get('gold_answer')}")
+    if result.get("input_images"):
+        print("input_images:")
+        print(json.dumps(result.get("input_images") or [], ensure_ascii=False, indent=2))
     print(f"extracted_answer: {result.get('extracted_answer')}")
     print("answer_judge:")
     print(json.dumps(result.get("answer_judge") or {}, ensure_ascii=False, indent=2))
@@ -121,6 +128,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--question", help="Single question to debug.")
     parser.add_argument("--gold-answer", default="", help="Gold answer for single-question mode.")
     parser.add_argument("--hop-chain-json", help="JSON list for single-question hop chain.")
+    parser.add_argument("--image", action="append", help="Attach a local image path to the user input.")
+    parser.add_argument("--image-url", action="append", help="Attach a remote image URL to the user input.")
     parser.add_argument("--limit", type=int, default=5, help="How many questions to run in batch mode.")
     parser.add_argument("--offset", type=int, default=0, help="Start offset in batch mode.")
     parser.add_argument("--workdir", default=os.path.join(os.getcwd(), "synthesis_sft_runs"))
@@ -164,6 +173,20 @@ def _parse_json_flag(value: str | None) -> dict[str, Any] | None:
     return parsed
 
 
+def _build_user_messages(record: dict[str, Any]) -> list[dict[str, Any]] | None:
+    image_paths = [str(item).strip() for item in (record.get("image_paths") or []) if str(item).strip()]
+    image_urls = [str(item).strip() for item in (record.get("image_urls") or []) if str(item).strip()]
+    if not image_paths and not image_urls:
+        return None
+
+    content: list[dict[str, Any]] = [{"type": "text", "text": str(record.get("question") or "")}]
+    for path in image_paths:
+        content.append({"type": "image_path", "path": path})
+    for url in image_urls:
+        content.append({"type": "image_url", "image_url": {"url": url}})
+    return [{"role": "user", "content": content}]
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
@@ -183,7 +206,14 @@ def main(argv: list[str] | None = None) -> int:
             question=args.question,
             gold_answer=args.gold_answer,
             hop_chain_json=args.hop_chain_json,
+            image_paths=args.image,
+            image_urls=args.image_url,
         )
+
+    if args.vqa_dir and (args.image or args.image_url):
+        for record in records:
+            record["image_paths"] = list(args.image or [])
+            record["image_urls"] = list(args.image_url or [])
 
     agent_config = build_agent_config(
         model=args.model,
@@ -234,8 +264,21 @@ def main(argv: list[str] | None = None) -> int:
                     "path_id": record.get("path_id"),
                 },
             )
+            input_images: list[dict[str, str]] = []
+            for image_path in record.get("image_paths") or []:
+                normalized_path = os.path.abspath(str(image_path))
+                context.register_image(normalized_path)
+                input_images.append({"image_path": normalized_path})
+            for image_url in record.get("image_urls") or []:
+                normalized_url = str(image_url).strip()
+                if normalized_url:
+                    context.register_image(normalized_url)
+                    input_images.append({"image_url": normalized_url})
+
+            input_messages = _build_user_messages(record)
             messages = run_agent_loop(
-                prompt=str(record.get("question") or ""),
+                prompt=None if input_messages is not None else str(record.get("question") or ""),
+                messages=input_messages,
                 config=agent_config,
                 context=context,
             )
@@ -259,6 +302,7 @@ def main(argv: list[str] | None = None) -> int:
                 "path_id": record.get("path_id"),
                 "question": record.get("question"),
                 "gold_answer": record.get("gold_answer"),
+                "input_images": input_images,
                 "extracted_answer": extracted_answer,
                 "answer_judge": answer_judge,
                 "hop_chain": hop_chain,
