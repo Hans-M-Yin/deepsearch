@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 from typing import Any
 
+from synthesis.model_worker import LLM_WORKER
 from .pipeline import (
     build_agent_config,
     build_runtime_context,
@@ -136,7 +137,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-jsonl", help="Optional path to save structured debug results.")
     parser.add_argument("--verbose", action="store_true")
 
-    parser.add_argument("--model", default=os.environ.get("SFT_OPENAI_MODEL") or os.environ.get("OPENAI_MODEL") or "")
+    parser.add_argument(
+        "--model",
+        default=os.environ.get("SFT_OPENAI_MODEL") or os.environ.get("OPENAI_MODEL") or "",
+        help="Primary answer model. Prefer a registered alias from synthesis/models.json.",
+    )
     parser.add_argument("--api-key", default=os.environ.get("OPENAI_API_KEY"))
     parser.add_argument(
         "--azure-endpoint",
@@ -155,7 +160,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--headers-json", default=os.environ.get("SFT_OPENAI_HEADERS_JSON"))
     parser.add_argument("--extra-body-json", default=os.environ.get("SFT_OPENAI_EXTRA_BODY_JSON"))
 
-    parser.add_argument("--expert-model", default=os.environ.get("SFT_JUDGE_MODEL"))
+    parser.add_argument(
+        "--expert-model",
+        default=os.environ.get("SFT_JUDGE_MODEL"),
+        help="Expert judge model. Prefer a registered alias from synthesis/models.json.",
+    )
     parser.add_argument("--expert-api-key", default=os.environ.get("SFT_JUDGE_API_KEY"))
     parser.add_argument("--expert-azure-endpoint", default=os.environ.get("SFT_JUDGE_AZURE_ENDPOINT"))
     parser.add_argument("--expert-api-version", default=os.environ.get("SFT_JUDGE_API_VERSION") or os.environ.get("SFT_OPENAI_API_VERSION") or "2024-03-01-preview")
@@ -171,6 +180,78 @@ def _parse_json_flag(value: str | None) -> dict[str, Any] | None:
     if not isinstance(parsed, dict):
         raise ValueError("Expected a JSON object.")
     return parsed
+
+
+def _resolve_model_alias(alias_or_model: str | None) -> dict[str, Any] | None:
+    if not alias_or_model:
+        return None
+    try:
+        return LLM_WORKER.get_model(alias_or_model)
+    except Exception:
+        return None
+
+
+def _config_from_model_arg(
+    *,
+    model_arg: str | None,
+    api_key: str | None,
+    azure_endpoint: str | None,
+    api_version: str | None,
+    max_tokens: int,
+    temperature: float,
+    timeout_s: float,
+    system_prompt: str | None,
+    headers_json: str | None,
+    extra_body_json: str | None,
+    max_turns: int,
+    print_rounds: bool,
+) -> Any:
+    model_config = _resolve_model_alias(model_arg)
+    if model_config is not None:
+        sampling_params = dict(model_config.get("sampling_params") or {})
+        served_model = str(model_config.get("served_model") or model_arg or "").strip()
+        resolved_temperature = float(sampling_params.pop("temperature", temperature))
+        resolved_max_tokens = max_tokens
+        if resolved_max_tokens is None:
+            out_seq_length = sampling_params.pop("out_seq_length", None)
+            max_tokens_in_config = sampling_params.pop("max_tokens", None)
+            chosen = out_seq_length if out_seq_length is not None else max_tokens_in_config
+            if chosen is not None:
+                resolved_max_tokens = int(chosen)
+        client_type = str(model_config.get("client_type") or "openai")
+        extra_body = sampling_params or None
+        return build_agent_config(
+            model=served_model,
+            api_key=model_config.get("api_key") or api_key,
+            client_type=client_type,
+            azure_endpoint=model_config.get("azure_endpoint") or azure_endpoint,
+            base_url=model_config.get("base_url"),
+            api_version=model_config.get("api_version") or api_version,
+            max_tokens=resolved_max_tokens,
+            temperature=resolved_temperature,
+            timeout_s=float(model_config.get("timeout_s") or timeout_s),
+            system_prompt=system_prompt,
+            headers=model_config.get("default_headers") or _parse_json_flag(headers_json),
+            extra_body=extra_body or _parse_json_flag(extra_body_json),
+            max_turns=max_turns,
+            print_rounds=print_rounds,
+        )
+
+    return build_agent_config(
+        model=model_arg,
+        api_key=api_key,
+        client_type="azure_openai",
+        azure_endpoint=azure_endpoint,
+        api_version=api_version,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        timeout_s=timeout_s,
+        system_prompt=system_prompt,
+        headers=_parse_json_flag(headers_json),
+        extra_body=_parse_json_flag(extra_body_json),
+        max_turns=max_turns,
+        print_rounds=print_rounds,
+    )
 
 
 def _build_user_messages(record: dict[str, Any]) -> list[dict[str, Any]] | None:
@@ -215,8 +296,8 @@ def main(argv: list[str] | None = None) -> int:
             record["image_paths"] = list(args.image or [])
             record["image_urls"] = list(args.image_url or [])
 
-    agent_config = build_agent_config(
-        model=args.model,
+    agent_config = _config_from_model_arg(
+        model_arg=args.model,
         api_key=args.api_key,
         azure_endpoint=args.azure_endpoint,
         api_version=args.api_version,
@@ -224,16 +305,16 @@ def main(argv: list[str] | None = None) -> int:
         temperature=args.temperature,
         timeout_s=args.timeout_s,
         system_prompt=args.system_prompt,
-        headers=_parse_json_flag(args.headers_json),
-        extra_body=_parse_json_flag(args.extra_body_json),
+        headers_json=args.headers_json,
+        extra_body_json=args.extra_body_json,
         max_turns=args.max_turns,
         print_rounds=args.verbose,
     )
 
     expert_config = None
     if args.expert_model:
-        expert_config = build_agent_config(
-            model=args.expert_model,
+        expert_config = _config_from_model_arg(
+            model_arg=args.expert_model,
             api_key=args.expert_api_key or args.api_key,
             azure_endpoint=args.expert_azure_endpoint or args.azure_endpoint,
             api_version=args.expert_api_version,
@@ -244,6 +325,9 @@ def main(argv: list[str] | None = None) -> int:
                 "You are a strict trajectory auditor. "
                 "You inspect whether an agent trajectory truly covers each intended reasoning hop."
             ),
+            headers_json=args.headers_json,
+            extra_body_json=None,
+            max_turns=args.max_turns,
             print_rounds=False,
         )
 

@@ -184,7 +184,9 @@ def build_agent_config(
     *,
     model: str | None = None,
     api_key: str | None = None,
+    client_type: str = "azure_openai",
     azure_endpoint: str | None = None,
+    base_url: str | None = None,
     api_version: str | None = None,
     max_tokens: int | None = None,
     temperature: float | None = None,
@@ -204,9 +206,15 @@ def build_agent_config(
     return OpenAIToolAgentConfig(
         model=resolved_model,
         api_key=api_key or os.environ.get("OPENAI_API_KEY"),
+        client_type=client_type,
         azure_endpoint=(
             azure_endpoint
             or os.environ.get("SFT_OPENAI_AZURE_ENDPOINT")
+            or os.environ.get("SFT_OPENAI_BASE_URL")
+            or os.environ.get("OPENAI_BASE_URL")
+        ),
+        base_url=(
+            base_url
             or os.environ.get("SFT_OPENAI_BASE_URL")
             or os.environ.get("OPENAI_BASE_URL")
         ),

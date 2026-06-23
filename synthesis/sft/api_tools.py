@@ -106,7 +106,9 @@ class OpenAIToolAgentConfig:
 
     model: str
     api_key: str | None = None
+    client_type: str = "azure_openai"
     azure_endpoint: str | None = None
+    base_url: str | None = None
     api_version: str = "2024-03-01-preview"
     api_mode: str = "chat_completions"
     max_tokens: int = 1024
@@ -759,11 +761,11 @@ def execute_tool_call(
 
 
 class OpenAIToolAgent:
-    """AzureOpenAI-based multi-turn chat-completions agent with tool calling."""
+    """OpenAI/AzureOpenAI-based multi-turn chat-completions agent with tool calling."""
 
     def __init__(self, config: OpenAIToolAgentConfig) -> None:
         try:
-            from openai import AzureOpenAI
+            from openai import AzureOpenAI, OpenAI
         except ImportError as exc:  # pragma: no cover - import guard
             raise ImportError(
                 "OpenAIToolAgent requires the `openai` package."
@@ -771,19 +773,34 @@ class OpenAIToolAgent:
 
         self.config = config
         api_key = config.api_key or os.environ.get("OPENAI_API_KEY") or "EMPTY"
-        azure_endpoint = (
-            config.azure_endpoint
-            or os.environ.get("SFT_OPENAI_AZURE_ENDPOINT")
-            or os.environ.get("SFT_OPENAI_BASE_URL")
-            or os.environ.get("OPENAI_BASE_URL")
-        )
-        self.client = AzureOpenAI(
-            api_key=api_key,
-            azure_endpoint=azure_endpoint,
-            api_version=config.api_version,
-            timeout=config.timeout_s,
-            default_headers=config.default_headers,
-        )
+        client_type = str(config.client_type or "azure_openai").strip().lower()
+        if client_type == "openai":
+            base_url = (
+                config.base_url
+                or os.environ.get("SFT_OPENAI_BASE_URL")
+                or os.environ.get("OPENAI_BASE_URL")
+            )
+            self.client = OpenAI(
+                api_key=api_key,
+                base_url=base_url,
+                timeout=config.timeout_s,
+                default_headers=config.default_headers,
+            )
+        else:
+            azure_endpoint = (
+                config.azure_endpoint
+                or config.base_url
+                or os.environ.get("SFT_OPENAI_AZURE_ENDPOINT")
+                or os.environ.get("SFT_OPENAI_BASE_URL")
+                or os.environ.get("OPENAI_BASE_URL")
+            )
+            self.client = AzureOpenAI(
+                api_key=api_key,
+                azure_endpoint=azure_endpoint,
+                api_version=config.api_version,
+                timeout=config.timeout_s,
+                default_headers=config.default_headers,
+            )
 
     def run(
         self,
