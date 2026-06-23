@@ -497,33 +497,34 @@ Your goal is NOT to make the question longer, more literary, or more confusing. 
 1. reduce direct exposure of intermediate entities;
 2. remove strong clues that allow common-sense shortcutting;
 3. replace those strong clues with weaker, vaguer expressions that still preserve contextual identification function;
-4. keep the entire question fluent and natural.
+4. reduce the obviously step-by-step sequential reasoning structure, so that the order of clues does not mechanically mirror the hop order;
+5. keep the entire question fluent, natural, and benchmark-like.
 
 Strict requirements:
-1. Do not change the core question and the final answer.
+1. Do not change the core question or the final answer.
 2. Do not merely perform synonym substitution; you must genuinely reduce the salience of intermediate entities.
-3. Do not simply delete strong clues without replacement; you must replace them with weaker but still useful contextual descriptions.
-4. A replacement expression must satisfy this condition: by itself it should not directly identify the target entity, but within the full question context it should still help uniquely constrain the correct path.
-5. Do not rewrite clues that identify a specific person, place, or object into abstract themes, symbolic meanings, or generalized concepts.
-6. While reducing salience, you must preserve or add enough non-shortcut constraints so that the question remains uniquely solvable.
+3. A replacement expression must satisfy this condition: by itself it should not directly identify the target entity, but within the full question context it should still help uniquely constrain the correct path.
+4. While reducing salience, you must preserve or add enough non-shortcut constraints so that the question remains uniquely solvable.
+5. If the original question is artificially tied to a specific source framing (“according to profile X,” “in source Y’s description,” etc.) but the answer is really a real-world fact rather than a document-specific wording question, remove or naturalize that framing instead of keeping it mechanically.
 
 Preferred rewriting strategies:
-1. Use relational, structural, or contextual constraints instead of highly distinctive signals including *famous titles*, *people names*, *signature works*, *unique achievements*, *strong year markers*.
+1. Use relational, structural, or contextual constraints instead of highly distinctive signals including famous titles, people names, signature works, unique achievements, strong year markers, or iconic paper titles.
 2. Remove features that directly expose intermediate entities, but replace them with weaker contextual descriptions rather than simply deleting them.
 3. If obfuscation introduces ambiguity, add non-shortcut constraints to eliminate wrong candidates.
-4. Keep the question natural, concise, and benchmark-like rather than turning it into a pile of hints.
+4. Avoid an overly explicit hop-by-hop reasoning structure; the order of clues should not mechanically mirror the order of inference steps.
+5. Keep the question natural, concise, and benchmark-like rather than turning it into a pile of hints.
 
-Below are few-shot examples. Learn the rewriting style from them:
+Below are examples. Learn the rewriting style from them.
 
-**Example 1**:
-question: A famous cult statue from a temple, once one of the ancient world's great marvels, is adorned with numerous oval objects. Modern scholarship reinterprets these objects based on finds from 1987–1988 excavations. The temple was in the same city where the apostle shown in the image undergoing a trial by ordeal is traditionally believed to have died of natural causes. What is this modern interpretation, and what specific artifacts support it?
+Example 1:
+question: The man shown in this image later became nationally prominent for his handling of a devastating 1927 flood centered on the lower Mississippi Valley, a development that helped lead to his 1928 presidential nomination by the political party whose modern encyclopedic profile says Donald Trump narrowly carried three long-Democratic “blue wall” states in 2016. Which three states were they, and what broader effect did that victory have on that party according to the profile?
 Output:
 {
-    "analysis": "The original question is too easy because it uses multiple strong clues that can directly identify the intermediate entity, such as “ancient world's great marvels,” “numerous oval objects,” and “apostle ... died of natural causes.” Together these clues allow a strong model to infer the target object during question reading, compressing the intended multi-hop reasoning path. The rewrite should remove these strong clues and replace them with weaker but still functional descriptions, for example replacing the statue-revealing phrase with “a long-debated feature of an Anatolian cult image,” and replacing the figure-revealing phrase with “the figure shown in the accompanying ordeal scene.” At the same time, it should preserve non-shortcut constraints such as “1987–1988 excavations,” “same city,” and “Christian tradition,” so the question remains uniquely solvable.",
-    "question": "A long-debated feature of an Anatolian cult image has traditionally been interpreted in anatomical terms, but more recent scholarship argues that this reading is mistaken. The revised interpretation draws on objects recovered during 1987–1988 excavations from debris associated with an earlier version of the image. The sanctuary where the image was venerated stood in the same city that later Christian tradition associates with the figure shown in the accompanying ordeal scene. What alternative interpretation do modern scholars propose for this disputed feature, and what excavated objects are cited in support?"
+  "analysis": "The original question was too easy in two important ways. First, the phrase “Donald Trump” plus “three long-Democratic blue wall states” created an overly direct shortcut to the Republican Party, which in turn made the earlier flood-and-nomination clue almost unnecessary for identifying the party connection. The revision removes the explicit mention of “Democratic,” because once that label is stated outright, the party in the earlier clause becomes mechanically recoverable without requiring the intended historical bridge through the flood response and the 1928 nomination. This weakens the partisan cue while still preserving a uniquely recoverable political contrast through “the opposing party.” Second, the original phrasing anchored the answer to a specific “modern encyclopedic profile” and repeatedly referred to what “the profile says” or “the overview says.” The revision removes that framing, because the question is really about the underlying factual content rather than about a particular document as an object. Keeping that document frame made the question sound artificially source-bound and less natural, even though the intended answer is a real-world fact rather than a source-specific wording task. Beyond those two user-motivated improvements, the revised version also softens other high-salience expressions: “centered on the lower Mississippi Valley” becomes the less directly identifying “a catastrophic flood in 1927,” and “blue wall states” becomes the more contextual “states that had long been regarded as reliably belonging to the opposing party in presidential elections.” These replacements reduce direct entity exposure while preserving enough relational structure to keep the question uniquely solvable. The result is more natural, less template-like, and less vulnerable to partisan shortcutting, while keeping the original answer, factual relations, and reasoning chain intact.",
+  "question": "The man shown here later gained national prominence through his response to a catastrophic flood in 1927, a development that helped him secure his party’s presidential nomination the following year. That same party’s 2016 nominee narrowly flipped three states that had long been regarded as reliably belonging to the opposing party in presidential elections. Which three states were they, and what broader effect were those victories said to have had on that party?"
 }
 
-**Example 2**:
+Example 2:
 question: This image shows a work on the Moon’s motion. That subject also appears in a geometrical diagram in Newton’s landmark 1687 mathematical treatise on natural philosophy. Before the final three-book structure of the Principia was settled, what was the planned title of the surviving fair-copy draft of its second volume, about when was that draft completed, and which later part of the finished work did it largely correspond to in purpose?
 Output:
 {
