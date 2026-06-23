@@ -152,7 +152,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--api-version", default=os.environ.get("SFT_OPENAI_API_VERSION") or "2024-03-01-preview")
-    parser.add_argument("--max-tokens", type=int, default=int(os.environ.get("SFT_OPENAI_MAX_TOKENS", "1024")))
+    parser.add_argument("--max-tokens", type=int, default=_optional_env_int("SFT_OPENAI_MAX_TOKENS"))
     parser.add_argument(
         "--temperature",
         type=float,
@@ -172,7 +172,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--expert-api-key", default=os.environ.get("SFT_JUDGE_API_KEY"))
     parser.add_argument("--expert-azure-endpoint", default=os.environ.get("SFT_JUDGE_AZURE_ENDPOINT"))
     parser.add_argument("--expert-api-version", default=os.environ.get("SFT_JUDGE_API_VERSION") or os.environ.get("SFT_OPENAI_API_VERSION") or "2024-03-01-preview")
-    parser.add_argument("--expert-max-tokens", type=int, default=int(os.environ.get("SFT_JUDGE_MAX_TOKENS", "4096")))
+    parser.add_argument("--expert-max-tokens", type=int, default=_optional_env_int("SFT_JUDGE_MAX_TOKENS"))
     parser.add_argument(
         "--expert-temperature",
         type=float,
@@ -205,8 +205,8 @@ def _config_from_model_arg(
     api_key: str | None,
     azure_endpoint: str | None,
     api_version: str | None,
-    max_tokens: int,
-    temperature: float,
+    max_tokens: int | None,
+    temperature: float | None,
     timeout_s: float,
     system_prompt: str | None,
     headers_json: str | None,
@@ -218,7 +218,9 @@ def _config_from_model_arg(
     if model_config is not None:
         sampling_params = dict(model_config.get("sampling_params") or {})
         served_model = str(model_config.get("served_model") or model_arg or "").strip()
-        resolved_temperature = float(sampling_params.pop("temperature", temperature))
+        resolved_temperature = sampling_params.pop("temperature", temperature)
+        if resolved_temperature is not None:
+            resolved_temperature = float(resolved_temperature)
         resolved_max_tokens = max_tokens
         if resolved_max_tokens is None:
             out_seq_length = sampling_params.pop("out_seq_length", None)
@@ -274,6 +276,13 @@ def _build_user_messages(record: dict[str, Any]) -> list[dict[str, Any]] | None:
     for url in image_urls:
         content.append({"type": "image_url", "image_url": {"url": url}})
     return [{"role": "user", "content": content}]
+
+
+def _optional_env_int(name: str) -> int | None:
+    value = os.environ.get(name)
+    if value is None or str(value).strip() == "":
+        return None
+    return int(value)
 
 
 def main(argv: list[str] | None = None) -> int:

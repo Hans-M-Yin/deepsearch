@@ -23,6 +23,13 @@ def _optional_env_float(name: str) -> float | None:
     return float(value)
 
 
+def _optional_env_int(name: str) -> int | None:
+    value = os.environ.get(name)
+    if value is None or str(value).strip() == "":
+        return None
+    return int(value)
+
+
 def _message_text(content: Any) -> str:
     if content in (None, ""):
         return ""
@@ -227,7 +234,7 @@ def build_agent_config(
         ),
         api_version=api_version or os.environ.get("SFT_OPENAI_API_VERSION") or "2024-03-01-preview",
         api_mode="chat_completions",
-        max_tokens=max_tokens or int(os.environ.get("SFT_OPENAI_MAX_TOKENS", "1024")),
+        max_tokens=max_tokens if max_tokens is not None else _optional_env_int("SFT_OPENAI_MAX_TOKENS"),
         temperature=temperature if temperature is not None else _optional_env_float("SFT_OPENAI_TEMPERATURE"),
         timeout_s=timeout_s if timeout_s is not None else float(os.environ.get("SFT_OPENAI_TIMEOUT_S", "120")),
         system_prompt=system_prompt or DEFAULT_SYSTEM_PROMPT,
