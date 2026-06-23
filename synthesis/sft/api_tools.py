@@ -30,7 +30,9 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_SYSTEM_PROMPT = """You are an expert in answering multi-hop knowledge questions. You need to analyze each question carefully and, when necessary, use the appropriate tools to identify images, look for clues, and search the web for additional information.
 
-At each turn, you must think step by step, provide a detailed analysis, and clearly plan the next action so that your reasoning process is reliable and trustworthy. Note that you may use only one tool per turn.
+
+Please always keep your response strategy firmly in mind: you need to carefully analyze the question, and at every step explicitly list the current problem state, the clues obtained so far, and the plan for the next step in non-thinking tokens. Then, based on that plan, call the tool you need. The tool will return a result, and you must use that new result to conduct a fresh analysis, summary, and plan, then iteratively call the next tool until you can answer the question accurately and without error.
+Note that you may use only one tool in each round, and when the tool result is returned, you must promptly analyze it, reason about it, and plan the next step—that is, follow the Think-Act loop until you are able to provide an accurate answer.
 
 As for the available tools:
 - t2t_search allows you to retrieve relevant web pages based on text and returns a list of URLs. You should examine the results, select the useful ones, and then use the read_url tool to access the page content.
@@ -39,6 +41,17 @@ As for the available tools:
 
 Once you believe the evidence is sufficient and there are no remaining unclear or uncertain points, provide the final answer and end the output.
 """
+
+
+def _truncate_tool_calls(tool_calls: list[Any], *, source: str) -> list[Any]:
+    if len(tool_calls) > 1:
+        logger.warning(
+            "Expected at most one tool call per turn; keeping only the first from %s and dropping %d extra call(s).",
+            source,
+            len(tool_calls) - 1,
+        )
+        return tool_calls[:1]
+    return tool_calls
 
 
 @dataclass(slots=True)
@@ -392,10 +405,9 @@ def _materialize_remote_image_url(source: Any, context: ToolRuntimeContext, tool
 
 def _assistant_message_for_followup(message: Any) -> dict[str, Any]:
     tool_calls = []
-    for index, tool_call in enumerate(getattr(message, "tool_calls", None) or []):
+    for tool_call in getattr(message, "tool_calls", None) or []:
         tool_calls.append(
             {
-                "index": index,
                 "id": tool_call.id,
                 "type": "function",
                 "function": {
@@ -497,11 +509,10 @@ def _print_round_output(turn_index: int, assistant_message: Any) -> None:
     tool_calls = getattr(assistant_message, "tool_calls", None) or []
     if tool_calls:
         print("tool_calls:")
-        for index, tool_call in enumerate(tool_calls):
+        for tool_call in tool_calls:
             print(
                 _json_text(
                     {
-                        "index": index,
                         "id": tool_call.id,
                         "type": "function",
                         "function": {
@@ -640,7 +651,6 @@ def _extract_responses_content_and_tool_calls(raw_response: dict[str, Any]) -> t
             call_id = item.get("call_id") or item.get("id") or ""
             tool_calls.append(
                 {
-                    "index": len(tool_calls),
                     "id": call_id,
                     "type": "function",
                     "function": {
@@ -867,7 +877,7 @@ class OpenAIToolAgent:
             assistant_message = choice.message
             if self.config.print_rounds:
                 _print_round_output(turn_index, assistant_message)
-            tool_calls = assistant_message.tool_calls or []
+            tool_calls = _truncate_tool_calls(list(assistant_message.tool_calls or []), source="chat_completions")
 
             if not tool_calls:
                 final_text = assistant_message.content or ""
@@ -956,6 +966,7 @@ class OpenAIToolAgent:
                 previous_response_id = None
 
             assistant_content, assistant_tool_calls = _extract_responses_content_and_tool_calls(raw_response)
+            assistant_tool_calls = _truncate_tool_calls(assistant_tool_calls, source="responses")
             if self.config.print_rounds:
                 _print_round_output_from_responses(
                     turn_index,
