@@ -181,7 +181,6 @@ def get_responses_tool_definitions() -> list[dict[str, Any]]:
                 "name": function_block["name"],
                 "description": function_block["description"],
                 "parameters": json.loads(json.dumps(function_block["parameters"])),
-                "strict": True,
             }
         )
     return definitions
