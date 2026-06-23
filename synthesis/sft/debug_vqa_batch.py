@@ -144,6 +144,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--api-key", default=os.environ.get("OPENAI_API_KEY"))
     parser.add_argument(
+        "--api-mode",
+        choices=("chat_completions", "responses"),
+        default=os.environ.get("SFT_OPENAI_API_MODE") or "responses",
+        help="API mode for the trajectory collection loop. Defaults to responses.",
+    )
+    parser.add_argument(
         "--azure-endpoint",
         default=(
             os.environ.get("SFT_OPENAI_AZURE_ENDPOINT")
@@ -203,6 +209,7 @@ def _config_from_model_arg(
     *,
     model_arg: str | None,
     api_key: str | None,
+    api_mode: str,
     azure_endpoint: str | None,
     api_version: str | None,
     max_tokens: int | None,
@@ -234,6 +241,7 @@ def _config_from_model_arg(
             model=served_model,
             api_key=model_config.get("api_key") or api_key,
             client_type=client_type,
+            api_mode=api_mode,
             azure_endpoint=model_config.get("azure_endpoint") or azure_endpoint,
             base_url=model_config.get("base_url"),
             api_version=model_config.get("api_version") or api_version,
@@ -251,6 +259,7 @@ def _config_from_model_arg(
         model=model_arg,
         api_key=api_key,
         client_type="azure_openai",
+        api_mode=api_mode,
         azure_endpoint=azure_endpoint,
         api_version=api_version,
         max_tokens=max_tokens,
@@ -316,6 +325,7 @@ def main(argv: list[str] | None = None) -> int:
     agent_config = _config_from_model_arg(
         model_arg=args.model,
         api_key=args.api_key,
+        api_mode=args.api_mode,
         azure_endpoint=args.azure_endpoint,
         api_version=args.api_version,
         max_tokens=args.max_tokens,
@@ -333,6 +343,7 @@ def main(argv: list[str] | None = None) -> int:
         expert_config = _config_from_model_arg(
             model_arg=args.expert_model,
             api_key=args.expert_api_key or args.api_key,
+            api_mode="chat_completions",
             azure_endpoint=args.expert_azure_endpoint or args.azure_endpoint,
             api_version=args.expert_api_version,
             max_tokens=args.expert_max_tokens,

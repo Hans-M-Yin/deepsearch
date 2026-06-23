@@ -125,7 +125,7 @@ class OpenAIToolAgentConfig:
     azure_endpoint: str | None = None
     base_url: str | None = None
     api_version: str = "2024-03-01-preview"
-    api_mode: str = "chat_completions"
+    api_mode: str = "responses"
     max_tokens: int = 1024
     temperature: float | None = None
     timeout_s: float = 120.0
@@ -541,20 +541,23 @@ def _print_round_output_from_responses(
             print(_json_text(tool_call))
 
 
-def _message_content_to_responses_content(content: Any) -> list[dict[str, Any]]:
+def _message_content_to_responses_content(content: Any, *, role: str = "user") -> list[dict[str, Any]]:
+    text_type = "output_text" if role == "assistant" else "input_text"
     if isinstance(content, str):
-        return [{"type": "input_text", "text": content}]
+        return [{"type": text_type, "text": content}]
     if isinstance(content, list):
         normalized_parts: list[dict[str, Any]] = []
         for part in content:
             if not isinstance(part, dict):
-                normalized_parts.append({"type": "input_text", "text": str(part)})
+                normalized_parts.append({"type": text_type, "text": str(part)})
                 continue
             part_type = part.get("type")
             if part_type == "text":
-                normalized_parts.append({"type": "input_text", "text": str(part.get("text", ""))})
+                normalized_parts.append({"type": text_type, "text": str(part.get("text", ""))})
             elif part_type == "input_text":
-                normalized_parts.append({"type": "input_text", "text": str(part.get("text", ""))})
+                normalized_parts.append({"type": text_type, "text": str(part.get("text", ""))})
+            elif part_type == "output_text":
+                normalized_parts.append({"type": text_type, "text": str(part.get("text", ""))})
             elif part_type == "image_url":
                 image_url = part.get("image_url")
                 if isinstance(image_url, dict):
@@ -573,8 +576,8 @@ def _message_content_to_responses_content(content: Any) -> list[dict[str, Any]]:
                 normalized_parts.append(dict(part))
         return normalized_parts
     if content is None:
-        return [{"type": "input_text", "text": ""}]
-    return [{"type": "input_text", "text": str(content)}]
+        return [{"type": text_type, "text": ""}]
+    return [{"type": text_type, "text": str(content)}]
 
 
 def _messages_to_responses_input(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -586,7 +589,7 @@ def _messages_to_responses_input(messages: list[dict[str, Any]]) -> list[dict[st
         items.append(
             {
                 "role": role,
-                "content": _message_content_to_responses_content(message.get("content")),
+                "content": _message_content_to_responses_content(message.get("content"), role=role),
             }
         )
     return items
@@ -605,7 +608,7 @@ def _conversation_messages_to_responses_input(messages: list[dict[str, Any]]) ->
                 items.append(
                     {
                         "role": role,
-                        "content": _message_content_to_responses_content(content),
+                        "content": _message_content_to_responses_content(content, role=role),
                     }
                 )
             if role == "assistant":
@@ -1068,7 +1071,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--api-mode",
         choices=("chat_completions", "responses"),
-        default=os.environ.get("SFT_OPENAI_API_MODE") or "chat_completions",
+        default=os.environ.get("SFT_OPENAI_API_MODE") or "responses",
     )
     parser.add_argument(
         "--azure-endpoint",
@@ -1098,7 +1101,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--case-id", default="sft_session")
     parser.add_argument("--image", action="append", help="Preload a local image path as img_n.")
     parser.add_argument("--image-url", action="append", help="Preload a remote image URL as img_n.")
-    parser.add_argument("--gpt54", action="store_true", help="Use the GPT-5.4 chat.completions branch from .sft_env.")
+    parser.add_argument("--gpt54", action="store_true", help="Use the GPT-5.4 responses branch from .sft_env.")
     parser.add_argument(
         "--gemini35-flash",
         action="store_true",
@@ -1127,7 +1130,7 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("Use only one model shortcut: --gpt54 or --gemini35-flash.")
 
     if args.gpt54:
-        args.api_mode = "chat_completions"
+        args.api_mode = "responses"
         args.model = os.environ.get("SFT_GPT54_MODEL") or "gpt-5.4-2026-03-05"
         args.api_key = os.environ.get("SFT_GPT54_API_KEY") or args.api_key
         args.azure_endpoint = os.environ.get("SFT_GPT54_AZURE_ENDPOINT") or args.azure_endpoint
