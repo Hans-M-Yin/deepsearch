@@ -1,0 +1,281 @@
+"""Debug and inspect SFT trajectories over one question or a VQA batch directory."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from pathlib import Path
+from typing import Any
+
+from .pipeline import (
+    build_agent_config,
+    build_runtime_context,
+    check_hop_chain_coverage,
+    extract_answer,
+    format_messages,
+    judge,
+    run_agent_loop,
+)
+
+
+def _load_jsonl(path: Path) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            parsed = json.loads(line)
+            if isinstance(parsed, dict):
+                records.append(parsed)
+    return records
+
+
+def _load_vqa_records(vqa_dir: Path) -> list[dict[str, Any]]:
+    questions_path = vqa_dir / "questions.jsonl"
+    samples_path = vqa_dir / "samples.jsonl"
+    if not questions_path.exists():
+        raise FileNotFoundError(f"questions.jsonl does not exist: {questions_path}")
+    if not samples_path.exists():
+        raise FileNotFoundError(f"samples.jsonl does not exist: {samples_path}")
+
+    question_records = _load_jsonl(questions_path)
+    sample_records = _load_jsonl(samples_path)
+    samples_by_id = {
+        str(record.get("sample_id")): record
+        for record in sample_records
+        if record.get("sample_id") is not None
+    }
+
+    merged_records: list[dict[str, Any]] = []
+    for question_record in question_records:
+        sample = samples_by_id.get(str(question_record.get("sample_id") or ""))
+        merged_records.append(
+            {
+                "question_id": question_record.get("question_id"),
+                "sample_id": question_record.get("sample_id"),
+                "path_id": question_record.get("path_id"),
+                "question": question_record.get("final_question") or question_record.get("question") or "",
+                "gold_answer": question_record.get("answer") or "",
+                "hop_chain": list((sample or {}).get("hop_chain") or []),
+                "sample_record": sample or {},
+                "question_record": question_record,
+            }
+        )
+    return merged_records
+
+
+def _single_question_record(
+    *,
+    question: str,
+    gold_answer: str,
+    hop_chain_json: str | None,
+) -> list[dict[str, Any]]:
+    hop_chain = json.loads(hop_chain_json) if hop_chain_json else []
+    if not isinstance(hop_chain, list):
+        raise ValueError("--hop-chain-json must decode to a JSON list.")
+    return [
+        {
+            "question_id": "single_question",
+            "sample_id": None,
+            "path_id": None,
+            "question": question,
+            "gold_answer": gold_answer,
+            "hop_chain": hop_chain,
+            "sample_record": {},
+            "question_record": {
+                "question": question,
+                "answer": gold_answer,
+            },
+        }
+    ]
+
+
+def _print_record_result(result: dict[str, Any]) -> None:
+    print("\n" + "=" * 100)
+    print(f"question_id: {result.get('question_id')}")
+    if result.get("sample_id") is not None:
+        print(f"sample_id: {result.get('sample_id')}")
+    if result.get("path_id") is not None:
+        print(f"path_id: {result.get('path_id')}")
+    print(f"question: {result.get('question')}")
+    print(f"gold_answer: {result.get('gold_answer')}")
+    print(f"extracted_answer: {result.get('extracted_answer')}")
+    print("answer_judge:")
+    print(json.dumps(result.get("answer_judge") or {}, ensure_ascii=False, indent=2))
+    if result.get("hop_chain"):
+        print("hop_chain_coverage:")
+        print(json.dumps(result.get("hop_chain_coverage") or {}, ensure_ascii=False, indent=2))
+    print("\n--- Trajectory Text ---")
+    print((result.get("formatted_trajectory") or {}).get("text") or "")
+    images = (result.get("formatted_trajectory") or {}).get("images") or []
+    if images:
+        print("\n--- Trajectory Images ---")
+        print(json.dumps(images, ensure_ascii=False, indent=2))
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--vqa-dir", help="Directory produced by synthesis.vqa.run_batch.")
+    parser.add_argument("--question", help="Single question to debug.")
+    parser.add_argument("--gold-answer", default="", help="Gold answer for single-question mode.")
+    parser.add_argument("--hop-chain-json", help="JSON list for single-question hop chain.")
+    parser.add_argument("--limit", type=int, default=5, help="How many questions to run in batch mode.")
+    parser.add_argument("--offset", type=int, default=0, help="Start offset in batch mode.")
+    parser.add_argument("--workdir", default=os.path.join(os.getcwd(), "synthesis_sft_runs"))
+    parser.add_argument("--output-jsonl", help="Optional path to save structured debug results.")
+    parser.add_argument("--verbose", action="store_true")
+
+    parser.add_argument("--model", default=os.environ.get("SFT_OPENAI_MODEL") or os.environ.get("OPENAI_MODEL") or "")
+    parser.add_argument("--api-key", default=os.environ.get("OPENAI_API_KEY"))
+    parser.add_argument(
+        "--azure-endpoint",
+        default=(
+            os.environ.get("SFT_OPENAI_AZURE_ENDPOINT")
+            or os.environ.get("SFT_OPENAI_BASE_URL")
+            or os.environ.get("OPENAI_BASE_URL")
+        ),
+    )
+    parser.add_argument("--api-version", default=os.environ.get("SFT_OPENAI_API_VERSION") or "2024-03-01-preview")
+    parser.add_argument("--max-tokens", type=int, default=int(os.environ.get("SFT_OPENAI_MAX_TOKENS", "1024")))
+    parser.add_argument("--temperature", type=float, default=float(os.environ.get("SFT_OPENAI_TEMPERATURE", "0.2")))
+    parser.add_argument("--max-turns", type=int, default=int(os.environ.get("SFT_OPENAI_MAX_TURNS", "8")))
+    parser.add_argument("--timeout-s", type=float, default=float(os.environ.get("SFT_OPENAI_TIMEOUT_S", "120")))
+    parser.add_argument("--system-prompt", default=None)
+    parser.add_argument("--headers-json", default=os.environ.get("SFT_OPENAI_HEADERS_JSON"))
+    parser.add_argument("--extra-body-json", default=os.environ.get("SFT_OPENAI_EXTRA_BODY_JSON"))
+
+    parser.add_argument("--expert-model", default=os.environ.get("SFT_JUDGE_MODEL"))
+    parser.add_argument("--expert-api-key", default=os.environ.get("SFT_JUDGE_API_KEY"))
+    parser.add_argument("--expert-azure-endpoint", default=os.environ.get("SFT_JUDGE_AZURE_ENDPOINT"))
+    parser.add_argument("--expert-api-version", default=os.environ.get("SFT_JUDGE_API_VERSION") or os.environ.get("SFT_OPENAI_API_VERSION") or "2024-03-01-preview")
+    parser.add_argument("--expert-max-tokens", type=int, default=int(os.environ.get("SFT_JUDGE_MAX_TOKENS", "4096")))
+    parser.add_argument("--expert-temperature", type=float, default=float(os.environ.get("SFT_JUDGE_TEMPERATURE", "0")))
+    return parser
+
+
+def _parse_json_flag(value: str | None) -> dict[str, Any] | None:
+    if not value:
+        return None
+    parsed = json.loads(value)
+    if not isinstance(parsed, dict):
+        raise ValueError("Expected a JSON object.")
+    return parsed
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_arg_parser()
+    args = parser.parse_args(argv)
+
+    if bool(args.vqa_dir) == bool(args.question):
+        parser.error("Use exactly one of --vqa-dir or --question.")
+    if args.question and not args.model:
+        parser.error("--model is required in single-question mode unless SFT_OPENAI_MODEL / OPENAI_MODEL is set.")
+    if args.vqa_dir and not args.model:
+        parser.error("--model is required in batch mode unless SFT_OPENAI_MODEL / OPENAI_MODEL is set.")
+
+    if args.vqa_dir:
+        all_records = _load_vqa_records(Path(args.vqa_dir))
+        records = all_records[args.offset : args.offset + args.limit]
+    else:
+        records = _single_question_record(
+            question=args.question,
+            gold_answer=args.gold_answer,
+            hop_chain_json=args.hop_chain_json,
+        )
+
+    agent_config = build_agent_config(
+        model=args.model,
+        api_key=args.api_key,
+        azure_endpoint=args.azure_endpoint,
+        api_version=args.api_version,
+        max_tokens=args.max_tokens,
+        temperature=args.temperature,
+        timeout_s=args.timeout_s,
+        system_prompt=args.system_prompt,
+        headers=_parse_json_flag(args.headers_json),
+        extra_body=_parse_json_flag(args.extra_body_json),
+        max_turns=args.max_turns,
+        print_rounds=args.verbose,
+    )
+
+    expert_config = None
+    if args.expert_model:
+        expert_config = build_agent_config(
+            model=args.expert_model,
+            api_key=args.expert_api_key or args.api_key,
+            azure_endpoint=args.expert_azure_endpoint or args.azure_endpoint,
+            api_version=args.expert_api_version,
+            max_tokens=args.expert_max_tokens,
+            temperature=args.expert_temperature,
+            timeout_s=args.timeout_s,
+            system_prompt=(
+                "You are a strict trajectory auditor. "
+                "You inspect whether an agent trajectory truly covers each intended reasoning hop."
+            ),
+            print_rounds=False,
+        )
+
+    output_handle = None
+    if args.output_jsonl:
+        output_path = Path(args.output_jsonl)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_handle = output_path.open("w", encoding="utf-8")
+
+    try:
+        for index, record in enumerate(records, start=1):
+            context = build_runtime_context(
+                working_dir=os.path.join(args.workdir, f"debug_{index:04d}_{record.get('question_id') or 'question'}"),
+                case_id=str(record.get("question_id") or f"debug_{index:04d}"),
+                metadata={
+                    "question_id": record.get("question_id"),
+                    "sample_id": record.get("sample_id"),
+                    "path_id": record.get("path_id"),
+                },
+            )
+            messages = run_agent_loop(
+                prompt=str(record.get("question") or ""),
+                config=agent_config,
+                context=context,
+            )
+            extracted_answer = extract_answer(messages)
+            answer_judge = judge(
+                question=str(record.get("question") or ""),
+                answer=str(record.get("gold_answer") or ""),
+                extracted_answer=extracted_answer,
+            )
+            formatted_trajectory = format_messages(messages)
+            hop_chain = list(record.get("hop_chain") or [])
+            hop_chain_coverage = (
+                check_hop_chain_coverage(messages, hop_chain, config=expert_config)
+                if hop_chain and expert_config is not None
+                else None
+            )
+
+            result_record = {
+                "question_id": record.get("question_id"),
+                "sample_id": record.get("sample_id"),
+                "path_id": record.get("path_id"),
+                "question": record.get("question"),
+                "gold_answer": record.get("gold_answer"),
+                "extracted_answer": extracted_answer,
+                "answer_judge": answer_judge,
+                "hop_chain": hop_chain,
+                "hop_chain_coverage": hop_chain_coverage,
+                "formatted_trajectory": formatted_trajectory,
+                "messages": messages,
+            }
+            _print_record_result(result_record)
+            if output_handle is not None:
+                output_handle.write(json.dumps(result_record, ensure_ascii=False) + "\n")
+                output_handle.flush()
+    finally:
+        if output_handle is not None:
+            output_handle.close()
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

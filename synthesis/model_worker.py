@@ -18,6 +18,9 @@ import time
 from typing import Any, Protocol
 
 
+VALID_REASONING_EFFORTS = {"low", "medium", "high", "xhigh"}
+
+
 def _jsonify(value: Any) -> Any:
     if isinstance(value, Enum):
         return value.value
@@ -101,6 +104,18 @@ def _trace_model_call(
     print(" ".join(parts), file=sys.stderr, flush=True)
 
 
+def _is_gpt_model_name(model: str | None) -> bool:
+    normalized = str(model or "").strip().lower()
+    return normalized.startswith("gpt")
+
+
+def _normalize_reasoning_effort(value: Any, *, default: str = "medium") -> str:
+    normalized = str(value or "").strip().lower()
+    if normalized in VALID_REASONING_EFFORTS:
+        return normalized
+    return default
+
+
 class OpenAIModelWorkerClient:
     """OpenAI-compatible model worker.
 
@@ -158,6 +173,9 @@ class OpenAIModelWorkerClient:
             kwargs["max_tokens"] = request.max_tokens
         if request.response_format is not None:
             kwargs["response_format"] = request.response_format
+        reasoning_effort = request.metadata.get("reasoning_effort")
+        if reasoning_effort is not None and _is_gpt_model_name(request.model or self.model):
+            kwargs["reasoning_effort"] = _normalize_reasoning_effort(reasoning_effort)
 
         extra_body = request.metadata.get("extra_body")
         if isinstance(extra_body, dict):
@@ -281,6 +299,9 @@ class AzureOpenAIModelWorkerClient:
             kwargs["max_tokens"] = request.max_tokens
         if request.response_format is not None:
             kwargs["response_format"] = request.response_format
+        reasoning_effort = request.metadata.get("reasoning_effort")
+        if reasoning_effort is not None and _is_gpt_model_name(request.model or self.model):
+            kwargs["reasoning_effort"] = _normalize_reasoning_effort(reasoning_effort)
 
         extra_body = request.metadata.get("extra_body")
         if isinstance(extra_body, dict):
@@ -378,6 +399,13 @@ class ModelRouterWorkerClient:
                     raise ValueError(f"Azure model config for {alias!r} is missing 'azure_endpoint'.")
                 if not config.get("api_version"):
                     raise ValueError(f"Azure model config for {alias!r} is missing 'api_version'.")
+            sampling_params = dict(config.get("sampling_params") or {})
+            if "reasoning_effort" in sampling_params:
+                effort = _normalize_reasoning_effort(sampling_params.get("reasoning_effort"), default="")
+                if effort not in VALID_REASONING_EFFORTS:
+                    raise ValueError(
+                        f"Model config for {alias!r} has invalid reasoning_effort: {sampling_params.get('reasoning_effort')!r}"
+                    )
             normalized[alias] = dict(config)
 
         self._configs = normalized
@@ -412,6 +440,7 @@ class ModelRouterWorkerClient:
         client = self._client_for(alias, config)
         sampling_params = dict(config.get("sampling_params") or {})
         extra_body = dict(request.metadata.get("extra_body") or {})
+        reasoning_effort = request.metadata.get("reasoning_effort")
         routed_temperature = sampling_params.pop("temperature", request.temperature)
         routed_max_tokens = request.max_tokens
         if routed_max_tokens is None:
@@ -420,8 +449,14 @@ class ModelRouterWorkerClient:
             chosen_max_tokens = out_seq_length if out_seq_length is not None else max_tokens
             if chosen_max_tokens is not None:
                 routed_max_tokens = int(chosen_max_tokens)
+        if reasoning_effort is None and _is_gpt_model_name(config.get("served_model")):
+            reasoning_effort = sampling_params.pop("reasoning_effort", "medium")
+        else:
+            sampling_params.pop("reasoning_effort", None)
         extra_body = {**sampling_params, **extra_body} if sampling_params or extra_body else {}
         routed_metadata = dict(request.metadata or {})
+        if reasoning_effort is not None and _is_gpt_model_name(config.get("served_model")):
+            routed_metadata["reasoning_effort"] = _normalize_reasoning_effort(reasoning_effort)
         if extra_body:
             routed_metadata["extra_body"] = extra_body
         routed_request = ModelRequest(

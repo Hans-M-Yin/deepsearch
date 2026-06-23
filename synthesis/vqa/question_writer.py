@@ -491,41 +491,47 @@ Please return valid JSON with exactly the following field:
 """
 
 PROMPT_DIFFICULTY_ENHANCEMENT = """
-You are strengthening a generated multi-hop VQA question to make it harder, less template-like, and less vulnerable to a rigid left-to-right search procedure.
+You are a difficulty enhancement editor for multi-hop search questions. Rewrite the question so that it becomes harder for strong models to immediately identify the intermediate entities, while keeping the original answer, factual relations, and core reasoning chain unchanged. The rewritten question must remain uniquely solvable and verifiable.
 
-You will be given:
-- the current question
-- the hop chain that defines the intended underlying reasoning trajectory
-- possibly an image, if the trajectory starts from an image
+Your goal is NOT to make the question longer, more literary, or more confusing. Instead, you should:
+1. reduce direct exposure of intermediate entities;
+2. remove strong clues that allow common-sense shortcutting;
+3. replace those strong clues with weaker, vaguer expressions that still preserve contextual identification function;
+4. keep the entire question fluent and natural.
 
-Your goal:
-- keep the underlying reasoning trajectory compatible with the original hop chain
-- keep the question's final answer unchanged
-- make the surface form harder in a productive way
+Strict requirements:
+1. Do not change the core question and the final answer.
+2. Do not merely perform synonym substitution; you must genuinely reduce the salience of intermediate entities.
+3. Do not simply delete strong clues without replacement; you must replace them with weaker but still useful contextual descriptions.
+4. A replacement expression must satisfy this condition: by itself it should not directly identify the target entity, but within the full question context it should still help uniquely constrain the correct path.
+5. Do not rewrite clues that identify a specific person, place, or object into abstract themes, symbolic meanings, or generalized concepts.
+6. While reducing salience, you must preserve or add enough non-shortcut constraints so that the question remains uniquely solvable.
 
-What "harder" means here:
-- reduce obvious one-hop-at-a-time scaffolding
-- make clue ordering less mechanically aligned with hop ordering
-- compress or reorganize descriptions so the solver must do more interpretation
-- replace overly revealing names, titles, and strongly identifying descriptions with more indirect but still answerable descriptions
-- reduce reliance on rigid repeated patterns
-- increase the need for genuine reasoning, local disambiguation, and search error recovery
+Preferred rewriting strategies:
+1. Use relational, structural, or contextual constraints instead of highly distinctive signals including *famous titles*, *people names*, *signature works*, *unique achievements*, *strong year markers*.
+2. Remove features that directly expose intermediate entities, but replace them with weaker contextual descriptions rather than simply deleting them.
+3. If obfuscation introduces ambiguity, add non-shortcut constraints to eliminate wrong candidates.
+4. Keep the question natural, concise, and benchmark-like rather than turning it into a pile of hints.
 
-What you must NOT do:
-- do not change the final answer
-- do not make the question ambiguous
-- do not add unsupported facts
-- do not remove so much structure that the intended hop chain no longer works
-- do not make the question merely longer or more verbose
-- do not make it artificially obscure if the result becomes unanswerable
+Below are few-shot examples. Learn the rewriting style from them:
 
-You should first analyze the current question:
-- where it is too linear
-- where clue wording is too explicit
-- where descriptions make the correct search trajectory too obvious
-- where a solver can proceed mechanically instead of reasoning
+**Example 1**:
+question: A famous cult statue from a temple, once one of the ancient world's great marvels, is adorned with numerous oval objects. Modern scholarship reinterprets these objects based on finds from 1987–1988 excavations. The temple was in the same city where the apostle shown in the image undergoing a trial by ordeal is traditionally believed to have died of natural causes. What is this modern interpretation, and what specific artifacts support it?
+Output:
+{
+    "analysis": "The original question is too easy because it uses multiple strong clues that can directly identify the intermediate entity, such as “ancient world's great marvels,” “numerous oval objects,” and “apostle ... died of natural causes.” Together these clues allow a strong model to infer the target object during question reading, compressing the intended multi-hop reasoning path. The rewrite should remove these strong clues and replace them with weaker but still functional descriptions, for example replacing the statue-revealing phrase with “a long-debated feature of an Anatolian cult image,” and replacing the figure-revealing phrase with “the figure shown in the accompanying ordeal scene.” At the same time, it should preserve non-shortcut constraints such as “1987–1988 excavations,” “same city,” and “Christian tradition,” so the question remains uniquely solvable.",
+    "question": "A long-debated feature of an Anatolian cult image has traditionally been interpreted in anatomical terms, but more recent scholarship argues that this reading is mistaken. The revised interpretation draws on objects recovered during 1987–1988 excavations from debris associated with an earlier version of the image. The sanctuary where the image was venerated stood in the same city that later Christian tradition associates with the figure shown in the accompanying ordeal scene. What alternative interpretation do modern scholars propose for this disputed feature, and what excavated objects are cited in support?"
+}
 
-Then rewrite the question into a tighter, more diverse, harder version while keeping the same answer and latent trajectory.
+**Example 2**:
+question: This image shows a work on the Moon’s motion. That subject also appears in a geometrical diagram in Newton’s landmark 1687 mathematical treatise on natural philosophy. Before the final three-book structure of the Principia was settled, what was the planned title of the surviving fair-copy draft of its second volume, about when was that draft completed, and which later part of the finished work did it largely correspond to in purpose?
+Output:
+{
+  "analysis": "The original question is too easy because it exposes the bridge entities too directly and presents the clues in almost the same order as the hop chain, allowing a strong model to identify the target work and its composition history during question reading. First, the phrase “Moon’s motion” is not a proper name, but when combined with the later Newton cue it sharply narrows the search space, so it should be replaced with the weaker expression “The topic treated in the work shown here,” which preserves the semantic link to the pictured text without repeating an overly revealing subject label. Second, “Newton’s landmark 1687 mathematical treatise on natural philosophy” is an especially strong identifying bundle: it gives the author, the year, the genre, and a canonical-status cue, which together almost amount to naming the Principia outright. This should therefore be weakened to “a late seventeenth-century mathematical work on natural philosophy,” which keeps the period, disciplinary context, and textual type while removing the most direct author- and year-based shortcuts. Third, the phrase “Before the final three-book structure of the Principia was settled” not only names the work again but also points the solver straight to the specific composition-history page about its evolving structure. The revision replaces this with “was not yet fixed in its eventual three-book arrangement when one surviving fair-copy draft was prepared,” which preserves the same manuscript-history constraint while no longer directly naming the Principia or making the search path so explicit. Fourth, “the surviving fair-copy draft of its second volume” is actually a valuable non-shortcut constraint and should be retained rather than removed, because it is part of what keeps the question uniquely solvable. In the revision, it becomes “the draft corresponding to what was then planned as its second volume,” which preserves the same functional role while making the transition slightly less template-like. Fifth, the original question follows a highly mechanical sequence: pictured topic -> Newton’s treatise -> Principia composition history -> second-volume fair-copy -> title/date/correspondence. The revision improves this by folding the pictured topic and the geometric treatment into a single sentence and by centering the question more on the unstable early structural state of the work, so the solver must reconstruct the composition history instead of simply following a rigid scaffold. Overall, these changes are justified because they remove or weaken highly distinctive cues such as the author name, exact year, work title, and canonical-status framing, while preserving enough non-shortcut constraints—late seventeenth-century natural-philosophical mathematics, eventual three-book structure, surviving fair-copy, planned second volume, and title/date/later-book correspondence—to keep the question uniquely solvable and faithful to the original answer chain.",
+  "question": "The topic treated in the work shown here also appears in geometrical form in a late seventeenth-century mathematical work on natural philosophy that was not yet fixed in its eventual three-book arrangement when one surviving fair-copy draft was prepared. For the draft corresponding to what was then planned as its second volume, what title was intended, roughly when was it completed, and which later portion of the finished work did it largely match in purpose?"
+}
+
+Now perform the same style of difficulty enhancement on the following question.
 
 Return valid JSON with exactly these fields:
 {
@@ -1040,6 +1046,24 @@ class QuestionWriter:
         if self.model_client is None:
             return draft
         starting_image_url = self._starting_image_url(path=path, graph=graph)
+        return self._enhance_difficulty_with_image(draft=draft, starting_image_url=starting_image_url)
+
+    def enhance_difficulty_direct(
+        self,
+        *,
+        draft: QuestionDraft,
+        starting_image_url: str | None = None,
+    ) -> QuestionDraft:
+        if self.model_client is None:
+            return draft
+        return self._enhance_difficulty_with_image(draft=draft, starting_image_url=starting_image_url)
+
+    def _enhance_difficulty_with_image(
+        self,
+        *,
+        draft: QuestionDraft,
+        starting_image_url: str | None,
+    ) -> QuestionDraft:
         payload = self._difficulty_enhancement_payload(
             question=draft.question,
             hops=draft.reasoning_steps,
@@ -1850,5 +1874,91 @@ def _debug_main() -> None:
     )
 
 
+def _difficulty_only_main() -> None:
+    """
+    python -m synthesis.vqa.question_writer \
+  --model-alias gpt54_internal_azure \
+  --question "The trophies in this image are from a specific year of a major tennis tournament..." \
+  --answer "Knight Frank; Charles was ...; Francis was ..." \
+  --hops-json '[{"hop_index":0,"source":"...","target":"...","statement":"...","relation":"...","retrieval_query":""}]'
+    """
+    parser = argparse.ArgumentParser(description="Debug difficulty enhancement on a manually supplied question.")
+    parser.add_argument(
+        "--model-alias",
+        required=True,
+        help="Model alias registered in synthesis/models.json for difficulty enhancement.",
+    )
+    parser.add_argument(
+        "--question",
+        required=True,
+        help="Question to be passed into enhance_difficulty.",
+    )
+    parser.add_argument(
+        "--answer",
+        default="",
+        help="Optional answer carried through the QuestionDraft.",
+    )
+    parser.add_argument(
+        "--answer-type",
+        default="other",
+        help="Optional answer_type carried through the QuestionDraft.",
+    )
+    parser.add_argument(
+        "--hops-json",
+        default="[]",
+        help="JSON string containing the hop chain list for difficulty enhancement.",
+    )
+    parser.add_argument(
+        "--image-url",
+        default=None,
+        help="Optional image URL to attach for image-start questions.",
+    )
+    args = parser.parse_args()
+
+    try:
+        hops = json.loads(args.hops_json)
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"--hops-json is not valid JSON: {exc}") from exc
+    if not isinstance(hops, list):
+        raise SystemExit("--hops-json must decode to a JSON list.")
+
+    draft = QuestionDraft(
+        question=args.question,
+        answer=args.answer,
+        answer_type=args.answer_type,
+        reasoning_steps=[item for item in hops if isinstance(item, dict)],
+        used_evidence_ids=[],
+        metadata={},
+    )
+    writer = QuestionWriter(
+        model_client=LLM_WORKER,
+        model=args.model_alias,
+    )
+    enhanced = writer.enhance_difficulty_direct(
+        draft=draft,
+        starting_image_url=args.image_url,
+    )
+
+    print("input_question:")
+    print(args.question)
+    print("input_hops:")
+    print(json.dumps(draft.reasoning_steps, ensure_ascii=False, indent=2))
+    print("enhanced_output:")
+    print(
+        json.dumps(
+            {
+                "question": enhanced.question,
+                "answer": enhanced.answer,
+                "answer_type": enhanced.answer_type,
+                "difficulty_enhancement_result": enhanced.metadata.get("difficulty_enhancement_result"),
+                "writer_warnings": enhanced.metadata.get("writer_warnings") or [],
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+
+
 if __name__ == "__main__":
-    _debug_main()
+    # _debug_main()
+    _difficulty_only_main()
