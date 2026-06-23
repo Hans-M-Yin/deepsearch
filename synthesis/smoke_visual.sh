@@ -10,6 +10,6 @@ python synthesis/run_min_graph.py \
   --max-steps 12345678 \
   --max-nodes 8192 \
   --max-depth 128 \
-  --parallel-workers 32 \
-  --batch-size 32 \
+  --parallel-workers 128 \
+  --batch-size 128 \
   --image-backend serper 
