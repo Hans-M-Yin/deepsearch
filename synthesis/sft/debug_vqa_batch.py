@@ -153,7 +153,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--api-version", default=os.environ.get("SFT_OPENAI_API_VERSION") or "2024-03-01-preview")
     parser.add_argument("--max-tokens", type=int, default=int(os.environ.get("SFT_OPENAI_MAX_TOKENS", "1024")))
-    parser.add_argument("--temperature", type=float, default=float(os.environ.get("SFT_OPENAI_TEMPERATURE", "0.2")))
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=(float(os.environ["SFT_OPENAI_TEMPERATURE"]) if os.environ.get("SFT_OPENAI_TEMPERATURE") else None),
+    )
     parser.add_argument("--max-turns", type=int, default=int(os.environ.get("SFT_OPENAI_MAX_TURNS", "8")))
     parser.add_argument("--timeout-s", type=float, default=float(os.environ.get("SFT_OPENAI_TIMEOUT_S", "120")))
     parser.add_argument("--system-prompt", default=None)
@@ -169,7 +173,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--expert-azure-endpoint", default=os.environ.get("SFT_JUDGE_AZURE_ENDPOINT"))
     parser.add_argument("--expert-api-version", default=os.environ.get("SFT_JUDGE_API_VERSION") or os.environ.get("SFT_OPENAI_API_VERSION") or "2024-03-01-preview")
     parser.add_argument("--expert-max-tokens", type=int, default=int(os.environ.get("SFT_JUDGE_MAX_TOKENS", "4096")))
-    parser.add_argument("--expert-temperature", type=float, default=float(os.environ.get("SFT_JUDGE_TEMPERATURE", "0")))
+    parser.add_argument(
+        "--expert-temperature",
+        type=float,
+        default=(float(os.environ["SFT_JUDGE_TEMPERATURE"]) if os.environ.get("SFT_JUDGE_TEMPERATURE") else None),
+    )
     return parser
 
 

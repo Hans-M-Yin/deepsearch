@@ -112,7 +112,7 @@ class OpenAIToolAgentConfig:
     api_version: str = "2024-03-01-preview"
     api_mode: str = "chat_completions"
     max_tokens: int = 1024
-    temperature: float = 0.2
+    temperature: float | None = None
     timeout_s: float = 120.0
     system_prompt: str = DEFAULT_SYSTEM_PROMPT
     default_headers: dict[str, str] | None = None
@@ -849,10 +849,11 @@ class OpenAIToolAgent:
                 "model": self.config.model,
                 "messages": conversation_messages,
                 "tools": tools.get_tool_definitions(),
-                "temperature": self.config.temperature,
                 "max_tokens": self.config.max_tokens,
                 "stream": False,
             }
+            if self.config.temperature is not None:
+                kwargs["temperature"] = self.config.temperature
             if self.config.extra_body:
                 kwargs["extra_body"] = self.config.extra_body
 

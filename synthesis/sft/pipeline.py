@@ -16,6 +16,13 @@ from .api_tools import ToolRuntimeContext
 Message = dict[str, Any]
 
 
+def _optional_env_float(name: str) -> float | None:
+    value = os.environ.get(name)
+    if value is None or str(value).strip() == "":
+        return None
+    return float(value)
+
+
 def _message_text(content: Any) -> str:
     if content in (None, ""):
         return ""
@@ -221,7 +228,7 @@ def build_agent_config(
         api_version=api_version or os.environ.get("SFT_OPENAI_API_VERSION") or "2024-03-01-preview",
         api_mode="chat_completions",
         max_tokens=max_tokens or int(os.environ.get("SFT_OPENAI_MAX_TOKENS", "1024")),
-        temperature=temperature if temperature is not None else float(os.environ.get("SFT_OPENAI_TEMPERATURE", "0.2")),
+        temperature=temperature if temperature is not None else _optional_env_float("SFT_OPENAI_TEMPERATURE"),
         timeout_s=timeout_s if timeout_s is not None else float(os.environ.get("SFT_OPENAI_TIMEOUT_S", "120")),
         system_prompt=system_prompt or DEFAULT_SYSTEM_PROMPT,
         default_headers=headers,
@@ -349,7 +356,7 @@ def check_hop_chain_coverage(
         ),
         api_version=os.environ.get("SFT_JUDGE_API_VERSION") or os.environ.get("SFT_OPENAI_API_VERSION") or "2024-03-01-preview",
         max_tokens=int(os.environ.get("SFT_JUDGE_MAX_TOKENS", "4096")),
-        temperature=float(os.environ.get("SFT_JUDGE_TEMPERATURE", "0")),
+        temperature=_optional_env_float("SFT_JUDGE_TEMPERATURE"),
         system_prompt=(
             "You are a strict trajectory auditor. "
             "You inspect whether an agent trajectory truly covers each intended reasoning hop."
@@ -357,17 +364,19 @@ def check_hop_chain_coverage(
         print_rounds=False,
     )
     client = OpenAIToolAgent(agent_config).client
-    completion = client.chat.completions.create(
-        model=agent_config.model,
-        messages=[
+    completion_kwargs: dict[str, Any] = {
+        "model": agent_config.model,
+        "messages": [
             {"role": "system", "content": agent_config.system_prompt},
             {"role": "user", "content": prompt},
         ],
-        temperature=agent_config.temperature,
-        max_tokens=agent_config.max_tokens,
-        stream=False,
-        response_format={"type": "json_object"},
-    )
+        "max_tokens": agent_config.max_tokens,
+        "stream": False,
+        "response_format": {"type": "json_object"},
+    }
+    if agent_config.temperature is not None:
+        completion_kwargs["temperature"] = agent_config.temperature
+    completion = client.chat.completions.create(**completion_kwargs)
     content = completion.choices[0].message.content or "{}"
     parsed = _try_parse_json_text(content)
     if not isinstance(parsed, dict):
