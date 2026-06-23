@@ -35,7 +35,8 @@ Requirements:
 2. Since no correct answer is provided, you must also correctly solve the question while drafting the standard answer.
 3. In the standard answer you write, the following logic should be visible: after each tool call and its returned result, analyze the new clues, review the existing clues and the question, determine and plan the next step, and then call a new tool as needed.
 4. In the standard answer, only one tool may be called in each round.
-5. Once you believe the evidence is sufficient and there are no remaining unclear or uncertain points, provide the final answer and end the standard answer.
+5. When you call a tool, you must provide all required arguments. Never emit an empty tool call. For search tools, always provide a concrete query string.
+6. Once you believe the evidence is sufficient and there are no remaining unclear or uncertain points, provide the final answer and end the standard answer.
 
 As for the available tools:
 - t2t_search allows you to retrieve relevant web pages based on text and returns a list of URLs. You should examine the results, select the useful ones, and then use the read_url tool to access the page content.
@@ -683,25 +684,25 @@ def execute_tool_call(
     params = tools.normalize_tool_arguments(name, arguments)
 
     if name == "t2t_search":
-        query = params.get("q") or params.get("query") or ""
+        query = params.get("query") or params.get("q") or ""
         if not query:
-            output = {"ok": False, "error": "q is required for t2t_search"}
+            output = {"ok": False, "error": "query is required for t2t_search"}
         else:
             output = tools.t2t_search(
                 query=query,
-                lang=params.get("hl", "en"),
+                lang=params.get("lang") or params.get("hl") or "en",
                 top_k=int(params.get("top_k", 5)),
             )
         return ToolExecutionResult(name=name, arguments=params, output=output, output_text=_json_text(output))
 
     if name == "t2i_search":
-        query = params.get("q") or params.get("query") or ""
+        query = params.get("query") or params.get("q") or ""
         if not query:
-            output = {"ok": False, "error": "q is required for t2i_search"}
+            output = {"ok": False, "error": "query is required for t2i_search"}
         else:
             output = tools.t2i_search(
                 query=query,
-                lang=params.get("hl", "en"),
+                lang=params.get("lang") or params.get("hl") or "en",
                 top_k=int(params.get("top_k", 5)),
             )
         return ToolExecutionResult(name=name, arguments=params, output=output, output_text=_json_text(output))
