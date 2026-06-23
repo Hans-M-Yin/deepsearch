@@ -45,6 +45,7 @@ def get_tool_definitions() -> list[dict[str, Any]]:
                 ),
                 "parameters": {
                     "type": "object",
+                    "additionalProperties": False,
                     "properties": {
                         "query": {
                             "type": "string",
@@ -73,6 +74,7 @@ def get_tool_definitions() -> list[dict[str, Any]]:
                 "description": "Search images from a text query.",
                 "parameters": {
                     "type": "object",
+                    "additionalProperties": False,
                     "properties": {
                         "query": {
                             "type": "string",
@@ -105,6 +107,7 @@ def get_tool_definitions() -> list[dict[str, Any]]:
                 ),
                 "parameters": {
                     "type": "object",
+                    "additionalProperties": False,
                     "properties": {
                         "image": {
                             "type": "string",
@@ -147,6 +150,7 @@ def get_tool_definitions() -> list[dict[str, Any]]:
                 ),
                 "parameters": {
                     "type": "object",
+                    "additionalProperties": False,
                     "properties": {
                         "url": {
                             "type": "string",
