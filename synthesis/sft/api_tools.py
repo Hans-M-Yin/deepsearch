@@ -124,7 +124,11 @@ class ToolRuntimeContext:
     def image_summary(self) -> str:
         if not self.image_registry:
             return ""
-        lines = ["Available image refs:"]
+        lines = [
+            "Available image refs:",
+            "Use these aliases exactly in tool parameters such as i2i_search.params.image.",
+            "Do not invent a new image name. Reuse one of the listed img_n aliases.",
+        ]
         for image_id, payload in self.image_registry.items():
             lines.append(f"- {image_id}: {str(payload)[:120]}")
         return "\n".join(lines)
@@ -316,6 +320,10 @@ def _tool_reference_text() -> str:
         function = item["function"]
         lines.append(f"- {function['name']}: {function['description']}")
         lines.append(json.dumps(function, ensure_ascii=False, indent=2, sort_keys=True))
+    lines.append(
+        "Important image-reference rule: for i2i_search, the `image` field must be an existing image alias such as "
+        "`img_1` from the current context. Use `url` only when you truly have a direct remote image URL."
+    )
     lines.append('- finish: End the trajectory. Full definition:')
     lines.append(
         json.dumps(
@@ -622,6 +630,7 @@ def _build_initial_messages(
 
 
 def _load_pil_image(source: Any, context: ToolRuntimeContext) -> Image.Image:
+    original_source = source
     payload = _resolve_image_payload(source, context)
     if isinstance(payload, Image.Image):
         return payload.copy()
@@ -636,6 +645,17 @@ def _load_pil_image(source: Any, context: ToolRuntimeContext) -> Image.Image:
             return Image.open(io.BytesIO(response.content))
         if os.path.exists(payload):
             return Image.open(payload)
+        known_refs = ", ".join(sorted(context.image_registry.keys()))
+        if isinstance(original_source, str) and not payload.startswith(("http://", "https://", "data:image")):
+            if known_refs:
+                raise ValueError(
+                    "Unsupported image source string. Expected an existing image alias such as "
+                    f"{known_refs}, a local file path, a direct image URL, or a data URL; got {original_source!r}."
+                )
+            raise ValueError(
+                "Unsupported image source string. Expected a local file path, a direct image URL, or a data URL; "
+                f"got {original_source!r}."
+            )
     raise ValueError(f"Unsupported image source: {type(payload)!r}")
 
 

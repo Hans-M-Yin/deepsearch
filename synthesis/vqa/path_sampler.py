@@ -200,12 +200,12 @@ class RandomPathSampler(PathSampler):
 
     def generate_one(self, start_node_id: str | None = None) -> PathCandidate | None:
         node_ids = self._candidate_start_nodes()
-        ##### DEBUG #####
-        node_ids = [
-            node_id for node_id in node_ids
-            if (self.graph.get_node(node_id) or {}).get("node_type") == "image"
-        ]
-        ##### END #####
+        # ##### DEBUG #####
+        # node_ids = [
+        #     node_id for node_id in node_ids
+        #     if (self.graph.get_node(node_id) or {}).get("node_type") == "image"
+        # ]
+        # ##### END #####
         if not node_ids:
             self.last_generation_stats = SamplerGenerationStats(requested=1, attempts=0, accepted=0)
             return None
