@@ -13,8 +13,10 @@ separate evidence-builder stage. Internally it follows a five-step process:
 from __future__ import annotations
 
 import argparse
+import base64
 from dataclasses import dataclass, field
 import json
+import mimetypes
 from pathlib import Path
 import re
 import sys
@@ -1218,10 +1220,31 @@ class QuestionWriter:
         prompt_text = json.dumps(user_payload, ensure_ascii=False, indent=2)
         if not image_url:
             return prompt_text
+        resolved_image_url = QuestionWriter._resolve_multimodal_image_url(image_url)
         return [
             {"type": "text", "text": prompt_text},
-            {"type": "image_url", "image_url": {"url": image_url}},
+            {"type": "image_url", "image_url": {"url": resolved_image_url}},
         ]
+
+    @staticmethod
+    def _resolve_multimodal_image_url(image_url: str) -> str:
+        normalized = str(image_url or "").strip()
+        if not normalized:
+            return normalized
+        lowered = normalized.lower()
+        if lowered.startswith(("http://", "https://", "data:")):
+            return normalized
+        if lowered.startswith("file://"):
+            local_path = Path(normalized[7:])
+        else:
+            local_path = Path(normalized)
+        if not local_path.exists() or not local_path.is_file():
+            return normalized
+        mime_type, _ = mimetypes.guess_type(local_path.name)
+        if not mime_type:
+            mime_type = "application/octet-stream"
+        encoded = base64.b64encode(local_path.read_bytes()).decode("ascii")
+        return f"data:{mime_type};base64,{encoded}"
 
     @staticmethod
     def _extract_json_object(text: str) -> dict[str, Any]:
