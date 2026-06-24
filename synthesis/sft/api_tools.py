@@ -8,6 +8,7 @@ import io
 import json
 import logging
 import os
+import re
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -43,6 +44,33 @@ As for the available tools:
 - t2i_search allows you to retrieve relevant images based on a text description. As with the other search tools, you should review the returned URLs and then use read_url to inspect the images.
 
 """
+
+MANUAL_REACT_PROTOCOL = """
+You must answer exactly one step at a time using the following visible format:
+
+Thought:
+<brief but explicit reasoning about the current state, what is missing, and what to do next>
+
+Action:
+<one of: t2t_search, t2i_search, i2i_search, read_url, finish>
+
+Action Input:
+<strict JSON object>
+
+Rules:
+- Output exactly one Action in each round.
+- Do not use function calling. Do not emit tool_calls.
+- The Action Input must be valid JSON.
+- If Action is a search tool, Action Input must contain a concrete query string.
+- If Action is read_url, Action Input must contain a url field.
+- If you already have enough evidence, use Action: finish with Action Input like {"answer": "..."}.
+"""
+
+_MANUAL_REACT_ACTIONS = {"t2t_search", "t2i_search", "i2i_search", "read_url", "finish"}
+_MANUAL_REACT_STEP_RE = re.compile(
+    r"Thought:\s*(?P<thought>.*?)\nAction:\s*(?P<action>[A-Za-z0-9_]+)\s*\nAction Input:\s*(?P<input>.+)\Z",
+    re.DOTALL | re.IGNORECASE,
+)
 
 
 def _truncate_tool_calls(tool_calls: list[Any], *, source: str) -> list[Any]:
@@ -125,8 +153,8 @@ class OpenAIToolAgentConfig:
     azure_endpoint: str | None = None
     base_url: str | None = None
     api_version: str = "2024-03-01-preview"
-    api_mode: str = "chat_completions"
-    max_tokens: int = 1024
+    api_mode: str = "manual_react"
+    max_tokens: int | None = 1024
     temperature: float | None = None
     timeout_s: float = 120.0
     system_prompt: str = DEFAULT_SYSTEM_PROMPT
@@ -144,6 +172,14 @@ class AgentRunResult:
     messages: list[dict[str, Any]]
     tool_results: list[ToolExecutionResult]
     raw_responses: list[dict[str, Any]]
+
+
+@dataclass(slots=True)
+class ManualReActStep:
+    thought: str
+    action: str
+    action_input: dict[str, Any]
+    raw_text: str
 
 
 def _guess_mime_type(path: str) -> str:
@@ -274,6 +310,219 @@ def _append_system_text(message: dict[str, Any], extra_text: str) -> dict[str, A
     updated = dict(message)
     updated["content"] = extra_text
     return updated
+
+
+def _tool_reference_text() -> str:
+    lines = ["Available tools:"]
+    for item in tools.get_tool_definitions():
+        function = item["function"]
+        lines.append(f"- {function['name']}: {function['description']}")
+        lines.append(
+            f"  Action Input JSON schema: {json.dumps(function['parameters'], ensure_ascii=False, sort_keys=True)}"
+        )
+    lines.append('- finish: End the trajectory. Action Input JSON schema: {"answer": "final answer text"}')
+    return "\n".join(lines)
+
+
+def _latest_tool_message(messages: list[dict[str, Any]]) -> dict[str, Any] | None:
+    for message in reversed(messages):
+        if message.get("role") == "tool":
+            return message
+    return None
+
+
+def _contains_image_context(messages: list[dict[str, Any]], context: ToolRuntimeContext) -> bool:
+    if context.image_registry:
+        return True
+    for message in messages:
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            if str(part.get("type") or "") in {"image_url", "image", "input_image", "image_path", "image_ref"}:
+                return True
+    return False
+
+
+def _build_state_guidance(messages: list[dict[str, Any]], context: ToolRuntimeContext) -> str:
+    latest_tool = _latest_tool_message(messages)
+    has_images = _contains_image_context(messages, context)
+    guidance: list[str] = ["Current state guidance:"]
+    if latest_tool is None:
+        if has_images:
+            guidance.extend(
+                [
+                    "- There is image context available.",
+                    "- You may inspect whether the current image already contains the target evidence.",
+                    "- If a specific local object matters, consider i2i_search with a region crop.",
+                    "- If the entity is generic or the question mainly asks for background knowledge, a text search may be better than reverse image search.",
+                ]
+            )
+        else:
+            guidance.extend(
+                [
+                    "- No tool has been used yet.",
+                    "- Start by identifying the first missing piece of evidence.",
+                    "- Prefer t2t_search for textual evidence gathering and read_url for inspecting a specific result.",
+                ]
+            )
+        return "\n".join(guidance)
+
+    tool_name = str(latest_tool.get("name") or "")
+    output_text = str(latest_tool.get("content") or "")
+    output_obj: Any = None
+    try:
+        output_obj = json.loads(output_text)
+    except Exception:
+        output_obj = None
+
+    if isinstance(output_obj, dict) and output_obj.get("ok") is False:
+        guidance.extend(
+            [
+                f"- The previous tool `{tool_name}` failed.",
+                "- Fix the parameter problem instead of repeating the same invalid action.",
+                "- Explain briefly why the previous call failed before choosing the next action.",
+            ]
+        )
+        return "\n".join(guidance)
+
+    if tool_name == "t2t_search":
+        guidance.extend(
+            [
+                "- You now have a list of text-search results.",
+                "- Prefer selecting one promising URL and using read_url, rather than repeating a very similar search immediately.",
+                "- Only search again if the returned results are clearly off-target or ambiguous.",
+            ]
+        )
+    elif tool_name == "t2i_search":
+        guidance.extend(
+            [
+                "- You now have image-search results.",
+                "- You may inspect the image result pages with read_url or use the new clues to refine the search.",
+                "- If the question is really about a specific pictured object, consider whether reverse image search is needed next.",
+            ]
+        )
+    elif tool_name == "i2i_search":
+        guidance.extend(
+            [
+                "- You now have reverse-image matches.",
+                "- Use the matched titles and source URLs to decide whether to inspect a specific source with read_url.",
+                "- If the reverse-image results are too noisy, fall back to text search with the strongest visual clue.",
+            ]
+        )
+    elif tool_name == "read_url":
+        if isinstance(output_obj, dict) and output_obj.get("kind") == "image":
+            guidance.extend(
+                [
+                    "- The last URL resolved to an image.",
+                    "- Decide whether this image itself contains the target evidence.",
+                    "- If a local object matters, i2i_search on the image or a cropped region may help.",
+                ]
+            )
+        else:
+            guidance.extend(
+                [
+                    "- The last URL provided page content.",
+                    "- Decide whether the page already supports the current claim strongly enough.",
+                    "- If not, either inspect another URL or run a refined search to fill the remaining gap.",
+                ]
+            )
+    else:
+        guidance.append("- Choose the next action based on the strongest remaining evidence gap.")
+    return "\n".join(guidance)
+
+
+def _build_manual_react_system_prompt(
+    *,
+    base_system_prompt: str,
+    messages: list[dict[str, Any]],
+    context: ToolRuntimeContext,
+) -> str:
+    parts = [base_system_prompt.strip(), MANUAL_REACT_PROTOCOL.strip(), _tool_reference_text(), _build_state_guidance(messages, context)]
+    return "\n\n".join(part for part in parts if part).strip()
+
+
+def _build_manual_react_request_messages(
+    conversation_messages: list[dict[str, Any]],
+    context: ToolRuntimeContext,
+    base_system_prompt: str,
+) -> list[dict[str, Any]]:
+    system_seed = base_system_prompt
+    for message in conversation_messages:
+        if message.get("role") == "system" and message.get("content"):
+            system_seed = str(message.get("content"))
+            break
+    full_system_prompt = _build_manual_react_system_prompt(
+        base_system_prompt=system_seed,
+        messages=conversation_messages,
+        context=context,
+    )
+    request_messages: list[dict[str, Any]] = []
+    system_replaced = False
+    for message in conversation_messages:
+        role = message.get("role")
+        if role == "tool":
+            tool_name = str(message.get("name") or "tool").strip()
+            observation_text = str(message.get("content") or "")
+            copied = {
+                "role": "user",
+                "content": f"Observation from {tool_name}:\n{observation_text}",
+            }
+        else:
+            copied = dict(message)
+        if copied.get("role") == "system" and not system_replaced:
+            copied["content"] = full_system_prompt
+            system_replaced = True
+        request_messages.append(copied)
+    if not system_replaced:
+        request_messages.insert(0, {"role": "system", "content": full_system_prompt})
+    return request_messages
+
+
+def _strip_code_fence(text: str) -> str:
+    candidate = text.strip()
+    match = re.match(r"^```(?:json)?\s*(.*?)\s*```$", candidate, flags=re.DOTALL)
+    if match:
+        return match.group(1).strip()
+    return candidate
+
+
+def _extract_json_object(text: str) -> dict[str, Any] | None:
+    candidate = _strip_code_fence(text)
+    try:
+        parsed = json.loads(candidate)
+        return parsed if isinstance(parsed, dict) else None
+    except json.JSONDecodeError:
+        pass
+    start = candidate.find("{")
+    end = candidate.rfind("}")
+    if start >= 0 and end > start:
+        try:
+            parsed = json.loads(candidate[start : end + 1])
+            return parsed if isinstance(parsed, dict) else None
+        except json.JSONDecodeError:
+            return None
+    return None
+
+
+def _parse_manual_react_step(text: str) -> ManualReActStep | None:
+    stripped = text.strip()
+    match = _MANUAL_REACT_STEP_RE.search(stripped)
+    if not match:
+        return None
+    thought = match.group("thought").strip()
+    action = match.group("action").strip()
+    action_input = _extract_json_object(match.group("input"))
+    if action not in _MANUAL_REACT_ACTIONS or action_input is None:
+        return None
+    return ManualReActStep(
+        thought=thought,
+        action=action,
+        action_input=action_input,
+        raw_text=stripped,
+    )
 
 
 def _normalize_message(message: dict[str, Any], context: ToolRuntimeContext) -> dict[str, Any]:
@@ -680,25 +929,25 @@ def execute_tool_call(
     params = tools.normalize_tool_arguments(name, arguments)
 
     if name == "t2t_search":
-        query = params.get("q") or params.get("query") or ""
+        query = params.get("query") or params.get("q") or ""
         if not query:
-            output = {"ok": False, "error": "q is required for t2t_search"}
+            output = {"ok": False, "error": "query is required for t2t_search"}
         else:
             output = tools.t2t_search(
                 query=query,
-                lang=params.get("hl", "en"),
+                lang=params.get("lang") or params.get("hl") or "en",
                 top_k=int(params.get("top_k", 5)),
             )
         return ToolExecutionResult(name=name, arguments=params, output=output, output_text=_json_text(output))
 
     if name == "t2i_search":
-        query = params.get("q") or params.get("query") or ""
+        query = params.get("query") or params.get("q") or ""
         if not query:
-            output = {"ok": False, "error": "q is required for t2i_search"}
+            output = {"ok": False, "error": "query is required for t2i_search"}
         else:
             output = tools.t2i_search(
                 query=query,
-                lang=params.get("hl", "en"),
+                lang=params.get("lang") or params.get("hl") or "en",
                 top_k=int(params.get("top_k", 5)),
             )
         return ToolExecutionResult(name=name, arguments=params, output=output, output_text=_json_text(output))
@@ -824,6 +1073,13 @@ class OpenAIToolAgent:
         context: ToolRuntimeContext | None = None,
         system_prompt: str | None = None,
     ) -> AgentRunResult:
+        if self.config.api_mode == "manual_react":
+            return self._run_manual_react(
+                prompt=prompt,
+                messages=messages,
+                context=context,
+                system_prompt=system_prompt,
+            )
         if self.config.api_mode == "responses":
             return self._run_responses(
                 prompt=prompt,
@@ -836,6 +1092,87 @@ class OpenAIToolAgent:
             messages=messages,
             context=context,
             system_prompt=system_prompt,
+        )
+
+    def _run_manual_react(
+        self,
+        *,
+        prompt: str | None = None,
+        messages: list[dict[str, Any]] | None = None,
+        context: ToolRuntimeContext | None = None,
+        system_prompt: str | None = None,
+    ) -> AgentRunResult:
+        context = context or ToolRuntimeContext(working_dir=os.getcwd())
+        conversation_messages = _build_initial_messages(
+            prompt=prompt,
+            messages=messages,
+            context=context,
+            system_prompt=system_prompt,
+            default_system_prompt=self.config.system_prompt,
+        )
+        tool_results: list[ToolExecutionResult] = []
+        raw_responses: list[dict[str, Any]] = []
+        final_text = ""
+
+        for turn_index in range(self.config.max_turns):
+            request_messages = _build_manual_react_request_messages(
+                conversation_messages,
+                context,
+                system_prompt or self.config.system_prompt,
+            )
+            kwargs: dict[str, Any] = {
+                "model": self.config.model,
+                "messages": request_messages,
+                "stream": False,
+            }
+            if self.config.max_tokens is not None:
+                kwargs["max_tokens"] = self.config.max_tokens
+            if self.config.temperature is not None:
+                kwargs["temperature"] = self.config.temperature
+            if self.config.extra_body:
+                kwargs["extra_body"] = self.config.extra_body
+
+            completion = self.client.chat.completions.create(**kwargs)
+            raw_responses.append(
+                completion.model_dump() if hasattr(completion, "model_dump") else {"repr": repr(completion)}
+            )
+            choice = completion.choices[0]
+            assistant_message = choice.message
+            assistant_text = assistant_message.content or ""
+            if self.config.print_rounds:
+                print(f"\n=== Model Round {turn_index + 1} ===")
+                if assistant_text:
+                    print(assistant_text)
+            conversation_messages.append({"role": "assistant", "content": assistant_text})
+
+            step = _parse_manual_react_step(assistant_text)
+            if step is None:
+                logger.warning("Failed to parse manual ReAct step; treating the latest assistant text as final output.")
+                final_text = assistant_text
+                break
+            if step.action == "finish":
+                final_text = str(step.action_input.get("answer") or assistant_text).strip()
+                break
+
+            result = execute_tool_call(step.action, step.action_input, context)
+            tool_results.append(result)
+            conversation_messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": f"manual_{turn_index + 1}_{step.action}",
+                    "name": step.action,
+                    "content": result.output_text,
+                    "type": "manual_react_tool",
+                }
+            )
+        else:
+            final_text = "Max ReAct turns reached before the model produced a final answer."
+
+        return AgentRunResult(
+            final_text=final_text,
+            messages=conversation_messages,
+            tool_results=tool_results,
+            raw_responses=raw_responses,
         )
 
     def _run_chat_completions(
@@ -1067,8 +1404,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--api-key", default=os.environ.get("OPENAI_API_KEY"))
     parser.add_argument(
         "--api-mode",
-        choices=("chat_completions", "responses"),
-        default=os.environ.get("SFT_OPENAI_API_MODE") or "chat_completions",
+        choices=("manual_react", "chat_completions", "responses"),
+        default=os.environ.get("SFT_OPENAI_API_MODE") or "manual_react",
     )
     parser.add_argument(
         "--azure-endpoint",
@@ -1098,11 +1435,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--case-id", default="sft_session")
     parser.add_argument("--image", action="append", help="Preload a local image path as img_n.")
     parser.add_argument("--image-url", action="append", help="Preload a remote image URL as img_n.")
-    parser.add_argument("--gpt54", action="store_true", help="Use the GPT-5.4 chat.completions branch from .sft_env.")
+    parser.add_argument("--gpt54", action="store_true", help="Use the GPT-5.4 manual-ReAct branch from .sft_env.")
     parser.add_argument(
         "--gemini35-flash",
         action="store_true",
-        help="Use the Gemini 3.5 Flash chat.completions branch from .sft_env.",
+        help="Use the Gemini 3.5 Flash manual-ReAct branch from .sft_env.",
     )
     parser.add_argument("--verbose", action="store_true")
     return parser
@@ -1127,13 +1464,13 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("Use only one model shortcut: --gpt54 or --gemini35-flash.")
 
     if args.gpt54:
-        args.api_mode = "chat_completions"
+        args.api_mode = "manual_react"
         args.model = os.environ.get("SFT_GPT54_MODEL") or "gpt-5.4-2026-03-05"
         args.api_key = os.environ.get("SFT_GPT54_API_KEY") or args.api_key
         args.azure_endpoint = os.environ.get("SFT_GPT54_AZURE_ENDPOINT") or args.azure_endpoint
         args.api_version = os.environ.get("SFT_GPT54_API_VERSION") or args.api_version
     elif args.gemini35_flash:
-        args.api_mode = "chat_completions"
+        args.api_mode = "manual_react"
         args.model = os.environ.get("SFT_GEMINI35_FLASH_MODEL") or "gemini-3.5-flash"
         args.api_key = os.environ.get("SFT_GEMINI35_FLASH_API_KEY") or args.api_key
         args.azure_endpoint = os.environ.get("SFT_GEMINI35_FLASH_AZURE_ENDPOINT") or args.azure_endpoint

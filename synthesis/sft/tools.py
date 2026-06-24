@@ -45,20 +45,22 @@ def get_tool_definitions() -> list[dict[str, Any]]:
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "query": {"type": "string"},
-                        "q": {
+                        "query": {
                             "type": "string",
-                            "description": "Alias for query.",
+                            "description": "A concrete web search query string.",
                         },
-                        "hl": {"type": "string", "default": "en"},
                         "lang": {
                             "type": "string",
-                            "description": "Alias for hl.",
+                            "description": "Language code for search, such as en.",
                             "default": "en",
                         },
-                        "top_k": {"type": "integer", "default": MAX_SEARCH_RESULTS},
+                        "top_k": {
+                            "type": "integer",
+                            "description": "Maximum number of search results to return.",
+                            "default": MAX_SEARCH_RESULTS,
+                        },
                     },
-                    "required": [],
+                    "required": ["query"],
                 },
             },
         },
@@ -70,20 +72,22 @@ def get_tool_definitions() -> list[dict[str, Any]]:
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "query": {"type": "string"},
-                        "q": {
+                        "query": {
                             "type": "string",
-                            "description": "Alias for query.",
+                            "description": "A concrete image-search query string.",
                         },
-                        "hl": {"type": "string", "default": "en"},
                         "lang": {
                             "type": "string",
-                            "description": "Alias for hl.",
+                            "description": "Language code for search, such as en.",
                             "default": "en",
                         },
-                        "top_k": {"type": "integer", "default": MAX_SEARCH_RESULTS},
+                        "top_k": {
+                            "type": "integer",
+                            "description": "Maximum number of image results to return.",
+                            "default": MAX_SEARCH_RESULTS,
+                        },
                     },
-                    "required": [],
+                    "required": ["query"],
                 },
             },
         },
@@ -140,10 +144,9 @@ def get_tool_definitions() -> list[dict[str, Any]]:
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "URL": {"type": "string"},
                         "url": {
                             "type": "string",
-                            "description": "Alias for URL.",
+                            "description": "The URL to read.",
                         },
                         "query": {
                             "type": "string",
@@ -151,7 +154,7 @@ def get_tool_definitions() -> list[dict[str, Any]]:
                             "default": "",
                         },
                     },
-                    "required": [],
+                    "required": ["url"],
                 },
             },
         },
@@ -185,10 +188,10 @@ def normalize_tool_arguments(name: str, arguments: dict[str, Any]) -> dict[str, 
 
     params = dict(arguments)
     if name in {"t2t_search", "t2i_search"}:
-        if "query" in params and "q" not in params:
-            params["q"] = params.pop("query")
-        if "lang" in params and "hl" not in params:
-            params["hl"] = params.pop("lang")
+        if "q" in params and "query" not in params:
+            params["query"] = params.pop("q")
+        if "hl" in params and "lang" not in params:
+            params["lang"] = params.pop("hl")
     if name == "read_url" and "URL" in params and "url" not in params:
         params["url"] = params.pop("URL")
     if name == "i2i_search" and isinstance(params.get("region"), str):

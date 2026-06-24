@@ -144,6 +144,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--api-key", default=os.environ.get("OPENAI_API_KEY"))
     parser.add_argument(
+        "--api-mode",
+        choices=("manual_react", "chat_completions", "responses"),
+        default=os.environ.get("SFT_OPENAI_API_MODE") or "manual_react",
+        help="Primary trajectory collection mode. Defaults to manual_react.",
+    )
+    parser.add_argument(
         "--azure-endpoint",
         default=(
             os.environ.get("SFT_OPENAI_AZURE_ENDPOINT")
@@ -203,6 +209,7 @@ def _config_from_model_arg(
     *,
     model_arg: str | None,
     api_key: str | None,
+    api_mode: str,
     azure_endpoint: str | None,
     api_version: str | None,
     max_tokens: int | None,
@@ -237,6 +244,7 @@ def _config_from_model_arg(
             azure_endpoint=model_config.get("azure_endpoint") or azure_endpoint,
             base_url=model_config.get("base_url"),
             api_version=model_config.get("api_version") or api_version,
+            api_mode=api_mode,
             max_tokens=resolved_max_tokens,
             temperature=resolved_temperature,
             timeout_s=float(model_config.get("timeout_s") or timeout_s),
@@ -253,6 +261,7 @@ def _config_from_model_arg(
         client_type="azure_openai",
         azure_endpoint=azure_endpoint,
         api_version=api_version,
+        api_mode=api_mode,
         max_tokens=max_tokens,
         temperature=temperature,
         timeout_s=timeout_s,
@@ -316,6 +325,7 @@ def main(argv: list[str] | None = None) -> int:
     agent_config = _config_from_model_arg(
         model_arg=args.model,
         api_key=args.api_key,
+        api_mode=args.api_mode,
         azure_endpoint=args.azure_endpoint,
         api_version=args.api_version,
         max_tokens=args.max_tokens,
@@ -333,6 +343,7 @@ def main(argv: list[str] | None = None) -> int:
         expert_config = _config_from_model_arg(
             model_arg=args.expert_model,
             api_key=args.expert_api_key or args.api_key,
+            api_mode="chat_completions",
             azure_endpoint=args.expert_azure_endpoint or args.azure_endpoint,
             api_version=args.expert_api_version,
             max_tokens=args.expert_max_tokens,

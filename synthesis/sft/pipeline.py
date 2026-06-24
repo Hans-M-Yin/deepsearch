@@ -202,6 +202,7 @@ def build_agent_config(
     azure_endpoint: str | None = None,
     base_url: str | None = None,
     api_version: str | None = None,
+    api_mode: str = "manual_react",
     max_tokens: int | None = None,
     temperature: float | None = None,
     timeout_s: float | None = None,
@@ -233,7 +234,7 @@ def build_agent_config(
             or os.environ.get("OPENAI_BASE_URL")
         ),
         api_version=api_version or os.environ.get("SFT_OPENAI_API_VERSION") or "2024-03-01-preview",
-        api_mode="chat_completions",
+        api_mode=api_mode,
         max_tokens=max_tokens if max_tokens is not None else _optional_env_int("SFT_OPENAI_MAX_TOKENS"),
         temperature=temperature if temperature is not None else _optional_env_float("SFT_OPENAI_TEMPERATURE"),
         timeout_s=timeout_s if timeout_s is not None else float(os.environ.get("SFT_OPENAI_TIMEOUT_S", "120")),
