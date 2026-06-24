@@ -50,6 +50,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Optional model alias for LLM-guided next-hop selection. Defaults to VQA_SAMPLER_MODEL.",
     )
     parser.add_argument(
+        "--compress-hop-model-alias",
+        default=None,
+        help="Optional model alias for compress_hop. Defaults to VQA_COMPRESS_HOP_MODEL.",
+    )
+    parser.add_argument(
         "--neighbor-selection-strategy",
         choices=("random", "llm_guided"),
         default="random",
@@ -66,6 +71,7 @@ def main(argv: list[str] | None = None) -> int:
     output_dir = args.output_dir.resolve() if args.output_dir else _default_output_dir(graph_dir)
     model_alias = args.model_alias or os.environ.get("VQA_WRITER_MODEL")
     sampler_model_alias = args.sampler_model_alias or os.environ.get("VQA_SAMPLER_MODEL")
+    compress_hop_model_alias = args.compress_hop_model_alias or os.environ.get("VQA_COMPRESS_HOP_MODEL")
     config = SamplerConfiguration(
         min_hops=args.min_hops,
         max_hops=args.max_hops,
@@ -88,6 +94,8 @@ def main(argv: list[str] | None = None) -> int:
     writer = QuestionWriter(
         model_client=LLM_WORKER if model_alias else None,
         model=model_alias,
+        compress_hop_model_client=LLM_WORKER if compress_hop_model_alias else None,
+        compress_hop_model=compress_hop_model_alias,
     )
     pipeline = VqaGenerationPipeline(
         store=store,

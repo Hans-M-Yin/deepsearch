@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 import json
 import mimetypes
@@ -598,6 +599,8 @@ class QuestionWriter:
 
     model_client: ModelWorkerClient | None = None
     model: str | None = None
+    compress_hop_model_client: ModelWorkerClient | None = None
+    compress_hop_model: str | None = None
     temperature: float | None = None
     max_tokens: int = 800
 
@@ -639,7 +642,9 @@ class QuestionWriter:
     def compress_hop(self, *, hop: HopContext) -> dict[str, Any]:
         source_label = self._hop_anchor_label(hop.src_content, fallback=hop.src_node_id)
         target_label = self._hop_anchor_label(hop.dst_content, fallback=hop.dst_node_id)
-        if self.model_client is None:
+        model_client = self.compress_hop_model_client or self.model_client
+        model = self.compress_hop_model or self.model
+        if model_client is None:
             return self._fallback_compress_hop(hop, source_label=source_label, target_label=target_label)
         prompt = {
             "hop_type": f"{hop.src_modality}->{hop.dst_modality}",
@@ -654,6 +659,8 @@ class QuestionWriter:
             system=PROMPT_COMPRESS_HOP,
             user_payload=prompt,
             trace_label=f"compress_hop_{hop.hop_index}",
+            model_client=model_client,
+            model=model,
         )
         statement = str(parsed.get("statement") or "").strip()
         source = source_label
@@ -804,7 +811,7 @@ class QuestionWriter:
         context: WriterContext | None = None,
     ) -> QuestionDraft:
         context = context or self.build_writer_context(path=path, graph=graph)
-        hop_summaries = [self.compress_hop(hop=hop) for hop in context.hops]
+        hop_summaries = self._compress_hops(context.hops)
         opening_package = self.select_opening_package(context=context, hop_summaries=hop_summaries)
         target_ask = self.select_target_ask(context=context)
         opening_mode = "image_start" if path.trajectory.starts_with_image else "text_start"
@@ -898,28 +905,47 @@ class QuestionWriter:
         warnings: list[dict[str, Any]] = []
         subtask_specs = [
             ("entity_obfuscation", PROMPT_POLISH_ENTITY_OBFUSCATION, obfuscation_payload, False),
-            ("shortcut", PROMPT_POLISH_SHORTCUT, polish_payload, False),
-            ("ambiguity", PROMPT_POLISH_AMBIGUITY, polish_payload, False),
+            # ("shortcut", PROMPT_POLISH_SHORTCUT, polish_payload, False),
+            # ("ambiguity", PROMPT_POLISH_AMBIGUITY, polish_payload, False),
             ("redundancy", PROMPT_POLISH_REDUNDANCY, polish_payload, False),
             ("wording", PROMPT_POLISH_WORDING, polish_payload, True),
         ]
-        for task_name, system_prompt, payload, use_starting_image in subtask_specs:
-            try:
-                parsed = self._generate_json(
-                    system=system_prompt,
-                    user_payload=payload,
-                    trace_label=f"polish_{task_name}",
+        if len(subtask_specs) <= 1:
+            subtask_results = [
+                self._run_polish_subtask(
+                    task_name=task_name,
+                    system_prompt=system_prompt,
+                    payload=payload,
                     image_url=starting_image_url if use_starting_image else None,
                 )
-            except Exception as exc:
+                for task_name, system_prompt, payload, use_starting_image in subtask_specs
+            ]
+        else:
+            with ThreadPoolExecutor(max_workers=min(len(subtask_specs), 4)) as executor:
+                subtask_results = list(
+                    executor.map(
+                        lambda spec: self._run_polish_subtask(
+                            task_name=spec[0],
+                            system_prompt=spec[1],
+                            payload=spec[2],
+                            image_url=starting_image_url if spec[3] else None,
+                        ),
+                        subtask_specs,
+                    )
+                )
+        for result in subtask_results:
+            task_name = str(result.get("task_name") or "")
+            error = result.get("error")
+            if error is not None:
                 warnings.append(
                     {
                         "stage": f"polish_{task_name}",
-                        "error_type": exc.__class__.__name__,
-                        "error": str(exc),
+                        "error_type": error.__class__.__name__,
+                        "error": str(error),
                     }
                 )
                 continue
+            parsed = result.get("parsed") or {}
             issues = str(parsed.get("issues") or "").strip()
             advice = str(parsed.get("advice") or parsed.get("adjust") or "").strip()
             has_feedback = self._has_effective_feedback(issues=issues, advice=advice)
@@ -1149,11 +1175,15 @@ class QuestionWriter:
         user_payload: dict[str, Any],
         trace_label: str,
         image_url: str | None = None,
+        model_client: ModelWorkerClient | None = None,
+        model: str | None = None,
     ) -> dict[str, Any]:
-        if self.model_client is None:
+        active_model_client = model_client or self.model_client
+        active_model = model or self.model
+        if active_model_client is None:
             raise RuntimeError("model_client is required for _generate_json")
         request = ModelRequest(
-            model=self.model,
+            model=active_model,
             temperature=self.temperature,
             max_tokens=self.max_tokens,
             response_format={"type": "json_object"},
@@ -1166,7 +1196,7 @@ class QuestionWriter:
             ],
             metadata={"trace_label": trace_label},
         )
-        response = self.model_client.generate(request)
+        response = active_model_client.generate(request)
         # print('####',response.content,"####")
         try:
             parsed = json.loads(response.content)
@@ -1175,6 +1205,31 @@ class QuestionWriter:
         if not isinstance(parsed, dict):
             raise ValueError(f"Expected JSON object for {trace_label}, got: {type(parsed)!r}")
         return parsed
+
+    def _compress_hops(self, hops: list[HopContext]) -> list[dict[str, Any]]:
+        if len(hops) <= 1:
+            return [self.compress_hop(hop=hop) for hop in hops]
+        with ThreadPoolExecutor(max_workers=min(len(hops), 8)) as executor:
+            return list(executor.map(lambda hop: self.compress_hop(hop=hop), hops))
+
+    def _run_polish_subtask(
+        self,
+        *,
+        task_name: str,
+        system_prompt: str,
+        payload: dict[str, Any],
+        image_url: str | None,
+    ) -> dict[str, Any]:
+        try:
+            parsed = self._generate_json(
+                system=system_prompt,
+                user_payload=payload,
+                trace_label=f"polish_{task_name}",
+                image_url=image_url,
+            )
+            return {"task_name": task_name, "parsed": parsed, "error": None}
+        except Exception as exc:
+            return {"task_name": task_name, "parsed": None, "error": exc}
 
     @staticmethod
     def _starting_image_url(*, path: PathCandidate, graph: GraphView) -> str | None:
@@ -1785,6 +1840,11 @@ def _debug_main() -> None:
         help="Optional model alias registered in synthesis/models.json for LLM-guided next-hop selection.",
     )
     parser.add_argument(
+        "--compress-hop-model-alias",
+        default=None,
+        help="Optional model alias registered in synthesis/models.json for compress_hop.",
+    )
+    parser.add_argument(
         "--hop-sampling-strategy",
         choices=("uniform", "middle_biased"),
         default="middle_biased",
@@ -1828,6 +1888,8 @@ def _debug_main() -> None:
     writer = QuestionWriter(
         model_client=LLM_WORKER if args.model_alias else None,
         model=args.model_alias,
+        compress_hop_model_client=LLM_WORKER if args.compress_hop_model_alias else None,
+        compress_hop_model=args.compress_hop_model_alias,
     )
     context = writer.build_writer_context(path=path, graph=graph)
     hop_summaries = [writer.compress_hop(hop=hop) for hop in context.hops]

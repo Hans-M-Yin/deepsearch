@@ -14,6 +14,7 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+import threading
 import time
 from typing import Any, Protocol
 
@@ -114,6 +115,13 @@ def _normalize_reasoning_effort(value: Any, *, default: str = "medium") -> str:
     if normalized in VALID_REASONING_EFFORTS:
         return normalized
     return default
+
+
+def _usage_int(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 class OpenAIModelWorkerClient:
@@ -348,6 +356,8 @@ class ModelRouterWorkerClient:
         self.config_path = Path(config_path) if config_path else None
         self._configs: dict[str, dict[str, Any]] = {}
         self._clients: dict[str, Any] = {}
+        self._token_totals_lock = threading.Lock()
+        self._token_totals: dict[str, dict[str, int]] = {}
         if self.config_path is not None and self.config_path.exists():
             self.load_config(self.config_path)
 
@@ -478,6 +488,7 @@ class ModelRouterWorkerClient:
                 "sampling_params": config.get("sampling_params"),
             }
         )
+        self._update_and_print_token_totals(alias=alias, response=response)
         return response
 
     def generate_json(self, request: ModelRequest) -> dict[str, Any]:
@@ -514,6 +525,45 @@ class ModelRouterWorkerClient:
                 )
             self._clients[alias] = client
         return client
+
+    def _update_and_print_token_totals(self, *, alias: str, response: ModelResponse) -> None:
+        usage = dict(response.usage or {})
+        prompt_tokens = _usage_int(usage.get("prompt_tokens"))
+        completion_tokens = _usage_int(usage.get("completion_tokens"))
+        total_tokens = _usage_int(usage.get("total_tokens"))
+        if total_tokens <= 0:
+            total_tokens = prompt_tokens + completion_tokens
+        with self._token_totals_lock:
+            totals = self._token_totals.setdefault(
+                alias,
+                {
+                    "calls": 0,
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "total_tokens": 0,
+                },
+            )
+            totals["calls"] += 1
+            totals["prompt_tokens"] += prompt_tokens
+            totals["completion_tokens"] += completion_tokens
+            totals["total_tokens"] += total_tokens
+            snapshot = dict(totals)
+        ##### DEBUG #####
+        print(
+            "[llm-usage]"
+            f" alias={alias}"
+            f" served_model={response.metadata.get('served_model') or response.model}"
+            f" call_prompt_tokens={prompt_tokens}"
+            f" call_completion_tokens={completion_tokens}"
+            f" call_total_tokens={total_tokens}"
+            f" cumulative_calls={snapshot['calls']}"
+            f" cumulative_prompt_tokens={snapshot['prompt_tokens']}"
+            f" cumulative_completion_tokens={snapshot['completion_tokens']}"
+            f" cumulative_total_tokens={snapshot['total_tokens']}",
+            file=sys.stderr,
+            flush=True,
+        )
+        ##### END #####
 
 
 LLM_WORKER = ModelRouterWorkerClient.from_env()
