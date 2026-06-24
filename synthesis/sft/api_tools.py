@@ -524,11 +524,28 @@ def _extract_json_object(text: str) -> dict[str, Any] | None:
     return None
 
 
+def _complete_trailing_action_block(text: str, finish_reason: str | None) -> str:
+    """Close a trailing <action> block if generation stopped at the stop sequence."""
+
+    stripped = text.rstrip()
+    lower = stripped.lower()
+    last_open = lower.rfind("<action>")
+    last_close = lower.rfind("</action>")
+    if last_open == -1 or last_close > last_open:
+        return stripped
+    if finish_reason != "stop":
+        return stripped
+    if stripped.endswith("}"):
+        return f"{stripped}\n</action>"
+    return f"{stripped}</action>"
+
+
 def _parse_manual_react_step(text: str) -> ManualReActStep | None:
     stripped = text.strip()
-    match = _MANUAL_REACT_ACTION_RE.search(stripped)
-    if not match:
+    matches = list(_MANUAL_REACT_ACTION_RE.finditer(stripped))
+    if not matches:
         return None
+    match = matches[-1]
     thought = stripped[: match.start()].strip()
     action_payload = _extract_json_object(match.group("json"))
     if not isinstance(action_payload, dict):
@@ -1163,7 +1180,10 @@ class OpenAIToolAgent:
             )
             choice = completion.choices[0]
             assistant_message = choice.message
-            assistant_text = assistant_message.content or ""
+            assistant_text = _complete_trailing_action_block(
+                assistant_message.content or "",
+                getattr(choice, "finish_reason", None),
+            )
             if self.config.print_rounds:
                 print(f"\n=== Model Round {turn_index + 1} ===")
                 if assistant_text:
