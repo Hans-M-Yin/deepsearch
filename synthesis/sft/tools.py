@@ -168,19 +168,7 @@ def get_tool_definitions() -> list[dict[str, Any]]:
 def get_responses_tool_definitions() -> list[dict[str, Any]]:
     """Return Responses-API-compatible function tool definitions."""
 
-    definitions: list[dict[str, Any]] = []
-    for item in get_tool_definitions():
-        function_block = item["function"]
-        definitions.append(
-            {
-                "type": "function",
-                "name": function_block["name"],
-                "description": function_block["description"],
-                "parameters": json.loads(json.dumps(function_block["parameters"])),
-                "strict": True,
-            }
-        )
-    return definitions
+    return json.loads(json.dumps(get_tool_definitions()))
 
 
 def get_tool_definitions_json() -> str:
