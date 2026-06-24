@@ -39,38 +39,36 @@ Requirements:
 5. Once you believe the evidence is sufficient and there are no remaining unclear or uncertain points, provide the final answer and end the standard answer.
 
 As for the available tools:
-- t2t_search allows you to retrieve relevant web pages based on text and returns a list of URLs. You should examine the results, select the useful ones, and then use the read_url tool to access the page content.
-- i2i_search allows you to search the web for similar images based on a selected region of an image, which is useful for identifying unfamiliar people or objects in the image. It also returns a list of URLs, which you should review and then inspect further using read_url.
-- t2i_search allows you to retrieve relevant images based on a text description. As with the other search tools, you should review the returned URLs and then use read_url to inspect the images.
-
+- t2t_search allows you to retrieve relevant web pages based on text and returns a list of URLs. You should examine the results, select the useful ones, and then use the read_url tool to access the page content. Use this tool when you need to look up world knowledge or content information.
+- i2i_search allows you to search the web for similar images based on a selected region of an image, which is useful for identifying unfamiliar people or objects in the image. It also returns a list of URLs, which you should review and then inspect further using read_url. Use this tool when you need to identify an object in an image, such as figuring out who a person is or what a certain object is. Provide the coordinates of the region you want to identify (if you want to search the whole image, provide the boundary coordinates of the original image), and the tool will return similar images as well as descriptions of that object.
+- t2i_search allows you to retrieve relevant images based on a text description. As with the other search tools, you should review the returned URLs and then use read_url to inspect the images. Use this tool when the missing clues require you to search for relevant images yourself, or when the images you find are likely to help you answer the question.
 """
 
 MANUAL_REACT_PROTOCOL = """
-You must answer exactly one step at a time using the following visible format:
+You must answer exactly one step at a time.
+First write your visible reasoning in natural language.
+Then end your response with exactly one action block in the following format:
 
-Thought:
-<brief but explicit reasoning about the current state, what is missing, and what to do next>
-
-Action:
-<one of: t2t_search, t2i_search, i2i_search, read_url, finish>
-
-Action Input:
-<strict JSON object>
+<action>
+{
+  "tool_name": "t2t_search",
+  "params": {
+    "query": "your query here"
+  },
+  "goal": "why this tool is the right next step"
+}
+</action>
 
 Rules:
-- Output exactly one Action in each round.
-- Do not use function calling. Do not emit tool_calls.
-- The Action Input must be valid JSON.
-- If Action is a search tool, Action Input must contain a concrete query string.
-- If Action is read_url, Action Input must contain a url field.
-- If you already have enough evidence, use Action: finish with Action Input like {"answer": "..."}.
+- Output exactly one <action>...</action> block in each round.
+- The content inside <action> must be valid JSON.
+- The JSON must contain exactly these top-level keys: tool_name, params, goal.
+
+If the evidence is enough, summarize and conclude your final answer in the end.
 """
 
 _MANUAL_REACT_ACTIONS = {"t2t_search", "t2i_search", "i2i_search", "read_url", "finish"}
-_MANUAL_REACT_STEP_RE = re.compile(
-    r"Thought:\s*(?P<thought>.*?)\nAction:\s*(?P<action>[A-Za-z0-9_]+)\s*\nAction Input:\s*(?P<input>.+)\Z",
-    re.DOTALL | re.IGNORECASE,
-)
+_MANUAL_REACT_ACTION_RE = re.compile(r"<action>\s*(?P<json>\{.*?\})\s*</action>", re.DOTALL | re.IGNORECASE)
 
 
 def _truncate_tool_calls(tool_calls: list[Any], *, source: str) -> list[Any]:
@@ -313,14 +311,33 @@ def _append_system_text(message: dict[str, Any], extra_text: str) -> dict[str, A
 
 
 def _tool_reference_text() -> str:
-    lines = ["Available tools:"]
+    lines = ["Available tools and their full definitions:"]
     for item in tools.get_tool_definitions():
         function = item["function"]
         lines.append(f"- {function['name']}: {function['description']}")
-        lines.append(
-            f"  Action Input JSON schema: {json.dumps(function['parameters'], ensure_ascii=False, sort_keys=True)}"
+        lines.append(json.dumps(function, ensure_ascii=False, indent=2, sort_keys=True))
+    lines.append('- finish: End the trajectory. Full definition:')
+    lines.append(
+        json.dumps(
+            {
+                "name": "finish",
+                "description": "End the trajectory and provide the final answer.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "answer": {
+                            "type": "string",
+                            "description": "The final answer text.",
+                        }
+                    },
+                    "required": ["answer"],
+                },
+            },
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
         )
-    lines.append('- finish: End the trajectory. Action Input JSON schema: {"answer": "final answer text"}')
+    )
     return "\n".join(lines)
 
 
@@ -349,21 +366,20 @@ def _contains_image_context(messages: list[dict[str, Any]], context: ToolRuntime
 def _build_state_guidance(messages: list[dict[str, Any]], context: ToolRuntimeContext) -> str:
     latest_tool = _latest_tool_message(messages)
     has_images = _contains_image_context(messages, context)
-    guidance: list[str] = ["Current state guidance:"]
+    guidance: list[str] = ["Recommendation for Tool Use:"]
     if latest_tool is None:
         if has_images:
             guidance.extend(
                 [
                     "- There is image context available.",
                     "- You may inspect whether the current image already contains the target evidence.",
-                    "- If a specific local object matters, consider i2i_search with a region crop.",
+                    "- If a specific local object matters, consider i2i_search with a region crop first. Then i2i_search will provide recognization of the object.",
                     "- If the entity is generic or the question mainly asks for background knowledge, a text search may be better than reverse image search.",
                 ]
             )
         else:
             guidance.extend(
                 [
-                    "- No tool has been used yet.",
                     "- Start by identifying the first missing piece of evidence.",
                     "- Prefer t2t_search for textual evidence gathering and read_url for inspecting a specific result.",
                 ]
@@ -440,7 +456,8 @@ def _build_manual_react_system_prompt(
     messages: list[dict[str, Any]],
     context: ToolRuntimeContext,
 ) -> str:
-    parts = [base_system_prompt.strip(), MANUAL_REACT_PROTOCOL.strip(), _tool_reference_text(), _build_state_guidance(messages, context)]
+    # Dynamic state guidance is disabled for now so the prompt stays stable across turns.
+    parts = [base_system_prompt.strip(), _tool_reference_text(), MANUAL_REACT_PROTOCOL.strip()]
     return "\n\n".join(part for part in parts if part).strip()
 
 
@@ -509,19 +526,26 @@ def _extract_json_object(text: str) -> dict[str, Any] | None:
 
 def _parse_manual_react_step(text: str) -> ManualReActStep | None:
     stripped = text.strip()
-    match = _MANUAL_REACT_STEP_RE.search(stripped)
+    match = _MANUAL_REACT_ACTION_RE.search(stripped)
     if not match:
         return None
-    thought = match.group("thought").strip()
-    action = match.group("action").strip()
-    action_input = _extract_json_object(match.group("input"))
-    if action not in _MANUAL_REACT_ACTIONS or action_input is None:
+    thought = stripped[: match.start()].strip()
+    action_payload = _extract_json_object(match.group("json"))
+    if not isinstance(action_payload, dict):
         return None
+    action = str(action_payload.get("tool_name") or "").strip()
+    params = action_payload.get("params")
+    goal = str(action_payload.get("goal") or "").strip()
+    if action not in _MANUAL_REACT_ACTIONS or not isinstance(params, dict):
+        return None
+    normalized_text = stripped[: match.end()].strip()
+    if goal:
+        thought = f"{thought}\n\nGoal: {goal}".strip() if thought else f"Goal: {goal}"
     return ManualReActStep(
         thought=thought,
         action=action,
-        action_input=action_input,
-        raw_text=stripped,
+        action_input=params,
+        raw_text=normalized_text,
     )
 
 
@@ -1124,6 +1148,7 @@ class OpenAIToolAgent:
                 "model": self.config.model,
                 "messages": request_messages,
                 "stream": False,
+                "stop": ["</action>"],
             }
             if self.config.max_tokens is not None:
                 kwargs["max_tokens"] = self.config.max_tokens
@@ -1143,15 +1168,16 @@ class OpenAIToolAgent:
                 print(f"\n=== Model Round {turn_index + 1} ===")
                 if assistant_text:
                     print(assistant_text)
-            conversation_messages.append({"role": "assistant", "content": assistant_text})
 
             step = _parse_manual_react_step(assistant_text)
             if step is None:
+                conversation_messages.append({"role": "assistant", "content": assistant_text})
                 logger.warning("Failed to parse manual ReAct step; treating the latest assistant text as final output.")
                 final_text = assistant_text
                 break
+            conversation_messages.append({"role": "assistant", "content": step.raw_text})
             if step.action == "finish":
-                final_text = str(step.action_input.get("answer") or assistant_text).strip()
+                final_text = str(step.action_input.get("answer") or step.raw_text).strip()
                 break
 
             result = execute_tool_call(step.action, step.action_input, context)
