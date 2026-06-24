@@ -34,7 +34,6 @@ def get_tool_definitions() -> list[dict[str, Any]]:
     return [
         {
             "type": "function",
-            "name": "t2t_search",
             "function": {
                 "name": "t2t_search",
                 "description": (
@@ -46,56 +45,50 @@ def get_tool_definitions() -> list[dict[str, Any]]:
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "query": {
+                        "query": {"type": "string"},
+                        "q": {
                             "type": "string",
-                            "description": "A concrete web search query string.",
+                            "description": "Alias for query.",
                         },
+                        "hl": {"type": "string", "default": "en"},
                         "lang": {
                             "type": "string",
-                            "description": "Language code for search, such as en.",
+                            "description": "Alias for hl.",
                             "default": "en",
                         },
-                        "top_k": {
-                            "type": "integer",
-                            "description": "Maximum number of search results to return.",
-                            "default": MAX_SEARCH_RESULTS,
-                        },
+                        "top_k": {"type": "integer", "default": MAX_SEARCH_RESULTS},
                     },
-                    "required": ["query"],
+                    "required": [],
                 },
             },
         },
         {
             "type": "function",
-            "name": "t2i_search",
             "function": {
                 "name": "t2i_search",
                 "description": "Search images from a text query.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "query": {
+                        "query": {"type": "string"},
+                        "q": {
                             "type": "string",
-                            "description": "A concrete image-search query string.",
+                            "description": "Alias for query.",
                         },
+                        "hl": {"type": "string", "default": "en"},
                         "lang": {
                             "type": "string",
-                            "description": "Language code for search, such as en.",
+                            "description": "Alias for hl.",
                             "default": "en",
                         },
-                        "top_k": {
-                            "type": "integer",
-                            "description": "Maximum number of image results to return.",
-                            "default": MAX_SEARCH_RESULTS,
-                        },
+                        "top_k": {"type": "integer", "default": MAX_SEARCH_RESULTS},
                     },
-                    "required": ["query"],
+                    "required": [],
                 },
             },
         },
         {
             "type": "function",
-            "name": "i2i_search",
             "function": {
                 "name": "i2i_search",
                 "description": (
@@ -136,7 +129,6 @@ def get_tool_definitions() -> list[dict[str, Any]]:
         },
         {
             "type": "function",
-            "name": "read_url",
             "function": {
                 "name": "read_url",
                 "description": (
@@ -148,9 +140,10 @@ def get_tool_definitions() -> list[dict[str, Any]]:
                 "parameters": {
                     "type": "object",
                     "properties": {
+                        "URL": {"type": "string"},
                         "url": {
                             "type": "string",
-                            "description": "The URL to read.",
+                            "description": "Alias for URL.",
                         },
                         "query": {
                             "type": "string",
@@ -158,7 +151,7 @@ def get_tool_definitions() -> list[dict[str, Any]]:
                             "default": "",
                         },
                     },
-                    "required": ["url"],
+                    "required": [],
                 },
             },
         },
@@ -168,7 +161,17 @@ def get_tool_definitions() -> list[dict[str, Any]]:
 def get_responses_tool_definitions() -> list[dict[str, Any]]:
     """Return Responses-API-compatible function tool definitions."""
 
-    return json.loads(json.dumps(get_tool_definitions()))
+    definitions: list[dict[str, Any]] = []
+    for item in get_tool_definitions():
+        function_block = dict(item["function"])
+        definitions.append(
+            {
+                "type": "function",
+                "name": function_block["name"],
+                "function": function_block,
+            }
+        )
+    return definitions
 
 
 def get_tool_definitions_json() -> str:
@@ -182,10 +185,10 @@ def normalize_tool_arguments(name: str, arguments: dict[str, Any]) -> dict[str, 
 
     params = dict(arguments)
     if name in {"t2t_search", "t2i_search"}:
-        if "q" in params and "query" not in params:
-            params["query"] = params.pop("q")
-        if "hl" in params and "lang" not in params:
-            params["lang"] = params.pop("hl")
+        if "query" in params and "q" not in params:
+            params["q"] = params.pop("query")
+        if "lang" in params and "hl" not in params:
+            params["hl"] = params.pop("lang")
     if name == "read_url" and "URL" in params and "url" not in params:
         params["url"] = params.pop("URL")
     if name == "i2i_search" and isinstance(params.get("region"), str):
