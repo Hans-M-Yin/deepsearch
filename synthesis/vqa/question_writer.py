@@ -1165,7 +1165,7 @@ class QuestionWriter:
             metadata={"trace_label": trace_label},
         )
         response = self.model_client.generate(request)
-        print('####',response.content,"####")
+        # print('####',response.content,"####")
         try:
             parsed = json.loads(response.content)
         except json.JSONDecodeError:

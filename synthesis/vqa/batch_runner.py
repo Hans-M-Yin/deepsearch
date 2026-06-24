@@ -187,6 +187,7 @@ class VqaBatchRunner:
                 question_number=summary.existing_samples + summary.completed,
             ),
         )
+        self._print_sample_timing(sample)
 
         for warning in sample.metadata.get("writer_warnings") or []:
             summary.warnings += 1
@@ -321,6 +322,7 @@ class VqaBatchRunner:
             "progress": sample.get("progress") or {},
             "metadata": {
                 "writer_warnings": list((sample.get("metadata") or {}).get("writer_warnings") or []),
+                "timings": dict((sample.get("metadata") or {}).get("timings") or {}),
             },
             "input_image_url": VqaBatchRunner._extract_input_image_url(sample),
             "created_at": sample.get("created_at"),
@@ -366,6 +368,33 @@ class VqaBatchRunner:
     def _append_jsonl(handle, record: dict[str, Any]) -> None:
         handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True))
         handle.write("\n")
+
+    @staticmethod
+    def _print_sample_timing(sample: VqaSample) -> None:
+        timings = dict(sample.metadata.get("timings") or {})
+        if not timings:
+            return
+        parts = [
+            f"[vqa-timing] sample_id={sample.sample_id}",
+            f"path_id={sample.path.path_id}",
+            f"status={sample.status.value}",
+        ]
+        for key in (
+            "sampling_seconds",
+            "draft_seconds",
+            "polish_seconds",
+            "difficulty_enhancement_seconds",
+            "verification_seconds",
+            "total_generation_seconds",
+        ):
+            value = timings.get(key)
+            if value is None:
+                continue
+            try:
+                parts.append(f"{key}={float(value):.3f}s")
+            except (TypeError, ValueError):
+                continue
+        print(" ".join(parts), flush=True)
 
     def _fill_inflight(
         self,

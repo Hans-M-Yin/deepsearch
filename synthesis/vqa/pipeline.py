@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import os
+import time
 
 from synthesis.model_worker import LLM_WORKER
 from synthesis.store import JsonlGraphStore
@@ -63,10 +64,20 @@ class VqaGenerationPipeline:
     def sample_paths(self, *, limit: int | None = None) -> list[PathCandidate]:
         """Sample paths serially so sampler diversity state remains consistent."""
         sample_limit = self.config.max_samples if limit is None else limit
-        return self.sampler.generate(limit=sample_limit)
+        candidates: list[PathCandidate] = []
+        for _ in range(sample_limit):
+            started_at = time.perf_counter()
+            candidate = self.sampler.generate_one()
+            elapsed_s = time.perf_counter() - started_at
+            if candidate is None:
+                continue
+            candidate.metadata["sampling_seconds"] = elapsed_s
+            candidates.append(candidate)
+        return candidates
 
     def generate_path(self, path: PathCandidate) -> VqaSample:
         """Generate and verify one question from an already sampled path."""
+        total_started_at = time.perf_counter()
         progress = SampleProgress()
         evidence = EvidenceBundle(
             bundle_id=f"bundle_{path.path_id}",
@@ -74,31 +85,39 @@ class VqaGenerationPipeline:
             metadata={"placeholder": True, "source": "pipeline_without_evidence_builder"},
         )
 
-        draft = self._run_stage(
+        draft, draft_elapsed_s = self._run_timed_stage(
             path=path,
             stage="draft",
             operation=lambda: self.writer.draft(path=path, graph=self.graph),
         )
         progress.drafted_at = _utc_now()
-        polished = self._run_stage(
+        polished, polish_elapsed_s = self._run_timed_stage(
             path=path,
             stage="polish",
             operation=lambda: self.writer.polish(draft=draft, path=path, graph=self.graph),
         )
         progress.polished_at = _utc_now()
-        obfuscated = self._run_stage(
+        obfuscated, difficulty_elapsed_s = self._run_timed_stage(
             path=path,
             stage="difficulty_enhancement",
             operation=lambda: self.writer.enhance_difficulty(draft=polished, path=path, graph=self.graph),
         )
         progress.post_obfuscated_at = _utc_now()
-        verification = self._run_stage(
+        verification, verification_elapsed_s = self._run_timed_stage(
             path=path,
             stage="verification",
             operation=lambda: self.verifier.verify(question=obfuscated),
         )
         progress.verified_at = _utc_now()
         status = SampleStatus.VERIFIED if verification.final_keep else SampleStatus.REJECTED
+        timing_summary = {
+            "sampling_seconds": float(path.metadata.get("sampling_seconds") or 0.0),
+            "draft_seconds": draft_elapsed_s,
+            "polish_seconds": polish_elapsed_s,
+            "difficulty_enhancement_seconds": difficulty_elapsed_s,
+            "verification_seconds": verification_elapsed_s,
+            "total_generation_seconds": time.perf_counter() - total_started_at,
+        }
         return VqaSample(
             sample_id=f"sample_{path.path_id}",
             status=status,
@@ -111,6 +130,7 @@ class VqaGenerationPipeline:
             progress=progress,
             metadata={
                 "writer_warnings": list(obfuscated.metadata.get("writer_warnings") or []),
+                "timings": timing_summary,
             },
         )
 
@@ -123,3 +143,9 @@ class VqaGenerationPipeline:
             return operation()
         except Exception as exc:
             raise VqaGenerationError(path_id=path.path_id, stage=stage, cause=exc) from exc
+
+    @staticmethod
+    def _run_timed_stage(*, path: PathCandidate, stage: str, operation):
+        started_at = time.perf_counter()
+        result = VqaGenerationPipeline._run_stage(path=path, stage=stage, operation=operation)
+        return result, time.perf_counter() - started_at
