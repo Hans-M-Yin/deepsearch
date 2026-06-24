@@ -636,68 +636,6 @@ def _conversation_messages_to_responses_input(messages: list[dict[str, Any]]) ->
     return items
 
 
-def _sanitize_responses_input_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Normalize replay items to match strict Responses-API content typing rules."""
-
-    sanitized: list[dict[str, Any]] = []
-    for item in items:
-        if not isinstance(item, dict):
-            sanitized.append(item)
-            continue
-        role = item.get("role")
-        if role != "assistant":
-            sanitized.append(item)
-            continue
-
-        content = item.get("content")
-        if not isinstance(content, list):
-            sanitized.append(item)
-            continue
-
-        normalized_content: list[dict[str, Any]] = []
-        for part in content:
-            if not isinstance(part, dict):
-                normalized_content.append({"type": "output_text", "text": str(part)})
-                continue
-            part_type = part.get("type")
-            if part_type in {"text", "input_text", "output_text"}:
-                normalized_content.append({"type": "output_text", "text": str(part.get("text", ""))})
-            else:
-                normalized_content.append(dict(part))
-        normalized_item = dict(item)
-        normalized_item["content"] = normalized_content
-        sanitized.append(normalized_item)
-    return sanitized
-
-
-def _prepare_responses_input(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Sanitize and validate Responses API input items before sending."""
-
-    sanitized = _sanitize_responses_input_items(items)
-    for index, item in enumerate(sanitized):
-        if not isinstance(item, dict):
-            continue
-        if item.get("role") != "assistant":
-            continue
-        content = item.get("content")
-        if not isinstance(content, list):
-            continue
-        for content_index, part in enumerate(content):
-            if not isinstance(part, dict):
-                raise ValueError(
-                    f"Assistant replay content at input[{index}].content[{content_index}] must be an object."
-                )
-            part_type = part.get("type")
-            if part_type not in {"output_text", "refusal"}:
-                raise ValueError(
-                    "Assistant replay content type must be 'output_text' or 'refusal', "
-                    f"got {part_type!r} at input[{index}].content[{content_index}]."
-                )
-    if logger.isEnabledFor(logging.DEBUG):
-        logger.debug("Prepared Responses input: %s", _json_text(sanitized))
-    return sanitized
-
-
 def _extract_responses_content_and_tool_calls(raw_response: dict[str, Any]) -> tuple[str, list[dict[str, Any]]]:
     output_items = raw_response.get("output") or []
     text_parts: list[str] = []
@@ -995,7 +933,7 @@ class OpenAIToolAgent:
         tool_results: list[ToolExecutionResult] = []
         raw_responses: list[dict[str, Any]] = []
         final_text = ""
-        current_input = _prepare_responses_input(_messages_to_responses_input(conversation_messages))
+        current_input = _messages_to_responses_input(conversation_messages)
         previous_response_id: str | None = None
         use_previous_response_id = True
 
@@ -1022,9 +960,7 @@ class OpenAIToolAgent:
                     )
                     use_previous_response_id = False
                     kwargs.pop("previous_response_id", None)
-                    kwargs["input"] = _prepare_responses_input(
-                        _conversation_messages_to_responses_input(conversation_messages)
-                    )
+                    kwargs["input"] = _conversation_messages_to_responses_input(conversation_messages)
                     response = self.client.responses.create(**kwargs)
                 else:
                     raise
@@ -1078,9 +1014,7 @@ class OpenAIToolAgent:
                     }
                 )
             if not use_previous_response_id:
-                current_input = _prepare_responses_input(
-                    _conversation_messages_to_responses_input(conversation_messages)
-                )
+                current_input = _conversation_messages_to_responses_input(conversation_messages)
         else:
             final_text = "Max tool-calling turns reached before the model produced a final answer."
 
