@@ -255,7 +255,7 @@ class VqaBatchRunner:
             or {}
         )
         path = sample.get("path") or {}
-        return {
+        record = {
             "question_id": f"q_{question_number:06d}",
             "sample_id": sample.get("sample_id"),
             "path_id": path.get("path_id"),
@@ -265,6 +265,10 @@ class VqaBatchRunner:
             "final_question": final_question.get("question"),
             "answer": final_question.get("answer"),
         }
+        image_url = VqaBatchRunner._extract_input_image_url(sample)
+        if image_url:
+            record["image_url"] = image_url
+        return record
 
     @staticmethod
     def _compact_sample_record(sample: dict[str, Any]) -> dict[str, Any]:
@@ -318,6 +322,7 @@ class VqaBatchRunner:
             "metadata": {
                 "writer_warnings": list((sample.get("metadata") or {}).get("writer_warnings") or []),
             },
+            "input_image_url": VqaBatchRunner._extract_input_image_url(sample),
             "created_at": sample.get("created_at"),
             "updated_at": sample.get("updated_at"),
         }
@@ -332,6 +337,21 @@ class VqaBatchRunner:
             "answer_type": stage.get("answer_type"),
             "used_evidence_ids": stage.get("used_evidence_ids") or [],
         }
+
+    @staticmethod
+    def _extract_input_image_url(sample: dict[str, Any]) -> str | None:
+        metadata = sample.get("metadata") or {}
+        compact_image_url = str(sample.get("input_image_url") or metadata.get("input_image_url") or "").strip()
+        if compact_image_url:
+            return compact_image_url
+        for stage_name in ("obfuscated", "polished", "draft"):
+            stage = sample.get(stage_name) or {}
+            stage_metadata = stage.get("metadata") or {}
+            for key in ("starting_image_url", "polish_starting_image_url"):
+                image_url = str(stage_metadata.get(key) or "").strip()
+                if image_url:
+                    return image_url
+        return None
 
     def _write_summary(self, summary: VqaBatchSummary, *, elapsed: float | None = None) -> None:
         payload = summary.to_dict()
