@@ -1207,6 +1207,7 @@ class OpenAIToolAgent:
                     "role": "tool",
                     "tool_call_id": f"manual_{turn_index + 1}_{step.action}",
                     "name": step.action,
+                    "arguments": result.arguments,
                     "content": result.output_text,
                     "type": "manual_react_tool",
                 }
@@ -1279,6 +1280,7 @@ class OpenAIToolAgent:
                         "role": "tool",
                         "tool_call_id": tool_call.id,
                         "name": tool_call.function.name,
+                        "arguments": result.arguments,
                         "content": result.output_text,
                         "type": "function",
                     }
@@ -1381,6 +1383,7 @@ class OpenAIToolAgent:
                         "role": "tool",
                         "tool_call_id": tool_call["id"],
                         "name": tool_call["function"]["name"],
+                        "arguments": result.arguments,
                         "content": result.output_text,
                         "type": "function",
                     }

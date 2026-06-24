@@ -31,6 +31,17 @@ def _jsonify(value: Any) -> Any:
     return value
 
 
+def _augment_query_with_site_exclusion(query: str, domain: str) -> str:
+    normalized_query = str(query or "").strip()
+    normalized_domain = str(domain or "").strip().lower()
+    if not normalized_query or not normalized_domain:
+        return normalized_query
+    exclusion = f"-site:{normalized_domain}"
+    if exclusion.lower() in normalized_query.lower():
+        return normalized_query
+    return f"{normalized_query} {exclusion}".strip()
+
+
 @dataclass(slots=True)
 class TextSearchResult:
     title: str | None = None
@@ -469,7 +480,10 @@ class SerperAdapterSearchClient:
 
     @staticmethod
     def _serper_body(query: str, limit: int, params: dict[str, Any]) -> dict[str, Any]:
-        body = {"q": query, "num": max(1, min(int(limit), 100))}
+        body = {
+            "q": _augment_query_with_site_exclusion(query, "wikipedia.org"),
+            "num": max(1, min(int(limit), 100)),
+        }
         for src_key, dst_key in (
             ("hl", "hl"),
             ("lang", "hl"),
@@ -599,7 +613,10 @@ class SerperSearchClient:
 
     @staticmethod
     def _serper_body(query: str, limit: int, params: dict[str, Any]) -> dict[str, Any]:
-        body = {"q": query, "num": max(1, min(int(limit), 100))}
+        body = {
+            "q": _augment_query_with_site_exclusion(query, "wikipedia.org"),
+            "num": max(1, min(int(limit), 100)),
+        }
         for src_key, dst_key in (
             ("hl", "hl"),
             ("lang", "hl"),
@@ -1110,7 +1127,7 @@ def _smoke_test() -> None:
         5,
         {"hl": "en", "gl": "us", "location": "Austin, Texas, United States"},
     )
-    assert serper_body["q"] == "Coffee"
+    assert serper_body["q"] == "Coffee -site:wikipedia.org"
     assert serper_body["num"] == 5
     assert serper_body["hl"] == "en"
     assert serper_body["gl"] == "us"

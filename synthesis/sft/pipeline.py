@@ -111,14 +111,26 @@ def _format_single_message(index: int, message: Message) -> tuple[str, list[dict
     if role == "tool":
         tool_name = str(message.get("name") or "").strip()
         tool_call_id = str(message.get("tool_call_id") or "").strip()
+        tool_arguments = message.get("arguments")
         if tool_name:
             sections.append(f"Tool Name: {tool_name}")
         if tool_call_id:
             sections.append(f"Tool Call ID: {tool_call_id}")
+        if tool_arguments is not None:
+            sections.append("Tool Arguments:")
+            sections.append(json.dumps(tool_arguments, ensure_ascii=False, indent=2))
         tool_text, tool_images = _format_tool_content(message.get("content"))
-        if tool_text:
-            sections.append("Tool Output:")
-            sections.append(tool_text)
+        parsed_tool_output = _try_parse_json_text(tool_text) if tool_text else None
+        if isinstance(parsed_tool_output, dict):
+            ok_value = parsed_tool_output.get("ok")
+            if ok_value is False:
+                sections.append("Tool Status: error")
+                if parsed_tool_output.get("error"):
+                    sections.append(f"Tool Error: {parsed_tool_output['error']}")
+            elif ok_value is True:
+                sections.append("Tool Status: ok")
+        elif tool_text:
+            sections.append("Tool Status: non_json_output")
         for image in tool_images:
             image_value = image["image"]
             if image_value not in seen:
