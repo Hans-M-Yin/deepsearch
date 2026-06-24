@@ -49,7 +49,7 @@ You must answer exactly one step at a time.
 First write your visible reasoning in natural language.
 Then end your response with exactly one action block in the following format:
 
-<action>
+<tool>
 {
   "tool_name": "t2t_search",
   "params": {
@@ -57,18 +57,18 @@ Then end your response with exactly one action block in the following format:
   },
   "goal": "why this tool is the right next step"
 }
-</action>
+</tool>
 
 Rules:
-- Output exactly one <action>...</action> block in each round.
-- The content inside <action> must be valid JSON.
+- Output exactly one <tool>...</tool> block in each round.
+- The content inside <tool> must be valid JSON.
 - The JSON must contain exactly these top-level keys: tool_name, params, goal.
 
 If the evidence is enough, summarize and conclude your final answer in the end.
 """
 
 _MANUAL_REACT_ACTIONS = {"t2t_search", "t2i_search", "i2i_search", "read_url", "finish"}
-_MANUAL_REACT_ACTION_RE = re.compile(r"<action>\s*(?P<json>\{.*?\})\s*</action>", re.DOTALL | re.IGNORECASE)
+_MANUAL_REACT_ACTION_RE = re.compile(r"<tool>\s*(?P<json>\{.*?\})\s*</tool>", re.DOTALL | re.IGNORECASE)
 
 
 def _truncate_tool_calls(tool_calls: list[Any], *, source: str) -> list[Any]:
@@ -525,19 +525,19 @@ def _extract_json_object(text: str) -> dict[str, Any] | None:
 
 
 def _complete_trailing_action_block(text: str, finish_reason: str | None) -> str:
-    """Close a trailing <action> block if generation stopped at the stop sequence."""
+    """Close a trailing <tool> block if generation stopped at the stop sequence."""
 
     stripped = text.rstrip()
     lower = stripped.lower()
-    last_open = lower.rfind("<action>")
-    last_close = lower.rfind("</action>")
+    last_open = lower.rfind("<tool>")
+    last_close = lower.rfind("</tool>")
     if last_open == -1 or last_close > last_open:
         return stripped
     if finish_reason != "stop":
         return stripped
     if stripped.endswith("}"):
-        return f"{stripped}\n</action>"
-    return f"{stripped}</action>"
+        return f"{stripped}\n</tool>"
+    return f"{stripped}</tool>"
 
 
 def _parse_manual_react_step(text: str) -> ManualReActStep | None:
@@ -1165,7 +1165,7 @@ class OpenAIToolAgent:
                 "model": self.config.model,
                 "messages": request_messages,
                 "stream": False,
-                "stop": ["</action>"],
+                "stop": ["</tool>"],
             }
             if self.config.max_tokens is not None:
                 kwargs["max_tokens"] = self.config.max_tokens
