@@ -96,25 +96,17 @@ def get_tool_definitions() -> list[dict[str, Any]]:
             "function": {
                 "name": "i2i_search",
                 "description": (
-                    "Search for visually similar or matching images from an "
-                    "input image reference or image URL. Optionally crop a "
-                    "region first before performing the search."
+                    "Search for visually similar or matching images from the "
+                    "most recent image in the current context. Optionally crop "
+                    "a region first before performing the search."
                 ),
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "image": {
-                            "type": "string",
-                            "description": "Image reference such as img_1.",
-                        },
-                        "url": {
-                            "type": "string",
-                            "description": "Direct remote image URL.",
-                        },
                         "region": {
                             "type": "array",
                             "description": (
-                                "Optional bounding box to crop before search. "
+                                "Optional bounding box on the current image to crop before search. "
                                 "Preferred format: [x1, y1, x2, y2]."
                             ),
                             "items": {"type": "number"},

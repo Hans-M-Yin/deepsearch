@@ -659,6 +659,13 @@ def _load_pil_image(source: Any, context: ToolRuntimeContext) -> Image.Image:
     raise ValueError(f"Unsupported image source: {type(payload)!r}")
 
 
+def _latest_registered_image_source(context: ToolRuntimeContext) -> Any | None:
+    if not context.image_registry:
+        return None
+    last_key = next(reversed(context.image_registry))
+    return context.image_registry[last_key]
+
+
 def _persist_pil_image(
     image: Image.Image,
     context: ToolRuntimeContext,
@@ -1028,9 +1035,12 @@ def execute_tool_call(
         return ToolExecutionResult(name=name, arguments=params, output=output, output_text=_json_text(output), new_images=new_images)
 
     if name == "i2i_search":
-        image_source = params.get("image") or params.get("url") or ""
-        if not image_source:
-            output = {"ok": False, "error": "image or url is required for i2i_search"}
+        image_source = _latest_registered_image_source(context)
+        if image_source is None:
+            output = {
+                "ok": False,
+                "error": "i2i_search requires at least one image in the current context, but none is available.",
+            }
             return ToolExecutionResult(name=name, arguments=params, output=output, output_text=_json_text(output))
 
         region = params.get("region")
