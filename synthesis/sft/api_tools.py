@@ -682,6 +682,21 @@ def _persist_pil_image(
     return image_id, save_path
 
 
+def _persist_pil_image_to_cache(
+    image: Image.Image,
+    context: ToolRuntimeContext,
+    tool_name: str,
+) -> tuple[str, str]:
+    image_id = context.next_image_id()
+    cache_dir = Path(__file__).resolve().parents[1] / ".image_cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    filename = f"{context.filename_prefix}_{context.session_id}_{tool_name}_{image_id}.png"
+    save_path = str(cache_dir / filename)
+    image.save(save_path)
+    context.image_registry[image_id] = save_path
+    return image_id, save_path
+
+
 def _try_upload_pil_image(
     image: Image.Image,
     context: ToolRuntimeContext,
@@ -1093,28 +1108,27 @@ def execute_tool_call(
             image = _load_pil_image(image_source, context)
             x, y, width, height = bbox
             cropped = image.crop((x, y, x + width, y + height))
-            cropped_id, cropped_path = _persist_pil_image(cropped, context, "i2i_region")
-            new_images[cropped_id] = cropped_path
             uploaded_url = _try_upload_pil_image(cropped, context, "i2i_region")
             if not uploaded_url:
+                cropped_id, cropped_path = _persist_pil_image_to_cache(cropped, context, "i2i_region")
+                new_images[cropped_id] = cropped_path
                 output = {
                     "ok": False,
                     "error": (
                         "Cropped region was created, but reverse image search needs a public URL. "
-                        "The optional uploader is not available."
+                        "Uploading the cropped image failed, so it was saved to the local image cache instead."
                     ),
                     "cropped_image_id": cropped_id,
                     "cropped_image_path": cropped_path,
                 }
                 return ToolExecutionResult(name=name, arguments=params, output=output, output_text=_json_text(output), new_images=new_images)
+            context.register_image(uploaded_url)
             output = tools.i2i_search(
                 image_url=uploaded_url,
                 visual_lookup=context.visual_lookup,
                 top_k=int(params.get("top_k", 5)),
             )
             output = dict(output)
-            output["cropped_image_id"] = cropped_id
-            output["cropped_image_path"] = cropped_path
             output["cropped_image_url"] = uploaded_url
             return ToolExecutionResult(name=name, arguments=params, output=output, output_text=_json_text(output), new_images=new_images)
 
