@@ -236,16 +236,15 @@ def summarize_with_qwen(content: str, query: str, title: str) -> str:
     """Summarize webpage content with an OpenAI-compatible client."""
 
     prompt = (
-        f"Based on the following webpage content, provide a concise summary "
-        f"that is relevant to the query: \"{query}\"\n\n"
+        f"Based on the following webpage content, extract and summarize the content that is RELEVANT to the query: \"{query}\"\n "
         f"Webpage Title: {title}\n"
-        f"Content:\n{content[:2000]}\n\n"
+        f"Content:\n{content[:10000]}\n\n"
     )
     try:
         completion = _openai_client().chat.completions.create(
             model=_summarizer_model(),
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=1024,
+            max_tokens=8192,
             temperature=0.3,
             extra_body={
                 "top_k": 20,
@@ -258,7 +257,7 @@ def summarize_with_qwen(content: str, query: str, title: str) -> str:
             return content_text.strip()
     except Exception as exc:  # pragma: no cover - network bound
         logger.warning("Summarization failed: %s", exc)
-    return content[:500] + ("..." if len(content) > 500 else "")
+    return content[:1000] + ("..." if len(content) > 1000 else "")
 
 
 def summarize_image_search(result_obj: object) -> object:
