@@ -414,7 +414,6 @@ def read_url(url: str, query: str = "") -> dict[str, Any]:
             handle.write(response.content)
         return {
             "ok": True,
-            "kind": "image",
             "url": normalized_url,
             "content_type": content_type,
             "local_path": save_path,
@@ -427,15 +426,13 @@ def read_url(url: str, query: str = "") -> dict[str, Any]:
 
     content = document.get("content", "") or ""
     title = document.get("title", "") or ""
-    summary = summarize_with_qwen(content=content, query=query, title=title) if query else ""
+    summarized_content = summarize_with_qwen(content=content, query=query, title=title) if query else content[:500]
     return {
         "ok": True,
         "kind": "text",
         "url": document.get("url") or normalized_url,
         "title": title,
-        "content": content,
-        "summary": summary,
-        "raw_markdown": document.get("raw_markdown", "") or "",
+        "content": summarized_content,
     }
 
 
@@ -451,15 +448,12 @@ def t2t_search(query: str, lang: str = "en", top_k: int = 5) -> dict[str, Any]:
                 "title": item.title or "",
                 "url": item.url or "",
                 "snippet": item.snippet or "",
-                "source": item.source,
                 "rank": item.rank,
             }
         )
     return {
         "ok": True,
         "query": query,
-        "lang": lang,
-        "count": len(results),
         "results": results,
     }
 
@@ -474,9 +468,7 @@ def t2i_search(query: str, lang: str = "en", top_k: int = 5) -> dict[str, Any]:
             "title": item.title,
             "image_url": item.image_url,
             "source_page_url": item.source_page_url,
-            "thumbnail_url": item.thumbnail_url,
             "snippet": item.snippet,
-            "source": item.source,
             "rank": item.rank,
         }
         for item in response.results[:top_k]
@@ -484,8 +476,6 @@ def t2i_search(query: str, lang: str = "en", top_k: int = 5) -> dict[str, Any]:
     return {
         "ok": True,
         "query": query,
-        "lang": lang,
-        "count": len(results),
         "results": results,
     }
 

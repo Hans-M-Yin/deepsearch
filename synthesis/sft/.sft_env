@@ -19,7 +19,8 @@ export SFT_OPENAI_AZURE_ENDPOINT="https://aidp-i18ntt-sg.byteintl.net/api/modelh
 # Backward-compatible alias.
 export SFT_OPENAI_BASE_URL="${SFT_OPENAI_AZURE_ENDPOINT}"
 export SFT_OPENAI_API_VERSION="2024-03-01-preview"
-export SFT_OPENAI_API_MODE="chat_completions"
+export SFT_OPENAI_API_MODE=manual_react
+
 
 # Request headers / body knobs.
 # Fill in a real logid before running if needed.
