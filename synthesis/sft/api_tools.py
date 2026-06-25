@@ -9,7 +9,9 @@ import json
 import logging
 import os
 import re
+import tempfile
 import uuid
+from datetime import datetime
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -688,19 +690,55 @@ def _try_upload_pil_image(
         from opensearch_vl.opensearch_infer import cos_upload
     except Exception as exc:  # pragma: no cover - optional dependency
         logger.debug("COS uploader import failed: %s", exc)
-        return None
+        cos_upload = None
 
     try:
-        return cos_upload.upload_pil_image(
-            image,
-            context.filename_prefix,
-            0,
-            0,
-            tool_name,
-        )
+        if cos_upload is not None:
+            uploaded = cos_upload.upload_pil_image(
+                image,
+                context.filename_prefix,
+                0,
+                0,
+                tool_name,
+            )
+            if uploaded:
+                return uploaded
     except Exception as exc:  # pragma: no cover - optional dependency
         logger.warning("COS upload failed for %s: %s", tool_name, exc)
+
+    # Fallback: call the OSS uploader directly via the legacy upload_cos ABI.
+    try:
+        from opensearch_vl.opensearch_infer import upload as oss_upload
+    except Exception as exc:  # pragma: no cover - optional dependency
+        logger.debug("OSS uploader import failed: %s", exc)
         return None
+
+    tmp_path: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+            image.save(tmp.name, format="PNG")
+            tmp_path = tmp.name
+        date_str = datetime.now().strftime("%Y-%m-%d")
+        filename = f"{context.filename_prefix}_{context.session_id}_{tool_name}.png"
+        mode = f"{context.filename_prefix}_{date_str}_{tool_name}"
+        _, public_url = oss_upload.upload_cos(
+            tmp_path,
+            filename,
+            date_str,
+            mode,
+            context.case_id or "sft",
+            use_direct_url=True,
+        )
+        return public_url
+    except Exception as exc:  # pragma: no cover - optional dependency
+        logger.warning("OSS upload failed for %s: %s", tool_name, exc)
+        return None
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
 
 
 def _materialize_remote_image_url(source: Any, context: ToolRuntimeContext, tool_name: str) -> tuple[str | None, str | None]:
