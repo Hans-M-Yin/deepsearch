@@ -34,8 +34,8 @@ You are writing a standard answer for a multi-hop knowledge question. Specifical
 Requirements:
 1. You may think freely during your internal reasoning phase, but the statements ultimately included in the written solution process must also follow rigorous logic, ensuring that the solution remains sound and error-free even if one reads only the written solution process and ignores your private thinking.
 2. Since no correct answer is provided, you must also correctly solve the question while drafting the standard answer.
-3. In the standard answer you write, the following logic should be visible: after each tool call and its returned result, analyze the new clues, review the existing clues and the question, determine and plan the next step, and then call a new tool as needed.
-4. In the standard answer, only one tool may be called in each round.
+3. In the standard answer you write, the following logic should be visible: after each tool call and its returned result, analyze the new clues, review the existing clues and the question, determine and plan the next step, and then call a new tool as needed. In the standard answer, only one tool may be called in each round.
+4. The perspective of the standard answer you write should be that of a respondent with very limited prior knowledge. Therefore, any facts, world knowledge, or identification of a specific object in an image during the solving process—such as a celebrity, a logo, or any other unique entity—must be supported by reliable evidence. For factual knowledge, use the t2t_search tool to search for evidence. For identifying objects in images, use i2i_search; its results include evidence showing what the object actually is.
 5. Once you believe the evidence is sufficient and there are no remaining unclear or uncertain points, provide the final answer and end the standard answer.
 
 As for the available tools:

@@ -69,25 +69,57 @@ def _try_parse_json_text(text: str) -> Any | None:
         return None
 
 
-def _collect_image_references(value: Any, sink: list[dict[str, str]], seen: set[str]) -> None:
+_IMAGE_FIELD_HINTS = (
+    "image",
+    "image_url",
+    "thumbnail",
+    "local_path",
+    "cropped_image",
+    "path",
+)
+
+
+def _looks_like_image_reference(text: str, field_name: str | None = None) -> bool:
+    lowered = text.lower().strip()
+    if not lowered:
+        return False
+    if lowered.startswith("img_") or lowered.startswith("data:image"):
+        return True
+    if field_name:
+        field_lower = field_name.lower()
+        if any(hint in field_lower for hint in _IMAGE_FIELD_HINTS):
+            return True
+    image_suffixes = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tiff", ".svg")
+    return lowered.startswith("/") and lowered.endswith(image_suffixes) or (
+        lowered.startswith(("http://", "https://")) and lowered.endswith(image_suffixes)
+    )
+
+
+def _collect_image_references(
+    value: Any,
+    sink: list[dict[str, str]],
+    seen: set[str],
+    *,
+    field_name: str | None = None,
+) -> None:
     if value is None:
         return
     if isinstance(value, str):
         text = value.strip()
         if not text:
             return
-        if text.startswith(("http://", "https://", "data:image", "/")) or text.startswith("img_"):
+        if _looks_like_image_reference(text, field_name):
             if text not in seen:
                 seen.add(text)
                 sink.append({"image": text})
         return
     if isinstance(value, dict):
-        for nested in value.values():
-            _collect_image_references(nested, sink, seen)
+        for nested_key, nested in value.items():
+            _collect_image_references(nested, sink, seen, field_name=str(nested_key))
         return
     if isinstance(value, list):
         for item in value:
-            _collect_image_references(item, sink, seen)
+            _collect_image_references(item, sink, seen, field_name=field_name)
 
 
 def _format_tool_content(content: Any) -> tuple[str, list[dict[str, str]]]:
