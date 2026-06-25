@@ -9,9 +9,7 @@ import json
 import logging
 import os
 import re
-import tempfile
 import uuid
-from datetime import datetime
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -34,17 +32,16 @@ logger = logging.getLogger(__name__)
 DEFAULT_SYSTEM_PROMPT = """
 You are writing a standard answer for a multi-hop knowledge question. Specifically, based on the question provided to you, you need to produce a complete solution process that includes scientifically rigorous, logically sound reasoning steps. This solution process should contain analysis and reasoning about the question, tool calls, analysis and reflection on tool results, replanning of the solution steps, multiple search attempts, and a final accurate standard answer.
 Requirements:
-1. The statements ultimately included in the written solution process MUST follow rigorous logic, ensuring that the solution remains sound and error-free even if one reads only the written solution process and ignores your private thinking. So please recheck the reasoning process to confirm that the solution process is logically rigorous and consistent with the problem description. DO NOT include any events or facts that are not supported by search evidence.
+1. You may think freely during your internal reasoning phase, but the statements ultimately included in the written solution process must also follow rigorous logic, ensuring that the solution remains sound and error-free even if one reads only the written solution process and ignores your private thinking.
 2. Since no correct answer is provided, you must also correctly solve the question while drafting the standard answer.
-3. In the standard answer you write, the following logic should be visible: after each tool call and its returned result, analyze the new clues, review the existing clues and the question, determine and plan the next step, and then call a new tool as needed. In the standard answer, only one tool may be called in each round.
-4. The perspective of the standard answer you write should be that of a respondent with very limited prior knowledge. Therefore, any facts, world knowledge, or identification of a specific object in an image during the solving process—such as a celebrity, a logo, or any other unique entity—must be supported by reliable evidence. For factual knowledge, use the t2t_search tool to search for evidence. For identifying objects in images, use i2i_search; its results include evidence showing what the object actually is.
+3. In the standard answer you write, the following logic should be visible: after each tool call and its returned result, analyze the new clues, review the existing clues and the question, determine and plan the next step, and then call a new tool as needed.
+4. In the standard answer, only one tool may be called in each round.
 5. Once you believe the evidence is sufficient and there are no remaining unclear or uncertain points, provide the final answer and end the standard answer.
 
 As for the available tools:
 - t2t_search allows you to retrieve relevant web pages based on text and returns a list of URLs. You should examine the results, select the useful ones, and then use the read_url tool to access the page content. Use this tool when you need to look up world knowledge or content information.
 - i2i_search allows you to search the web for similar images based on a selected region of an image, which is useful for identifying unfamiliar people or objects in the image. It also returns a list of URLs, which you should review and then inspect further using read_url. Use this tool when you need to identify an object in an image, such as figuring out who a person is or what a certain object is. Provide the coordinates of the region you want to identify (if you want to search the whole image, provide the boundary coordinates of the original image), and the tool will return similar images as well as descriptions of that object.
 - t2i_search allows you to retrieve relevant images based on a text description. As with the other search tools, you should review the returned URLs and then use read_url to inspect the images. Use this tool when the missing clues require you to search for relevant images yourself, or when the images you find are likely to help you answer the question.
-- after a successful search, you can use read_url to examine in more detail the pages returned in the search results or to inspect the images you found. If you think it is necessary, you may select among the search results based on their titles and snippets, and then use read_url to read or inspect the results that are likely to help answer the question.
 """
 
 MANUAL_REACT_PROTOCOL = """
@@ -52,7 +49,7 @@ You must answer exactly one step at a time.
 First write your visible reasoning in natural language.
 Then end your response with exactly one action block in the following format:
 
-<start_tool>
+<action>
 {
   "tool_name": "t2t_search",
   "params": {
@@ -60,18 +57,18 @@ Then end your response with exactly one action block in the following format:
   },
   "goal": "why this tool is the right next step"
 }
-<end_tool>
+</action>
 
 Rules:
-- Output exactly one <start_tool>...<end_tool> block in each round.
-- The content inside <start_tool> must be valid JSON.
+- Output exactly one <action>...</action> block in each round.
+- The content inside <action> must be valid JSON.
 - The JSON must contain exactly these top-level keys: tool_name, params, goal.
 
 If the evidence is enough, summarize and conclude your final answer in the end.
 """
 
 _MANUAL_REACT_ACTIONS = {"t2t_search", "t2i_search", "i2i_search", "read_url", "finish"}
-_MANUAL_REACT_ACTION_RE = re.compile(r"<start_tool>\s*(?P<json>\{.*?\})\s*<end_tool>", re.DOTALL | re.IGNORECASE)
+_MANUAL_REACT_ACTION_RE = re.compile(r"<action>\s*(?P<json>\{.*?\})\s*</action>", re.DOTALL | re.IGNORECASE)
 
 
 def _truncate_tool_calls(tool_calls: list[Any], *, source: str) -> list[Any]:
@@ -127,11 +124,7 @@ class ToolRuntimeContext:
     def image_summary(self) -> str:
         if not self.image_registry:
             return ""
-        lines = [
-            "Available image refs:",
-            "Use these aliases exactly in tool parameters such as i2i_search.params.image.",
-            "Do not invent a new image name. Reuse one of the listed img_n aliases.",
-        ]
+        lines = ["Available image refs:"]
         for image_id, payload in self.image_registry.items():
             lines.append(f"- {image_id}: {str(payload)[:120]}")
         return "\n".join(lines)
@@ -323,10 +316,6 @@ def _tool_reference_text() -> str:
         function = item["function"]
         lines.append(f"- {function['name']}: {function['description']}")
         lines.append(json.dumps(function, ensure_ascii=False, indent=2, sort_keys=True))
-    lines.append(
-        "Important image-reference rule: for i2i_search, the `image` field must be an existing image alias such as "
-        "`img_1` from the current context. Use `url` only when you truly have a direct remote image URL."
-    )
     lines.append('- finish: End the trajectory. Full definition:')
     lines.append(
         json.dumps(
@@ -536,19 +525,19 @@ def _extract_json_object(text: str) -> dict[str, Any] | None:
 
 
 def _complete_trailing_action_block(text: str, finish_reason: str | None) -> str:
-    """Close a trailing <start_tool> block if generation stopped at the stop sequence."""
+    """Close a trailing <action> block if generation stopped at the stop sequence."""
 
     stripped = text.rstrip()
     lower = stripped.lower()
-    last_open = lower.rfind("<start_tool>")
-    last_close = lower.rfind("<end_tool>")
+    last_open = lower.rfind("<action>")
+    last_close = lower.rfind("</action>")
     if last_open == -1 or last_close > last_open:
         return stripped
     if finish_reason != "stop":
         return stripped
     if stripped.endswith("}"):
-        return f"{stripped}\n<end_tool>"
-    return f"{stripped}<end_tool>"
+        return f"{stripped}\n</action>"
+    return f"{stripped}</action>"
 
 
 def _parse_manual_react_step(text: str) -> ManualReActStep | None:
@@ -633,7 +622,6 @@ def _build_initial_messages(
 
 
 def _load_pil_image(source: Any, context: ToolRuntimeContext) -> Image.Image:
-    original_source = source
     payload = _resolve_image_payload(source, context)
     if isinstance(payload, Image.Image):
         return payload.copy()
@@ -648,25 +636,7 @@ def _load_pil_image(source: Any, context: ToolRuntimeContext) -> Image.Image:
             return Image.open(io.BytesIO(response.content))
         if os.path.exists(payload):
             return Image.open(payload)
-        known_refs = ", ".join(sorted(context.image_registry.keys()))
-        if isinstance(original_source, str) and not payload.startswith(("http://", "https://", "data:image")):
-            if known_refs:
-                raise ValueError(
-                    "Unsupported image source string. Expected an existing image alias such as "
-                    f"{known_refs}, a local file path, a direct image URL, or a data URL; got {original_source!r}."
-                )
-            raise ValueError(
-                "Unsupported image source string. Expected a local file path, a direct image URL, or a data URL; "
-                f"got {original_source!r}."
-            )
     raise ValueError(f"Unsupported image source: {type(payload)!r}")
-
-
-def _latest_registered_image_source(context: ToolRuntimeContext) -> Any | None:
-    if not context.image_registry:
-        return None
-    last_key = next(reversed(context.image_registry))
-    return context.image_registry[last_key]
 
 
 def _persist_pil_image(
@@ -706,55 +676,19 @@ def _try_upload_pil_image(
         from opensearch_vl.opensearch_infer import cos_upload
     except Exception as exc:  # pragma: no cover - optional dependency
         logger.debug("COS uploader import failed: %s", exc)
-        cos_upload = None
+        return None
 
     try:
-        if cos_upload is not None:
-            uploaded = cos_upload.upload_pil_image(
-                image,
-                context.filename_prefix,
-                0,
-                0,
-                tool_name,
-            )
-            if uploaded:
-                return uploaded
+        return cos_upload.upload_pil_image(
+            image,
+            context.filename_prefix,
+            0,
+            0,
+            tool_name,
+        )
     except Exception as exc:  # pragma: no cover - optional dependency
         logger.warning("COS upload failed for %s: %s", tool_name, exc)
-
-    # Fallback: call the OSS uploader directly via the legacy upload_cos ABI.
-    try:
-        from opensearch_vl.opensearch_infer import upload as oss_upload
-    except Exception as exc:  # pragma: no cover - optional dependency
-        logger.debug("OSS uploader import failed: %s", exc)
         return None
-
-    tmp_path: str | None = None
-    try:
-        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
-            image.save(tmp.name, format="PNG")
-            tmp_path = tmp.name
-        date_str = datetime.now().strftime("%Y-%m-%d")
-        filename = f"{context.filename_prefix}_{context.session_id}_{tool_name}.png"
-        mode = f"{context.filename_prefix}_{date_str}_{tool_name}"
-        _, public_url = oss_upload.upload_cos(
-            tmp_path,
-            filename,
-            date_str,
-            mode,
-            context.case_id or "sft",
-            use_direct_url=True,
-        )
-        return public_url
-    except Exception as exc:  # pragma: no cover - optional dependency
-        logger.warning("OSS upload failed for %s: %s", tool_name, exc)
-        return None
-    finally:
-        if tmp_path and os.path.exists(tmp_path):
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
 
 
 def _materialize_remote_image_url(source: Any, context: ToolRuntimeContext, tool_name: str) -> tuple[str | None, str | None]:
@@ -1089,12 +1023,9 @@ def execute_tool_call(
         return ToolExecutionResult(name=name, arguments=params, output=output, output_text=_json_text(output), new_images=new_images)
 
     if name == "i2i_search":
-        image_source = _latest_registered_image_source(context)
-        if image_source is None:
-            output = {
-                "ok": False,
-                "error": "i2i_search requires at least one image in the current context, but none is available.",
-            }
+        image_source = params.get("image") or params.get("url") or ""
+        if not image_source:
+            output = {"ok": False, "error": "image or url is required for i2i_search"}
             return ToolExecutionResult(name=name, arguments=params, output=output, output_text=_json_text(output))
 
         region = params.get("region")
@@ -1248,7 +1179,7 @@ class OpenAIToolAgent:
                 "model": self.config.model,
                 "messages": request_messages,
                 "stream": False,
-                "stop": ["<end_tool>"],
+                "stop": ["</action>"],
             }
             if self.config.max_tokens is not None:
                 kwargs["max_tokens"] = self.config.max_tokens
@@ -1290,7 +1221,6 @@ class OpenAIToolAgent:
                     "role": "tool",
                     "tool_call_id": f"manual_{turn_index + 1}_{step.action}",
                     "name": step.action,
-                    "arguments": result.arguments,
                     "content": result.output_text,
                     "type": "manual_react_tool",
                 }
@@ -1337,7 +1267,6 @@ class OpenAIToolAgent:
                 kwargs["temperature"] = self.config.temperature
             if self.config.extra_body:
                 kwargs["extra_body"] = self.config.extra_body
-            print(kwargs)
             completion = self.client.chat.completions.create(**kwargs)
             raw_responses.append(
                 completion.model_dump() if hasattr(completion, "model_dump") else {"repr": repr(completion)}
@@ -1363,7 +1292,6 @@ class OpenAIToolAgent:
                         "role": "tool",
                         "tool_call_id": tool_call.id,
                         "name": tool_call.function.name,
-                        "arguments": result.arguments,
                         "content": result.output_text,
                         "type": "function",
                     }
@@ -1466,7 +1394,6 @@ class OpenAIToolAgent:
                         "role": "tool",
                         "tool_call_id": tool_call["id"],
                         "name": tool_call["function"]["name"],
-                        "arguments": result.arguments,
                         "content": result.output_text,
                         "type": "function",
                     }
