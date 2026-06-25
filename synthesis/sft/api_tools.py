@@ -1267,6 +1267,7 @@ class OpenAIToolAgent:
                 kwargs["temperature"] = self.config.temperature
             if self.config.extra_body:
                 kwargs["extra_body"] = self.config.extra_body
+            print('##############\n',kwargs,'\n##############')
             completion = self.client.chat.completions.create(**kwargs)
             raw_responses.append(
                 completion.model_dump() if hasattr(completion, "model_dump") else {"repr": repr(completion)}
