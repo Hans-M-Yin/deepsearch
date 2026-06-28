@@ -1,13 +1,12 @@
 GRAPH_PATH=runs/multi_seed_visual_8192_1
 
-SAMPLES=10
-WORKERS=10
+SAMPLES=5000
+WORKERS=32
 MIN_HOPS=2
 MAX_HOPS=5
 
 python -m synthesis.vqa.run_batch \
   --graph-dir $GRAPH_PATH \
-  --output-dir $GRAPH_PATH/vqa \
   --samples $SAMPLES \
   --workers $WORKERS \
   --min-hops $MIN_HOPS \
