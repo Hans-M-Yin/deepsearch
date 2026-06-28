@@ -24,6 +24,9 @@ from .graph_view import GraphView
 from .schemas import PathCandidate, TrajectoryStats
 
 
+SAMPLER_STATE_VERSION = 1
+
+
 PROMPT_LLM_NEXT_HOP_SELECTION = """You are reviewing candidate next hops for graph trajectory sampling in a multi-hop question-generation pipeline.
 
 Your job is NOT to choose the most generally related next node.
@@ -201,10 +204,10 @@ class RandomPathSampler(PathSampler):
     def generate_one(self, start_node_id: str | None = None) -> PathCandidate | None:
         node_ids = self._candidate_start_nodes()
         # ##### DEBUG #####
-        node_ids = [
-            node_id for node_id in node_ids
-            if (self.graph.get_node(node_id) or {}).get("node_type") == "image"
-        ]
+        # node_ids = [
+        #     node_id for node_id in node_ids
+        #     if (self.graph.get_node(node_id) or {}).get("node_type") == "image"
+        # ]
         # ##### END #####
         if not node_ids:
             self.last_generation_stats = SamplerGenerationStats(requested=1, attempts=0, accepted=0)
@@ -278,6 +281,73 @@ class RandomPathSampler(PathSampler):
     def sample_candidates(self, limit: int) -> list[PathCandidate]:
         """Backward-compatible alias for early callers."""
         return self.generate(limit=limit)
+
+    def export_state(
+        self,
+        *,
+        used_exact_signatures: set[str] | None = None,
+        edge_usage_counts: dict[str, int] | None = None,
+    ) -> dict[str, Any]:
+        signatures_source = self.used_exact_signatures if used_exact_signatures is None else used_exact_signatures
+        counts_source = self.edge_usage_counts if edge_usage_counts is None else edge_usage_counts
+        normalized_signatures = sorted(
+            {
+                str(signature).strip()
+                for signature in signatures_source
+                if str(signature).strip()
+            }
+        )
+        normalized_counts = {
+            str(edge_id).strip(): int(count)
+            for edge_id, count in sorted(counts_source.items())
+            if str(edge_id).strip() and int(count) > 0
+        }
+        return {
+            "version": SAMPLER_STATE_VERSION,
+            "sampler_type": self.__class__.__name__,
+            "config": self.config.to_dict(),
+            "used_exact_signatures": normalized_signatures,
+            "edge_usage_counts": normalized_counts,
+        }
+
+    def load_state(self, state: dict[str, Any], *, replace: bool = True) -> None:
+        if not isinstance(state, dict):
+            raise ValueError("sampler state must be a JSON object")
+        version = state.get("version")
+        if version not in (None, SAMPLER_STATE_VERSION):
+            raise ValueError(f"unsupported sampler state version: {version}")
+
+        raw_signatures = state.get("used_exact_signatures") or []
+        raw_edge_counts = state.get("edge_usage_counts") or {}
+        if not isinstance(raw_signatures, list):
+            raise ValueError("sampler state field 'used_exact_signatures' must be a list")
+        if not isinstance(raw_edge_counts, dict):
+            raise ValueError("sampler state field 'edge_usage_counts' must be an object")
+
+        normalized_signatures = {
+            str(signature).strip()
+            for signature in raw_signatures
+            if str(signature).strip()
+        }
+        normalized_edge_counts: dict[str, int] = {}
+        for edge_id, count in raw_edge_counts.items():
+            edge_text = str(edge_id).strip()
+            if not edge_text:
+                continue
+            try:
+                normalized_count = int(count)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"invalid sampler edge count for {edge_text!r}: {count!r}") from exc
+            if normalized_count <= 0:
+                continue
+            normalized_edge_counts[edge_text] = normalized_count
+
+        if replace:
+            self.used_exact_signatures = set()
+            self.edge_usage_counts = {}
+        self.used_exact_signatures.update(normalized_signatures)
+        for edge_id, count in normalized_edge_counts.items():
+            self.edge_usage_counts[edge_id] = self.edge_usage_counts.get(edge_id, 0) + count
 
     def _sample_one(
         self,

@@ -176,7 +176,7 @@ class OpenAIModelWorkerClient:
             "model": request.model or self.model,
             "messages": [message.to_dict() for message in request.messages],
         }
-        print(kwargs['messages'])
+        # print(kwargs['messages'])
         if request.temperature is not None:
             kwargs["temperature"] = request.temperature
         if request.max_tokens is not None:

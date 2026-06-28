@@ -7,6 +7,8 @@ from datetime import datetime
 import json
 import os
 from pathlib import Path
+import shlex
+import sys
 
 from synthesis.model_worker import LLM_WORKER
 from synthesis.store import JsonlGraphStore
@@ -61,14 +63,22 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--llm-candidate-count", type=int, default=6)
     parser.add_argument("--llm-score-temperature", type=float, default=0.35)
+    parser.add_argument(
+        "--sampler-state",
+        type=Path,
+        default=None,
+        help="Optional sampler state JSON file to import before sampling.",
+    )
     parser.add_argument("--no-resume", action="store_true")
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = build_arg_parser().parse_args(argv)
+    argv_to_parse = list(argv) if argv is not None else sys.argv[1:]
+    args = build_arg_parser().parse_args(argv_to_parse)
     graph_dir = args.graph_dir.resolve()
     output_dir = args.output_dir.resolve() if args.output_dir else _default_output_dir(graph_dir)
+    sampler_state_input_path = args.sampler_state.resolve() if args.sampler_state else None
     model_alias = args.model_alias or os.environ.get("VQA_WRITER_MODEL")
     sampler_model_alias = args.sampler_model_alias or os.environ.get("VQA_SAMPLER_MODEL")
     compress_hop_model_alias = args.compress_hop_model_alias or os.environ.get("VQA_COMPRESS_HOP_MODEL")
@@ -109,14 +119,46 @@ def main(argv: list[str] | None = None) -> int:
         workers=args.workers,
         resume=not args.no_resume,
         max_inflight=args.max_inflight,
+        sampler_state_input_path=sampler_state_input_path,
+        question_metadata={
+            "entrypoint": "synthesis.vqa.run_batch",
+            "invocation": {
+                "argv": argv_to_parse,
+                "replay_command": shlex.join(
+                    [sys.executable, "-m", "synthesis.vqa.run_batch", *argv_to_parse]
+                ),
+                "cwd": str(Path.cwd().resolve()),
+            },
+            "paths": {
+                "graph_dir": str(graph_dir),
+                "output_dir": str(output_dir),
+            },
+            "sampling_parameters": config.to_dict(),
+            "batch_parameters": {
+                "samples": args.samples,
+                "workers": args.workers,
+                "max_inflight": args.max_inflight,
+                "resume": not args.no_resume,
+            },
+            "models": {
+                "writer_model_alias": model_alias,
+                "sampler_model_alias": sampler_model_alias,
+                "compress_hop_model_alias": compress_hop_model_alias,
+            },
+            "sampler_state_request": {
+                "input_path": str(sampler_state_input_path) if sampler_state_input_path else None,
+            },
+        },
     )
     summary = runner.run(limit=args.samples)
     print(json.dumps(summary.to_dict(), ensure_ascii=False, indent=2))
     print(f"samples: {runner.samples_path}")
     print(f"questions: {runner.questions_path}")
+    print(f"question_metadata: {runner.question_metadata_path}")
     print(f"errors: {runner.errors_path}")
     print(f"warnings: {runner.warnings_path}")
     print(f"summary: {runner.summary_path}")
+    print(f"sampler_state: {runner.sampler_state_path}")
     return 0 if summary.failed == 0 else 1
 
 
