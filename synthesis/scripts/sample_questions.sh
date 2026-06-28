@@ -1,4 +1,4 @@
-GRAPH_PATH=runs/multi_seed_visual_smoke_6
+GRAPH_PATH=runs/multi_seed_visual_8192_1
 
 SAMPLES=10
 WORKERS=10
