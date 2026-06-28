@@ -9,10 +9,20 @@ import json
 from pathlib import Path
 import time
 import traceback
-from typing import Any, Iterator
+from typing import Any
 
+from .path_sampler import RandomPathSampler, SamplerConfiguration
 from .pipeline import VqaGenerationError, VqaGenerationPipeline
 from .schemas import PathCandidate, VqaSample
+
+
+_MAX_SAME_CORE_SIGNATURE = 2
+_MAX_SAME_PREFIX_SIGNATURE = 2
+_MAX_SAME_TARGET_NODE = 3
+_MAX_EDGE_OVERLAP_RATIO = 0.75
+_MAX_NODE_OVERLAP_RATIO = 0.80
+_MIN_STALLED_PROPOSALS_PER_VERSION = 8
+_STALLED_PROPOSALS_MULTIPLIER = 4
 
 
 def _utc_now() -> str:
@@ -24,6 +34,9 @@ class VqaBatchSummary:
     requested_total: int
     existing_samples: int
     sampled_paths: int
+    proposed_paths: int = 0
+    acceptor_rejected: int = 0
+    sampler_exhausted_proposals: int = 0
     completed: int = 0
     verified: int = 0
     rejected: int = 0
@@ -33,6 +46,39 @@ class VqaBatchSummary:
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+@dataclass(slots=True)
+class _ProposalContext:
+    proposal_id: int
+    state_version: int
+    sampler_seed: int
+
+
+@dataclass(slots=True)
+class _AcceptedPathFingerprint:
+    path_id: str
+    exact_signature: str
+    core_signature: str
+    prefix_signature: str
+    target_node_id: str
+    node_ids: tuple[str, ...]
+    node_id_set: frozenset[str]
+    edge_id_set: frozenset[str]
+    edge_ids: tuple[str, ...]
+
+
+@dataclass(slots=True)
+class _AcceptorState:
+    used_exact_signatures: set[str]
+    edge_usage_counts: dict[str, int]
+    version: int = 0
+    core_counts: dict[str, int] = field(default_factory=dict)
+    prefix_counts: dict[str, int] = field(default_factory=dict)
+    target_counts: dict[str, int] = field(default_factory=dict)
+    core_buckets: dict[str, list[_AcceptedPathFingerprint]] = field(default_factory=dict)
+    prefix_buckets: dict[str, list[_AcceptedPathFingerprint]] = field(default_factory=dict)
+    target_buckets: dict[str, list[_AcceptedPathFingerprint]] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -81,13 +127,20 @@ class VqaBatchRunner:
 
         self.output_dir.mkdir(parents=True, exist_ok=True)
         existing = self._load_existing_samples() if self.resume else {}
-        persisted_signatures, persisted_edge_usage_counts, sampler_state_info = self._restore_sampler_state(
+        persisted_signatures, persisted_edge_usage_counts, persisted_fingerprints, acceptor_state, sampler_state_info = self._restore_sampler_state(
             existing_records=existing.values(),
         )
         if not self.resume:
             self._reset_outputs(preserve_paths=self._reset_preserve_paths())
             existing = {}
         self._rebuild_questions_file(existing.values())
+
+        remaining = max(0, limit - len(existing))
+        sampler_workers = self._sampler_worker_count(remaining)
+        batch_parameters = dict(self.question_metadata.get("batch_parameters") or {})
+        batch_parameters["pipeline_mode"] = "streaming_acceptor_writer"
+        batch_parameters["sampler_workers"] = sampler_workers
+        self.question_metadata["batch_parameters"] = batch_parameters
 
         self._write_question_metadata(
             limit=limit,
@@ -97,20 +150,19 @@ class VqaBatchRunner:
             status="running",
         )
 
-        remaining = max(0, limit - len(existing))
-        paths = self.pipeline.sample_paths(limit=remaining) if remaining else []
         summary = VqaBatchSummary(
             requested_total=limit,
             existing_samples=len(existing),
-            sampled_paths=len(paths),
+            sampled_paths=0,
         )
         started_at = time.perf_counter()
-        if not paths:
+        if not remaining:
             summary.elapsed_seconds = time.perf_counter() - started_at
             self._write_summary(summary)
             self._write_sampler_state(
                 used_exact_signatures=persisted_signatures,
                 edge_usage_counts=persisted_edge_usage_counts,
+                persisted_fingerprints=persisted_fingerprints,
             )
             self._refresh_sampler_state_info(
                 sampler_state_info=sampler_state_info,
@@ -127,46 +179,130 @@ class VqaBatchRunner:
             return summary
 
         mode = "a" if self.resume else "w"
+        inflight_limit = max(
+            self.workers,
+            self.max_inflight or self.workers * 2,
+        )
+        stalled_threshold = max(
+            _MIN_STALLED_PROPOSALS_PER_VERSION,
+            sampler_workers * _STALLED_PROPOSALS_MULTIPLIER,
+        )
         with (
             self.samples_path.open(mode, encoding="utf-8") as samples_file,
             self.questions_path.open("a", encoding="utf-8") as questions_file,
             self.errors_path.open(mode, encoding="utf-8") as errors_file,
             self.warnings_path.open(mode, encoding="utf-8") as warnings_file,
-            ThreadPoolExecutor(max_workers=self.workers) as executor,
+            ThreadPoolExecutor(max_workers=sampler_workers) as sampler_executor,
+            ThreadPoolExecutor(max_workers=self.workers) as writer_executor,
         ):
-            path_iter = iter(paths)
-            inflight_limit = max(
-                self.workers,
-                self.max_inflight or self.workers * 2,
-            )
-            futures: dict[Future[VqaSample], PathCandidate] = {}
-            self._fill_inflight(
-                executor=executor,
-                path_iter=path_iter,
-                futures=futures,
-                limit=inflight_limit,
-            )
-            while futures:
-                done, _ = wait(tuple(futures), return_when=FIRST_COMPLETED)
-                for future in done:
-                    path = futures.pop(future)
-                    self._record_future(
-                        future=future,
-                        path=path,
-                        summary=summary,
-                        samples_file=samples_file,
-                        questions_file=questions_file,
-                        errors_file=errors_file,
-                        warnings_file=warnings_file,
-                        persisted_signatures=persisted_signatures,
-                        persisted_edge_usage_counts=persisted_edge_usage_counts,
+            proposal_futures: dict[Future[PathCandidate | None], _ProposalContext] = {}
+            writer_futures: dict[Future[VqaSample], PathCandidate] = {}
+            stalled_proposals_by_version: dict[int, int] = {}
+            proposal_sequence = 0
+            cached_snapshot_version: int | None = None
+            cached_snapshot: dict[str, Any] | None = None
+
+            def current_version_is_stalled() -> bool:
+                current_version = acceptor_state.version
+                if summary.sampled_paths >= remaining:
+                    return True
+                if any(context.state_version == current_version for context in proposal_futures.values()):
+                    return False
+                return stalled_proposals_by_version.get(current_version, 0) >= stalled_threshold
+
+            def current_snapshot() -> dict[str, Any]:
+                nonlocal cached_snapshot, cached_snapshot_version
+                if cached_snapshot is None or cached_snapshot_version != acceptor_state.version:
+                    cached_snapshot = self._sampler_template().export_state(
+                        used_exact_signatures=acceptor_state.used_exact_signatures,
+                        edge_usage_counts=acceptor_state.edge_usage_counts,
                     )
-                self._fill_inflight(
-                    executor=executor,
-                    path_iter=path_iter,
-                    futures=futures,
-                    limit=inflight_limit,
-                )
+                    cached_snapshot_version = acceptor_state.version
+                return cached_snapshot
+
+            def fill_sampler_futures() -> None:
+                nonlocal proposal_sequence
+                if current_version_is_stalled():
+                    return
+                room = max(0, inflight_limit - len(writer_futures))
+                target = min(sampler_workers, room)
+                while len(proposal_futures) < target and summary.sampled_paths < remaining:
+                    proposal_sequence += 1
+                    context = _ProposalContext(
+                        proposal_id=proposal_sequence,
+                        state_version=acceptor_state.version,
+                        sampler_seed=self._proposal_seed(proposal_sequence),
+                    )
+                    future = sampler_executor.submit(
+                        self._sample_path_proposal,
+                        sampler_state=current_snapshot(),
+                        proposal_id=context.proposal_id,
+                        state_version=context.state_version,
+                        sampler_seed=context.sampler_seed,
+                    )
+                    proposal_futures[future] = context
+
+            fill_sampler_futures()
+            while proposal_futures or writer_futures:
+                done, _ = wait(tuple(proposal_futures) + tuple(writer_futures), return_when=FIRST_COMPLETED)
+                for future in done:
+                    if future in writer_futures:
+                        path = writer_futures.pop(future)
+                        self._record_future(
+                            future=future,
+                            path=path,
+                            summary=summary,
+                            samples_file=samples_file,
+                            questions_file=questions_file,
+                            errors_file=errors_file,
+                            warnings_file=warnings_file,
+                            persisted_signatures=persisted_signatures,
+                            persisted_edge_usage_counts=persisted_edge_usage_counts,
+                        )
+                        continue
+
+                    context = proposal_futures.pop(future)
+                    try:
+                        candidate = future.result()
+                    except Exception as exc:
+                        summary.failed += 1
+                        stalled_proposals_by_version[context.state_version] = (
+                            stalled_proposals_by_version.get(context.state_version, 0) + 1
+                        )
+                        self._record_sampler_failure(
+                            exc=exc,
+                            context=context,
+                            errors_file=errors_file,
+                        )
+                        continue
+
+                    if candidate is None:
+                        summary.sampler_exhausted_proposals += 1
+                        stalled_proposals_by_version[context.state_version] = (
+                            stalled_proposals_by_version.get(context.state_version, 0) + 1
+                        )
+                        continue
+
+                    summary.proposed_paths += 1
+                    if summary.sampled_paths >= remaining:
+                        continue
+
+                    accepted, _reject_reason = self._accept_path_candidate(
+                        path=candidate,
+                        acceptor_state=acceptor_state,
+                    )
+                    if not accepted:
+                        summary.acceptor_rejected += 1
+                        stalled_proposals_by_version[context.state_version] = (
+                            stalled_proposals_by_version.get(context.state_version, 0) + 1
+                        )
+                        continue
+
+                    summary.sampled_paths += 1
+                    writer_future = writer_executor.submit(self.pipeline.generate_path, candidate)
+                    writer_futures[writer_future] = candidate
+
+                fill_sampler_futures()
                 self._write_summary(summary, elapsed=time.perf_counter() - started_at)
 
         summary.elapsed_seconds = time.perf_counter() - started_at
@@ -174,6 +310,7 @@ class VqaBatchRunner:
         self._write_sampler_state(
             used_exact_signatures=persisted_signatures,
             edge_usage_counts=persisted_edge_usage_counts,
+            persisted_fingerprints=persisted_fingerprints,
         )
         self._refresh_sampler_state_info(
             sampler_state_info=sampler_state_info,
@@ -258,6 +395,261 @@ class VqaBatchRunner:
                     "created_at": _utc_now(),
                 },
             )
+
+    def _record_sampler_failure(
+        self,
+        *,
+        exc: Exception,
+        context: _ProposalContext,
+        errors_file,
+    ) -> None:
+        self._append_jsonl(
+            errors_file,
+            {
+                "proposal_id": context.proposal_id,
+                "stage": "sampling",
+                "error_type": exc.__class__.__name__,
+                "error": str(exc),
+                "traceback": "".join(traceback.format_exception(exc)),
+                "sampler_state_version": context.state_version,
+                "sampler_seed": context.sampler_seed,
+                "created_at": _utc_now(),
+            },
+        )
+
+    def _sample_path_proposal(
+        self,
+        *,
+        sampler_state: dict[str, Any],
+        proposal_id: int,
+        state_version: int,
+        sampler_seed: int,
+    ) -> PathCandidate | None:
+        started_at = time.perf_counter()
+        sampler = self._build_sampler_clone(
+            sampler_state=sampler_state,
+            sampler_seed=sampler_seed,
+        )
+        candidate = sampler.generate_one()
+        if candidate is None:
+            return None
+        elapsed_s = time.perf_counter() - started_at
+        candidate.metadata["sampling_seconds"] = elapsed_s
+        candidate.metadata["proposal_id"] = proposal_id
+        candidate.metadata["sampler_state_version"] = state_version
+        candidate.metadata["sampler_seed"] = sampler_seed
+        if sampler.last_generation_stats is not None:
+            candidate.metadata["sampler_generation_stats"] = sampler.last_generation_stats.to_dict()
+        return candidate
+
+    def _build_sampler_clone(
+        self,
+        *,
+        sampler_state: dict[str, Any],
+        sampler_seed: int,
+    ) -> RandomPathSampler:
+        template = self._sampler_template()
+        config_payload = dict(self.pipeline.config.to_dict())
+        config_payload["random_seed"] = sampler_seed
+        config = SamplerConfiguration(**config_payload)
+        sampler = RandomPathSampler(
+            graph=self.pipeline.graph,
+            config=config,
+            model_client=template.model_client,
+            model=template.model,
+            llm_temperature=template.llm_temperature,
+            llm_max_tokens=template.llm_max_tokens,
+        )
+        sampler.load_state(sampler_state, replace=True)
+        return sampler
+
+    def _sampler_template(self) -> RandomPathSampler:
+        sampler = self.pipeline.sampler
+        if sampler is None:
+            raise RuntimeError("pipeline sampler is not initialized")
+        if not isinstance(sampler, RandomPathSampler):
+            raise TypeError(f"VqaBatchRunner requires RandomPathSampler, got {type(sampler)!r}")
+        return sampler
+
+    def _accept_path_candidate(
+        self,
+        *,
+        path: PathCandidate,
+        acceptor_state: _AcceptorState,
+    ) -> tuple[bool, str | None]:
+        fingerprint = self._fingerprint_from_path_candidate(path)
+        if fingerprint is None:
+            return False, "invalid_path"
+        if self.pipeline.config.dedup_by_exact_signature and fingerprint.exact_signature in acceptor_state.used_exact_signatures:
+            return False, "duplicate_exact"
+        if fingerprint.core_signature and acceptor_state.core_counts.get(fingerprint.core_signature, 0) >= _MAX_SAME_CORE_SIGNATURE:
+            return False, "duplicate_core_signature"
+        if fingerprint.prefix_signature and acceptor_state.prefix_counts.get(fingerprint.prefix_signature, 0) >= _MAX_SAME_PREFIX_SIGNATURE:
+            return False, "duplicate_prefix_signature"
+        if fingerprint.target_node_id and acceptor_state.target_counts.get(fingerprint.target_node_id, 0) >= _MAX_SAME_TARGET_NODE:
+            return False, "duplicate_target_node"
+        overlap_reason = self._overlap_reject_reason(
+            fingerprint=fingerprint,
+            acceptor_state=acceptor_state,
+        )
+        if overlap_reason is not None:
+            return False, overlap_reason
+
+        self._register_acceptor_fingerprint(
+            acceptor_state=acceptor_state,
+            fingerprint=fingerprint,
+            increment_version=True,
+            count_edge_usage=True,
+        )
+        path.metadata["acceptor"] = {
+            "proposal_state_version": path.metadata.get("sampler_state_version"),
+            "accepted_state_version": acceptor_state.version,
+        }
+        return True, None
+
+    @staticmethod
+    def _register_acceptor_fingerprint(
+        *,
+        acceptor_state: _AcceptorState,
+        fingerprint: _AcceptedPathFingerprint,
+        increment_version: bool,
+        count_edge_usage: bool,
+    ) -> None:
+        acceptor_state.used_exact_signatures.add(fingerprint.exact_signature)
+        if count_edge_usage:
+            for edge_id in fingerprint.edge_ids:
+                acceptor_state.edge_usage_counts[edge_id] = acceptor_state.edge_usage_counts.get(edge_id, 0) + 1
+        if fingerprint.core_signature:
+            acceptor_state.core_counts[fingerprint.core_signature] = (
+                acceptor_state.core_counts.get(fingerprint.core_signature, 0) + 1
+            )
+            acceptor_state.core_buckets.setdefault(fingerprint.core_signature, []).append(fingerprint)
+        if fingerprint.prefix_signature:
+            acceptor_state.prefix_counts[fingerprint.prefix_signature] = (
+                acceptor_state.prefix_counts.get(fingerprint.prefix_signature, 0) + 1
+            )
+            acceptor_state.prefix_buckets.setdefault(fingerprint.prefix_signature, []).append(fingerprint)
+        if fingerprint.target_node_id:
+            acceptor_state.target_counts[fingerprint.target_node_id] = (
+                acceptor_state.target_counts.get(fingerprint.target_node_id, 0) + 1
+            )
+            acceptor_state.target_buckets.setdefault(fingerprint.target_node_id, []).append(fingerprint)
+        if increment_version:
+            acceptor_state.version += 1
+
+    @staticmethod
+    def _overlap_reject_reason(
+        *,
+        fingerprint: _AcceptedPathFingerprint,
+        acceptor_state: _AcceptorState,
+    ) -> str | None:
+        seen_exact_signatures: set[str] = set()
+        bucket_specs = [
+            ("core", acceptor_state.core_buckets.get(fingerprint.core_signature, [])),
+            ("prefix", acceptor_state.prefix_buckets.get(fingerprint.prefix_signature, [])),
+            ("target", acceptor_state.target_buckets.get(fingerprint.target_node_id, [])),
+        ]
+        for bucket_name, bucket_records in bucket_specs:
+            for existing in bucket_records:
+                if existing.exact_signature in seen_exact_signatures:
+                    continue
+                seen_exact_signatures.add(existing.exact_signature)
+                edge_overlap = VqaBatchRunner._overlap_ratio(fingerprint.edge_id_set, existing.edge_id_set)
+                if edge_overlap >= _MAX_EDGE_OVERLAP_RATIO:
+                    return f"high_{bucket_name}_edge_overlap"
+                node_overlap = VqaBatchRunner._overlap_ratio(fingerprint.node_id_set, existing.node_id_set)
+                if node_overlap >= _MAX_NODE_OVERLAP_RATIO:
+                    return f"high_{bucket_name}_node_overlap"
+        return None
+
+    @staticmethod
+    def _overlap_ratio(left: frozenset[str], right: frozenset[str]) -> float:
+        if not left or not right:
+            return 0.0
+        return len(left & right) / float(min(len(left), len(right)))
+
+    @staticmethod
+    def _fingerprint_from_path_candidate(path: PathCandidate) -> _AcceptedPathFingerprint | None:
+        node_ids = tuple(str(node_id).strip() for node_id in path.node_ids if str(node_id).strip())
+        edge_ids = tuple(str(edge_id).strip() for edge_id in path.edge_ids if str(edge_id).strip())
+        if not node_ids:
+            return None
+        exact_signature = str(path.exact_signature or "|".join(node_ids)).strip()
+        if not exact_signature:
+            return None
+        core_signature = str(
+            path.core_signature or ("|".join(node_ids[-3:]) if len(node_ids) >= 3 else exact_signature)
+        ).strip()
+        start_node_id = str(path.start_node_id or node_ids[0]).strip()
+        target_node_id = str(path.target_node_id or node_ids[-1]).strip()
+        return _AcceptedPathFingerprint(
+            path_id=str(path.path_id or exact_signature),
+            exact_signature=exact_signature,
+            core_signature=core_signature,
+            prefix_signature=VqaBatchRunner._prefix_signature(start_node_id, edge_ids),
+            target_node_id=target_node_id,
+            node_ids=node_ids,
+            node_id_set=frozenset(node_ids),
+            edge_id_set=frozenset(edge_ids),
+            edge_ids=edge_ids,
+        )
+
+    @staticmethod
+    def _fingerprint_from_record(record: dict[str, Any]) -> _AcceptedPathFingerprint | None:
+        path = record.get("path") or {}
+        node_ids = tuple(str(node_id).strip() for node_id in (path.get("node_ids") or []) if str(node_id).strip())
+        edge_ids = tuple(str(edge_id).strip() for edge_id in (path.get("edge_ids") or []) if str(edge_id).strip())
+        if not node_ids:
+            return None
+        exact_signature = str(path.get("exact_signature") or "|".join(node_ids)).strip()
+        if not exact_signature:
+            return None
+        core_signature = str(
+            path.get("core_signature") or ("|".join(node_ids[-3:]) if len(node_ids) >= 3 else exact_signature)
+        ).strip()
+        start_node_id = str(path.get("start_node_id") or node_ids[0]).strip()
+        target_node_id = str(path.get("target_node_id") or node_ids[-1]).strip()
+        return _AcceptedPathFingerprint(
+            path_id=str(path.get("path_id") or exact_signature),
+            exact_signature=exact_signature,
+            core_signature=core_signature,
+            prefix_signature=VqaBatchRunner._prefix_signature(start_node_id, edge_ids),
+            target_node_id=target_node_id,
+            node_ids=node_ids,
+            node_id_set=frozenset(node_ids),
+            edge_id_set=frozenset(edge_ids),
+            edge_ids=edge_ids,
+        )
+
+    @staticmethod
+    def _fingerprint_from_state_record(record: dict[str, Any]) -> _AcceptedPathFingerprint | None:
+        node_ids = tuple(str(node_id).strip() for node_id in (record.get("node_ids") or []) if str(node_id).strip())
+        edge_ids = tuple(str(edge_id).strip() for edge_id in (record.get("edge_ids") or []) if str(edge_id).strip())
+        exact_signature = str(record.get("exact_signature") or "|".join(node_ids)).strip()
+        if not exact_signature:
+            return None
+        core_signature = str(record.get("core_signature") or exact_signature).strip()
+        prefix_signature = str(record.get("prefix_signature") or "").strip()
+        target_node_id = str(record.get("target_node_id") or "").strip()
+        return _AcceptedPathFingerprint(
+            path_id=str(record.get("path_id") or exact_signature),
+            exact_signature=exact_signature,
+            core_signature=core_signature,
+            prefix_signature=prefix_signature,
+            target_node_id=target_node_id,
+            node_ids=node_ids,
+            node_id_set=frozenset(node_ids),
+            edge_id_set=frozenset(edge_ids),
+            edge_ids=edge_ids,
+        )
+
+    @staticmethod
+    def _prefix_signature(start_node_id: str, edge_ids: tuple[str, ...]) -> str:
+        start = str(start_node_id or "").strip()
+        if not start:
+            return ""
+        first_edge_id = edge_ids[0] if edge_ids else ""
+        return f"{start}|{first_edge_id}" if first_edge_id else start
 
     def _load_existing_samples(self) -> dict[str, dict[str, Any]]:
         if not self.samples_path.exists():
@@ -436,11 +828,16 @@ class VqaBatchRunner:
         *,
         used_exact_signatures: set[str],
         edge_usage_counts: dict[str, int],
+        persisted_fingerprints: list[_AcceptedPathFingerprint] | None = None,
     ) -> None:
-        payload = self.pipeline.sampler.export_state(
+        payload = self._sampler_template().export_state(
             used_exact_signatures=used_exact_signatures,
             edge_usage_counts=edge_usage_counts,
         )
+        payload["accepted_path_fingerprints"] = [
+            self._fingerprint_to_state_record(fingerprint)
+            for fingerprint in self._persisted_path_fingerprints(base_fingerprints=persisted_fingerprints)
+        ]
         payload["updated_at"] = _utc_now()
         payload["tracked_exact_signature_count"] = len(used_exact_signatures)
         payload["tracked_edge_count"] = len(edge_usage_counts)
@@ -507,13 +904,14 @@ class VqaBatchRunner:
         self,
         *,
         existing_records,
-    ) -> tuple[set[str], dict[str, int], dict[str, Any]]:
+    ) -> tuple[set[str], dict[str, int], list[_AcceptedPathFingerprint], _AcceptorState, dict[str, Any]]:
         loaded_state, source_info = self._load_sampler_state_file()
-        used_exact_signatures, edge_usage_counts = self._state_accumulator_from_sampler_state(loaded_state)
+        persisted_signatures, persisted_edge_usage_counts = self._state_accumulator_from_sampler_state(loaded_state)
+        persisted_fingerprints = self._state_fingerprints_from_sampler_state(loaded_state)
         merged_existing = self._merge_sample_records_into_state(
             existing_records,
-            used_exact_signatures=used_exact_signatures,
-            edge_usage_counts=edge_usage_counts,
+            used_exact_signatures=persisted_signatures,
+            edge_usage_counts=persisted_edge_usage_counts,
         )
         if source_info["mode"] == "fresh" and merged_existing:
             source_info = {
@@ -521,16 +919,31 @@ class VqaBatchRunner:
                 "path": str(self.samples_path.resolve()),
             }
         source_info["merged_existing_samples"] = merged_existing
-        source_info["tracked_exact_signature_count"] = len(used_exact_signatures)
-        source_info["tracked_edge_count"] = len(edge_usage_counts)
-        self.pipeline.sampler.load_state(
-            self.pipeline.sampler.export_state(
-                used_exact_signatures=used_exact_signatures,
-                edge_usage_counts=edge_usage_counts,
+        source_info["tracked_exact_signature_count"] = len(persisted_signatures)
+        source_info["tracked_edge_count"] = len(persisted_edge_usage_counts)
+        self._sampler_template().load_state(
+            self._sampler_template().export_state(
+                used_exact_signatures=persisted_signatures,
+                edge_usage_counts=persisted_edge_usage_counts,
             ),
             replace=True,
         )
-        return used_exact_signatures, edge_usage_counts, source_info
+        acceptor_state = _AcceptorState(
+            used_exact_signatures=set(persisted_signatures),
+            edge_usage_counts=dict(persisted_edge_usage_counts),
+        )
+        registered_exact_signatures: set[str] = set()
+        self._merge_fingerprints_into_acceptor_state(
+            persisted_fingerprints,
+            acceptor_state=acceptor_state,
+            registered_exact_signatures=registered_exact_signatures,
+        )
+        self._merge_sample_records_into_acceptor_state(
+            existing_records,
+            acceptor_state=acceptor_state,
+            registered_exact_signatures=registered_exact_signatures,
+        )
+        return persisted_signatures, persisted_edge_usage_counts, persisted_fingerprints, acceptor_state, source_info
 
     def _load_sampler_state_file(self) -> tuple[dict[str, Any] | None, dict[str, Any]]:
         candidate = self._resolved_sampler_state_input_path()
@@ -602,6 +1015,97 @@ class VqaBatchRunner:
             )
         return merged
 
+    def _merge_sample_records_into_acceptor_state(
+        self,
+        records,
+        *,
+        acceptor_state: _AcceptorState,
+        registered_exact_signatures: set[str] | None = None,
+    ) -> None:
+        registered = registered_exact_signatures if registered_exact_signatures is not None else set()
+        for record in records:
+            fingerprint = self._fingerprint_from_record(record)
+            if fingerprint is None or fingerprint.exact_signature in registered:
+                continue
+            registered.add(fingerprint.exact_signature)
+            self._register_acceptor_fingerprint(
+                acceptor_state=acceptor_state,
+                fingerprint=fingerprint,
+                increment_version=True,
+                count_edge_usage=False,
+            )
+
+    def _merge_fingerprints_into_acceptor_state(
+        self,
+        fingerprints: list[_AcceptedPathFingerprint],
+        *,
+        acceptor_state: _AcceptorState,
+        registered_exact_signatures: set[str] | None = None,
+    ) -> None:
+        registered = registered_exact_signatures if registered_exact_signatures is not None else set()
+        for fingerprint in fingerprints:
+            if fingerprint.exact_signature in registered:
+                continue
+            registered.add(fingerprint.exact_signature)
+            self._register_acceptor_fingerprint(
+                acceptor_state=acceptor_state,
+                fingerprint=fingerprint,
+                increment_version=True,
+                count_edge_usage=False,
+            )
+
+    @staticmethod
+    def _fingerprint_to_state_record(fingerprint: _AcceptedPathFingerprint) -> dict[str, Any]:
+        return {
+            "path_id": fingerprint.path_id,
+            "exact_signature": fingerprint.exact_signature,
+            "core_signature": fingerprint.core_signature,
+            "prefix_signature": fingerprint.prefix_signature,
+            "target_node_id": fingerprint.target_node_id,
+            "node_ids": list(fingerprint.node_ids),
+            "edge_ids": list(fingerprint.edge_ids),
+        }
+
+    def _persisted_path_fingerprints(
+        self,
+        *,
+        base_fingerprints: list[_AcceptedPathFingerprint] | None = None,
+    ) -> list[_AcceptedPathFingerprint]:
+        persisted_records = self._load_existing_samples().values()
+        fingerprints: list[_AcceptedPathFingerprint] = []
+        seen_exact_signatures: set[str] = set()
+        for fingerprint in base_fingerprints or []:
+            if fingerprint.exact_signature in seen_exact_signatures:
+                continue
+            seen_exact_signatures.add(fingerprint.exact_signature)
+            fingerprints.append(fingerprint)
+        for record in persisted_records:
+            fingerprint = self._fingerprint_from_record(record)
+            if fingerprint is None or fingerprint.exact_signature in seen_exact_signatures:
+                continue
+            seen_exact_signatures.add(fingerprint.exact_signature)
+            fingerprints.append(fingerprint)
+        return fingerprints
+
+    @staticmethod
+    def _state_fingerprints_from_sampler_state(state: dict[str, Any] | None) -> list[_AcceptedPathFingerprint]:
+        if not state:
+            return []
+        raw_records = state.get("accepted_path_fingerprints") or []
+        if not isinstance(raw_records, list):
+            return []
+        fingerprints: list[_AcceptedPathFingerprint] = []
+        seen_exact_signatures: set[str] = set()
+        for raw_record in raw_records:
+            if not isinstance(raw_record, dict):
+                continue
+            fingerprint = VqaBatchRunner._fingerprint_from_state_record(raw_record)
+            if fingerprint is None or fingerprint.exact_signature in seen_exact_signatures:
+                continue
+            seen_exact_signatures.add(fingerprint.exact_signature)
+            fingerprints.append(fingerprint)
+        return fingerprints
+
     @staticmethod
     def _merge_sample_record_into_state(
         record: dict[str, Any],
@@ -653,18 +1157,10 @@ class VqaBatchRunner:
                 continue
         print(" ".join(parts), flush=True)
 
-    def _fill_inflight(
-        self,
-        *,
-        executor: ThreadPoolExecutor,
-        path_iter: Iterator[PathCandidate],
-        futures: dict[Future[VqaSample], PathCandidate],
-        limit: int,
-    ) -> None:
-        while len(futures) < limit:
-            try:
-                path = next(path_iter)
-            except StopIteration:
-                return
-            future = executor.submit(self.pipeline.generate_path, path)
-            futures[future] = path
+    def _sampler_worker_count(self, remaining: int) -> int:
+        if remaining <= 0:
+            return 0
+        return max(1, min(self.workers, remaining))
+
+    def _proposal_seed(self, proposal_id: int) -> int:
+        return int(self.pipeline.config.random_seed) + proposal_id * 9973
