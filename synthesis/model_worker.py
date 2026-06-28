@@ -7,6 +7,7 @@ small protocol instead of a specific serving stack.
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 import json
@@ -356,6 +357,8 @@ class ModelRouterWorkerClient:
         self.config_path = Path(config_path) if config_path else None
         self._configs: dict[str, dict[str, Any]] = {}
         self._clients: dict[str, Any] = {}
+        self._qpm_lock = threading.Lock()
+        self._qpm_windows: dict[str, deque[float]] = {}
         self._token_totals_lock = threading.Lock()
         self._token_totals: dict[str, dict[str, int]] = {}
         if self.config_path is not None and self.config_path.exists():
@@ -411,6 +414,14 @@ class ModelRouterWorkerClient:
                     raise ValueError(f"Azure model config for {alias!r} is missing 'azure_endpoint'.")
                 if not config.get("api_version"):
                     raise ValueError(f"Azure model config for {alias!r} is missing 'api_version'.")
+            qpm = config.get("qpm")
+            if qpm is not None:
+                try:
+                    qpm_value = int(qpm)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(f"Model config for {alias!r} has invalid qpm: {qpm!r}") from exc
+                if qpm_value <= 0:
+                    raise ValueError(f"Model config for {alias!r} must set qpm > 0 when configured.")
             sampling_params = dict(config.get("sampling_params") or {})
             if "reasoning_effort" in sampling_params:
                 effort = _normalize_reasoning_effort(sampling_params.get("reasoning_effort"), default="")
@@ -418,10 +429,15 @@ class ModelRouterWorkerClient:
                     raise ValueError(
                         f"Model config for {alias!r} has invalid reasoning_effort: {sampling_params.get('reasoning_effort')!r}"
                     )
-            normalized[alias] = dict(config)
+            normalized_config = dict(config)
+            if qpm is not None:
+                normalized_config["qpm"] = qpm_value
+            normalized[alias] = normalized_config
 
         self._configs = normalized
         self._clients.clear()
+        with self._qpm_lock:
+            self._qpm_windows.clear()
 
     def reload(self) -> None:
         self.load_config(self.config_path)
@@ -436,6 +452,8 @@ class ModelRouterWorkerClient:
     def clear(self) -> None:
         self._configs.clear()
         self._clients.clear()
+        with self._qpm_lock:
+            self._qpm_windows.clear()
 
     def generate(self, request: ModelRequest) -> ModelResponse:
         alias = request.model
@@ -479,13 +497,19 @@ class ModelRouterWorkerClient:
             response_format=request.response_format,
             metadata=routed_metadata,
         )
-        response = client.generate(routed_request)
+        response = self._generate_with_retry(
+            alias=alias,
+            config=config,
+            client=client,
+            request=routed_request,
+        )
         response.metadata.update(
             {
                 "model_alias": alias,
                 "served_model": config["served_model"],
                 "base_url": config.get("base_url") or config.get("azure_endpoint"),
                 "sampling_params": config.get("sampling_params"),
+                "qpm": config.get("qpm"),
             }
         )
         self._update_and_print_token_totals(alias=alias, response=response)
@@ -525,6 +549,68 @@ class ModelRouterWorkerClient:
                 )
             self._clients[alias] = client
         return client
+
+    def _generate_with_retry(
+        self,
+        *,
+        alias: str,
+        config: dict[str, Any],
+        client: Any,
+        request: ModelRequest,
+    ) -> ModelResponse:
+        served_model = str(config.get("served_model") or request.model or alias)
+        last_error: Exception | None = None
+        for attempt_index in range(2):
+            self._wait_for_qpm_slot(alias=alias, config=config, served_model=served_model)
+            try:
+                return client.generate(request)
+            except Exception as exc:
+                last_error = exc
+                if attempt_index >= 1:
+                    break
+                print(
+                    "[llm-retry]"
+                    f" alias={alias}"
+                    f" served_model={served_model}"
+                    f" attempt={attempt_index + 1}"
+                    f" error_type={exc.__class__.__name__}"
+                    f" error={str(exc)!r}"
+                    " sleep_seconds=30",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                time.sleep(30)
+        if last_error is None:
+            raise RuntimeError(f"Model request failed without a captured exception for alias={alias!r}")
+        raise last_error
+
+    def _wait_for_qpm_slot(self, *, alias: str, config: dict[str, Any], served_model: str) -> None:
+        qpm = config.get("qpm")
+        if qpm is None:
+            return
+        qpm_limit = int(qpm)
+        while True:
+            now = time.monotonic()
+            with self._qpm_lock:
+                window = self._qpm_windows.setdefault(alias, deque())
+                cutoff = now - 60.0
+                while window and window[0] <= cutoff:
+                    window.popleft()
+                if len(window) < qpm_limit:
+                    window.append(now)
+                    return
+                current_qpm = len(window)
+            print(
+                "[llm-qpm]"
+                f" alias={alias}"
+                f" served_model={served_model}"
+                f" qpm_limit={qpm_limit}"
+                f" current_window_calls={current_qpm}"
+                " sleep_seconds=30",
+                file=sys.stderr,
+                flush=True,
+            )
+            time.sleep(30)
 
     def _update_and_print_token_totals(self, *, alias: str, response: ModelResponse) -> None:
         usage = dict(response.usage or {})
@@ -587,6 +673,7 @@ def _smoke_test() -> None:
                             "served_model": "dummy-model",
                             "base_url": "http://127.0.0.1:8000/v1",
                             "api_key": "EMPTY",
+                            "qpm": 12,
                         }
                     }
                 }
@@ -595,6 +682,7 @@ def _smoke_test() -> None:
         )
         router = ModelRouterWorkerClient(config_path)
         assert router.get_model("text_process")["served_model"] == "dummy-model"
+        assert router.get_model("text_process")["qpm"] == 12
         assert "text_process" in router.list_models()
     print("model_worker smoke test passed")
 

@@ -603,6 +603,7 @@ class QuestionWriter:
     compress_hop_model: str | None = None
     temperature: float | None = None
     max_tokens: int = 800
+    json_retry_attempts: int = 2
 
     def build_writer_context(self, *, path: PathCandidate, graph: GraphView) -> WriterContext:
         hops: list[HopContext] = []
@@ -655,13 +656,21 @@ class QuestionWriter:
             },
             "destination_node": hop.dst_content,
         }
-        parsed = self._generate_json(
-            system=PROMPT_COMPRESS_HOP,
-            user_payload=prompt,
-            trace_label=f"compress_hop_{hop.hop_index}",
-            model_client=model_client,
-            model=model,
-        )
+        try:
+            parsed = self._generate_json(
+                system=PROMPT_COMPRESS_HOP,
+                user_payload=prompt,
+                trace_label=f"compress_hop_{hop.hop_index}",
+                model_client=model_client,
+                model=model,
+            )
+        except Exception as exc:
+            fallback = self._fallback_compress_hop(hop, source_label=source_label, target_label=target_label)
+            fallback["writer_warning"] = self._writer_warning_entry(
+                stage=f"compress_hop_{hop.hop_index}",
+                error=exc,
+            )
+            return fallback
         statement = str(parsed.get("statement") or "").strip()
         source = source_label
         target = target_label
@@ -689,12 +698,20 @@ class QuestionWriter:
         target_node_type = str(context.target_node.get("node_type") or "")
         system_prompt = PROMPT_SELECT_IMAGE_TARGET if target_node_type == "image" else PROMPT_SELECT_TEXT_TARGET
         target_image_url = self._target_image_url(context.target_node)
-        parsed = self._generate_json(
-            system=system_prompt,
-            user_payload={"target_node": context.target_node},
-            trace_label=f"select_target_ask_{target_node_type or 'unknown'}",
-            image_url=target_image_url,
-        )
+        try:
+            parsed = self._generate_json(
+                system=system_prompt,
+                user_payload={"target_node": context.target_node},
+                trace_label=f"select_target_ask_{target_node_type or 'unknown'}",
+                image_url=target_image_url,
+            )
+        except Exception as exc:
+            fallback = self._fallback_select_target(context.target_node)
+            fallback["writer_warning"] = self._writer_warning_entry(
+                stage=f"select_target_ask_{target_node_type or 'unknown'}",
+                error=exc,
+            )
+            return fallback
         ask_target = self._ensure_question(str(parsed.get("ask_target") or "").strip())
         answer = str(parsed.get("answer") or "").strip()
         supporting_facts = parsed.get("supporting_facts") or []
@@ -740,38 +757,38 @@ class QuestionWriter:
             }
 
         if self.model_client is None:
-            clue = self._fallback_select_source(source_node, forbidden_labels=forbidden_labels)
-            packaged_first_hop = self._fallback_package_first_hop(
-                source_clue=clue,
+            return self._fallback_opening_package(
+                source_node=source_node,
                 first_hop_summary=first_hop_summary,
                 forbidden_labels=forbidden_labels,
             )
-            return {
-                "source_clue": clue,
-                "source_supporting_facts": [clue] if clue else [],
-                "packaged_first_hop": packaged_first_hop,
-                "first_hop_support": "Fallback first-hop packaging generated from the first-hop summary.",
-                "why_relevant": "Fallback source clue generated from the source node summary/attributes.",
-                "forbidden_labels": forbidden_labels,
-            }
 
-        parsed = self._generate_json(
-            system=PROMPT_SELECT_OPENING_PACKAGE,
-            user_payload={
-                "statement": first_hop_summary.get("statement") or "",
-                "source": source_node.get("title") or first_hop_summary.get("source") or "",
-                "target": first_hop_summary.get("target") or "",
-                "forbidden_labels": forbidden_labels,
-                "wikipedia_page": {
-                    "title": source_node.get("title"),
-                    "aliases": list(source_node.get("aliases") or []),
-                    "summary": source_node.get("summary"),
-                    "description": source_node.get("description"),
-                    "attributes": dict(source_node.get("attributes") or {}),
+        try:
+            parsed = self._generate_json(
+                system=PROMPT_SELECT_OPENING_PACKAGE,
+                user_payload={
+                    "statement": first_hop_summary.get("statement") or "",
+                    "source": source_node.get("title") or first_hop_summary.get("source") or "",
+                    "target": first_hop_summary.get("target") or "",
+                    "forbidden_labels": forbidden_labels,
+                    "wikipedia_page": {
+                        "title": source_node.get("title"),
+                        "aliases": list(source_node.get("aliases") or []),
+                        "summary": source_node.get("summary"),
+                        "description": source_node.get("description"),
+                        "attributes": dict(source_node.get("attributes") or {}),
+                    },
                 },
-            },
-            trace_label="select_opening_package",
-        )
+                trace_label="select_opening_package",
+            )
+        except Exception as exc:
+            fallback = self._fallback_opening_package(
+                source_node=source_node,
+                first_hop_summary=first_hop_summary,
+                forbidden_labels=forbidden_labels,
+            )
+            fallback["writer_warning"] = self._writer_warning_entry(stage="select_opening_package", error=exc)
+            return fallback
         clue = str(parsed.get("source_clue") or "").strip()
         supporting_facts = parsed.get("source_supporting_facts") or []
         if not isinstance(supporting_facts, list):
@@ -814,17 +831,18 @@ class QuestionWriter:
         hop_summaries = self._compress_hops(context.hops)
         opening_package = self.select_opening_package(context=context, hop_summaries=hop_summaries)
         target_ask = self.select_target_ask(context=context)
+        draft_warnings = self._collect_writer_warnings(hop_summaries, opening_package, target_ask)
         opening_mode = "image_start" if path.trajectory.starts_with_image else "text_start"
         answer_type = self._default_answer_type(context.target_node)
         if self.model_client is None:
-            return self._fallback_compose_question(
+            return self._draft_with_writer_warnings(self._fallback_compose_question(
                 path=path,
                 hop_summaries=hop_summaries,
                 opening_package=opening_package,
                 target_ask=target_ask,
                 opening_mode=opening_mode,
                 answer_type=answer_type,
-            )
+            ), warnings=draft_warnings)
         compose_hops = hop_summaries
         compose_payload = self._compose_question_payload(
             opening_mode=opening_mode,
@@ -833,12 +851,26 @@ class QuestionWriter:
             target_ask=target_ask,
         )
         starting_image_url = self._starting_image_url(path=path, graph=graph)
-        parsed = self._generate_json(
-            system=PROMPT_COMPOSE_QUESTION,
-            user_payload=compose_payload,
-            trace_label="compose_question",
-            image_url=starting_image_url,
-        )
+        try:
+            parsed = self._generate_json(
+                system=PROMPT_COMPOSE_QUESTION,
+                user_payload=compose_payload,
+                trace_label="compose_question",
+                image_url=starting_image_url,
+            )
+        except Exception as exc:
+            draft_warnings.append(self._writer_warning_entry(stage="compose_question", error=exc))
+            return self._draft_with_writer_warnings(
+                self._fallback_compose_question(
+                    path=path,
+                    hop_summaries=hop_summaries,
+                    opening_package=opening_package,
+                    target_ask=target_ask,
+                    opening_mode=opening_mode,
+                    answer_type=answer_type,
+                ),
+                warnings=draft_warnings,
+            )
         question = self._clean_composed_question(str(parsed.get("question") or "").strip())
         answer = str(target_ask.get("answer") or "").strip()
         if (
@@ -847,12 +879,16 @@ class QuestionWriter:
             or self._looks_like_chain_narration(question)
             or self._contains_forbidden_label(question, opening_package.get("forbidden_labels") or [])
         ):
-            rewritten = self._rewrite_chain_narration(
-                opening_mode=opening_mode,
-                hop_summaries=compose_hops,
-                opening_package=opening_package,
-                target_ask=target_ask,
-            )
+            try:
+                rewritten = self._rewrite_chain_narration(
+                    opening_mode=opening_mode,
+                    hop_summaries=compose_hops,
+                    opening_package=opening_package,
+                    target_ask=target_ask,
+                )
+            except Exception as exc:
+                draft_warnings.append(self._writer_warning_entry(stage="rewrite_chain_narration", error=exc))
+                rewritten = None
             if rewritten is not None:
                 question = rewritten
         if (
@@ -860,15 +896,15 @@ class QuestionWriter:
             or not answer
             or self._contains_forbidden_label(question, opening_package.get("forbidden_labels") or [])
         ):
-            return self._fallback_compose_question(
+            return self._draft_with_writer_warnings(self._fallback_compose_question(
                 path=path,
                 hop_summaries=hop_summaries,
                 opening_package=opening_package,
                 target_ask=target_ask,
                 opening_mode=opening_mode,
                 answer_type=answer_type,
-            )
-        return QuestionDraft(
+            ), warnings=draft_warnings)
+        return self._draft_with_writer_warnings(QuestionDraft(
             question=question,
             answer=answer,
             answer_type=answer_type,
@@ -882,7 +918,7 @@ class QuestionWriter:
                 "target_ask": target_ask,
                 "writer_context": context.to_dict(),
             },
-        )
+        ), warnings=draft_warnings)
 
     def draft(self, *, path: PathCandidate, graph: GraphView) -> QuestionDraft:
         return self.compose_question(path=path, graph=graph)
@@ -1140,13 +1176,7 @@ class QuestionWriter:
     ) -> QuestionDraft:
         metadata = dict(draft.metadata)
         warnings = list(metadata.get("writer_warnings") or [])
-        warnings.append(
-            {
-                "stage": stage,
-                "error_type": error.__class__.__name__,
-                "error": str(error),
-            }
-        )
+        warnings.append(QuestionWriter._writer_warning_entry(stage=stage, error=error))
         metadata["writer_warnings"] = warnings
         return QuestionDraft(
             question=draft.question,
@@ -1155,6 +1185,60 @@ class QuestionWriter:
             reasoning_steps=list(draft.reasoning_steps),
             used_evidence_ids=list(draft.used_evidence_ids),
             metadata=metadata,
+        )
+
+    @staticmethod
+    def _writer_warning_entry(*, stage: str, error: Exception) -> dict[str, str]:
+        return {
+            "stage": stage,
+            "error_type": error.__class__.__name__,
+            "error": str(error),
+        }
+
+    @staticmethod
+    def _collect_writer_warnings(*items: Any) -> list[dict[str, Any]]:
+        warnings: list[dict[str, Any]] = []
+        for item in items:
+            if isinstance(item, list):
+                for sub_item in item:
+                    if isinstance(sub_item, dict):
+                        warning = sub_item.get("writer_warning")
+                        if isinstance(warning, dict):
+                            warnings.append(dict(warning))
+                continue
+            if isinstance(item, dict):
+                warning = item.get("writer_warning")
+                if isinstance(warning, dict):
+                    warnings.append(dict(warning))
+        return warnings
+
+    @staticmethod
+    def _draft_with_writer_warnings(draft: QuestionDraft, *, warnings: list[dict[str, Any]]) -> QuestionDraft:
+        if not warnings:
+            return draft
+        metadata = dict(draft.metadata)
+        existing_warnings = list(metadata.get("writer_warnings") or [])
+        existing_warnings.extend(dict(warning) for warning in warnings if isinstance(warning, dict))
+        metadata["writer_warnings"] = existing_warnings
+        return QuestionDraft(
+            question=draft.question,
+            answer=draft.answer,
+            answer_type=draft.answer_type,
+            reasoning_steps=list(draft.reasoning_steps),
+            used_evidence_ids=list(draft.used_evidence_ids),
+            metadata=metadata,
+        )
+
+    @staticmethod
+    def _json_retry_system_prompt(system: str, *, attempt_index: int) -> str:
+        if attempt_index <= 0:
+            return system
+        return (
+            f"{system}\n\n"
+            "CRITICAL OUTPUT FORMAT REMINDER:\n"
+            "Return exactly one valid JSON object.\n"
+            "Do not output markdown, YAML, bullet lists, tables, explanations, or any text before or after the JSON.\n"
+            "All property names must use double quotes, and the JSON must be parseable by Python json.loads()."
         )
 
     @staticmethod
@@ -1182,29 +1266,40 @@ class QuestionWriter:
         active_model = model or self.model
         if active_model_client is None:
             raise RuntimeError("model_client is required for _generate_json")
-        request = ModelRequest(
-            model=active_model,
-            temperature=self.temperature,
-            max_tokens=self.max_tokens,
-            response_format={"type": "json_object"},
-            messages=[
-                ModelMessage(role="system", content=system),
-                ModelMessage(
-                    role="user",
-                    content=self._user_message_content(user_payload, image_url=image_url),
-                ),
-            ],
-            metadata={"trace_label": trace_label},
-        )
-        response = active_model_client.generate(request)
-        # print('####',response.content,"####")
-        try:
-            parsed = json.loads(response.content)
-        except json.JSONDecodeError:
-            parsed = self._extract_json_object(response.content)
-        if not isinstance(parsed, dict):
-            raise ValueError(f"Expected JSON object for {trace_label}, got: {type(parsed)!r}")
-        return parsed
+        attempts = max(1, int(self.json_retry_attempts) + 1)
+        last_error: Exception | None = None
+        for attempt_index in range(attempts):
+            request = ModelRequest(
+                model=active_model,
+                temperature=self.temperature,
+                max_tokens=self.max_tokens,
+                response_format={"type": "json_object"},
+                messages=[
+                    ModelMessage(
+                        role="system",
+                        content=self._json_retry_system_prompt(system, attempt_index=attempt_index),
+                    ),
+                    ModelMessage(
+                        role="user",
+                        content=self._user_message_content(user_payload, image_url=image_url),
+                    ),
+                ],
+                metadata={"trace_label": trace_label, "json_attempt": attempt_index + 1},
+            )
+            try:
+                response = active_model_client.generate(request)
+                try:
+                    parsed = json.loads(response.content)
+                except json.JSONDecodeError:
+                    parsed = self._extract_json_object(response.content)
+                if not isinstance(parsed, dict):
+                    raise ValueError(f"Expected JSON object for {trace_label}, got: {type(parsed)!r}")
+                return parsed
+            except Exception as exc:
+                last_error = exc
+        if last_error is None:
+            raise RuntimeError(f"{trace_label} failed without a captured exception")
+        raise last_error
 
     def _compress_hops(self, hops: list[HopContext]) -> list[dict[str, Any]]:
         if len(hops) <= 1:
@@ -1584,6 +1679,28 @@ class QuestionWriter:
         if rewritten:
             rewritten = rewritten[0].upper() + rewritten[1:]
         return rewritten or "This image provides the next clue."
+
+    def _fallback_opening_package(
+        self,
+        *,
+        source_node: dict[str, Any],
+        first_hop_summary: dict[str, Any],
+        forbidden_labels: list[str],
+    ) -> dict[str, Any]:
+        clue = self._fallback_select_source(source_node, forbidden_labels=forbidden_labels)
+        packaged_first_hop = self._fallback_package_first_hop(
+            source_clue=clue,
+            first_hop_summary=first_hop_summary,
+            forbidden_labels=forbidden_labels,
+        )
+        return {
+            "source_clue": clue,
+            "source_supporting_facts": [clue] if clue else [],
+            "packaged_first_hop": packaged_first_hop,
+            "first_hop_support": "Fallback first-hop packaging generated from the first-hop summary.",
+            "why_relevant": "Fallback source clue generated from the source node summary/attributes.",
+            "forbidden_labels": forbidden_labels,
+        }
 
     def _select_image_opening_first_hop(self, first_hop_summary: dict[str, Any]) -> str:
         fallback = self._fallback_package_image_first_hop(first_hop_summary)

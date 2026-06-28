@@ -356,6 +356,7 @@ class VqaBatchRunner:
                     "path": path.to_dict(),
                     "created_at": _utc_now(),
                 },
+                flush=True,
             )
             return
 
@@ -369,6 +370,7 @@ class VqaBatchRunner:
         self._append_jsonl(
             samples_file,
             compact_sample_record,
+            flush=True,
         )
         self._append_jsonl(
             questions_file,
@@ -376,6 +378,7 @@ class VqaBatchRunner:
                 sample_dict,
                 question_number=summary.existing_samples + summary.completed,
             ),
+            flush=True,
         )
         self._merge_sample_record_into_state(
             compact_sample_record,
@@ -394,6 +397,7 @@ class VqaBatchRunner:
                     **warning,
                     "created_at": _utc_now(),
                 },
+                flush=True,
             )
 
     def _record_sampler_failure(
@@ -415,6 +419,7 @@ class VqaBatchRunner:
                 "sampler_seed": context.sampler_seed,
                 "created_at": _utc_now(),
             },
+            flush=True,
         )
 
     def _sample_path_proposal(
@@ -1126,9 +1131,11 @@ class VqaBatchRunner:
         return True
 
     @staticmethod
-    def _append_jsonl(handle, record: dict[str, Any]) -> None:
+    def _append_jsonl(handle, record: dict[str, Any], *, flush: bool = False) -> None:
         handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True))
         handle.write("\n")
+        if flush:
+            handle.flush()
 
     @staticmethod
     def _print_sample_timing(sample: VqaSample) -> None:
