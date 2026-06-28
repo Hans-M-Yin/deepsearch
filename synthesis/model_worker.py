@@ -176,6 +176,7 @@ class OpenAIModelWorkerClient:
             "model": request.model or self.model,
             "messages": [message.to_dict() for message in request.messages],
         }
+        print(kwargs['messages'])
         if request.temperature is not None:
             kwargs["temperature"] = request.temperature
         if request.max_tokens is not None:
@@ -316,7 +317,6 @@ class AzureOpenAIModelWorkerClient:
         extra_body = request.metadata.get("extra_body")
         if isinstance(extra_body, dict):
             kwargs["extra_body"] = extra_body
-
         # Rebuild client per request when dynamic TT logid is enabled.
         if self.generate_tt_logid:
             self.client = self._build_client()
