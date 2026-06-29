@@ -121,6 +121,11 @@ class ToolRuntimeContext:
         self.image_registry[image_id] = payload
         return image_id
 
+    def latest_image_reference(self) -> str | None:
+        if not self.image_registry:
+            return None
+        return next(reversed(self.image_registry))
+
     def image_summary(self) -> str:
         if not self.image_registry:
             return ""
@@ -1015,7 +1020,7 @@ def execute_tool_call(
             return ToolExecutionResult(name=name, arguments=params, output=output, output_text=_json_text(output))
         output = tools.read_url(url=url, query=params.get("query", "") or "")
         new_images: dict[str, Any] = {}
-        if output.get("ok") and output.get("kind") == "image" and output.get("local_path"):
+        if output.get("ok") and output.get("local_path"):
             image_id = context.register_image(output["local_path"])
             output = dict(output)
             output["image_id"] = image_id
@@ -1023,9 +1028,12 @@ def execute_tool_call(
         return ToolExecutionResult(name=name, arguments=params, output=output, output_text=_json_text(output), new_images=new_images)
 
     if name == "i2i_search":
-        image_source = params.get("image") or params.get("url") or ""
+        image_source = params.get("image") or params.get("url") or context.latest_image_reference() or ""
         if not image_source:
-            output = {"ok": False, "error": "image or url is required for i2i_search"}
+            output = {
+                "ok": False,
+                "error": "No image is available in the current context for i2i_search.",
+            }
             return ToolExecutionResult(name=name, arguments=params, output=output, output_text=_json_text(output))
 
         region = params.get("region")
