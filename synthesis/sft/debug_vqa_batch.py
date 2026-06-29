@@ -105,6 +105,46 @@ def _load_jsonl(path: Path) -> list[dict[str, Any]]:
     return records
 
 
+def _extract_image_urls_from_vqa_records(
+    question_record: dict[str, Any],
+    sample_record: dict[str, Any] | None,
+) -> list[str]:
+    candidates: list[Any] = [
+        question_record.get("image_url"),
+        question_record.get("input_image_url"),
+    ]
+    sample_record = sample_record or {}
+    candidates.extend(
+        [
+            sample_record.get("input_image_url"),
+            ((sample_record.get("metadata") or {}).get("input_image_url") if isinstance(sample_record.get("metadata"), dict) else None),
+        ]
+    )
+
+    writer_outputs = sample_record.get("writer_outputs") or {}
+    if isinstance(writer_outputs, dict):
+        for stage_name in ("obfuscated", "polished", "draft"):
+            stage = writer_outputs.get(stage_name) or {}
+            stage_metadata = stage.get("metadata") or {}
+            if isinstance(stage_metadata, dict):
+                candidates.extend(
+                    [
+                        stage_metadata.get("starting_image_url"),
+                        stage_metadata.get("polish_starting_image_url"),
+                    ]
+                )
+
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        value = str(candidate or "").strip()
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        normalized.append(value)
+    return normalized
+
+
 def _load_vqa_records(vqa_dir: Path) -> list[dict[str, Any]]:
     questions_path = vqa_dir / "questions.jsonl"
     samples_path = vqa_dir / "samples.jsonl"
@@ -132,6 +172,8 @@ def _load_vqa_records(vqa_dir: Path) -> list[dict[str, Any]]:
                 "question": question_record.get("final_question") or question_record.get("question") or "",
                 "gold_answer": question_record.get("answer") or "",
                 "hop_chain": list((sample or {}).get("hop_chain") or []),
+                "image_paths": [],
+                "image_urls": _extract_image_urls_from_vqa_records(question_record, sample),
                 "sample_record": sample or {},
                 "question_record": question_record,
             }
