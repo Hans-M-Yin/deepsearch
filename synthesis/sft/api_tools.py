@@ -647,30 +647,18 @@ def _build_initial_messages(
         raise ValueError("Provide either prompt or messages, not both.")
 
     effective_system_prompt = system_prompt or default_system_prompt
-    context_summary = context.image_summary()
 
     if messages is None:
         initial_messages: list[dict[str, Any]] = [
             {"role": "system", "content": effective_system_prompt},
             {"role": "user", "content": prompt or ""},
         ]
-        if context_summary:
-            initial_messages[0]["content"] = f"{initial_messages[0]['content']}\n\n{context_summary}"
         return initial_messages
 
     normalized_messages = [_normalize_message(message, context) for message in messages]
     has_system = any(message.get("role") == "system" for message in normalized_messages)
     if not has_system and effective_system_prompt:
         normalized_messages.insert(0, {"role": "system", "content": effective_system_prompt})
-        has_system = True
-    if context_summary:
-        if has_system:
-            for index, message in enumerate(normalized_messages):
-                if message.get("role") == "system":
-                    normalized_messages[index] = _append_system_text(message, context_summary)
-                    break
-        else:
-            normalized_messages.insert(0, {"role": "system", "content": context_summary})
     return normalized_messages
 
 

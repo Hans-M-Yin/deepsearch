@@ -105,7 +105,7 @@ def get_tool_definitions() -> list[dict[str, Any]]:
                         "region": {
                             "type": "array",
                             "description": (
-                                "Optional bounding box on the current image to crop before search. The relative coordinates of the region containing an unfamiliar/task-related person, logo, object, or other entity are recommended. If this parameter is not provided, the entire image will be searched."
+                                "Optional bounding box on the current image to crop before search. The relative coordinates between 0~1000 of the region containing an unfamiliar/task-related person, logo, object, or other entity are recommended. If this parameter is not provided, the entire image will be searched."
                                 "Preferred format: [x1, y1, x2, y2]."
                             ),
                             "items": {"type": "number"},
