@@ -566,6 +566,7 @@ class ModelRouterWorkerClient:
                 return client.generate(request)
             except Exception as exc:
                 last_error = exc
+                print(request)
                 if attempt_index >= 1:
                     break
                 print(
