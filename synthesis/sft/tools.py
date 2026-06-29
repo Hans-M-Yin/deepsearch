@@ -96,9 +96,8 @@ def get_tool_definitions() -> list[dict[str, Any]]:
             "function": {
                 "name": "i2i_search",
                 "description": (
-                    "Search for visually similar or matching images from the "
-                    "most recent image in the current context. Optionally crop "
-                    "a region first before performing the search."
+                    "Search for visually similar or matching images from the most recent image in the current context. "
+                    "You can locate the bounding box of the valuable entity in the image and then search that region separately as an image."
                 ),
                 "parameters": {
                     "type": "object",
@@ -106,7 +105,7 @@ def get_tool_definitions() -> list[dict[str, Any]]:
                         "region": {
                             "type": "array",
                             "description": (
-                                "Optional bounding box on the current image to crop before search. "
+                                "Optional bounding box on the current image to crop before search. The relative coordinates of the region containing an unfamiliar/task-related person, logo, object, or other entity are recommended. If this parameter is not provided, the entire image will be searched."
                                 "Preferred format: [x1, y1, x2, y2]."
                             ),
                             "items": {"type": "number"},

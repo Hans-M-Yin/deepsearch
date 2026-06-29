@@ -69,6 +69,41 @@ If the evidence is enough, summarize and conclude your final answer in the end.
 
 _MANUAL_REACT_ACTIONS = {"t2t_search", "t2i_search", "i2i_search", "read_url", "finish"}
 _MANUAL_REACT_ACTION_RE = re.compile(r"<action>\s*(?P<json>\{.*?\})\s*</action>", re.DOTALL | re.IGNORECASE)
+_NORMALIZED_COORD_SCALE = 1000.0
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw_value = os.environ.get(name)
+    if raw_value is None:
+        return default
+    return raw_value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _prepare_region_for_crop(region: object, image_size: tuple[int, int]) -> object:
+    """Convert model-style normalized coordinates into absolute crop coordinates."""
+
+    if not isinstance(region, (list, tuple)) or len(region) != 4:
+        return region
+
+    try:
+        coords = [float(value) for value in region]
+    except (TypeError, ValueError):
+        return region
+
+    if _env_flag("REVERSE_IMAGE_CROP_COORDS"):
+        coords = [coords[1], coords[0], coords[3], coords[2]]
+
+    image_width, image_height = image_size
+    x1 = int(round(coords[0] / _NORMALIZED_COORD_SCALE * image_width))
+    y1 = int(round(coords[1] / _NORMALIZED_COORD_SCALE * image_height))
+    x2 = int(round(coords[2] / _NORMALIZED_COORD_SCALE * image_width))
+    y2 = int(round(coords[3] / _NORMALIZED_COORD_SCALE * image_height))
+
+    x1 = min(max(x1, 0), image_width)
+    y1 = min(max(y1, 0), image_height)
+    x2 = min(max(x2, 0), image_width)
+    y2 = min(max(y2, 0), image_height)
+    return [x1, y1, x2, y2]
 
 
 def _truncate_tool_calls(tool_calls: list[Any], *, source: str) -> list[Any]:
@@ -1052,12 +1087,13 @@ def execute_tool_call(
         region = params.get("region")
         new_images: dict[str, Any] = {}
         if region not in (None, ""):
+            image = _load_pil_image(image_source, context)
+            region = _prepare_region_for_crop(region, image.size)
             bbox, err = _normalize_region_bbox(region)
             if err:
                 output = {"ok": False, "error": err}
                 return ToolExecutionResult(name=name, arguments=params, output=output, output_text=_json_text(output))
             assert bbox is not None
-            image = _load_pil_image(image_source, context)
             x, y, width, height = bbox
             cropped = image.crop((x, y, x + width, y + height))
             uploaded_url = _try_upload_pil_image(cropped, context, "i2i_region")

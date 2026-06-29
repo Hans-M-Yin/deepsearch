@@ -72,6 +72,10 @@ export SFT_SUMMARIZER_API_BASE="http://127.0.0.1:6658/v1"
 export SFT_SUMMARIZER_MODEL="Qwen3-VL-32B"
 export SFT_SUMMARIZER_API_KEY="EMPTY"
 
+# Gemini-style box order uses [y1, x1, y2, x2]. Enable pairwise x/y swap
+# before i2i_search denormalizes 0-1000 region coordinates into pixels.
+export REVERSE_IMAGE_CROP_COORDS="true"
+
 
 export SERPER_API_KEY="7f1dbdcbe6f551e113a1a394fdd60b5b186ae0f3"
 export SERPER_SEARCH_URL="https://google.serper.dev/search"
