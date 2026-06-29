@@ -34,18 +34,20 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_SYSTEM_PROMPT = """
 You are writing a standard answer for a multi-hop knowledge question. Specifically, based on the question provided to you, you need to produce a complete solution process that includes scientifically rigorous, logically sound reasoning steps. This solution process should contain analysis and reasoning about the question, tool calls, analysis and reflection on tool results, replanning of the solution steps, multiple search attempts, and a final accurate standard answer.
+
 Requirements:
 1. You may think freely during your internal reasoning phase, but the statements ultimately included in the written solution process must also follow rigorous logic, ensuring that the solution remains sound and error-free even if one reads only the written solution process and ignores your private thinking.
 2. Since no correct answer is provided, you must also correctly solve the question while drafting the standard answer.
-3. In the standard answer you write, the following logic should be visible: after each tool call and its returned result, analyze the new clues, review the existing clues and the question, determine and plan the next step, and then call a new tool as needed.
+3. In the standard answer you write, the following logic should be explicitly visible: after each tool call and its returned result, you must carefully analyze the new clues in detail, review the existing clues and the question, determine and plan the next step in detail, and then call a new tool as needed with an explanation.
 4. In the standard answer, only one tool may be called in each round.
 5. Once you believe the evidence is sufficient and there are no remaining unclear or uncertain points, provide the final answer and end the standard answer.
-6. Do not search Wikipedia or Wiki Commons in your standard answer to prevent shortcuts.
+6. In your standard answer, DO NOT use tools to search for pages related to Wikipedia or Wiki Commons, in order to avoid shortcuts.
 
 As for the available tools:
-- t2t_search allows you to retrieve relevant web pages based on text and returns a list of URLs. You should examine the results, select the useful ones, and then use the read_url tool to access the page content. Use this tool when you need to look up world knowledge or content information.
-- i2i_search allows you to search the web for similar images based on a selected region of an image, which is useful for identifying unfamiliar people or objects in the image. It also returns a list of URLs, which you should review and then inspect further using read_url. Use this tool when you need to identify an object in an image, such as figuring out who a person is or what a certain object is. Provide the coordinates of the region you want to identify (if you want to search the whole image, provide the boundary coordinates of the original image), and the tool will return similar images as well as descriptions of that object.
-- t2i_search allows you to retrieve relevant images based on a text description. As with the other search tools, you should review the returned URLs and then use read_url to inspect the images. Use this tool when the missing clues require you to search for relevant images yourself, or when the images you find are likely to help you answer the question.
+
+- t2t_search: allows you to retrieve relevant web pages based on text and returns a list of URLs for text pages. You should examine the results, select the useful ones, and then use the read_url tool to access the page content. Use this tool when you need to look up world knowledge or content information.
+- i2i_search: allows you to search the web for similar images based on a selected region of an image, which is very useful for identifying unfamiliar people or objects in the image. It returns a list of image URLs. You should first select the search results that are likely to match your current image, then use read_url to download those related images and inspect their content. Tip: when you see a new image and need to identify an unfamiliar person or object in it, you can use i2i_search on that local region. The tool will return URLs of similar images as well as descriptions of those images. Then you can use read_url to compare the similar images. Once you determine that the new image and the previous image depict the same object, you can use the description of the new image to figure out who or what that object is. You should reflect this logic in the standard answer.
+- t2i_search: allows you to retrieve relevant images based on a text description. The returned URLs all represent images. You should review the returned URLs and then use read_url to inspect those images. Use this tool when the missing clues require you to search for relevant images yourself, or when the images you find are likely to help you answer the question.
 """
 
 MANUAL_REACT_PROTOCOL = """
@@ -83,7 +85,7 @@ I will give you an image and a passage containing analysis and tool-call process
 
 Rules:
 1. Only polish the text related to tool calling, such as the purpose of calling the tool, the motivation, what is intended to be searched, and so on. Do not modify other content or the overall logic.
-2. When polishing, besides making the logic more rigorous and careful, you may also appropriately add text describing that the next step is to locate the target object of interest. But make sure the logic remains rigorous.
+2. When polishing, besides making the logic more rigorous and detailed, you may also appropriately add text describing that the next step is to locate the target object of interest. But make sure the logic remains rigorous. Do not use formatted polishment such as "Goal: ...".
 3. Any text that is kept unchanged must remain exactly the same as the original in content, format, and even punctuation.
 4. Output in the following format:
 <object>The entity in the image that this passage is trying to find</object>
@@ -103,9 +105,7 @@ My first step is to use the provided image to identify the celestial body.
 </action>"
 Your output:
 <object>Celestial body</object>
-<refined>To answer this question, I need to follow a multi-step process. First, I need to identify the celestial body shown in the image to determine the orbiter that discovered its prominent equatorial ridge. Once the orbiter is identified, I can find its launch vehicle program. Then, I will research the three consecutive launch failures of that program between August 1998 and April 1999 and find the distinct root cause for each.
-
-So based on the above plan, for the input image, I first need to locate the position of this celestial body within the image, crop out the relevant local region, and pass its position to the i2i_search tool so that I can search for this celestial body. Ideally, by using similar images and their descriptions, I can determine exactly which celestial body it is.
+<refined>To answer this question, I need to follow a multi-step process. First, I need to identify the celestial body shown in the image to determine the orbiter that discovered its prominent equatorial ridge. Once the orbiter is identified, I can find its launch vehicle program. Then, I will research the three consecutive launch failures of that program between August 1998 and April 1999 and find the distinct root cause for each. So based on the above plan, for the input image, I first need to locate the position of this celestial body within the image, crop out the relevant local region, and pass its position to the i2i_search tool so that I can search for this celestial body. Ideally, by using similar images and their descriptions, I can determine exactly which celestial body it is.
 
 <action>
 {
