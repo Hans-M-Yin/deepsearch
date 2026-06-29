@@ -264,6 +264,17 @@ def _image_source_to_model_url(source: Any, context: ToolRuntimeContext) -> str:
     raise ValueError(f"Unsupported image source for model input: {type(payload)!r}")
 
 
+def _ensure_inline_image_registered(source: Any, context: ToolRuntimeContext) -> None:
+    if not isinstance(source, str) or not source.startswith("data:image"):
+        return
+    if source in context.image_registry:
+        return
+    for payload in context.image_registry.values():
+        if payload == source:
+            return
+    context.register_image(source)
+
+
 def _normalize_content_part(part: Any, context: ToolRuntimeContext) -> dict[str, Any]:
     if not isinstance(part, dict):
         return {"type": "text", "text": str(part)}
@@ -279,6 +290,7 @@ def _normalize_content_part(part: Any, context: ToolRuntimeContext) -> dict[str,
             source = image_url.get("url", "")
         else:
             source = image_url
+        _ensure_inline_image_registered(source, context)
         normalized = {"type": "image_url", "image_url": {"url": _image_source_to_model_url(source, context)}}
         if detail:
             normalized["image_url"]["detail"] = detail
@@ -292,6 +304,7 @@ def _normalize_content_part(part: Any, context: ToolRuntimeContext) -> dict[str,
             or part.get("image_url")
             or part.get("ref")
         )
+        _ensure_inline_image_registered(source, context)
         normalized = {"type": "image_url", "image_url": {"url": _image_source_to_model_url(source, context)}}
         if part.get("detail"):
             normalized["image_url"]["detail"] = part["detail"]
