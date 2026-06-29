@@ -37,6 +37,7 @@ Requirements:
 3. In the standard answer you write, the following logic should be visible: after each tool call and its returned result, analyze the new clues, review the existing clues and the question, determine and plan the next step, and then call a new tool as needed.
 4. In the standard answer, only one tool may be called in each round.
 5. Once you believe the evidence is sufficient and there are no remaining unclear or uncertain points, provide the final answer and end the standard answer.
+6. Do not search Wikipedia or Wiki Commons in your standard answer to prevent shortcuts.
 
 As for the available tools:
 - t2t_search allows you to retrieve relevant web pages based on text and returns a list of URLs. You should examine the results, select the useful ones, and then use the read_url tool to access the page content. Use this tool when you need to look up world knowledge or content information.
