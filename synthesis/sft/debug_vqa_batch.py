@@ -9,6 +9,8 @@ from pathlib import Path
 from typing import Any
 
 from synthesis.model_worker import LLM_WORKER
+from synthesis.model_worker import ModelMessage
+from synthesis.model_worker import ModelRequest
 from .pipeline import (
     build_agent_config,
     build_runtime_context,
@@ -18,6 +20,76 @@ from .pipeline import (
     judge,
     run_agent_loop,
 )
+
+
+PROMPT_DIAGNOSE_INCORRECT_TRAJECTORY = """You are diagnosing an incorrect multi-hop search trajectory for SFT repair.
+
+You will receive:
+1. The original question.
+2. The gold answer.
+3. The intended hop chain, where each hop contains the expected target and statement.
+4. The raw trajectory text produced by an agent.
+5. The extracted answer from the trajectory and a lightweight answer-judge result.
+
+Your task:
+- Identify the first hop where the trajectory clearly deviates from the intended hop chain.
+- Decide whether the root cause is:
+  - "question_problem": the question or hop wording is genuinely ambiguous or under-specified.
+  - "agent_trajectory_problem": the question is still recoverable, but the agent searched, read, inferred, or validated incorrectly.
+- If the root cause is "agent_trajectory_problem", further classify it as:
+  - "trajectory_execution_error"
+  - "insufficient_evidence"
+- Provide a concise explanation grounded in the trajectory and hop chain.
+- Provide a short reflection text that can be inserted into the trajectory, where the agent notices the branch is logically inconsistent and decides to restart.
+- Suggest the hop index from which the search should restart.
+
+Return strict JSON with this schema:
+{
+  "first_bad_hop_index": 0,
+  "error_category": "question_problem",
+  "trajectory_problem_type": "not_applicable",
+  "expected_target": "...",
+  "observed_target_or_branch": "...",
+  "reason": "...",
+  "evidence_excerpt": "...",
+  "should_patch_question": true,
+  "restart_from_hop_index": 0,
+  "reflection_text": "...",
+  "restart_query_hint": "..."
+}
+
+Rules:
+- If the trajectory is bad because it never gathered enough evidence, classify it as "agent_trajectory_problem" + "insufficient_evidence".
+- Use "not_applicable" for trajectory_problem_type when error_category is "question_problem".
+- Keep the reflection text natural and concise, as if written by the agent itself.
+- Do not output markdown or any text outside the JSON object.
+"""
+
+
+PROMPT_PATCH_QUESTION_MINIMALLY = """You are minimally repairing a multi-hop question.
+
+The original question should still lead to the same intended gold answer and the same hop chain.
+However, one hop is too ambiguous or under-specified, so the question must be minimally edited toward the intended answer.
+
+Your task:
+- Modify the original question as little as possible.
+- Preserve the original answer target and the overall multi-hop structure.
+- Add only the smallest extra clue needed to remove the ambiguity.
+- Do not adapt the question to the incorrect trajectory. Repair it toward the intended hop chain and gold answer.
+
+Return strict JSON:
+{
+  "revised_question": "...",
+  "edit_summary": "...",
+  "changed_span_summary": "...",
+  "reason": "..."
+}
+
+Rules:
+- Keep the wording style close to the original question.
+- Do not make the question easier than necessary.
+- Do not output markdown or any text outside the JSON object.
+"""
 
 
 def _load_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -123,6 +195,337 @@ def _print_record_result(result: dict[str, Any]) -> None:
         print(json.dumps(images, ensure_ascii=False, indent=2))
 
 
+def _write_jsonl_record(handle: Any, record: dict[str, Any]) -> None:
+    handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+    handle.flush()
+
+
+def _registered_model_alias(alias: str | None) -> str | None:
+    normalized = str(alias or "").strip()
+    if not normalized:
+        return None
+    return normalized if _resolve_model_alias(normalized) is not None else None
+
+
+def _worker_generate_json(
+    *,
+    model_alias: str | None,
+    system_prompt: str,
+    payload: dict[str, Any],
+    max_tokens: int,
+    trace_label: str,
+) -> dict[str, Any]:
+    if not model_alias:
+        raise RuntimeError("A registered model alias is required for LLM_WORKER generation.")
+    return LLM_WORKER.generate_json(
+        ModelRequest(
+            model=model_alias,
+            messages=[
+                ModelMessage(role="system", content=system_prompt),
+                ModelMessage(role="user", content=json.dumps(payload, ensure_ascii=False, indent=2)),
+            ],
+            response_format={"type": "json_object"},
+            max_tokens=max_tokens,
+            metadata={"trace_label": trace_label},
+        )
+    )
+
+
+def _fallback_incorrect_diagnosis(raw_record: dict[str, Any]) -> dict[str, Any]:
+    hop_chain = list(raw_record.get("hop_chain") or [])
+    first_hop = hop_chain[0] if hop_chain else {}
+    first_bad_hop_index = int(first_hop.get("hop_index") or 0)
+    return {
+        "first_bad_hop_index": first_bad_hop_index,
+        "error_category": "agent_trajectory_problem",
+        "trajectory_problem_type": "trajectory_execution_error",
+        "expected_target": str(first_hop.get("target") or raw_record.get("gold_answer") or "").strip(),
+        "observed_target_or_branch": str(raw_record.get("extracted_answer") or "").strip(),
+        "reason": "Fallback diagnosis used because the repair model was unavailable or failed.",
+        "evidence_excerpt": "",
+        "should_patch_question": False,
+        "restart_from_hop_index": first_bad_hop_index,
+        "reflection_text": (
+            "The branch I followed does not line up with the intended reasoning chain, "
+            "so I should discard it and restart the search from the last reliable point."
+        ),
+        "restart_query_hint": str(first_hop.get("retrieval_query") or first_hop.get("statement") or "").strip(),
+    }
+
+
+def _build_source_metadata(record: dict[str, Any], *, vqa_dir: str | None) -> dict[str, Any]:
+    return {
+        "vqa_dir": vqa_dir,
+        "question_id": record.get("question_id"),
+        "sample_id": record.get("sample_id"),
+        "path_id": record.get("path_id"),
+        "question_record": record.get("question_record") or {},
+        "sample_record": record.get("sample_record") or {},
+    }
+
+
+def _build_raw_trajectory_record(
+    *,
+    record: dict[str, Any],
+    input_images: list[dict[str, str]],
+    messages: list[dict[str, Any]],
+    formatted_trajectory: dict[str, Any],
+    extracted_answer: str,
+    answer_judge: dict[str, Any],
+    hop_chain_coverage: dict[str, Any] | None,
+    vqa_dir: str | None,
+) -> dict[str, Any]:
+    return {
+        "question_id": record.get("question_id"),
+        "sample_id": record.get("sample_id"),
+        "path_id": record.get("path_id"),
+        "question": record.get("question"),
+        "gold_answer": record.get("gold_answer"),
+        "input_images": input_images,
+        "source_metadata": _build_source_metadata(record, vqa_dir=vqa_dir),
+        "raw_messages": messages,
+        "raw_trajectory": formatted_trajectory,
+        "extracted_answer": extracted_answer,
+        "answer_judge": answer_judge,
+        "hop_chain": list(record.get("hop_chain") or []),
+        "hop_chain_coverage": hop_chain_coverage,
+    }
+
+
+def polish_correct_trajectory(raw_record: dict[str, Any]) -> dict[str, Any]:
+    """Keep correct trajectories unchanged for now."""
+
+    return {
+        "polish_mode": "pass_through",
+        "polish_status": "skipped_answer_correct",
+        "polish_notes": [
+            "Answer judge marked this trajectory correct, so no polishing was applied.",
+        ],
+        "final_question": raw_record.get("question") or "",
+        "repair_diagnosis": None,
+        "question_repair": None,
+        "final_messages": list(raw_record.get("raw_messages") or []),
+        "trajectory": raw_record.get("raw_trajectory") or {"text": "", "images": []},
+    }
+
+
+def diagnose_incorrect_trajectory(
+    raw_record: dict[str, Any],
+    *,
+    repair_model_alias: str | None,
+    repair_max_tokens: int,
+) -> dict[str, Any]:
+    payload = {
+        "question": raw_record.get("question"),
+        "gold_answer": raw_record.get("gold_answer"),
+        "hop_chain": raw_record.get("hop_chain") or [],
+        "raw_trajectory": (raw_record.get("raw_trajectory") or {}).get("text") or "",
+        "extracted_answer": raw_record.get("extracted_answer") or "",
+        "answer_judge": raw_record.get("answer_judge") or {},
+    }
+    try:
+        parsed = _worker_generate_json(
+            model_alias=repair_model_alias,
+            system_prompt=PROMPT_DIAGNOSE_INCORRECT_TRAJECTORY,
+            payload=payload,
+            max_tokens=repair_max_tokens,
+            trace_label=f"sft_repair_diagnose:{raw_record.get('question_id') or 'question'}",
+        )
+    except Exception as exc:
+        fallback = _fallback_incorrect_diagnosis(raw_record)
+        fallback["model_error"] = f"{exc.__class__.__name__}: {exc}"
+        return fallback
+
+    normalized = dict(parsed)
+    normalized.setdefault("first_bad_hop_index", 0)
+    normalized.setdefault("error_category", "agent_trajectory_problem")
+    normalized.setdefault("trajectory_problem_type", "trajectory_execution_error")
+    normalized.setdefault("expected_target", "")
+    normalized.setdefault("observed_target_or_branch", "")
+    normalized.setdefault("reason", "")
+    normalized.setdefault("evidence_excerpt", "")
+    normalized.setdefault("should_patch_question", False)
+    normalized.setdefault("restart_from_hop_index", normalized.get("first_bad_hop_index", 0))
+    normalized.setdefault("reflection_text", "")
+    normalized.setdefault("restart_query_hint", "")
+    return normalized
+
+
+def repair_question_minimally(
+    raw_record: dict[str, Any],
+    *,
+    diagnosis: dict[str, Any],
+    repair_model_alias: str | None,
+    repair_max_tokens: int,
+) -> dict[str, Any]:
+    original_question = str(raw_record.get("question") or "").strip()
+    if not original_question:
+        return {
+            "revised_question": "",
+            "edit_summary": "Question repair skipped because the original question is empty.",
+            "changed_span_summary": "",
+            "reason": "missing_original_question",
+        }
+
+    if not diagnosis.get("should_patch_question"):
+        return {
+            "revised_question": original_question,
+            "edit_summary": "Question repair skipped because diagnosis did not require a question patch.",
+            "changed_span_summary": "",
+            "reason": "not_required",
+        }
+
+    payload = {
+        "original_question": original_question,
+        "gold_answer": raw_record.get("gold_answer"),
+        "hop_chain": raw_record.get("hop_chain") or [],
+        "diagnosis": diagnosis,
+    }
+    try:
+        parsed = _worker_generate_json(
+            model_alias=repair_model_alias,
+            system_prompt=PROMPT_PATCH_QUESTION_MINIMALLY,
+            payload=payload,
+            max_tokens=repair_max_tokens,
+            trace_label=f"sft_repair_question:{raw_record.get('question_id') or 'question'}",
+        )
+    except Exception as exc:
+        return {
+            "revised_question": original_question,
+            "edit_summary": "Question repair failed, so the original question was kept.",
+            "changed_span_summary": "",
+            "reason": f"repair_model_error: {exc.__class__.__name__}: {exc}",
+        }
+
+    revised_question = str(parsed.get("revised_question") or "").strip() or original_question
+    return {
+        "revised_question": revised_question,
+        "edit_summary": str(parsed.get("edit_summary") or "").strip(),
+        "changed_span_summary": str(parsed.get("changed_span_summary") or "").strip(),
+        "reason": str(parsed.get("reason") or "").strip(),
+    }
+
+
+def build_restart_search_stub(
+    raw_record: dict[str, Any],
+    *,
+    diagnosis: dict[str, Any],
+    question_repair: dict[str, Any],
+) -> dict[str, Any]:
+    restart_question = str(question_repair.get("revised_question") or raw_record.get("question") or "").strip()
+    restart_from_hop_index = int(diagnosis.get("restart_from_hop_index") or diagnosis.get("first_bad_hop_index") or 0)
+    reflection_text = str(diagnosis.get("reflection_text") or "").strip()
+    if not reflection_text:
+        reflection_text = (
+            "The branch I just followed cannot support the intended target, so I should reject it and search again."
+        )
+
+    restart_hint = str(diagnosis.get("restart_query_hint") or "").strip()
+    if restart_hint:
+        restart_text = (
+            f"I should restart the search from hop {restart_from_hop_index} and use a tighter query or clue. "
+            f"A good restart hint is: {restart_hint}"
+        )
+    else:
+        restart_text = (
+            f"I should restart the search from hop {restart_from_hop_index} and verify the next target more carefully."
+        )
+    if restart_question and restart_question != str(raw_record.get("question") or "").strip():
+        restart_text = (
+            f"{restart_text}\n\nI should continue with the minimally repaired question:\n{restart_question}"
+        )
+
+    final_messages = list(raw_record.get("raw_messages") or [])
+    final_messages.append({"role": "assistant", "content": reflection_text})
+    final_messages.append({"role": "assistant", "content": restart_text})
+    final_trajectory = format_messages(final_messages)
+    return {
+        "status": "restart_todo",
+        "restart_from_hop_index": restart_from_hop_index,
+        "restart_question": restart_question,
+        "reflection_text": reflection_text,
+        "restart_text": restart_text,
+        "final_messages": final_messages,
+        "trajectory": final_trajectory,
+        "todo": (
+            "TODO: re-run search from the restart point, keep the wrong branch as context, "
+            "and insert the corrected continuation after the reflection step."
+        ),
+    }
+
+
+def polish_incorrect_trajectory(
+    raw_record: dict[str, Any],
+    *,
+    repair_model_alias: str | None,
+    repair_max_tokens: int,
+) -> dict[str, Any]:
+    """Diagnose and scaffold repair for incorrect trajectories."""
+
+    diagnosis = diagnose_incorrect_trajectory(
+        raw_record,
+        repair_model_alias=repair_model_alias,
+        repair_max_tokens=repair_max_tokens,
+    )
+    question_repair = repair_question_minimally(
+        raw_record,
+        diagnosis=diagnosis,
+        repair_model_alias=repair_model_alias,
+        repair_max_tokens=repair_max_tokens,
+    )
+    restart_stub = build_restart_search_stub(
+        raw_record,
+        diagnosis=diagnosis,
+        question_repair=question_repair,
+    )
+
+    return {
+        "polish_mode": "repair_after_failure",
+        "polish_status": str(restart_stub.get("status") or "restart_todo"),
+        "polish_notes": [
+            "Incorrect trajectory was diagnosed with LLM_WORKER.",
+            "A reflection-and-restart scaffold was inserted.",
+            str(restart_stub.get("todo") or ""),
+        ],
+        "final_question": str(question_repair.get("revised_question") or raw_record.get("question") or "").strip(),
+        "repair_diagnosis": diagnosis,
+        "question_repair": question_repair,
+        "trajectory_repair": restart_stub,
+        "final_messages": list(restart_stub.get("final_messages") or raw_record.get("raw_messages") or []),
+        "trajectory": restart_stub.get("trajectory") or raw_record.get("raw_trajectory") or {"text": "", "images": []},
+    }
+
+
+def _build_sft_training_record(
+    *,
+    raw_record: dict[str, Any],
+    polished: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "question_id": raw_record.get("question_id"),
+        "sample_id": raw_record.get("sample_id"),
+        "path_id": raw_record.get("path_id"),
+        "question": polished.get("final_question") or raw_record.get("question"),
+        "original_question": raw_record.get("question"),
+        "gold_answer": raw_record.get("gold_answer"),
+        "input_images": list(raw_record.get("input_images") or []),
+        "source_metadata": dict(raw_record.get("source_metadata") or {}),
+        "answer_judge": dict(raw_record.get("answer_judge") or {}),
+        "hop_chain": list(raw_record.get("hop_chain") or []),
+        "hop_chain_coverage": raw_record.get("hop_chain_coverage"),
+        "raw_messages": list(raw_record.get("raw_messages") or []),
+        "raw_trajectory": raw_record.get("raw_trajectory") or {"text": "", "images": []},
+        "polish_mode": polished.get("polish_mode"),
+        "polish_status": polished.get("polish_status"),
+        "polish_notes": list(polished.get("polish_notes") or []),
+        "repair_diagnosis": polished.get("repair_diagnosis"),
+        "question_repair": polished.get("question_repair"),
+        "trajectory_repair": polished.get("trajectory_repair"),
+        "final_messages": list(polished.get("final_messages") or []),
+        "final_trajectory": polished.get("trajectory") or {"text": "", "images": []},
+    }
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--vqa-dir", help="Directory produced by synthesis.vqa.run_batch.")
@@ -134,7 +537,22 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--limit", type=int, default=5, help="How many questions to run in batch mode.")
     parser.add_argument("--offset", type=int, default=0, help="Start offset in batch mode.")
     parser.add_argument("--workdir", default=os.path.join(os.getcwd(), "synthesis_sft_runs"))
-    parser.add_argument("--output-jsonl", help="Optional path to save structured debug results.")
+    parser.add_argument("--output-jsonl", help="Optional path to save raw trajectory records.")
+    parser.add_argument(
+        "--raw-trajectories-jsonl",
+        help="Optional path to save raw formatted trajectories.",
+    )
+    parser.add_argument(
+        "--repair-model",
+        default=os.environ.get("SFT_REPAIR_MODEL") or "",
+        help="Registered model alias for incorrect-trajectory diagnosis and repair with LLM_WORKER.",
+    )
+    parser.add_argument(
+        "--repair-max-tokens",
+        type=int,
+        default=_optional_env_int("SFT_REPAIR_MAX_TOKENS") or 2048,
+        help="Max tokens for the LLM_WORKER-based incorrect-trajectory repair stages.",
+    )
     parser.add_argument("--verbose", action="store_true")
 
     parser.add_argument(
@@ -337,7 +755,6 @@ def main(argv: list[str] | None = None) -> int:
         max_turns=args.max_turns,
         print_rounds=args.verbose,
     )
-
     expert_config = None
     if args.expert_model:
         expert_config = _config_from_model_arg(
@@ -359,11 +776,19 @@ def main(argv: list[str] | None = None) -> int:
             print_rounds=False,
         )
 
-    output_handle = None
-    if args.output_jsonl:
-        output_path = Path(args.output_jsonl)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_handle = output_path.open("w", encoding="utf-8")
+    raw_output_path: Path | None = None
+    if args.raw_trajectories_jsonl:
+        raw_output_path = Path(args.raw_trajectories_jsonl)
+    elif args.output_jsonl:
+        raw_output_path = Path(args.output_jsonl)
+
+    raw_output_handle = None
+    if raw_output_path is not None:
+        raw_output_path.parent.mkdir(parents=True, exist_ok=True)
+        raw_output_handle = raw_output_path.open("w", encoding="utf-8")
+    total_count = 0
+    correct_count = 0
+    incorrect_count = 0
 
     try:
         for index, record in enumerate(records, start=1):
@@ -423,12 +848,34 @@ def main(argv: list[str] | None = None) -> int:
                 "messages": messages,
             }
             _print_record_result(result_record)
-            if output_handle is not None:
-                output_handle.write(json.dumps(result_record, ensure_ascii=False) + "\n")
-                output_handle.flush()
+            raw_record = _build_raw_trajectory_record(
+                record=record,
+                input_images=input_images,
+                messages=messages,
+                formatted_trajectory=formatted_trajectory,
+                extracted_answer=extracted_answer,
+                answer_judge=answer_judge,
+                hop_chain_coverage=hop_chain_coverage,
+                vqa_dir=str(Path(args.vqa_dir).resolve()) if args.vqa_dir else None,
+            )
+            if raw_output_handle is not None:
+                _write_jsonl_record(raw_output_handle, raw_record)
+
+            is_correct = bool((answer_judge or {}).get("is_correct"))
+            total_count += 1
+            if is_correct:
+                correct_count += 1
+            else:
+                incorrect_count += 1
     finally:
-        if output_handle is not None:
-            output_handle.close()
+        if raw_output_handle is not None:
+            raw_output_handle.close()
+
+    print("\n" + "=" * 100)
+    print("Trajectory Judge Summary")
+    print(f"total: {total_count}")
+    print(f"correct: {correct_count}")
+    print(f"incorrect: {incorrect_count}")
 
     return 0
 
