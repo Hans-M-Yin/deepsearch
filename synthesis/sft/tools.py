@@ -97,7 +97,7 @@ def get_tool_definitions() -> list[dict[str, Any]]:
                 "name": "i2i_search",
                 "description": (
                     "Search for visually similar or matching images from the most recent image in the current context. "
-                    "You can locate the bounding box of the valuable entity in the image and then search that region separately as an image."
+                    "You can locate the bounding box of the entity you want to recognize in the image and then search that region separately as an image."
                 ),
                 "parameters": {
                     "type": "object",
@@ -129,8 +129,8 @@ def get_tool_definitions() -> list[dict[str, Any]]:
                 "description": (
                     "Read a URL. If it returns text, fetch content through a "
                     "reader backend and optionally summarize only the part "
-                    "relevant to the given query. If it returns an image, "
-                    "download the image."
+                    "relevant to the given query. If it returns an image, the image will be downloaded for you. "
+                    "NOTICE, only the URLs you have got from search tools can be read. Wikipedia and Wiki commons is excluded for safety reasons."
                 ),
                 "parameters": {
                     "type": "object",
