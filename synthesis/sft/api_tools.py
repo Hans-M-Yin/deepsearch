@@ -23,6 +23,9 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     __package__ = "synthesis.sft"
 
+from synthesis.model_worker import LLM_WORKER
+from synthesis.model_worker import ModelMessage
+from synthesis.model_worker import ModelRequest
 from . import tools
 
 
@@ -70,6 +73,61 @@ If the evidence is enough, summarize and conclude your final answer in the end.
 
 _MANUAL_REACT_ACTIONS = {"t2t_search", "t2i_search", "i2i_search", "read_url", "finish"}
 _MANUAL_REACT_ACTION_RE = re.compile(r"<action>\s*(?P<json>\{.*?\})\s*</action>", re.DOTALL | re.IGNORECASE)
+_I2I_WRAPPER_DEFAULT_MODEL_ALIAS = "multimodal_process"
+_I2I_WRAPPER_MAX_TOKENS = 2048
+
+PROMPT_I2I_REWRITE_ASSISTANT = """
+Please translate the following prompt into English.
+
+I will give you an image and a passage containing analysis and tool-call process text for a certain question. This passage is missing context. Your goal is to determine, based only on this single passage, which object in the image the passage is focusing on. Then, summarize that object as a noun phrase (possibly with a descriptive referring expression). Finally, polish the parts of the passage that are related to tool calling so that the logic becomes tighter and more coherent.
+
+Rules:
+1. Only polish the text related to tool calling, such as the purpose of calling the tool, the motivation, what is intended to be searched, and so on. Do not modify other content or the overall logic.
+2. When polishing, besides making the logic more rigorous and careful, you may also appropriately add text describing that the next step is to locate the target object of interest. But make sure the logic remains rigorous.
+3. Any text that is kept unchanged must remain exactly the same as the original in content, format, and even punctuation.
+4. Output in the following format:
+<object>The entity in the image that this passage is trying to find</object>
+<refined>The polished text</refined>
+
+Example:
+"To answer this question, I need to follow a multi-step process. First, I need to identify the celestial body shown in the image to determine the orbiter that discovered its prominent equatorial ridge. Once the orbiter is identified, I can find its launch vehicle program. Then, I will research the three consecutive launch failures of that program between August 1998 and April 1999 and find the distinct root cause for each.
+
+My first step is to use the provided image to identify the celestial body.
+
+<action>
+{
+  "tool_name": "i2i_search",
+  "params": {},
+  "goal": "Identify the celestial body in the image, which will help in identifying the orbiter that discovered the equatorial ridge."
+}
+</action>"
+Your output:
+<object>Celestial body</object>
+<refined>To answer this question, I need to follow a multi-step process. First, I need to identify the celestial body shown in the image to determine the orbiter that discovered its prominent equatorial ridge. Once the orbiter is identified, I can find its launch vehicle program. Then, I will research the three consecutive launch failures of that program between August 1998 and April 1999 and find the distinct root cause for each.
+
+So based on the above plan, for the input image, I first need to locate the position of this celestial body within the image, crop out the relevant local region, and pass its position to the i2i_search tool so that I can search for this celestial body. Ideally, by using similar images and their descriptions, I can determine exactly which celestial body it is.
+
+<action>
+{
+  "tool_name": "i2i_search",
+  "params": {},
+  "goal": "Identify the celestial body in the image, which will help in identifying the orbiter that discovered the equatorial ridge."
+}
+</action></refined>
+"""
+
+PROMPT_I2I_GROUND_OBJECT = """
+You need to localize a target object in an image for reverse image search.
+Please return one bounding box for the target object using normalized coordinates on a 0-1000 scale:
+Format: [x1, y1, x2, y2]
+If most of the image consists of the target object, or if the target is not a clearly defined entity (for example, it is a description of a scene), please return the full image:
+[0, 0, 1000, 1000]
+Please return strict JSON:
+{
+"label": "...",
+"bbox": [x1, y1, x1, y1]
+}
+"""
 _NORMALIZED_COORD_SCALE = 1000.0
 
 
@@ -221,6 +279,15 @@ class ManualReActStep:
     raw_text: str
 
 
+@dataclass(slots=True)
+class I2IRepairResult:
+    assistant_text: str
+    display_arguments: dict[str, Any]
+    execution_arguments: dict[str, Any]
+    target_object: str
+    used_full_image: bool = False
+
+
 def _guess_mime_type(path: str) -> str:
     suffix = Path(path).suffix.lower()
     if suffix == ".png":
@@ -266,6 +333,249 @@ def _normalize_region_bbox(region: object) -> tuple[tuple[int, int, int, int] | 
             return None, "Region list must be [x1, y1, x2, y2] with x2 > x1 and y2 > y1."
         return (x1, y1, width, height), None
     return None, "Region must be a 4-number list or a dict with x/y/width/height."
+
+
+def _resolve_registered_model_alias(alias_or_model: str | None) -> dict[str, Any] | None:
+    if not alias_or_model:
+        return None
+    try:
+        return LLM_WORKER.get_model(alias_or_model)
+    except Exception:
+        return None
+
+
+def _i2i_wrapper_model_alias() -> str | None:
+    alias = os.environ.get("SFT_I2I_WRAPPER_MODEL") or _I2I_WRAPPER_DEFAULT_MODEL_ALIAS
+    return alias if _resolve_registered_model_alias(alias) is not None else None
+
+
+def _i2i_wrapper_max_tokens() -> int:
+    raw_value = os.environ.get("SFT_I2I_WRAPPER_MAX_TOKENS")
+    if raw_value is None or str(raw_value).strip() == "":
+        return _I2I_WRAPPER_MAX_TOKENS
+    try:
+        return int(raw_value)
+    except (TypeError, ValueError):
+        return _I2I_WRAPPER_MAX_TOKENS
+
+
+def _worker_generate_json_message(
+    *,
+    model_alias: str,
+    system_prompt: str,
+    user_content: Any,
+    max_tokens: int,
+    trace_label: str,
+) -> dict[str, Any]:
+    response = LLM_WORKER.generate(
+        ModelRequest(
+            model=model_alias,
+            messages=[
+                ModelMessage(role="system", content=system_prompt),
+                ModelMessage(role="user", content=user_content),
+            ],
+            response_format={"type": "json_object"},
+            max_tokens=max_tokens,
+            metadata={"trace_label": trace_label},
+        )
+    )
+    parsed = _extract_json_object(response.content or "")
+    if parsed is None:
+        raise ValueError(f"Model response is not valid JSON: {response.content[:500]}")
+    return parsed
+
+
+def _latest_user_text(messages: list[dict[str, Any]]) -> str:
+    for message in reversed(messages):
+        if message.get("role") != "user":
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            return content.strip()
+        if isinstance(content, list):
+            chunks: list[str] = []
+            for part in content:
+                if isinstance(part, dict) and str(part.get("type") or "") in {"text", "input_text"}:
+                    text = str(part.get("text", "")).strip()
+                    if text:
+                        chunks.append(text)
+            if chunks:
+                return "\n".join(chunks).strip()
+    return ""
+
+
+def _parse_manual_react_goal(text: str) -> str:
+    matches = list(_MANUAL_REACT_ACTION_RE.finditer(text.strip()))
+    if not matches:
+        return ""
+    action_payload = _extract_json_object(matches[-1].group("json"))
+    if not isinstance(action_payload, dict):
+        return ""
+    return str(action_payload.get("goal") or "").strip()
+
+
+def _render_manual_react_text(
+    *,
+    thought: str,
+    action: str,
+    params: dict[str, Any],
+    goal: str,
+) -> str:
+    payload = {
+        "tool_name": action,
+        "params": params,
+        "goal": goal,
+    }
+    action_text = json.dumps(payload, ensure_ascii=False, indent=2)
+    cleaned_thought = thought.strip()
+    if cleaned_thought:
+        return f"{cleaned_thought}\n\n<action>\n{action_text}\n</action>"
+    return f"<action>\n{action_text}\n</action>"
+
+
+def _clip_box_coord(value: Any) -> int:
+    try:
+        numeric = int(round(float(value)))
+    except (TypeError, ValueError):
+        return 0
+    return min(max(numeric, 0), int(_NORMALIZED_COORD_SCALE))
+
+
+def _full_image_box_xyxy() -> list[int]:
+    max_coord = int(_NORMALIZED_COORD_SCALE)
+    return [0, 0, max_coord, max_coord]
+
+
+def _normalize_xyxy_box_1000(raw_box: Any) -> tuple[list[int], bool]:
+    if not isinstance(raw_box, (list, tuple)) or len(raw_box) != 4:
+        return _full_image_box_xyxy(), True
+    x1, y1, x2, y2 = [_clip_box_coord(value) for value in raw_box]
+    if x2 <= x1 or y2 <= y1:
+        return _full_image_box_xyxy(), True
+    return [x1, y1, x2, y2], False
+
+
+def _xyxy_to_yxyx(box_xyxy: list[int]) -> list[int]:
+    return [int(box_xyxy[1]), int(box_xyxy[0]), int(box_xyxy[3]), int(box_xyxy[2])]
+
+
+def _maybe_repair_i2i_tool_call(
+    *,
+    assistant_text: str,
+    tool_name: str,
+    tool_arguments: dict[str, Any],
+    context: ToolRuntimeContext,
+    question_text: str,
+) -> I2IRepairResult | None:
+    if tool_name != "i2i_search":
+        return None
+
+    model_alias = _i2i_wrapper_model_alias()
+    if not model_alias:
+        return None
+
+    image_source = tool_arguments.get("image") or tool_arguments.get("url") or context.latest_image_reference() or ""
+    if not image_source:
+        return None
+
+    try:
+        image = _load_pil_image(image_source, context)
+        image_width, image_height = image.size
+    except Exception as exc:
+        logger.warning("Failed to load image for i2i wrapper repair: %s", exc)
+        return None
+
+    try:
+        image_url = _image_source_to_model_url(image_source, context)
+    except Exception as exc:
+        logger.warning("Failed to materialize image input for i2i wrapper repair: %s", exc)
+        return None
+
+    wrapper_max_tokens = _i2i_wrapper_max_tokens()
+    question = question_text.strip()
+    original_text = assistant_text.strip()
+    original_region = tool_arguments.get("region")
+
+    try:
+        rewrite_payload = {
+            "question": question,
+            "assistant_text": original_text,
+            "current_tool_name": tool_name,
+            "current_tool_arguments": tool_arguments,
+            "current_region": original_region,
+            "image_size": {"width": image_width, "height": image_height},
+            "required_sentence_style": (
+                "Make it explicit what object in the image needs to be identified first and why reverse image search helps."
+            ),
+        }
+        rewrite_result = _worker_generate_json_message(
+            model_alias=model_alias,
+            system_prompt=PROMPT_I2I_REWRITE_ASSISTANT,
+            user_content=[
+                {"type": "text", "text": json.dumps(rewrite_payload, ensure_ascii=False, indent=2)},
+                {"type": "image_url", "image_url": {"url": image_url}},
+            ],
+            max_tokens=wrapper_max_tokens,
+            trace_label=f"i2i_wrapper_rewrite:{context.case_id}",
+        )
+        target_object = str(rewrite_result.get("target_object") or "").strip()
+        revised_assistant_text = str(rewrite_result.get("revised_assistant_text") or "").strip() or original_text
+        if not target_object:
+            target_object = "the relevant object in the image"
+    except Exception as exc:
+        logger.warning("i2i wrapper rewrite failed: %s", exc)
+        return None
+
+    try:
+        grounding_payload = {
+            "question": question,
+            "assistant_text": revised_assistant_text,
+            "target_object": target_object,
+            "current_region": original_region,
+            "image_size": {"width": image_width, "height": image_height},
+            "coordinate_format": {
+                "required_output": "[x1, y1, x2, y2]",
+                "normalized_scale": [0, int(_NORMALIZED_COORD_SCALE)],
+            },
+        }
+        grounding_result = _worker_generate_json_message(
+            model_alias=model_alias,
+            system_prompt=PROMPT_I2I_GROUND_OBJECT,
+            user_content=[
+                {"type": "text", "text": json.dumps(grounding_payload, ensure_ascii=False, indent=2)},
+                {"type": "image_url", "image_url": {"url": image_url}},
+            ],
+            max_tokens=wrapper_max_tokens,
+            trace_label=f"i2i_wrapper_ground:{context.case_id}",
+        )
+    except Exception as exc:
+        logger.warning("i2i wrapper grounding failed: %s", exc)
+        grounding_result = {"bbox": _full_image_box_xyxy(), "used_full_image": True}
+
+    bbox_xyxy, invalid_box = _normalize_xyxy_box_1000(
+        grounding_result.get("bbox")
+        or grounding_result.get("bbox_xyxy")
+        or grounding_result.get("region")
+    )
+    used_full_image = bool(grounding_result.get("used_full_image")) or invalid_box
+
+    display_arguments = dict(tool_arguments)
+    display_arguments["region"] = _xyxy_to_yxyx(bbox_xyxy)
+
+    execution_arguments = dict(tool_arguments)
+    execution_arguments["region"] = (
+        list(display_arguments["region"])
+        if _env_flag("REVERSE_IMAGE_CROP_COORDS")
+        else list(bbox_xyxy)
+    )
+
+    return I2IRepairResult(
+        assistant_text=revised_assistant_text,
+        display_arguments=display_arguments,
+        execution_arguments=execution_arguments,
+        target_object=target_object,
+        used_full_image=used_full_image,
+    )
 
 
 def _decode_data_url(data_url: str) -> bytes:
@@ -1255,12 +1565,30 @@ class OpenAIToolAgent:
                 logger.warning("Failed to parse manual ReAct step; treating the latest assistant text as final output.")
                 final_text = assistant_text
                 break
-            conversation_messages.append({"role": "assistant", "content": step.raw_text})
+            repaired_step_text = step.raw_text
+            execution_action_input = step.action_input
+            if step.action == "i2i_search":
+                repaired = _maybe_repair_i2i_tool_call(
+                    assistant_text=step.thought or step.raw_text,
+                    tool_name=step.action,
+                    tool_arguments=step.action_input,
+                    context=context,
+                    question_text=_latest_user_text(conversation_messages),
+                )
+                if repaired is not None:
+                    repaired_step_text = _render_manual_react_text(
+                        thought=repaired.assistant_text,
+                        action=step.action,
+                        params=repaired.display_arguments,
+                        goal=_parse_manual_react_goal(step.raw_text),
+                    )
+                    execution_action_input = repaired.execution_arguments
+            conversation_messages.append({"role": "assistant", "content": repaired_step_text})
             if step.action == "finish":
                 final_text = str(step.action_input.get("answer") or step.raw_text).strip()
                 break
 
-            result = execute_tool_call(step.action, step.action_input, context)
+            result = execute_tool_call(step.action, execution_action_input, context)
             tool_results.append(result)
             conversation_messages.append(
                 {
@@ -1329,16 +1657,50 @@ class OpenAIToolAgent:
                 conversation_messages.append({"role": "assistant", "content": final_text})
                 break
 
-            conversation_messages.append(_assistant_message_for_followup(assistant_message))
+            assistant_content = assistant_message.content or ""
+            followup_tool_calls: list[dict[str, Any]] = []
+            execution_payloads: list[tuple[str, dict[str, Any], str]] = []
             for tool_call in tool_calls:
                 parsed_args = json.loads(tool_call.function.arguments or "{}")
-                result = execute_tool_call(tool_call.function.name, parsed_args, context)
+                display_args = parsed_args
+                execution_args = parsed_args
+                if tool_call.function.name == "i2i_search":
+                    repaired = _maybe_repair_i2i_tool_call(
+                        assistant_text=assistant_content,
+                        tool_name=tool_call.function.name,
+                        tool_arguments=parsed_args,
+                        context=context,
+                        question_text=_latest_user_text(conversation_messages),
+                    )
+                    if repaired is not None:
+                        assistant_content = repaired.assistant_text
+                        display_args = repaired.display_arguments
+                        execution_args = repaired.execution_arguments
+                followup_tool_calls.append(
+                    {
+                        "id": tool_call.id,
+                        "type": "function",
+                        "function": {
+                            "name": tool_call.function.name,
+                            "arguments": json.dumps(display_args, ensure_ascii=False),
+                        },
+                    }
+                )
+                execution_payloads.append((tool_call.function.name, execution_args, tool_call.id))
+            conversation_messages.append(
+                _assistant_message_for_followup_from_dict(
+                    content=assistant_content,
+                    tool_calls=followup_tool_calls,
+                )
+            )
+            for tool_name, execution_args, tool_call_id in execution_payloads:
+                result = execute_tool_call(tool_name, execution_args, context)
                 tool_results.append(result)
                 conversation_messages.append(
                     {
                         "role": "tool",
-                        "tool_call_id": tool_call.id,
-                        "name": tool_call.function.name,
+                        "tool_call_id": tool_call_id,
+                        "name": tool_name,
                         "content": result.output_text,
                         "type": "function",
                     }
@@ -1424,23 +1786,50 @@ class OpenAIToolAgent:
                 conversation_messages.append({"role": "assistant", "content": final_text})
                 break
 
-            conversation_messages.append(
-                _assistant_message_for_followup_from_dict(
-                    content=assistant_content,
-                    tool_calls=assistant_tool_calls,
-                )
-            )
-
+            followup_tool_calls: list[dict[str, Any]] = []
+            execution_payloads: list[tuple[str, dict[str, Any], str]] = []
             current_input = []
             for tool_call in assistant_tool_calls:
                 parsed_args = json.loads(tool_call["function"]["arguments"] or "{}")
-                result = execute_tool_call(tool_call["function"]["name"], parsed_args, context)
+                display_args = parsed_args
+                execution_args = parsed_args
+                if tool_call["function"]["name"] == "i2i_search":
+                    repaired = _maybe_repair_i2i_tool_call(
+                        assistant_text=assistant_content,
+                        tool_name=tool_call["function"]["name"],
+                        tool_arguments=parsed_args,
+                        context=context,
+                        question_text=_latest_user_text(conversation_messages),
+                    )
+                    if repaired is not None:
+                        assistant_content = repaired.assistant_text
+                        display_args = repaired.display_arguments
+                        execution_args = repaired.execution_arguments
+                followup_tool_calls.append(
+                    {
+                        "id": tool_call["id"],
+                        "type": "function",
+                        "function": {
+                            "name": tool_call["function"]["name"],
+                            "arguments": json.dumps(display_args, ensure_ascii=False),
+                        },
+                    }
+                )
+                execution_payloads.append((tool_call["function"]["name"], execution_args, tool_call["id"]))
+            conversation_messages.append(
+                _assistant_message_for_followup_from_dict(
+                    content=assistant_content,
+                    tool_calls=followup_tool_calls,
+                )
+            )
+            for tool_name, execution_args, tool_call_id in execution_payloads:
+                result = execute_tool_call(tool_name, execution_args, context)
                 tool_results.append(result)
                 conversation_messages.append(
                     {
                         "role": "tool",
-                        "tool_call_id": tool_call["id"],
-                        "name": tool_call["function"]["name"],
+                        "tool_call_id": tool_call_id,
+                        "name": tool_name,
                         "content": result.output_text,
                         "type": "function",
                     }
@@ -1448,7 +1837,7 @@ class OpenAIToolAgent:
                 current_input.append(
                     {
                         "type": "function_call_output",
-                        "call_id": tool_call["id"],
+                        "call_id": tool_call_id,
                         "output": result.output_text,
                     }
                 )
