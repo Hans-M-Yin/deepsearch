@@ -42,6 +42,7 @@ Requirements:
 4. Your standard answer should be written from the perspective of someone with strong logical reasoning but no memory of world knowledge or history, so every statement must be evidence-based and no unsupported claims may appear. Every statement in your writing should be detailedly analysed or discussed. 
 5. Once you believe the evidence is sufficient and there are no remaining unclear or uncertain points, provide the final answer and end the standard answer.
 6. In your standard answer, DO NOT use tools to directly search for pages related to Wikipedia or Wiki Commons, in order to avoid shortcuts. However, you can read related Wikipedia or Wiki Commons pages which are the results of the search tools.
+7. When writing the answer, make full use of the tool results. For example, a searched URL may seem irrelevant to the clues, but you should still analyze whether the webpage may contain the clues needed to solve the problem based on any available snippets, and then use read_url to read it further.
 
 **Examples**
 Bad writing:
@@ -71,13 +72,12 @@ Based on the text and watermarks visible in the provided image, the stock photog
 </action>
 
 Discuss: In this version, the answer is more logically rigorous, the reasoning is more careful, and there are no clues appearing from nowhere. You should learn from this style of writing and avoid bad writing like the earlier version.
-****
 """
 
 MANUAL_REACT_PROTOCOL = """
 When you writing the standard answer, you can use tools following these useful tips:
 
-1. t2t_search returns a list of URLs for text pages. You should examine the results, select the useful ones, and then use the read_url tool to access the page content. Use this tool when you need to look up world knowledge or content information.
+1. t2t_search returns a list of URLs for text pages. You should select the potentially useful ones using the returned snippets, and then use the read_url tool to access the page content to get new clues. Use this tool when you need to look up world knowledge or content information.
 2. i2i_search is very useful for identifying unfamiliar people or objects in the image. Note that the return results might be not related to your original image, so you should first select the search results that are likely to match your current image according to the textual title, then use `read_url` to download those images and inspect their content. Once you determine that the new image and the previous image depict the same object, you can then use `read_url` again to read the linked page of the new image to figure out who or what that object is. You should reflect this logic in the standard answer.
 3. t2i_search retrieves relevant images based on a text description. You should review the returned information and then use read_url to inspect those images. Use this tool when the missing clues require you to inspect relevant images, or when the images you find are likely to help you answer the question. Note that after using this tool, the searched images are still not provided to you, and you should use `read_url` to inspect the corresponding images.
 
