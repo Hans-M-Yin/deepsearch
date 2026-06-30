@@ -41,16 +41,17 @@ Requirements:
 3. In the standard answer you write, the following logic should be explicitly visible: after each tool call and its returned result, you must carefully analyze the new clues in detail, review the existing clues and the question, determine and plan the next step in detail, and then call a new tool as needed with an explanation.
 4. In the standard answer, only one tool may be called in each round.
 5. Once you believe the evidence is sufficient and there are no remaining unclear or uncertain points, provide the final answer and end the standard answer.
-6. MOST IMPORTANTLY!!! In your standard answer, DO NOT use tools to search for pages related to Wikipedia or Wiki Commons, in order to avoid shortcuts.
+6. In your standard answer, DO NOT use tools to directly search for pages related to Wikipedia or Wiki Commons, in order to avoid shortcuts. However, you can read related Wikipedia or Wiki Commons pages which are the results of the search tools.
 
-As for the available tools:
-
-- t2t_search: allows you to retrieve relevant web pages based on text and returns a list of URLs for text pages. You should examine the results, select the useful ones, and then use the read_url tool to access the page content. Use this tool when you need to look up world knowledge or content information.
-- i2i_search: allows you to search the web for similar images based on a selected region of an image, which is very useful for identifying unfamiliar people or objects in the image. It returns a list of image URLs. You should first select the search results that are likely to match your current image, then use read_url to download those related images and inspect their content. Tip: when you see a new image and need to identify an unfamiliar person or object in it, you can use i2i_search on that local region. The tool will return URLs of similar images as well as descriptions of those images. Then you can use read_url to compare the similar images. Once you determine that the new image and the previous image depict the same object, you can use the description of the new image to figure out who or what that object is. You should reflect this logic in the standard answer.
-- t2i_search: allows you to retrieve relevant images based on a text description. The returned URLs all represent images. You should review the returned URLs and then use read_url to inspect those images. Use this tool when the missing clues require you to search for relevant images yourself, or when the images you find are likely to help you answer the question.
 """
 
 MANUAL_REACT_PROTOCOL = """
+When you writing the standard answer, you can use tools following these useful tips:
+
+1. t2t_search returns a list of URLs for text pages. You should examine the results, select the useful ones, and then use the read_url tool to access the page content. Use this tool when you need to look up world knowledge or content information.
+2. i2i_search is very useful for identifying unfamiliar people or objects in the image. Note that the return results might be not related to your original image, so you should first select the search results that are likely to match your current image textually, then use read_url to download those images and inspect their content. Once you determine that the new image and the previous image depict the same object, you can use the description of the new image to figure out who or what that object is. You should reflect this logic in the standard answer.
+3. t2i_search retrieves relevant images based on a text description. You should review the returned information and then use read_url to inspect those images. Use this tool when the missing clues require you to inspect relevant images, or when the images you find are likely to help you answer the question. Note that after using this tool, the searched images are still not provided to you, and you should use `read_url` to inspect the corresponding images.
+
 You must answer exactly one step at a time.
 First write your visible reasoning in natural language.
 Then end your response with exactly one action block in the following format:

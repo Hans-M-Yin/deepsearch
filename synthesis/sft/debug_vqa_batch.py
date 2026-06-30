@@ -231,10 +231,6 @@ def _print_record_result(result: dict[str, Any]) -> None:
         print(json.dumps(result.get("hop_chain_coverage") or {}, ensure_ascii=False, indent=2))
     print("\n--- Trajectory Text ---")
     print((result.get("formatted_trajectory") or {}).get("text") or "")
-    images = (result.get("formatted_trajectory") or {}).get("images") or []
-    if images:
-        print("\n--- Trajectory Images ---")
-        print(json.dumps(images, ensure_ascii=False, indent=2))
 
 
 def _write_jsonl_record(handle: Any, record: dict[str, Any]) -> None:
