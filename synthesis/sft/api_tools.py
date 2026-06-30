@@ -41,7 +41,7 @@ Requirements:
 3. In the standard answer you write, the following logic should be explicitly visible: after each tool call and its returned result, you must carefully analyze the new clues in detail, review the existing clues and the question, determine and plan the next step in detail, and then call a new tool as needed with an explanation.
 4. In the standard answer, only one tool may be called in each round.
 5. Once you believe the evidence is sufficient and there are no remaining unclear or uncertain points, provide the final answer and end the standard answer.
-6. In your standard answer, DO NOT use tools to search for pages related to Wikipedia or Wiki Commons, in order to avoid shortcuts.
+6. MOST IMPORTANTLY!!! In your standard answer, DO NOT use tools to search for pages related to Wikipedia or Wiki Commons, in order to avoid shortcuts.
 
 As for the available tools:
 
@@ -57,7 +57,7 @@ Then end your response with exactly one action block in the following format:
 
 <action>
 {
-  "tool_name": "t2t_search",
+  "tool_name": "tool_name",
   "params": {
     "query": "your query here"
   },
@@ -385,6 +385,36 @@ def _worker_generate_json_message(
     return parsed
 
 
+def _worker_generate_text_message(
+    *,
+    model_alias: str,
+    system_prompt: str,
+    user_content: Any,
+    max_tokens: int,
+    trace_label: str,
+) -> str:
+    response = LLM_WORKER.generate(
+        ModelRequest(
+            model=model_alias,
+            messages=[
+                ModelMessage(role="system", content=system_prompt),
+                ModelMessage(role="user", content=user_content),
+            ],
+            max_tokens=max_tokens,
+            metadata={"trace_label": trace_label},
+        )
+    )
+    return response.content or ""
+
+
+def _extract_xml_tag_content(text: str, tag_name: str) -> str:
+    pattern = rf"<{re.escape(tag_name)}>\s*(.*?)\s*</{re.escape(tag_name)}>"
+    match = re.search(pattern, text, flags=re.DOTALL | re.IGNORECASE)
+    if not match:
+        return ""
+    return match.group(1).strip()
+
+
 def _latest_user_text(messages: list[dict[str, Any]]) -> str:
     for message in reversed(messages):
         if message.get("role") != "user":
@@ -508,7 +538,7 @@ def _maybe_repair_i2i_tool_call(
                 "Make it explicit what object in the image needs to be identified first and why reverse image search helps."
             ),
         }
-        rewrite_result = _worker_generate_json_message(
+        rewrite_text = _worker_generate_text_message(
             model_alias=model_alias,
             system_prompt=PROMPT_I2I_REWRITE_ASSISTANT,
             user_content=[
@@ -518,8 +548,8 @@ def _maybe_repair_i2i_tool_call(
             max_tokens=wrapper_max_tokens,
             trace_label=f"i2i_wrapper_rewrite:{context.case_id}",
         )
-        target_object = str(rewrite_result.get("target_object") or "").strip()
-        revised_assistant_text = str(rewrite_result.get("revised_assistant_text") or "").strip() or original_text
+        target_object = _extract_xml_tag_content(rewrite_text, "object")
+        revised_assistant_text = _extract_xml_tag_content(rewrite_text, "refined") or original_text
         if not target_object:
             target_object = "the relevant object in the image"
     except Exception as exc:
