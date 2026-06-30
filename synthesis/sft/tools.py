@@ -509,9 +509,9 @@ def i2i_search(
                 raise RuntimeError(str(result["error"]))
             if isinstance(result, list):
                 result = result[:top_k]
-            print(result)
+            print(result, "#######")
             summarized = summarize_image_search(result)
-            print(summarized)
+            print(summarized, "#######")
             return {
                 "ok": True,
                 "image_url": image_url,
