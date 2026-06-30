@@ -892,6 +892,23 @@ def _build_manual_react_request_messages(
     return request_messages
 
 
+def _apply_system_prompt_to_messages(
+    messages: list[dict[str, Any]],
+    system_prompt: str,
+) -> list[dict[str, Any]]:
+    updated_messages: list[dict[str, Any]] = []
+    system_replaced = False
+    for message in messages:
+        copied = dict(message)
+        if copied.get("role") == "system" and not system_replaced:
+            copied["content"] = system_prompt
+            system_replaced = True
+        updated_messages.append(copied)
+    if not system_replaced:
+        updated_messages.insert(0, {"role": "system", "content": system_prompt})
+    return updated_messages
+
+
 def _strip_code_fence(text: str) -> str:
     candidate = text.strip()
     match = re.match(r"^```(?:json)?\s*(.*?)\s*```$", candidate, flags=re.DOTALL)
@@ -1631,6 +1648,13 @@ class OpenAIToolAgent:
             )
         else:
             final_text = "Max ReAct turns reached before the model produced a final answer."
+
+        if request_messages:
+            effective_system_prompt = str(request_messages[0].get("content") or "")
+            conversation_messages = _apply_system_prompt_to_messages(
+                conversation_messages,
+                effective_system_prompt,
+            )
 
         return AgentRunResult(
             final_text=final_text,
