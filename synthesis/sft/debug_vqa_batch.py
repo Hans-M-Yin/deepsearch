@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import os
 from pathlib import Path
@@ -89,6 +90,22 @@ Rules:
 - Keep the wording style close to the original question.
 - Do not make the question easier than necessary.
 - Do not output markdown or any text outside the JSON object.
+"""
+
+
+PROMPT_POLISH_CORRECT_ASSISTANT_STEP = """You are polishing one assistant turn inside a correct tool-using trajectory.
+
+Rules:
+- Rewrite only the current assistant message.
+- Keep all claims faithful to the provided history and current tool result.
+- Make the logic tighter, the reasoning more explicit, and the next-step motivation clearer.
+- Do not modify historical messages, the tool message, or the overall search direction.
+- Do not add unsupported facts.
+
+Return strict JSON:
+{
+  "assistant_content": "..."
+}
 """
 
 
@@ -269,6 +286,36 @@ def _worker_generate_json(
     )
 
 
+def _message_content_to_text(content: Any) -> str:
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    return json.dumps(content, ensure_ascii=False, indent=2)
+
+
+def _message_for_polish_payload(message: dict[str, Any]) -> dict[str, Any]:
+    payload = {
+        "role": message.get("role"),
+        "content": _message_content_to_text(message.get("content")),
+    }
+    if message.get("role") == "tool":
+        payload["name"] = message.get("name")
+        payload["tool_call_id"] = message.get("tool_call_id")
+    return payload
+
+
+def _correct_polish_candidate_indices(messages: list[dict[str, Any]]) -> list[int]:
+    indices: list[int] = []
+    for index, message in enumerate(messages):
+        if message.get("role") != "assistant":
+            continue
+        previous_role = str(messages[index - 1].get("role") or "") if index > 0 else ""
+        if previous_role in {"user", "tool"}:
+            indices.append(index)
+    return indices
+
+
 def _fallback_incorrect_diagnosis(raw_record: dict[str, Any]) -> dict[str, Any]:
     hop_chain = list(raw_record.get("hop_chain") or [])
     first_hop = hop_chain[0] if hop_chain else {}
@@ -330,20 +377,150 @@ def _build_raw_trajectory_record(
     }
 
 
-def polish_correct_trajectory(raw_record: dict[str, Any]) -> dict[str, Any]:
-    """Keep correct trajectories unchanged for now."""
+def polish_correct_trajectory(
+    raw_record: dict[str, Any],
+    *,
+    polish_model_alias: str | None,
+    polish_max_tokens: int,
+) -> dict[str, Any]:
+    """Polish each assistant turn from left to right while keeping tools/history fixed."""
+
+    original_messages = list(raw_record.get("raw_messages") or [])
+    if not original_messages:
+        return {
+            "polish_mode": "sequential_assistant_polish",
+            "polish_status": "skipped_empty_messages",
+            "polish_notes": ["No raw messages were available for correct-trajectory polishing."],
+            "correct_trajectory_polish": {
+                "model_alias": polish_model_alias,
+                "steps": [],
+            },
+            "final_question": raw_record.get("question") or "",
+            "repair_diagnosis": None,
+            "question_repair": None,
+            "final_messages": [],
+            "trajectory": {"text": "", "images": []},
+        }
+
+    if not polish_model_alias:
+        return {
+            "polish_mode": "sequential_assistant_polish",
+            "polish_status": "skipped_missing_model_alias",
+            "polish_notes": ["Correct trajectory polish was skipped because no model alias was provided."],
+            "correct_trajectory_polish": {
+                "model_alias": polish_model_alias,
+                "steps": [],
+            },
+            "final_question": raw_record.get("question") or "",
+            "repair_diagnosis": None,
+            "question_repair": None,
+            "final_messages": original_messages,
+            "trajectory": raw_record.get("raw_trajectory") or {"text": "", "images": []},
+        }
+
+    polished_messages = copy.deepcopy(original_messages)
+    step_records: list[dict[str, Any]] = []
+    polish_notes: list[str] = []
+
+    for assistant_index in _correct_polish_candidate_indices(polished_messages):
+        current_message = polished_messages[assistant_index]
+        previous_message = polished_messages[assistant_index - 1] if assistant_index > 0 else None
+        previous_role = str(previous_message.get("role") or "") if previous_message else ""
+
+        if previous_role == "tool":
+            history_messages = polished_messages[: assistant_index - 1]
+            current_tool_message = previous_message
+        elif previous_role == "user":
+            history_messages = polished_messages[:assistant_index]
+            current_tool_message = None
+        else:
+            step_records.append(
+                {
+                    "assistant_index": assistant_index,
+                    "status": "skipped_unexpected_previous_role",
+                    "previous_role": previous_role,
+                }
+            )
+            continue
+
+        current_content = current_message.get("content")
+        if not isinstance(current_content, str):
+            step_records.append(
+                {
+                    "assistant_index": assistant_index,
+                    "status": "skipped_non_text_content",
+                    "previous_role": previous_role,
+                }
+            )
+            continue
+
+        payload = {
+            "question": raw_record.get("question") or "",
+            "history_messages": [_message_for_polish_payload(message) for message in history_messages],
+            "current_tool_message": (
+                _message_for_polish_payload(current_tool_message) if current_tool_message is not None else None
+            ),
+            "current_assistant_message": current_content,
+        }
+
+        try:
+            parsed = _worker_generate_json(
+                model_alias=polish_model_alias,
+                system_prompt=PROMPT_POLISH_CORRECT_ASSISTANT_STEP,
+                payload=payload,
+                max_tokens=polish_max_tokens,
+                trace_label=f"sft_correct_polish:{raw_record.get('question_id') or 'question'}:{assistant_index}",
+            )
+            polished_content = str(parsed.get("assistant_content") or "").strip()
+            if not polished_content:
+                raise ValueError("assistant_content is empty")
+        except Exception as exc:
+            step_records.append(
+                {
+                    "assistant_index": assistant_index,
+                    "status": "fallback_original",
+                    "previous_role": previous_role,
+                    "error": f"{exc.__class__.__name__}: {exc}",
+                }
+            )
+            polish_notes.append(
+                f"Assistant message at index {assistant_index} kept original content because polishing failed."
+            )
+            continue
+
+        polished_messages[assistant_index] = {
+            **current_message,
+            "content": polished_content,
+        }
+        step_records.append(
+            {
+                "assistant_index": assistant_index,
+                "status": "polished",
+                "previous_role": previous_role,
+            }
+        )
+
+    if not polish_notes:
+        polish_notes.append("Correct trajectory was polished sequentially from left to right.")
+
+    final_trajectory = format_messages(polished_messages)
+    status = "completed"
+    if any(step.get("status") != "polished" for step in step_records):
+        status = "completed_with_fallbacks"
 
     return {
-        "polish_mode": "pass_through",
-        "polish_status": "skipped_answer_correct",
-        "polish_notes": [
-            "Answer judge marked this trajectory correct, so no polishing was applied.",
-        ],
+        "polish_mode": "sequential_assistant_polish",
+        "polish_status": status,
+        "polish_notes": polish_notes,
+        "correct_trajectory_polish": {
+            "model_alias": polish_model_alias,
+            "steps": step_records,
+        },
         "final_question": raw_record.get("question") or "",
         "repair_diagnosis": None,
         "question_repair": None,
-        "final_messages": list(raw_record.get("raw_messages") or []),
-        "trajectory": raw_record.get("raw_trajectory") or {"text": "", "images": []},
+        "final_messages": polished_messages,
+        "trajectory": final_trajectory,
     }
 
 
@@ -556,6 +733,7 @@ def _build_sft_training_record(
         "polish_mode": polished.get("polish_mode"),
         "polish_status": polished.get("polish_status"),
         "polish_notes": list(polished.get("polish_notes") or []),
+        "correct_trajectory_polish": polished.get("correct_trajectory_polish"),
         "repair_diagnosis": polished.get("repair_diagnosis"),
         "question_repair": polished.get("question_repair"),
         "trajectory_repair": polished.get("trajectory_repair"),

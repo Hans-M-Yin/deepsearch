@@ -13,6 +13,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import urlencode
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 try:
@@ -591,9 +592,23 @@ class SerperSearchClient:
             },
             method="POST",
         )
-        with urlopen(request, timeout=self.timeout_s) as response:
-            response_payload = response.read().decode("utf-8")
-            status_code = response.getcode()
+        try:
+            with urlopen(request, timeout=self.timeout_s) as response:
+                response_payload = response.read().decode("utf-8")
+                status_code = response.getcode()
+        except HTTPError as exc:
+            error_payload = ""
+            try:
+                error_payload = exc.read().decode("utf-8", errors="replace")
+            except Exception:
+                error_payload = ""
+            message = (
+                f"Serper request failed with HTTP {exc.code} for {url}. "
+                f"Request body: {json.dumps(body, ensure_ascii=False)}"
+            )
+            if error_payload:
+                message += f" Response body: {error_payload}"
+            raise RuntimeError(message) from exc
         raw = json.loads(response_payload)
         self._log_raw_response(url=url, body=body, status_code=status_code, raw=raw)
         metadata = {
