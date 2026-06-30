@@ -86,6 +86,7 @@ Rules:
 2. When polishing, besides making the logic more rigorous and detailed, you may also appropriately add text describing that the next step is to locate the target object of interest. But make sure the logic remains rigorous. Do not use structured polishment such as "Goal: ...".
 3. Any text that is kept unchanged must remain exactly the same as the original in content, format, and even punctuation.
 4. Output in the following format:
+...Think process first...
 <object>The entity in the image that this passage is trying to find</object>
 <refined>The polished text</refined>
 
@@ -102,6 +103,7 @@ My first step is to use the provided image to identify the celestial body.
 }
 </action>"
 Your output:
+...The detailed thinking process is ignored in this example, but you should think step by step in your response...
 <object>Celestial body</object>
 <refined>To answer this question, I need to follow a multi-step process. First, I need to identify the celestial body shown in the image to determine the orbiter that discovered its prominent equatorial ridge. Once the orbiter is identified, I can find its launch vehicle program. Then, I will research the three consecutive launch failures of that program between August 1998 and April 1999 and find the distinct root cause for each. So based on the above plan, for the input image, I first need to locate the position of this celestial body within the image, crop out the relevant local region, and pass its position to the i2i_search tool so that I can search for this celestial body. Ideally, by using similar images and their descriptions, I can determine exactly which celestial body it is.
 
