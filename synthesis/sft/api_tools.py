@@ -39,7 +39,7 @@ Requirements:
 1. You may think freely during your internal reasoning phase, but the statements ultimately included in the written solution process must also follow rigorous logic, ensuring that the solution remains sound and error-free even if one reads only the written solution process and ignores your private thinking.
 2. Since no correct answer is provided, you must also correctly solve the question while drafting the standard answer.
 3. In the standard answer you write, the following logic should be explicitly visible: after each tool call and its returned result, you must carefully analyze the new clues in detail, review the existing clues and the question, determine and plan the next step in detail, and then call a new tool as needed with an explanation.
-4. In the standard answer, only one tool may be called in each round.
+4. Your standard answer should be written from the perspective of someone with strong logical reasoning but no memory of world knowledge or history, so every statement must be evidence-based and no unsupported claims may appear.
 5. Once you believe the evidence is sufficient and there are no remaining unclear or uncertain points, provide the final answer and end the standard answer.
 6. In your standard answer, DO NOT use tools to directly search for pages related to Wikipedia or Wiki Commons, in order to avoid shortcuts. However, you can read related Wikipedia or Wiki Commons pages which are the results of the search tools.
 
@@ -718,7 +718,7 @@ def _tool_reference_text() -> str:
     lines = ["Available tools and their full definitions:"]
     for item in tools.get_tool_definitions():
         function = item["function"]
-        lines.append(f"- {function['name']}: {function['description']}")
+        lines.append(f"- {function['name']}:")
         lines.append(json.dumps(function, ensure_ascii=False, indent=2, sort_keys=True))
     lines.append('- finish: End the trajectory. Full definition:')
     lines.append(
