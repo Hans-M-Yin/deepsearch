@@ -79,12 +79,10 @@ _I2I_WRAPPER_DEFAULT_MODEL_ALIAS = "multimodal_process"
 _I2I_WRAPPER_MAX_TOKENS = 2048
 
 PROMPT_I2I_REWRITE_ASSISTANT = """
-Please translate the following prompt into English.
-
 I will give you an image and a passage containing analysis and tool-call process text for a certain question. This passage is missing context. Your goal is to determine, based only on this single passage, which object in the image the passage is focusing on. Then, summarize that object as a noun phrase (possibly with a descriptive referring expression). Finally, polish the parts of the passage that are related to tool calling so that the logic becomes tighter and more coherent.
 
 Rules:
-1. Only polish the text related to tool calling, such as the purpose of calling the tool, the motivation, what is intended to be searched, and so on. Do not modify other content or the overall logic.
+1. Only polish the text related to tool calling detailedly, such as the purpose of calling the tool, the motivation, what is intended to be searched, and so on. Do not modify other content or the overall logic.
 2. When polishing, besides making the logic more rigorous and detailed, you may also appropriately add text describing that the next step is to locate the target object of interest. But make sure the logic remains rigorous. Do not use structured polishment such as "Goal: ...".
 3. Any text that is kept unchanged must remain exactly the same as the original in content, format, and even punctuation.
 4. Output in the following format:
