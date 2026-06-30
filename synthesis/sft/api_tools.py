@@ -43,6 +43,35 @@ Requirements:
 5. Once you believe the evidence is sufficient and there are no remaining unclear or uncertain points, provide the final answer and end the standard answer.
 6. In your standard answer, DO NOT use tools to directly search for pages related to Wikipedia or Wiki Commons, in order to avoid shortcuts. However, you can read related Wikipedia or Wiki Commons pages which are the results of the search tools.
 
+**Examples**
+Bad writing:
+
+Based on the text and watermarks visible in the provided image, the stock photography agency is Alamy. The question asks about a specific photograph from a different media repository that Alamy is known to source content from. My first step is to identify this repository.
+<action>
+{
+  "tool_name": "t2t_search",
+  "params": {
+    "query": "Alamy sources content from Wikimedia Commons"
+  },
+  "goal": "To determine if Alamy sources content from the freely licensed media repository, Wikimedia Commons, as suggested by the question's description."
+}
+</action>
+
+Discuss: In this example, thee answer never mentioned Wiki Commons during the analysis stage, yet it directly searched whether Alamy is related to Wiki Commons. At that point, Wiki Commons was an unsupported clue that appeared out of nowhere, which violates Rule 4. A better version of the writing would be:
+
+Based on the text and watermarks visible in the provided image, the stock photography agency is Alamy. The question asks about a specific photograph from a different media repository that Alamy is known to source content from. My first step is to identify this repository. Since the clue given in the question is "a large, freely licensed media repository," Wiki Commons may be a possible answer, but there is no evidence yet. So for now, I should first search which repository Alamy sources content from.
+<action>
+{
+"tool_name": "t2t_search",
+"params": {
+"query": "Which large and freely licensed repository does Alamy sources content from"
+},
+"goal": "Confirm which large freely licensed media repository Alamy sources content from."
+}
+</action>
+
+Discuss: In this version, the answer is more logically rigorous, the reasoning is more careful, and there are no clues appearing from nowhere. You should learn from this style of writing and avoid bad writing like the earlier version.
+****
 """
 
 MANUAL_REACT_PROTOCOL = """
@@ -52,9 +81,7 @@ When you writing the standard answer, you can use tools following these useful t
 2. i2i_search is very useful for identifying unfamiliar people or objects in the image. Note that the return results might be not related to your original image, so you should first select the search results that are likely to match your current image textually, then use read_url to download those images and inspect their content. Once you determine that the new image and the previous image depict the same object, you can use the description of the new image to figure out who or what that object is. You should reflect this logic in the standard answer.
 3. t2i_search retrieves relevant images based on a text description. You should review the returned information and then use read_url to inspect those images. Use this tool when the missing clues require you to inspect relevant images, or when the images you find are likely to help you answer the question. Note that after using this tool, the searched images are still not provided to you, and you should use `read_url` to inspect the corresponding images.
 
-You must answer exactly one step at a time.
-First write your visible reasoning in natural language.
-Then end your response with exactly one action block in the following format:
+You must answer exactly one step at a time. Then end your response with exactly one action block in the following format:
 
 <action>
 {
@@ -71,7 +98,6 @@ Rules:
 - The content inside <action> must be valid JSON.
 - The JSON must contain exactly these top-level keys: tool_name, params, goal.
 
-If the evidence is enough, summarize and conclude your final answer in the end.
 """
 
 _MANUAL_REACT_ACTIONS = {"t2t_search", "t2i_search", "i2i_search", "read_url", "finish"}
