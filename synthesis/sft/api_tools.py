@@ -415,6 +415,13 @@ def _extract_xml_tag_content(text: str, tag_name: str) -> str:
     return match.group(1).strip()
 
 
+def _strip_action_blocks(text: str) -> str:
+    if not text:
+        return ""
+    cleaned = _MANUAL_REACT_ACTION_RE.sub("", text)
+    return cleaned.strip()
+
+
 def _latest_user_text(messages: list[dict[str, Any]]) -> str:
     for message in reversed(messages):
         if message.get("role") != "user":
@@ -549,7 +556,9 @@ def _maybe_repair_i2i_tool_call(
             trace_label=f"i2i_wrapper_rewrite:{context.case_id}",
         )
         target_object = _extract_xml_tag_content(rewrite_text, "object")
-        revised_assistant_text = _extract_xml_tag_content(rewrite_text, "refined") or original_text
+        revised_assistant_text = _strip_action_blocks(
+            _extract_xml_tag_content(rewrite_text, "refined")
+        ) or original_text
         if not target_object:
             target_object = "the relevant object in the image"
     except Exception as exc:

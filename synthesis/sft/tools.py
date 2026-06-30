@@ -49,16 +49,6 @@ def get_tool_definitions() -> list[dict[str, Any]]:
                             "type": "string",
                             "description": "A concrete web search query string.",
                         },
-                        "lang": {
-                            "type": "string",
-                            "description": "Language code for search, such as en.",
-                            "default": "en",
-                        },
-                        "top_k": {
-                            "type": "integer",
-                            "description": "Maximum number of search results to return.",
-                            "default": MAX_SEARCH_RESULTS,
-                        },
                     },
                     "required": ["query"],
                 },
@@ -75,16 +65,6 @@ def get_tool_definitions() -> list[dict[str, Any]]:
                         "query": {
                             "type": "string",
                             "description": "A concrete image-search query string.",
-                        },
-                        "lang": {
-                            "type": "string",
-                            "description": "Language code for search, such as en.",
-                            "default": "en",
-                        },
-                        "top_k": {
-                            "type": "integer",
-                            "description": "Maximum number of image results to return.",
-                            "default": MAX_SEARCH_RESULTS,
                         },
                     },
                     "required": ["query"],
@@ -111,11 +91,6 @@ def get_tool_definitions() -> list[dict[str, Any]]:
                             "items": {"type": "number"},
                             "minItems": 4,
                             "maxItems": 4,
-                        },
-                        "top_k": {
-                            "type": "integer",
-                            "description": "Maximum number of reverse-image matches to return.",
-                            "default": MAX_SEARCH_RESULTS,
                         },
                     },
                     "required": [],
