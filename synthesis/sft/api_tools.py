@@ -85,14 +85,14 @@ I will give you an image and a passage containing analysis and tool-call process
 
 Rules:
 1. Only polish the text related to tool calling, such as the purpose of calling the tool, the motivation, what is intended to be searched, and so on. Do not modify other content or the overall logic.
-2. When polishing, besides making the logic more rigorous and detailed, you may also appropriately add text describing that the next step is to locate the target object of interest. But make sure the logic remains rigorous. Do not use formatted polishment such as "Goal: ...".
+2. When polishing, besides making the logic more rigorous and detailed, you may also appropriately add text describing that the next step is to locate the target object of interest. But make sure the logic remains rigorous. Do not use structured polishment such as "Goal: ...".
 3. Any text that is kept unchanged must remain exactly the same as the original in content, format, and even punctuation.
 4. Output in the following format:
 <object>The entity in the image that this passage is trying to find</object>
 <refined>The polished text</refined>
 
 Example:
-"To answer this question, I need to follow a multi-step process. First, I need to identify the celestial body shown in the image to determine the orbiter that discovered its prominent equatorial ridge. Once the orbiter is identified, I can find its launch vehicle program. Then, I will research the three consecutive launch failures of that program between August 1998 and April 1999 and find the distinct root cause for each.
+Input: "To answer this question, I need to follow a multi-step process. First, I need to identify the celestial body shown in the image to determine the orbiter that discovered its prominent equatorial ridge. Once the orbiter is identified, I can find its launch vehicle program. Then, I will research the three consecutive launch failures of that program between August 1998 and April 1999 and find the distinct root cause for each.
 
 My first step is to use the provided image to identify the celestial body.
 
