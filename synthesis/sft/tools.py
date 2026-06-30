@@ -235,55 +235,30 @@ def summarize_with_qwen(content: str, query: str, title: str) -> str:
 
 
 def summarize_image_search(result_obj: object) -> object:
-    """Reduce a raw image-search payload to compact identification data."""
+    """Normalize reverse-image search results to a compact fixed schema."""
 
-    try:
-        result_str = json.dumps(result_obj, ensure_ascii=False, indent=2)
-    except Exception:
-        result_str = str(result_obj)
+    def _normalize_item(item: object) -> dict[str, str] | None:
+        if not isinstance(item, dict):
+            return None
+        return {
+            "title": str(item.get("title", "") or item.get("name", "") or item.get("label", "")),
+            "source": str(item.get("source", "") or ""),
+            "link": str(item.get("link", "") or item.get("url", "") or ""),
+            "imageUrl": str(item.get("imageUrl", "") or item.get("image_url", "") or ""),
+            "thumbnailUrl": str(item.get("thumbnailUrl", "") or item.get("thumbnail_url", "") or ""),
+        }
 
-    prompt = (
-        "Extract only the relevant title/source information from the "
-        "following image search results. Return compact JSON.\n\n"
-        f"Image Search Results:\n{result_str[:3000]}"
-    )
-    try:
-        completion = _openai_client().chat.completions.create(
-            model=_summarizer_model(),
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=1024,
-            temperature=0.3,
-            extra_body={
-                "top_k": 20,
-                "chat_template_kwargs": {"enable_thinking": False},
-            },
-        )
-        content_text = completion.choices[0].message.content or ""
-        if content_text:
-            match = re.search(r"```(?:json)?\s*(\{.*?\}|\[.*?\])", content_text, re.DOTALL)
-            try:
-                if match:
-                    return json.loads(match.group(1))
-                return json.loads(content_text.strip())
-            except json.JSONDecodeError:
-                return {"summary": content_text.strip()}
-    except Exception as exc:  # pragma: no cover - network bound
-        logger.warning("Image search summarization failed: %s", exc)
+    if isinstance(result_obj, list):
+        return [normalized for item in result_obj if (normalized := _normalize_item(item)) is not None]
 
     if isinstance(result_obj, dict):
-        filtered: dict[str, object] = {}
-        for src_key, dst_key in (
-            ("title", "title"),
-            ("name", "title"),
-            ("label", "title"),
-            ("source", "source"),
-            ("url", "source"),
-            ("link", "source"),
-        ):
-            if src_key in result_obj and dst_key not in filtered:
-                filtered[dst_key] = result_obj[src_key]
-        return filtered or result_obj
-    return result_obj
+        organic = result_obj.get("organic")
+        if isinstance(organic, list):
+            return [normalized for item in organic if (normalized := _normalize_item(item)) is not None]
+        normalized = _normalize_item(result_obj)
+        return [normalized] if normalized is not None else []
+
+    return []
 
 
 def _guess_image_from_url(url: str) -> bool:
@@ -481,10 +456,9 @@ def _image_search_via_serper(image_url: str, top_k: int = MAX_SEARCH_RESULTS) ->
             {
                 "title": item.get("title", ""),
                 "source": item.get("source", "") or item.get("link", ""),
-                "url": item.get("link", ""),
-                "image_url": item.get("imageUrl", ""),
-                "thumbnail_url": item.get("thumbnailUrl", ""),
-                "snippet": item.get("snippet", ""),
+                "link": item.get("link", ""),
+                "imageUrl": item.get("imageUrl", ""),
+                "thumbnailUrl": item.get("thumbnailUrl", ""),
             }
         )
     return results
@@ -507,16 +481,12 @@ def i2i_search(
             result = visual_lookup(image_url=image_url, top_k=top_k)
             if isinstance(result, dict) and "error" in result:
                 raise RuntimeError(str(result["error"]))
-            if isinstance(result, list):
-                result = result[:top_k]
-            print(result, "#######")
-            summarized = summarize_image_search(result)
-            print(summarized, "#######")
+            matches = summarize_image_search(result)
             return {
                 "ok": True,
                 "image_url": image_url,
                 "top_k": top_k,
-                "matches": summarized,
+                "matches": matches[:top_k] if isinstance(matches, list) else matches,
             }
         except Exception as exc:  # pragma: no cover - network bound
             last_error = exc
