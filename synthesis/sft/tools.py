@@ -206,13 +206,36 @@ def _summarizer_model() -> str:
     )
 
 
-def summarize_with_qwen(content: str, query: str, title: str) -> str:
-    """Summarize webpage content with an OpenAI-compatible client."""
+def summarize_with_qwen(
+    content: str,
+    query: str,
+    title: str,
+    question_text: str = "",
+    assistant_output: str = "",
+) -> str:
+    """Compress webpage content while preserving information relevant to the current task."""
 
     prompt = (
-        f"Based on the following webpage content, extract and summarize the content that is RELEVANT to the query: \"{query}\"\n "
-        f"Webpage Title: {title}\n"
-        f"Content:\n{content[:10000]}\n\n"
+        "You are cleaning and compressing raw webpage content for a multi-hop question-answering agent.\n\n"
+        "Your job is NOT to write a short abstract. Your job is to produce a cleaned, compressed version of the "
+        "page that preserves all information relevant to the current question and the agent's current reasoning step, "
+        "while aggressively removing noise.\n\n"
+        "Compression rules:\n"
+        "1. Keep all facts that may help answer the current question or the agent's current sub-goal.\n"
+        "2. Preserve important details exactly when possible, including names, dates, numbers, relationships, quotes, "
+        "titles, roles, locations, and qualifiers.\n"
+        "3. If a paragraph is relevant, keep its meaning complete. Do not over-compress it into vague statements.\n"
+        "4. Remove noise completely when it is not relevant: navigation text, menus, repeated headers, footer text, "
+        "social buttons, unrelated recommendations, boilerplate, tracking text, and raw URL lists.\n"
+        "5. If a section is only partially relevant, keep the relevant sentences and shorten the rest.\n"
+        "6. Do not add outside knowledge. Do not infer missing facts. Do not rewrite the article into bullet points "
+        "unless the source itself is structured that way.\n"
+        "7. Output only the cleaned article text.\n\n"
+        f"Original question:\n{question_text or query}\n\n"
+        f"Agent's current output:\n{assistant_output or '(empty)'}\n\n"
+        f"Focused query for this URL:\n{query or '(empty)'}\n\n"
+        f"Webpage title:\n{title or '(untitled)'}\n\n"
+        f"Raw webpage content:\n{content[:10000]}\n"
     )
     try:
         completion = _openai_client().chat.completions.create(
@@ -340,7 +363,12 @@ def _read_document(url: str) -> dict[str, Any]:
     }
 
 
-def read_url(url: str, query: str = "") -> dict[str, Any]:
+def read_url(
+    url: str,
+    query: str = "",
+    question_text: str = "",
+    assistant_output: str = "",
+) -> dict[str, Any]:
     """Read a URL as either text content or a downloadable image."""
 
     normalized_url = (url or "").strip()
@@ -375,7 +403,17 @@ def read_url(url: str, query: str = "") -> dict[str, Any]:
 
     content = document.get("content", "") or ""
     title = document.get("title", "") or ""
-    summarized_content = summarize_with_qwen(content=content, query=query, title=title) if query else content[:500]
+    summarized_content = (
+        summarize_with_qwen(
+            content=content,
+            query=query,
+            title=title,
+            question_text=question_text,
+            assistant_output=assistant_output,
+        )
+        if query or question_text or assistant_output
+        else content[:500]
+    )
     return {
         "ok": True,
         "kind": "text",

@@ -64,7 +64,7 @@ Based on the text and watermarks visible in the provided image, the stock photog
 {
 "tool_name": "t2t_search",
 "params": {
-"query": "Which large and freely licensed repository does Alamy sources content from"
+"query": "The large repository Alamy sources content from"
 },
 "goal": "Confirm which large freely licensed media repository Alamy sources content from."
 }
@@ -1414,6 +1414,8 @@ def execute_tool_call(
     name: str,
     arguments: dict[str, Any],
     context: ToolRuntimeContext,
+    question_text: str = "",
+    assistant_text: str = "",
 ) -> ToolExecutionResult:
     """Execute one tool call against the runtime context."""
 
@@ -1448,7 +1450,12 @@ def execute_tool_call(
         if not url:
             output = {"ok": False, "error": "url is required for read_url"}
             return ToolExecutionResult(name=name, arguments=params, output=output, output_text=_json_text(output))
-        output = tools.read_url(url=url, query=params.get("query", "") or "")
+        output = tools.read_url(
+            url=url,
+            query=params.get("query", "") or "",
+            question_text=question_text,
+            assistant_output=assistant_text,
+        )
         new_images: dict[str, Any] = {}
         if output.get("ok") and output.get("local_path"):
             image_id = context.register_image(output["local_path"])
@@ -1671,7 +1678,13 @@ class OpenAIToolAgent:
                 final_text = str(step.action_input.get("answer") or step.raw_text).strip()
                 break
 
-            result = execute_tool_call(step.action, execution_action_input, context)
+            result = execute_tool_call(
+                step.action,
+                execution_action_input,
+                context,
+                question_text=_latest_user_text(conversation_messages),
+                assistant_text=_strip_action_blocks(repaired_step_text),
+            )
             tool_results.append(result)
             conversation_messages.append(
                 {
@@ -1784,7 +1797,13 @@ class OpenAIToolAgent:
                 )
             )
             for tool_name, execution_args, tool_call_id in execution_payloads:
-                result = execute_tool_call(tool_name, execution_args, context)
+                result = execute_tool_call(
+                    tool_name,
+                    execution_args,
+                    context,
+                    question_text=_latest_user_text(conversation_messages),
+                    assistant_text=assistant_content,
+                )
                 tool_results.append(result)
                 conversation_messages.append(
                     {
@@ -1913,7 +1932,13 @@ class OpenAIToolAgent:
                 )
             )
             for tool_name, execution_args, tool_call_id in execution_payloads:
-                result = execute_tool_call(tool_name, execution_args, context)
+                result = execute_tool_call(
+                    tool_name,
+                    execution_args,
+                    context,
+                    question_text=_latest_user_text(conversation_messages),
+                    assistant_text=assistant_content,
+                )
                 tool_results.append(result)
                 conversation_messages.append(
                     {
