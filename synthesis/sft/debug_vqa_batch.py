@@ -859,6 +859,7 @@ def _config_from_model_arg(
     if model_config is not None:
         sampling_params = dict(model_config.get("sampling_params") or {})
         served_model = str(model_config.get("served_model") or model_arg or "").strip()
+        resolved_model = str(model_arg or "").strip() if api_mode == "manual_react" else served_model
         resolved_temperature = sampling_params.pop("temperature", temperature)
         if resolved_temperature is not None:
             resolved_temperature = float(resolved_temperature)
@@ -872,7 +873,7 @@ def _config_from_model_arg(
         client_type = str(model_config.get("client_type") or "openai")
         extra_body = sampling_params or None
         return build_agent_config(
-            model=served_model,
+            model=resolved_model,
             api_key=model_config.get("api_key") or api_key,
             client_type=client_type,
             azure_endpoint=model_config.get("azure_endpoint") or azure_endpoint,
