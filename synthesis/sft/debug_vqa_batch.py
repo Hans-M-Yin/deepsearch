@@ -255,13 +255,6 @@ def _write_jsonl_record(handle: Any, record: dict[str, Any]) -> None:
     handle.flush()
 
 
-def _registered_model_alias(alias: str | None) -> str | None:
-    normalized = str(alias or "").strip()
-    if not normalized:
-        return None
-    return normalized if _resolve_model_alias(normalized) is not None else None
-
-
 def _worker_generate_json(
     *,
     model_alias: str | None,
@@ -830,15 +823,6 @@ def _parse_json_flag(value: str | None) -> dict[str, Any] | None:
     return parsed
 
 
-def _resolve_model_alias(alias_or_model: str | None) -> dict[str, Any] | None:
-    if not alias_or_model:
-        return None
-    try:
-        return LLM_WORKER.get_model(alias_or_model)
-    except Exception:
-        return None
-
-
 def _config_from_model_arg(
     *,
     model_arg: str | None,
@@ -855,41 +839,6 @@ def _config_from_model_arg(
     max_turns: int,
     print_rounds: bool,
 ) -> Any:
-    model_config = _resolve_model_alias(model_arg)
-    if model_config is not None:
-        sampling_params = dict(model_config.get("sampling_params") or {})
-        served_model = str(model_config.get("served_model") or model_arg or "").strip()
-        resolved_model = str(model_arg or "").strip() if api_mode == "manual_react" else served_model
-        resolved_temperature = sampling_params.pop("temperature", temperature)
-        if resolved_temperature is not None:
-            resolved_temperature = float(resolved_temperature)
-        resolved_max_tokens = max_tokens
-        if resolved_max_tokens is None:
-            out_seq_length = sampling_params.pop("out_seq_length", None)
-            max_tokens_in_config = sampling_params.pop("max_tokens", None)
-            chosen = out_seq_length if out_seq_length is not None else max_tokens_in_config
-            if chosen is not None:
-                resolved_max_tokens = int(chosen)
-        client_type = str(model_config.get("client_type") or "openai")
-        extra_body = sampling_params or None
-        return build_agent_config(
-            model=resolved_model,
-            api_key=model_config.get("api_key") or api_key,
-            client_type=client_type,
-            azure_endpoint=model_config.get("azure_endpoint") or azure_endpoint,
-            base_url=model_config.get("base_url"),
-            api_version=model_config.get("api_version") or api_version,
-            api_mode=api_mode,
-            max_tokens=resolved_max_tokens,
-            temperature=resolved_temperature,
-            timeout_s=float(model_config.get("timeout_s") or timeout_s),
-            system_prompt=system_prompt,
-            headers=model_config.get("default_headers") or _parse_json_flag(headers_json),
-            extra_body=extra_body or _parse_json_flag(extra_body_json),
-            max_turns=max_turns,
-            print_rounds=print_rounds,
-        )
-
     return build_agent_config(
         model=model_arg,
         api_key=api_key,
