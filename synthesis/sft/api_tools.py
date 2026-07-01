@@ -27,7 +27,7 @@ from synthesis.model_worker import LLM_WORKER
 from synthesis.model_worker import ModelMessage
 from synthesis.model_worker import ModelRequest
 from . import tools
-
+import sys
 
 logger = logging.getLogger(__name__)
 
