@@ -11,9 +11,9 @@ from .api_tools import DEFAULT_SYSTEM_PROMPT
 from .api_tools import OpenAIToolAgent
 from .api_tools import OpenAIToolAgentConfig
 from .api_tools import ToolRuntimeContext
-from .model_worker import LLM_WORKER
-from .model_worker import ModelMessage
-from .model_worker import ModelRequest
+from ..model_worker import LLM_WORKER
+from ..model_worker import ModelMessage
+from ..model_worker import ModelRequest
 
 
 Message = dict[str, Any]
