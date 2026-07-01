@@ -299,19 +299,6 @@ def _guess_image_from_url(url: str) -> bool:
     guessed_type, _ = mimetypes.guess_type(urlparse(url).path)
     return bool(guessed_type and guessed_type.startswith("image/"))
 
-
-def _augment_image_search_query(query: str) -> str:
-    normalized_query = str(query or "").strip()
-    if not normalized_query:
-        return normalized_query
-    augmented = normalized_query
-    for domain in T2I_BLOCKED_IMAGE_SEARCH_DOMAINS:
-        exclusion = f"-site:{domain}"
-        if exclusion.lower() not in augmented.lower():
-            augmented = f"{augmented} {exclusion}".strip()
-    return augmented
-
-
 def _url_matches_blocked_domain(url: str) -> bool:
     normalized_url = str(url or "").strip()
     if not normalized_url:
@@ -536,9 +523,8 @@ def t2i_search(query: str, lang: str = "en", top_k: int = 5) -> dict[str, Any]:
     """Search images from a text query."""
 
     top_k = max(1, min(int(top_k), MAX_SEARCH_RESULTS))
-    effective_query = _augment_image_search_query(query)
     fetch_limit = min(max(top_k * 3, top_k), 20)
-    response = _serper_client().search_image(effective_query, limit=fetch_limit, hl=lang)
+    response = _serper_client().search_image(query, limit=fetch_limit, hl=lang)
     results: list[dict[str, Any]] = []
     for item in response.results:
         if _url_matches_blocked_domain(item.image_url or ""):
