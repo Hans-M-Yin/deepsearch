@@ -315,6 +315,15 @@ def _url_matches_blocked_domain(url: str) -> bool:
     )
 
 
+def _sanitize_t2i_query(query: str) -> str:
+    normalized_query = str(query or "").strip()
+    if not normalized_query:
+        return normalized_query
+    sanitized = re.sub(r"[^\w\s\u4e00-\u9fff]", " ", normalized_query)
+    sanitized = re.sub(r"\s+", " ", sanitized).strip()
+    return sanitized or normalized_query
+
+
 def _probe_content_type(url: str) -> str:
     try:
         response = requests.head(url, allow_redirects=True, timeout=20)
@@ -524,7 +533,8 @@ def t2i_search(query: str, lang: str = "en", top_k: int = 5) -> dict[str, Any]:
 
     top_k = max(1, min(int(top_k), MAX_SEARCH_RESULTS))
     fetch_limit = min(max(top_k * 3, top_k), 20)
-    response = _serper_client().search_image(query, limit=fetch_limit, hl=lang)
+    effective_query = _sanitize_t2i_query(query)
+    response = _serper_client().search_image(effective_query, limit=fetch_limit, hl=lang)
     results: list[dict[str, Any]] = []
     for item in response.results:
         if _url_matches_blocked_domain(item.image_url or ""):
