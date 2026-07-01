@@ -498,7 +498,7 @@ class SerperAdapterSearchClient:
     @staticmethod
     def _serper_body(query: str, limit: int, params: dict[str, Any]) -> dict[str, Any]:
         body = {
-            "q": _augment_query_with_site_exclusion(query, "wikipedia.org"),
+            "q": query,
             "num": max(1, min(int(limit), 100)),
         }
         for src_key, dst_key in (
@@ -645,7 +645,7 @@ class SerperSearchClient:
     @staticmethod
     def _serper_body(query: str, limit: int, params: dict[str, Any]) -> dict[str, Any]:
         body = {
-            "q": _augment_query_with_site_exclusion(query, "wikipedia.org"),
+            "q": query,
             "num": max(1, min(int(limit), 100)),
         }
         for src_key, dst_key in (
