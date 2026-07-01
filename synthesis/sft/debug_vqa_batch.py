@@ -93,13 +93,13 @@ Rules:
 """
 
 
-PROMPT_POLISH_CORRECT_ASSISTANT_STEP = """You are polishing one assistant turn inside a correct tool-using trajectory.
+PROMPT_POLISH_CORRECT_ASSISTANT_STEP = """You are polishing one assistant analysis turn inside a correct tool-using trajectory.
 
 Rules:
-- Rewrite only the current assistant message.
-- Keep all claims faithful to the provided history and current tool result.
-- Make the logic tighter, the reasoning more explicit, and the next-step motivation clearer.
-- Do not modify historical messages, the tool message, or the overall search direction.
+- Rewrite only the current analysis under "====当前分析====".
+- Use both the earlier trajectory and the tool shown under "====下轮工具====" to improve continuity.
+- Keep all claims faithful to the provided trajectory and tool outputs.
+- Do not modify historical analyses, tool results, or the overall search direction.
 - Do not add unsupported facts.
 
 Return strict JSON:
@@ -259,18 +259,19 @@ def _worker_generate_json(
     *,
     model_alias: str | None,
     system_prompt: str,
-    payload: dict[str, Any],
+    payload: Any,
     max_tokens: int,
     trace_label: str,
 ) -> dict[str, Any]:
     if not model_alias:
         raise RuntimeError("A registered model alias is required for LLM_WORKER generation.")
+    user_content = payload if isinstance(payload, str) else json.dumps(payload, ensure_ascii=False, indent=2)
     return LLM_WORKER.generate_json(
         ModelRequest(
             model=model_alias,
             messages=[
                 ModelMessage(role="system", content=system_prompt),
-                ModelMessage(role="user", content=json.dumps(payload, ensure_ascii=False, indent=2)),
+                ModelMessage(role="user", content=user_content),
             ],
             response_format={"type": "json_object"},
             max_tokens=max_tokens,
@@ -287,15 +288,48 @@ def _message_content_to_text(content: Any) -> str:
     return json.dumps(content, ensure_ascii=False, indent=2)
 
 
-def _message_for_polish_payload(message: dict[str, Any]) -> dict[str, Any]:
-    payload = {
-        "role": message.get("role"),
-        "content": _message_content_to_text(message.get("content")),
-    }
-    if message.get("role") == "tool":
-        payload["name"] = message.get("name")
-        payload["tool_call_id"] = message.get("tool_call_id")
-    return payload
+def _message_text_for_transcript(message: dict[str, Any]) -> str:
+    role = str(message.get("role") or "")
+    content = _message_content_to_text(message.get("content")).strip()
+    if role == "tool":
+        tool_name = str(message.get("name") or "").strip()
+        if tool_name:
+            return f"[{tool_name}]\n{content}" if content else f"[{tool_name}]"
+    return content
+
+
+def _build_correct_polish_prompt(
+    *,
+    question: str,
+    history_messages: list[dict[str, Any]],
+    current_assistant_message: str,
+    next_tool_message: dict[str, Any] | None,
+) -> str:
+    history_lines: list[str] = []
+    for message in history_messages:
+        role = str(message.get("role") or "")
+        if role == "assistant":
+            history_lines.append(f"agent:{_message_text_for_transcript(message)}")
+        elif role == "tool":
+            history_lines.append(f"tool:{_message_text_for_transcript(message)}")
+
+    history_block = "\n\n".join(line for line in history_lines if line).strip()
+    next_tool_text = ""
+    if next_tool_message is not None:
+        next_tool_text = f"tool:{_message_text_for_transcript(next_tool_message)}".strip()
+
+    parts = [
+        f"问题\n{question.strip()}",
+        "",
+        "==== History analysis ====",
+        history_block,
+        "==== Current analysis ====",
+        f"agent:{current_assistant_message.strip()}",
+        "",
+        "==== Next tool ====",
+        next_tool_text,
+    ]
+    return "\n".join(parts).strip()
 
 
 def _correct_polish_candidate_indices(messages: list[dict[str, Any]]) -> list[int]:
@@ -422,10 +456,8 @@ def polish_correct_trajectory(
 
         if previous_role == "tool":
             history_messages = polished_messages[: assistant_index - 1]
-            current_tool_message = previous_message
         elif previous_role == "user":
             history_messages = polished_messages[:assistant_index]
-            current_tool_message = None
         else:
             step_records.append(
                 {
@@ -447,20 +479,20 @@ def polish_correct_trajectory(
             )
             continue
 
-        payload = {
-            "question": raw_record.get("question") or "",
-            "history_messages": [_message_for_polish_payload(message) for message in history_messages],
-            "current_tool_message": (
-                _message_for_polish_payload(current_tool_message) if current_tool_message is not None else None
-            ),
-            "current_assistant_message": current_content,
-        }
+        next_message = polished_messages[assistant_index + 1] if assistant_index + 1 < len(polished_messages) else None
+        next_tool_message = next_message if isinstance(next_message, dict) and next_message.get("role") == "tool" else None
+        prompt_text = _build_correct_polish_prompt(
+            question=str(raw_record.get("question") or ""),
+            history_messages=history_messages,
+            current_assistant_message=current_content,
+            next_tool_message=next_tool_message,
+        )
 
         try:
             parsed = _worker_generate_json(
                 model_alias=polish_model_alias,
                 system_prompt=PROMPT_POLISH_CORRECT_ASSISTANT_STEP,
-                payload=payload,
+                payload=prompt_text,
                 max_tokens=polish_max_tokens,
                 trace_label=f"sft_correct_polish:{raw_record.get('question_id') or 'question'}:{assistant_index}",
             )

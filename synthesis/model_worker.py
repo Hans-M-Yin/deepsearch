@@ -125,6 +125,15 @@ def _usage_int(value: Any) -> int:
         return 0
 
 
+def _get_usage_value(payload: Any, *path: str) -> Any:
+    current = payload
+    for key in path:
+        if not isinstance(current, dict):
+            return None
+        current = current.get(key)
+    return current
+
+
 class OpenAIModelWorkerClient:
     """OpenAI-compatible model worker.
 
@@ -625,6 +634,10 @@ class ModelRouterWorkerClient:
         prompt_tokens = _usage_int(usage.get("prompt_tokens"))
         completion_tokens = _usage_int(usage.get("completion_tokens"))
         total_tokens = _usage_int(usage.get("total_tokens"))
+        reasoning_tokens = _usage_int(_get_usage_value({"usage": usage}, "usage", "reasoning_tokens"))
+        cached_tokens = _usage_int(
+            _get_usage_value({"usage": usage}, "usage", "prompt_tokens_details", "cached_tokens")
+        )
         if total_tokens <= 0:
             total_tokens = prompt_tokens + completion_tokens
         with self._token_totals_lock:
@@ -635,12 +648,16 @@ class ModelRouterWorkerClient:
                     "prompt_tokens": 0,
                     "completion_tokens": 0,
                     "total_tokens": 0,
+                    "reasoning_tokens": 0,
+                    "cached_tokens": 0,
                 },
             )
             totals["calls"] += 1
             totals["prompt_tokens"] += prompt_tokens
             totals["completion_tokens"] += completion_tokens
             totals["total_tokens"] += total_tokens
+            totals["reasoning_tokens"] += reasoning_tokens
+            totals["cached_tokens"] += cached_tokens
             snapshot = dict(totals)
         ##### DEBUG #####
         print(
@@ -650,10 +667,14 @@ class ModelRouterWorkerClient:
             f" call_prompt_tokens={prompt_tokens}"
             f" call_completion_tokens={completion_tokens}"
             f" call_total_tokens={total_tokens}"
+            f" call_reasoning_tokens={reasoning_tokens}"
+            f" call_cached_tokens={cached_tokens}"
             f" cumulative_calls={snapshot['calls']}"
             f" cumulative_prompt_tokens={snapshot['prompt_tokens']}"
             f" cumulative_completion_tokens={snapshot['completion_tokens']}"
-            f" cumulative_total_tokens={snapshot['total_tokens']}",
+            f" cumulative_total_tokens={snapshot['total_tokens']}"
+            f" cumulative_reasoning_tokens={snapshot['reasoning_tokens']}"
+            f" cumulative_cached_tokens={snapshot['cached_tokens']}",
             file=sys.stderr,
             flush=True,
         )
