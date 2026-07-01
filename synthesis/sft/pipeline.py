@@ -11,6 +11,9 @@ from .api_tools import DEFAULT_SYSTEM_PROMPT
 from .api_tools import OpenAIToolAgent
 from .api_tools import OpenAIToolAgentConfig
 from .api_tools import ToolRuntimeContext
+from .model_worker import LLM_WORKER
+from .model_worker import ModelMessage
+from .model_worker import ModelRequest
 
 
 Message = dict[str, Any]
@@ -66,6 +69,15 @@ def _try_parse_json_text(text: str) -> Any | None:
     try:
         return json.loads(candidate)
     except json.JSONDecodeError:
+        return None
+
+
+def _resolve_registered_model_alias(alias_or_model: str | None) -> dict[str, Any] | None:
+    if not alias_or_model:
+        return None
+    try:
+        return LLM_WORKER.get_model(alias_or_model)
+    except Exception:
         return None
 
 
@@ -415,21 +427,28 @@ def check_hop_chain_coverage(
         ),
         print_rounds=False,
     )
-    client = OpenAIToolAgent(agent_config).client
-    completion_kwargs: dict[str, Any] = {
-        "model": agent_config.model,
-        "messages": [
-            {"role": "system", "content": agent_config.system_prompt},
-            {"role": "user", "content": prompt},
-        ],
-        "max_tokens": agent_config.max_tokens,
-        "stream": False,
-        "response_format": {"type": "json_object"},
-    }
-    if agent_config.temperature is not None:
-        completion_kwargs["temperature"] = agent_config.temperature
-    completion = client.chat.completions.create(**completion_kwargs)
-    content = completion.choices[0].message.content or "{}"
+    if _resolve_registered_model_alias(agent_config.model) is None:
+        raise ValueError(
+            "check_hop_chain_coverage requires `config.model` to be a registered LLM_WORKER model alias. "
+            f"Got: {agent_config.model!r}"
+        )
+    response = LLM_WORKER.generate(
+        ModelRequest(
+            model=agent_config.model,
+            messages=[
+                ModelMessage(role="system", content=agent_config.system_prompt),
+                ModelMessage(role="user", content=prompt),
+            ],
+            temperature=agent_config.temperature,
+            max_tokens=agent_config.max_tokens,
+            response_format={"type": "json_object"},
+            metadata={
+                "trace_label": "hop_chain_coverage",
+                **({"extra_body": agent_config.extra_body} if agent_config.extra_body else {}),
+            },
+        )
+    )
+    content = response.content or "{}"
     parsed = _try_parse_json_text(content)
     if not isinstance(parsed, dict):
         parsed = {
