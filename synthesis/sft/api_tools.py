@@ -1530,13 +1530,16 @@ class OpenAIToolAgent:
 
     def __init__(self, config: OpenAIToolAgentConfig) -> None:
         self.config = config
-        self._worker_model_alias = (
-            config.model
-            if config.api_mode == "manual_react" and _resolve_registered_model_alias(config.model) is not None
-            else None
-        )
+        self._worker_model_alias = None
         self.client = None
-        if self._worker_model_alias is not None:
+        if config.api_mode == "manual_react":
+            resolved_alias = _resolve_registered_model_alias(config.model)
+            if resolved_alias is None:
+                raise ValueError(
+                    "manual_react requires `config.model` to be a registered LLM_WORKER model alias. "
+                    f"Got: {config.model!r}"
+                )
+            self._worker_model_alias = config.model
             return
 
         try:
@@ -1654,6 +1657,11 @@ class OpenAIToolAgent:
         tool_results: list[ToolExecutionResult] = []
         raw_responses: list[dict[str, Any]] = []
         final_text = ""
+        print(
+            f"[manual_react backend] llm_worker alias={self._worker_model_alias}",
+            file=sys.stderr,
+            flush=True,
+        )
 
         for turn_index in range(self.config.max_turns):
             request_messages = _build_manual_react_request_messages(
@@ -1661,43 +1669,18 @@ class OpenAIToolAgent:
                 context,
                 system_prompt or self.config.system_prompt,
             )
-            if self._worker_model_alias is not None:
-                _, worker_response = self._call_worker_chat_completions(
-                    messages=request_messages,
-                    trace_label=f"manual_react_turn_{turn_index + 1}",
-                    stop=["</action>"],
-                )
-                raw_response = worker_response.raw_response or {"content": worker_response.content}
-                raw_responses.append(raw_response)
-                finish_reason = worker_response.metadata.get("finish_reason")
-                assistant_text = _complete_trailing_action_block(
-                    worker_response.content or "",
-                    finish_reason,
-                )
-            else:
-                kwargs: dict[str, Any] = {
-                    "model": self.config.model,
-                    "messages": request_messages,
-                    "stream": False,
-                    "stop": ["</action>"],
-                }
-                if self.config.max_tokens is not None:
-                    kwargs["max_tokens"] = self.config.max_tokens
-                if self.config.temperature is not None:
-                    kwargs["temperature"] = self.config.temperature
-                if self.config.extra_body:
-                    kwargs["extra_body"] = self.config.extra_body
-
-                completion = self.client.chat.completions.create(**kwargs)
-                raw_responses.append(
-                    completion.model_dump() if hasattr(completion, "model_dump") else {"repr": repr(completion)}
-                )
-                choice = completion.choices[0]
-                assistant_message = choice.message
-                assistant_text = _complete_trailing_action_block(
-                    assistant_message.content or "",
-                    getattr(choice, "finish_reason", None),
-                )
+            _, worker_response = self._call_worker_chat_completions(
+                messages=request_messages,
+                trace_label=f"manual_react_turn_{turn_index + 1}",
+                stop=["</action>"],
+            )
+            raw_response = worker_response.raw_response or {"content": worker_response.content}
+            raw_responses.append(raw_response)
+            finish_reason = worker_response.metadata.get("finish_reason")
+            assistant_text = _complete_trailing_action_block(
+                worker_response.content or "",
+                finish_reason,
+            )
             if self.config.print_rounds:
                 print(f"\n=== Model Round {turn_index + 1} ===")
                 if assistant_text:
