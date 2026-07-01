@@ -342,6 +342,7 @@ def _probe_content_type(url: str) -> str:
     except Exception:
         pass
 
+    guessed_type = None
     if _guess_image_from_url(url):
         guessed_type, _ = mimetypes.guess_type(urlparse(url).path)
     return guessed_type or "image/*"
