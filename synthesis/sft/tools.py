@@ -31,6 +31,12 @@ MAX_SEARCH_RESULTS = 5
 MAX_DOWNLOADED_IMAGE_LONG_EDGE = 1920
 MAX_DOWNLOADED_IMAGE_SHORT_EDGE = 1080
 RESIZED_IMAGE_LONG_EDGE = 1200
+T2I_BLOCKED_IMAGE_SEARCH_DOMAINS = (
+    "facebook.com",
+    "m.facebook.com",
+    "lookaside.fbsbx.com",
+    "fbsbx.com",
+)
 
 
 def get_tool_definitions() -> list[dict[str, Any]]:
@@ -294,6 +300,34 @@ def _guess_image_from_url(url: str) -> bool:
     return bool(guessed_type and guessed_type.startswith("image/"))
 
 
+def _augment_image_search_query(query: str) -> str:
+    normalized_query = str(query or "").strip()
+    if not normalized_query:
+        return normalized_query
+    augmented = normalized_query
+    for domain in T2I_BLOCKED_IMAGE_SEARCH_DOMAINS:
+        exclusion = f"-site:{domain}"
+        if exclusion.lower() not in augmented.lower():
+            augmented = f"{augmented} {exclusion}".strip()
+    return augmented
+
+
+def _url_matches_blocked_domain(url: str) -> bool:
+    normalized_url = str(url or "").strip()
+    if not normalized_url:
+        return False
+    try:
+        hostname = (urlparse(normalized_url).hostname or "").lower()
+    except Exception:
+        return False
+    if not hostname:
+        return False
+    return any(
+        hostname == blocked_domain or hostname.endswith(f".{blocked_domain}")
+        for blocked_domain in T2I_BLOCKED_IMAGE_SEARCH_DOMAINS
+    )
+
+
 def _probe_content_type(url: str) -> str:
     try:
         response = requests.head(url, allow_redirects=True, timeout=20)
@@ -502,17 +536,26 @@ def t2i_search(query: str, lang: str = "en", top_k: int = 5) -> dict[str, Any]:
     """Search images from a text query."""
 
     top_k = max(1, min(int(top_k), MAX_SEARCH_RESULTS))
-    response = _serper_client().search_image(query, limit=top_k, hl=lang)
-    results = [
-        {
-            "title": item.title,
-            "image_url": item.image_url,
-            "source_page_url": item.source_page_url,
-            "snippet": item.snippet,
-            "rank": item.rank,
-        }
-        for item in response.results[:top_k]
-    ]
+    effective_query = _augment_image_search_query(query)
+    fetch_limit = min(max(top_k * 3, top_k), 20)
+    response = _serper_client().search_image(effective_query, limit=fetch_limit, hl=lang)
+    results: list[dict[str, Any]] = []
+    for item in response.results:
+        if _url_matches_blocked_domain(item.image_url or ""):
+            continue
+        if _url_matches_blocked_domain(item.source_page_url or ""):
+            continue
+        results.append(
+            {
+                "title": item.title,
+                "image_url": item.image_url,
+                "source_page_url": item.source_page_url,
+                "snippet": item.snippet,
+                "rank": item.rank,
+            }
+        )
+        if len(results) >= top_k:
+            break
     return {
         "ok": True,
         "query": query,
