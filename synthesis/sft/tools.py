@@ -10,11 +10,13 @@ import re
 import sys
 import tempfile
 import time
+from io import BytesIO
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlparse
 
 import requests
+from PIL import Image, ImageOps
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -26,6 +28,9 @@ from synthesis.wiki_text_builder import EnhancedReaderClient
 
 logger = logging.getLogger(__name__)
 MAX_SEARCH_RESULTS = 5
+MAX_DOWNLOADED_IMAGE_LONG_EDGE = 1920
+MAX_DOWNLOADED_IMAGE_SHORT_EDGE = 1080
+RESIZED_IMAGE_LONG_EDGE = 1200
 
 
 def get_tool_definitions() -> list[dict[str, Any]]:
@@ -37,7 +42,7 @@ def get_tool_definitions() -> list[dict[str, Any]]:
             "function": {
                 "name": "t2t_search",
                 "description": (
-                    "Search text/web documents from a text query. Returns "
+                    "Search text/web documents on Google from a text query. Returns "
                     "search results such as title, url, and snippet. If the "
                     "agent wants the full content of a result, it should call "
                     "read_url separately."
@@ -58,7 +63,7 @@ def get_tool_definitions() -> list[dict[str, Any]]:
             "type": "function",
             "function": {
                 "name": "t2i_search",
-                "description": "Search images from a text query.",
+                "description": "Search images from a text query on Google.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -76,7 +81,7 @@ def get_tool_definitions() -> list[dict[str, Any]]:
             "function": {
                 "name": "i2i_search",
                 "description": (
-                    "Search for visually similar or matching images from the most recent image in the current context. "
+                    "Search for visually similar or matching images from the most recent image in the current context."
                     "You can locate the bounding box of the entity you want to recognize in the image and then search that region separately as an image."
                 ),
                 "parameters": {
@@ -309,8 +314,52 @@ def _probe_content_type(url: str) -> str:
 
     if _guess_image_from_url(url):
         guessed_type, _ = mimetypes.guess_type(urlparse(url).path)
-        return guessed_type or "image/*"
-    return ""
+    return guessed_type or "image/*"
+
+
+def _maybe_resize_downloaded_image(
+    payload: bytes,
+    *,
+    content_type: str,
+) -> tuple[bytes, str]:
+    try:
+        with Image.open(BytesIO(payload)) as image:
+            normalized = ImageOps.exif_transpose(image)
+            width, height = normalized.size
+            long_edge = max(width, height)
+            short_edge = min(width, height)
+            if (
+                long_edge <= MAX_DOWNLOADED_IMAGE_LONG_EDGE
+                and short_edge <= MAX_DOWNLOADED_IMAGE_SHORT_EDGE
+            ):
+                return payload, content_type
+
+            resized = normalized.copy()
+            resized.thumbnail(
+                (RESIZED_IMAGE_LONG_EDGE, RESIZED_IMAGE_LONG_EDGE),
+                Image.Resampling.LANCZOS,
+            )
+            output = BytesIO()
+            target_format = (normalized.format or "").upper()
+            has_alpha = resized.mode in ("RGBA", "LA") or (
+                resized.mode == "P" and "transparency" in resized.info
+            )
+            if has_alpha:
+                resized.save(output, format="PNG", optimize=True)
+                return output.getvalue(), "image/png"
+
+            if target_format not in {"JPEG", "JPG", "WEBP"}:
+                target_format = "JPEG"
+            if resized.mode not in ("RGB", "L"):
+                resized = resized.convert("RGB")
+            if target_format == "WEBP":
+                resized.save(output, format="WEBP", quality=90, method=6)
+                return output.getvalue(), "image/webp"
+
+            resized.save(output, format="JPEG", quality=90, optimize=True)
+            return output.getvalue(), "image/jpeg"
+    except Exception:
+        return payload, content_type
 
 
 def _read_via_jina(url: str) -> str:
@@ -381,18 +430,22 @@ def read_url(
     if content_type.startswith("image/"):
         temp_dir = tempfile.mkdtemp(prefix="synthesis_sft_read_url_")
         filename = os.path.basename(urlparse(normalized_url).path) or "downloaded_image"
-        if not os.path.splitext(filename)[1]:
-            extension = mimetypes.guess_extension(content_type) or ".png"
-            filename = f"{filename}{extension}"
-        save_path = os.path.join(temp_dir, filename)
         response = requests.get(normalized_url, timeout=60)
         response.raise_for_status()
+        image_bytes, resolved_content_type = _maybe_resize_downloaded_image(
+            response.content,
+            content_type=content_type,
+        )
+        extension = mimetypes.guess_extension(resolved_content_type) or os.path.splitext(filename)[1] or ".png"
+        stem = os.path.splitext(filename)[0] or "downloaded_image"
+        filename = f"{stem}{extension}"
+        save_path = os.path.join(temp_dir, filename)
         with open(save_path, "wb") as handle:
-            handle.write(response.content)
+            handle.write(image_bytes)
         return {
             "ok": True,
             "url": normalized_url,
-            "content_type": content_type,
+            "content_type": resolved_content_type,
             "local_path": save_path,
         }
 

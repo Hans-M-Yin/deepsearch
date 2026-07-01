@@ -177,7 +177,6 @@ class OpenAIModelWorkerClient:
             "model": request.model or self.model,
             "messages": [message.to_dict() for message in request.messages],
         }
-        # print(kwargs['messages'])
         if request.temperature is not None:
             kwargs["temperature"] = request.temperature
         if request.max_tokens is not None:
@@ -187,14 +186,17 @@ class OpenAIModelWorkerClient:
         reasoning_effort = request.metadata.get("reasoning_effort")
         if reasoning_effort is not None and _is_gpt_model_name(request.model or self.model):
             kwargs["reasoning_effort"] = _normalize_reasoning_effort(reasoning_effort)
-
+        stop = request.metadata.get("stop")
+        if isinstance(stop, list) and stop:
+            kwargs["stop"] = stop
+        elif isinstance(stop, str) and stop:
+            kwargs["stop"] = [stop]
         extra_body = request.metadata.get("extra_body")
         if isinstance(extra_body, dict):
             kwargs["extra_body"] = extra_body
 
         completion = self.client.chat.completions.create(**kwargs)
         elapsed_s = time.perf_counter() - started_at
-        # print(completion)
         choice = completion.choices[0]
         content = choice.message.content or ""
         _trace_model_call(
@@ -300,6 +302,9 @@ class AzureOpenAIModelWorkerClient:
             max_tokens=request.max_tokens,
         )
         started_at = time.perf_counter()
+        # Rebuild client per request when dynamic TT logid is enabled.
+        if self.generate_tt_logid:
+            self.client = self._build_client()
         kwargs: dict[str, Any] = {
             "model": request.model or self.model,
             "messages": [message.to_dict() for message in request.messages],
@@ -314,13 +319,15 @@ class AzureOpenAIModelWorkerClient:
         reasoning_effort = request.metadata.get("reasoning_effort")
         if reasoning_effort is not None and _is_gpt_model_name(request.model or self.model):
             kwargs["reasoning_effort"] = _normalize_reasoning_effort(reasoning_effort)
-
+        stop = request.metadata.get("stop")
+        if isinstance(stop, list) and stop:
+            kwargs["stop"] = stop
+        elif isinstance(stop, str) and stop:
+            kwargs["stop"] = [stop]
         extra_body = request.metadata.get("extra_body")
         if isinstance(extra_body, dict):
             kwargs["extra_body"] = extra_body
-        # Rebuild client per request when dynamic TT logid is enabled.
-        if self.generate_tt_logid:
-            self.client = self._build_client()
+
         completion = self.client.chat.completions.create(**kwargs)
         elapsed_s = time.perf_counter() - started_at
         choice = completion.choices[0]

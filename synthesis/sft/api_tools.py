@@ -77,9 +77,10 @@ Discuss: In this version, the answer is more logically rigorous, the reasoning i
 MANUAL_REACT_PROTOCOL = """
 When you writing the standard answer, you can use tools following these useful tips:
 
-1. t2t_search returns a list of URLs for text pages. You should select the potentially useful ones using the returned snippets, and then use the read_url tool to access the page content to get new clues. Use this tool when you need to look up world knowledge or content information.
-2. i2i_search is very useful for identifying unfamiliar people or objects in the image. Note that the return results might be not related to your original image, so you should first select the search results that are likely to match your current image according to the textual title, then use `read_url` to download those images and inspect their content. Once you determine that the new image and the previous image depict the same object, you can then use `read_url` again to read the linked page of the new image to figure out who or what that object is. You should reflect this logic in the standard answer.
+1. t2t_search is a google search tool that returns a list of URLs for text pages. You should select the potentially useful ones using the returned snippets, and then use the read_url tool to access the page content to get new clues. Use this tool when you need to look up world knowledge or content information.
+2. i2i_search is a google lens tool that is very useful for identifying unfamiliar people or objects in the image. Note that the return results might be not related to your original image, so you should first select the search results that are likely to match your current image according to the textual title, then use `read_url` to download those images and inspect their content. Once you determine that the new image and the previous image depict the same object, you can then use `read_url` again to read the linked page of the new image to figure out who or what that object is. You should reflect this logic in the standard answer.
 3. t2i_search retrieves relevant images based on a text description. You should review the returned information and then use read_url to inspect those images. Use this tool when the missing clues require you to inspect relevant images, or when the images you find are likely to help you answer the question. Note that after using this tool, the searched images are still not provided to you, and you should use `read_url` to inspect the corresponding images.
+4. After using i2i_search and t2i_search, images still cannot be seen in the standard answer; you need to call read_url to view the thumbnail or the original image.
 
 You must answer exactly one step at a time. Then end your response with exactly one action block in the following format:
 
@@ -1528,6 +1529,16 @@ class OpenAIToolAgent:
     """OpenAI/AzureOpenAI-based multi-turn chat-completions agent with tool calling."""
 
     def __init__(self, config: OpenAIToolAgentConfig) -> None:
+        self.config = config
+        self._worker_model_alias = (
+            config.model
+            if config.api_mode == "manual_react" and _resolve_registered_model_alias(config.model) is not None
+            else None
+        )
+        self.client = None
+        if self._worker_model_alias is not None:
+            return
+
         try:
             from openai import AzureOpenAI, OpenAI
         except ImportError as exc:  # pragma: no cover - import guard
@@ -1535,7 +1546,6 @@ class OpenAIToolAgent:
                 "OpenAIToolAgent requires the `openai` package."
             ) from exc
 
-        self.config = config
         api_key = config.api_key or os.environ.get("OPENAI_API_KEY") or "EMPTY"
         client_type = str(config.client_type or "azure_openai").strip().lower()
         if client_type == "openai":
@@ -1565,6 +1575,36 @@ class OpenAIToolAgent:
                 timeout=config.timeout_s,
                 default_headers=config.default_headers,
             )
+
+    def _call_worker_chat_completions(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        trace_label: str,
+        stop: list[str] | None = None,
+    ) -> tuple[ModelRequest, Any]:
+        if self._worker_model_alias is None:
+            raise RuntimeError("LLM_WORKER chat-completions call requires a registered model alias.")
+        request = ModelRequest(
+            model=self._worker_model_alias,
+            messages=[
+                ModelMessage(
+                    role=str(message.get("role") or "user"),
+                    content=message.get("content"),
+                )
+                for message in messages
+                if isinstance(message, dict)
+            ],
+            temperature=self.config.temperature,
+            max_tokens=self.config.max_tokens,
+            metadata={
+                "trace_label": trace_label,
+                **({"stop": stop} if stop else {}),
+                **({"extra_body": self.config.extra_body} if self.config.extra_body else {}),
+            },
+        )
+        response = LLM_WORKER.generate(request)
+        return request, response
 
     def run(
         self,
@@ -1621,29 +1661,43 @@ class OpenAIToolAgent:
                 context,
                 system_prompt or self.config.system_prompt,
             )
-            kwargs: dict[str, Any] = {
-                "model": self.config.model,
-                "messages": request_messages,
-                "stream": False,
-                "stop": ["</action>"],
-            }
-            if self.config.max_tokens is not None:
-                kwargs["max_tokens"] = self.config.max_tokens
-            if self.config.temperature is not None:
-                kwargs["temperature"] = self.config.temperature
-            if self.config.extra_body:
-                kwargs["extra_body"] = self.config.extra_body
+            if self._worker_model_alias is not None:
+                _, worker_response = self._call_worker_chat_completions(
+                    messages=request_messages,
+                    trace_label=f"manual_react_turn_{turn_index + 1}",
+                    stop=["</action>"],
+                )
+                raw_response = worker_response.raw_response or {"content": worker_response.content}
+                raw_responses.append(raw_response)
+                finish_reason = worker_response.metadata.get("finish_reason")
+                assistant_text = _complete_trailing_action_block(
+                    worker_response.content or "",
+                    finish_reason,
+                )
+            else:
+                kwargs: dict[str, Any] = {
+                    "model": self.config.model,
+                    "messages": request_messages,
+                    "stream": False,
+                    "stop": ["</action>"],
+                }
+                if self.config.max_tokens is not None:
+                    kwargs["max_tokens"] = self.config.max_tokens
+                if self.config.temperature is not None:
+                    kwargs["temperature"] = self.config.temperature
+                if self.config.extra_body:
+                    kwargs["extra_body"] = self.config.extra_body
 
-            completion = self.client.chat.completions.create(**kwargs)
-            raw_responses.append(
-                completion.model_dump() if hasattr(completion, "model_dump") else {"repr": repr(completion)}
-            )
-            choice = completion.choices[0]
-            assistant_message = choice.message
-            assistant_text = _complete_trailing_action_block(
-                assistant_message.content or "",
-                getattr(choice, "finish_reason", None),
-            )
+                completion = self.client.chat.completions.create(**kwargs)
+                raw_responses.append(
+                    completion.model_dump() if hasattr(completion, "model_dump") else {"repr": repr(completion)}
+                )
+                choice = completion.choices[0]
+                assistant_message = choice.message
+                assistant_text = _complete_trailing_action_block(
+                    assistant_message.content or "",
+                    getattr(choice, "finish_reason", None),
+                )
             if self.config.print_rounds:
                 print(f"\n=== Model Round {turn_index + 1} ===")
                 if assistant_text:
@@ -1744,7 +1798,6 @@ class OpenAIToolAgent:
                 kwargs["temperature"] = self.config.temperature
             if self.config.extra_body:
                 kwargs["extra_body"] = self.config.extra_body
-            print('##############\n',kwargs,'\n##############')
             completion = self.client.chat.completions.create(**kwargs)
             raw_responses.append(
                 completion.model_dump() if hasattr(completion, "model_dump") else {"repr": repr(completion)}
@@ -1759,18 +1812,19 @@ class OpenAIToolAgent:
                 final_text = assistant_message.content or ""
                 conversation_messages.append({"role": "assistant", "content": final_text})
                 break
-
             assistant_content = assistant_message.content or ""
             followup_tool_calls: list[dict[str, Any]] = []
             execution_payloads: list[tuple[str, dict[str, Any], str]] = []
             for tool_call in tool_calls:
+                tool_name = tool_call.function.name
                 parsed_args = json.loads(tool_call.function.arguments or "{}")
+                tool_call_id = tool_call.id
                 display_args = parsed_args
                 execution_args = parsed_args
-                if tool_call.function.name == "i2i_search":
+                if tool_name == "i2i_search":
                     repaired = _maybe_repair_i2i_tool_call(
                         assistant_text=assistant_content,
-                        tool_name=tool_call.function.name,
+                        tool_name=tool_name,
                         tool_arguments=parsed_args,
                         context=context,
                         question_text=_latest_user_text(conversation_messages),
@@ -1781,15 +1835,15 @@ class OpenAIToolAgent:
                         execution_args = repaired.execution_arguments
                 followup_tool_calls.append(
                     {
-                        "id": tool_call.id,
+                        "id": tool_call_id,
                         "type": "function",
                         "function": {
-                            "name": tool_call.function.name,
+                            "name": tool_name,
                             "arguments": json.dumps(display_args, ensure_ascii=False),
                         },
                     }
                 )
-                execution_payloads.append((tool_call.function.name, execution_args, tool_call.id))
+                execution_payloads.append((tool_name, execution_args, tool_call_id))
             conversation_messages.append(
                 _assistant_message_for_followup_from_dict(
                     content=assistant_content,
@@ -1862,6 +1916,7 @@ class OpenAIToolAgent:
 
             try:
                 response = self.client.responses.create(**kwargs)
+                raw_response = response.model_dump() if hasattr(response, "model_dump") else {"repr": repr(response)}
             except Exception as exc:
                 if previous_response_id and use_previous_response_id and _is_previous_response_not_found_error(exc):
                     logger.warning(
@@ -1872,9 +1927,9 @@ class OpenAIToolAgent:
                     kwargs.pop("previous_response_id", None)
                     kwargs["input"] = _conversation_messages_to_responses_input(conversation_messages)
                     response = self.client.responses.create(**kwargs)
+                    raw_response = response.model_dump() if hasattr(response, "model_dump") else {"repr": repr(response)}
                 else:
                     raise
-            raw_response = response.model_dump() if hasattr(response, "model_dump") else {"repr": repr(response)}
             raw_responses.append(raw_response)
             if use_previous_response_id:
                 previous_response_id = raw_response.get("id") or getattr(response, "id", None)

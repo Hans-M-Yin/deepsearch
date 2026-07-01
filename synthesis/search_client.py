@@ -43,6 +43,22 @@ def _augment_query_with_site_exclusion(query: str, domain: str) -> str:
     return f"{normalized_query} {exclusion}".strip()
 
 
+def _augment_query_with_literal_exclusion(query: str, exclusion: str) -> str:
+    normalized_query = str(query or "").strip()
+    normalized_exclusion = str(exclusion or "").strip()
+    if not normalized_query or not normalized_exclusion:
+        return normalized_query
+    if normalized_exclusion.lower() in normalized_query.lower():
+        return normalized_query
+    return f"{normalized_query} {normalized_exclusion}".strip()
+
+
+def _augment_text_query(query: str) -> str:
+    query = _augment_query_with_site_exclusion(query, "wikipedia.org")
+    query = _augment_query_with_literal_exclusion(query, "-filetype:pdf")
+    return query
+
+
 @dataclass(slots=True)
 class TextSearchResult:
     title: str | None = None
@@ -458,7 +474,7 @@ class SerperAdapterSearchClient:
         self.timeout_s = timeout_s
 
     def search_text(self, query: str, *, limit: int = 10, **kwargs: Any) -> SearchResponse:
-        body = self._serper_body(query, limit, kwargs)
+        body = self._serper_body(_augment_text_query(query), limit, kwargs)
         raw = self._post_json("/search", body)
         return SearchResponse(
             query=query,
@@ -552,7 +568,7 @@ class SerperSearchClient:
         self.timeout_s = timeout_s
 
     def search_text(self, query: str, *, limit: int = 10, **kwargs: Any) -> SearchResponse:
-        raw, status_code, metadata = self._post_json(self.search_url, self._serper_body(query, limit, kwargs))
+        raw, status_code, metadata = self._post_json(self.search_url, self._serper_body(_augment_text_query(query), limit, kwargs))
         return SearchResponse(
             query=query,
             engine="serper:search",
@@ -1138,11 +1154,11 @@ def _smoke_test() -> None:
     assert params["q"] == "Coffee"
 
     serper_body = SerperSearchClient._serper_body(
-        "Coffee",
+        _augment_text_query("Coffee"),
         5,
         {"hl": "en", "gl": "us", "location": "Austin, Texas, United States"},
     )
-    assert serper_body["q"] == "Coffee -site:wikipedia.org"
+    assert serper_body["q"] == "Coffee -site:wikipedia.org -filetype:pdf"
     assert serper_body["num"] == 5
     assert serper_body["hl"] == "en"
     assert serper_body["gl"] == "us"
