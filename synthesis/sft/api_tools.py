@@ -1192,7 +1192,7 @@ def _json_text(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, indent=2)
 
 
-def _format_message_content(content: Any) -> str:
+def _format_message_content(content: Any, *, include_images: bool = True) -> str:
     if content in (None, ""):
         return ""
     if isinstance(content, str):
@@ -1207,6 +1207,8 @@ def _format_message_content(content: Any) -> str:
             if part_type in {"text", "input_text"}:
                 formatted_parts.append(str(part.get("text", "")))
             elif part_type == "image_url":
+                if not include_images:
+                    continue
                 image_url = part.get("image_url")
                 if isinstance(image_url, dict):
                     url = image_url.get("url", "")
@@ -1214,6 +1216,8 @@ def _format_message_content(content: Any) -> str:
                     url = image_url
                 formatted_parts.append(f"[image_url] {url}")
             elif part_type in {"image", "input_image", "image_path", "image_ref"}:
+                if not include_images:
+                    continue
                 source = (
                     part.get("image")
                     or part.get("path")
@@ -1300,7 +1304,7 @@ def _print_manual_react_round_io(
         if role == "system":
             continue
         print(f"\n[{index}] {role}")
-        content_text = _format_message_content(message.get("content"))
+        content_text = _format_message_content(message.get("content"), include_images=False)
         if content_text:
             print(content_text)
     print(f"\n=== Manual ReAct Round {turn_index + 1} Output ===")
