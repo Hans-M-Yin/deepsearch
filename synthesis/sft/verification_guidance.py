@@ -11,44 +11,27 @@ from synthesis.model_worker import ModelMessage
 from synthesis.model_worker import ModelRequest
 
 PROMPT_CHECK_CURRENT_HOP = """
-You are checking whether the agent has already solved the current hop in a multi-hop search trajectory.
-
-You will receive:
-1. The original question.
-2. The current hop information.
-3. The visible trajectory so far.
-
-Return strict JSON:
-{
-  "found": false,
-  "reason": ""
-}
-
+Next, you will be given a multi-turn interaction from an agent. In this interaction, the agent is inferring what the target entity is based on a set of clues. You will also be given the correct answer for that target entity, and your job is to determine whether the agent has correctly inferred the target.
 Rules:
-- Mark found=true only if the current hop target has already been correctly identified with sufficiently strong evidence in the visible trajectory.
-- If the target is only guessed, weakly suggested, or unsupported, return found=false.
-- Do not output markdown or any text outside the JSON object.
+If the agent has not inferred the correct answer — for example, if it has not yet reached a conclusion, is still searching for clues, or has finished searching but inferred an incorrect target — then we consider that the agent has not found the target, and you should judge it as false.
+If the agent has inferred the target based on the clues and the evidence is sufficient, then you should judge it as true.
+Please return strict JSON:
+{
+"found": true/false,
+"reason": "Give the reason for your judgment"
+}
 """
 
 PROMPT_CHECK_INITIAL_SOURCE = """
-You are checking whether the agent has already identified the initial source entity of a multi-hop search trajectory.
-
-You will receive:
-1. The original question.
-2. The initial source information for the first search stage.
-3. The visible trajectory so far.
-
-Return strict JSON:
-{
-  "found": false,
-  "reason": ""
-}
-
+Next, you will be given a multi-turn interaction from an agent. In this interaction, the agent is inferring what the target entity is based on a set of clues. You will also be given the correct answer for that target entity, and your job is to determine whether the agent has correctly inferred the target.
 Rules:
-- Mark found=true only if the initial source entity has already been correctly identified with sufficiently strong evidence in the visible trajectory.
-- If the source is only guessed, weakly suggested, or unsupported, return found=false.
-- Do not require the agent to have solved the first hop target yet. At this stage, only check whether the starting source entity has been correctly identified.
-- Do not output markdown or any text outside the JSON object.
+If the agent has not inferred the correct answer — for example, if it has not yet reached a conclusion, is still searching for clues, or has finished searching but inferred an incorrect target — then we consider that the agent has not found the target, and you should judge it as false.
+If the agent has inferred the target based on the clues and the evidence is sufficient, then you should judge it as true.
+Please return strict JSON:
+{
+"found": true/false,
+"reason": "Give the reason for your judgment"
+}
 """
 
 
@@ -178,40 +161,29 @@ def maybe_advance_hop(
         if first_hop is None:
             return
         prompt = PROMPT_CHECK_INITIAL_SOURCE
-        payload = {
-            "question": state.question,
-            "initial_source_stage": {
-                "source": str(first_hop.get("source") or ""),
-                "source_node_id": str(first_hop.get("src_node_id") or ""),
-                "first_hop_statement": str(first_hop.get("statement") or ""),
-                "first_hop_relation": str(first_hop.get("relation") or ""),
-                "first_hop_target": str(first_hop.get("target") or ""),
-            },
-            "trajectory": _trajectory_text(trajectory_messages),
-        }
+        user_prompt = _build_initial_source_check_prompt(
+            question=state.question,
+            trajectory_messages=trajectory_messages,
+            source=str(first_hop.get("source") or ""),
+        )
     else:
         hop = state.current_hop()
         if hop is None:
             return
         prompt = PROMPT_CHECK_CURRENT_HOP
-        payload = {
-            "question": state.question,
-            "current_hop": {
-                "hop_index": int(hop.get("hop_index") or state.current_hop_index),
-                "source": str(hop.get("source") or ""),
-                "relation": str(hop.get("relation") or ""),
-                "target": str(hop.get("target") or ""),
-                "statement": str(hop.get("statement") or ""),
-            },
-            "trajectory": _trajectory_text(trajectory_messages),
-        }
+        user_prompt = _build_current_hop_check_prompt(
+            question=state.question,
+            trajectory_messages=trajectory_messages,
+            statement=str(hop.get("statement") or ""),
+            target=str(hop.get("target") or ""),
+        )
     try:
         parsed = LLM_WORKER.generate_json(
             ModelRequest(
                 model=model_alias,
                 messages=[
                     ModelMessage(role="system", content=prompt),
-                    ModelMessage(role="user", content=json.dumps(payload, ensure_ascii=False, indent=2)),
+                    ModelMessage(role="user", content=user_prompt),
                 ],
                 response_format={"type": "json_object"},
                 max_tokens=state.judge.max_tokens,
@@ -229,16 +201,75 @@ def _trajectory_text(messages: list[dict[str, Any]]) -> str:
     lines: list[str] = []
     for message in messages:
         role = str(message.get("role") or "")
-        content = message.get("content")
-        if isinstance(content, str):
-            text = content.strip()
+        if role not in {"assistant", "tool"}:
+            continue
+        text = _judge_message_text(message.get("content")).strip()
+        if not text:
+            continue
+        if role == "assistant":
+            lines.append(f"Assistant:\n{text}")
         else:
-            text = json.dumps(content, ensure_ascii=False, indent=2).strip()
-        if role == "tool":
-            role = f"tool[{str(message.get('name') or '').strip()}]"
-        if text:
-            lines.append(f"{role}: {text}")
+            tool_name = str(message.get("name") or "tool").strip()
+            lines.append(f"Tool Result ({tool_name}):\n{text}")
     return "\n\n".join(lines).strip()
+
+
+def _judge_message_text(content: Any) -> str:
+    if content in (None, ""):
+        return ""
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if not isinstance(item, dict):
+                parts.append(str(item))
+                continue
+            part_type = str(item.get("type") or "")
+            if part_type in {"text", "input_text"}:
+                text = str(item.get("text") or "").strip()
+                if text:
+                    parts.append(text)
+                continue
+            if part_type in {"image_url", "image", "input_image", "image_path", "image_ref"}:
+                parts.append("[image igored]")
+                continue
+            parts.append(json.dumps(item, ensure_ascii=False, indent=2))
+        return "\n".join(part for part in parts if part).strip()
+    if isinstance(content, (dict, tuple)):
+        return json.dumps(content, ensure_ascii=False, indent=2).strip()
+    return str(content).strip()
+
+
+def _build_initial_source_check_prompt(
+    *,
+    question: str,
+    trajectory_messages: list[dict[str, Any]],
+    source: str,
+) -> str:
+    transcript = _trajectory_text(trajectory_messages)
+    prefix = f"Question:\n{question.strip()}" if str(question).strip() else ""
+    suffix = "----- Target to be verified -----\n" f"Check whether the agent inferred '{source}'."
+    body = f"{transcript}\n\n{suffix}" if transcript else suffix
+    return f"{prefix}\n\n{body}" if prefix else body
+
+
+def _build_current_hop_check_prompt(
+    *,
+    question: str,
+    trajectory_messages: list[dict[str, Any]],
+    statement: str,
+    target: str,
+) -> str:
+    transcript = _trajectory_text(trajectory_messages)
+    prefix = f"Question:\n{question.strip()}" if str(question).strip() else ""
+    suffix = (
+        "\n\n----- Target to be verified -----\n"
+        f"information statement: {statement}\n"
+        f"check whether the agent inferred the target: {target}"
+    )
+    body = f"{transcript}{suffix}" if transcript else suffix.lstrip()
+    return f"{prefix}\n\n{body}" if prefix else body
 
 
 def _is_image_target_hop(hop: dict[str, Any] | None) -> bool:
