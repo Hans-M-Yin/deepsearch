@@ -337,7 +337,7 @@ def _build_image_part_from_source(
     image_url = _image_source_to_model_url(resolved)
     if not image_url:
         return None
-    return {"type": "image_url", "image_url": image_url}
+    return {"type": "image_url", "image_url": {"url": image_url}}
 
 
 def _resolve_image_payload(source: Any, *, image_registry: dict[str, Any] | None = None) -> Any:
