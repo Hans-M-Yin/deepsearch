@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import base64
 import json
+import mimetypes
+from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -15,6 +18,7 @@ Next, you will be given a multi-turn interaction from an agent. In this interact
 Rules:
 If the agent has not inferred the correct answer — for example, if it has not yet reached a conclusion, is still searching for clues, or has finished searching but inferred an incorrect target — then we consider that the agent has not found the target, and you should judge it as false.
 If the agent has inferred the target based on the clues and the evidence is sufficient, then you should judge it as true.
+If the target is an image, you need to determine comprehensively whether the model has found the target based on the agent’s image search query, the search results, and whether the agent actually opened and viewed the image (that is, whether the image appears in the context).
 Please return strict JSON:
 {
 "found": true/false,
@@ -27,6 +31,7 @@ Next, you will be given a multi-turn interaction from an agent. In this interact
 Rules:
 If the agent has not inferred the correct answer — for example, if it has not yet reached a conclusion, is still searching for clues, or has finished searching but inferred an incorrect target — then we consider that the agent has not found the target, and you should judge it as false.
 If the agent has inferred the target based on the clues and the evidence is sufficient, then you should judge it as true.
+If the target is an image, you need to determine comprehensively whether the model has found the target based on the agent’s image search query, the search results, and whether the agent actually opened and viewed the image (that is, whether the image appears in the context).
 Please return strict JSON:
 {
 "found": true/false,
@@ -68,7 +73,6 @@ class ManualReActHopState:
     def current_hop(self) -> dict[str, Any] | None:
         if self.in_initial_source_stage():
             return None
-        self.advance_past_image_hops()
         if self.current_hop_index < 0 or self.current_hop_index >= len(self.hop_chain):
             return None
         hop = self.hop_chain[self.current_hop_index]
@@ -79,16 +83,6 @@ class ManualReActHopState:
 
     def advance(self) -> None:
         if self.current_hop_index < len(self.hop_chain):
-            self.current_hop_index += 1
-        self.advance_past_image_hops()
-
-    def advance_past_image_hops(self) -> None:
-        if self.current_hop_index < 0:
-            return
-        while self.current_hop_index < len(self.hop_chain):
-            hop = self.hop_chain[self.current_hop_index]
-            if not _is_image_target_hop(hop):
-                break
             self.current_hop_index += 1
 
     def verification_guidance(self) -> str:
@@ -139,7 +133,6 @@ def build_hop_state(
             max_tokens=max(1, int(judge_max_tokens)),
         ),
     )
-    state.advance_past_image_hops()
     return state
 
 
@@ -147,6 +140,7 @@ def maybe_advance_hop(
     *,
     state: ManualReActHopState,
     trajectory_messages: list[dict[str, Any]],
+    image_registry: dict[str, Any] | None = None,
 ) -> None:
     model_alias = state.judge.model_alias
     if not model_alias:
@@ -165,6 +159,7 @@ def maybe_advance_hop(
             question=state.question,
             trajectory_messages=trajectory_messages,
             source=str(first_hop.get("source") or ""),
+            image_registry=image_registry,
         )
     else:
         hop = state.current_hop()
@@ -176,6 +171,7 @@ def maybe_advance_hop(
             trajectory_messages=trajectory_messages,
             statement=str(hop.get("statement") or ""),
             target=str(hop.get("target") or ""),
+            image_registry=image_registry,
         )
     try:
         parsed = LLM_WORKER.generate_json(
@@ -197,48 +193,94 @@ def maybe_advance_hop(
         state.advance()
 
 
-def _trajectory_text(messages: list[dict[str, Any]]) -> str:
-    lines: list[str] = []
+def _trajectory_content_parts(
+    messages: list[dict[str, Any]],
+    *,
+    image_registry: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    content_parts: list[dict[str, Any]] = []
     for message in messages:
         role = str(message.get("role") or "")
         if role not in {"assistant", "tool"}:
             continue
-        text = _judge_message_text(message.get("content")).strip()
-        if not text:
-            continue
         if role == "assistant":
-            lines.append(f"Assistant:\n{text}")
+            content_parts.append({"type": "text", "text": "Assistant:\n"})
+            content_parts.extend(_judge_content_parts(message.get("content"), image_registry=image_registry))
         else:
             tool_name = str(message.get("name") or "tool").strip()
-            lines.append(f"Tool Result ({tool_name}):\n{text}")
-    return "\n\n".join(lines).strip()
+            content_parts.append({"type": "text", "text": f"Tool Result ({tool_name}):\n"})
+            content_parts.extend(
+                _judge_tool_content_parts(
+                    message.get("content"),
+                    image_registry=image_registry,
+                )
+            )
+        content_parts.append({"type": "text", "text": "\n\n"})
+    while content_parts and content_parts[-1].get("type") == "text" and not str(content_parts[-1].get("text") or "").strip():
+        content_parts.pop()
+    return content_parts
 
 
-def _judge_message_text(content: Any) -> str:
-    if content in (None, ""):
-        return ""
+def _judge_tool_content_parts(content: Any, *, image_registry: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    parts = _judge_content_parts(content, image_registry=image_registry)
     if isinstance(content, str):
-        return content.strip()
+        try:
+            parsed = json.loads(content)
+        except json.JSONDecodeError:
+            parsed = None
+        if isinstance(parsed, dict):
+            for key in ("image_id", "cropped_image_id"):
+                image_id = parsed.get(key)
+                image_part = _build_image_part_from_source(image_id, image_registry=image_registry)
+                if image_part is not None:
+                    parts.append({"type": "text", "text": "\n"})
+                    parts.append(image_part)
+            for key in ("image_url", "cropped_image_url"):
+                image_source = parsed.get(key)
+                image_part = _build_image_part_from_source(image_source, image_registry=image_registry)
+                if image_part is not None:
+                    parts.append({"type": "text", "text": "\n"})
+                    parts.append(image_part)
+    return parts
+
+
+def _judge_content_parts(content: Any, *, image_registry: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    if content in (None, ""):
+        return []
+    if isinstance(content, str):
+        return [{"type": "text", "text": content.strip()}] if content.strip() else []
     if isinstance(content, list):
-        parts: list[str] = []
+        parts: list[dict[str, Any]] = []
         for item in content:
             if not isinstance(item, dict):
-                parts.append(str(item))
+                text = str(item).strip()
+                if text:
+                    parts.append({"type": "text", "text": text})
                 continue
             part_type = str(item.get("type") or "")
             if part_type in {"text", "input_text"}:
                 text = str(item.get("text") or "").strip()
                 if text:
-                    parts.append(text)
+                    parts.append({"type": "text", "text": text})
                 continue
             if part_type in {"image_url", "image", "input_image", "image_path", "image_ref"}:
-                parts.append("[image igored]")
+                source = (
+                    item.get("image")
+                    or item.get("path")
+                    or item.get("url")
+                    or item.get("image_url")
+                    or item.get("ref")
+                )
+                image_part = _build_image_part_from_source(source, image_registry=image_registry)
+                if image_part is not None:
+                    parts.append(image_part)
                 continue
-            parts.append(json.dumps(item, ensure_ascii=False, indent=2))
-        return "\n".join(part for part in parts if part).strip()
+            parts.append({"type": "text", "text": json.dumps(item, ensure_ascii=False, indent=2)})
+        return parts
     if isinstance(content, (dict, tuple)):
-        return json.dumps(content, ensure_ascii=False, indent=2).strip()
-    return str(content).strip()
+        return [{"type": "text", "text": json.dumps(content, ensure_ascii=False, indent=2).strip()}]
+    text = str(content).strip()
+    return [{"type": "text", "text": text}] if text else []
 
 
 def _build_initial_source_check_prompt(
@@ -246,12 +288,19 @@ def _build_initial_source_check_prompt(
     question: str,
     trajectory_messages: list[dict[str, Any]],
     source: str,
-) -> str:
-    transcript = _trajectory_text(trajectory_messages)
-    prefix = f"Question:\n{question.strip()}" if str(question).strip() else ""
-    suffix = "----- Target to be verified -----\n" f"Check whether the agent inferred '{source}'."
-    body = f"{transcript}\n\n{suffix}" if transcript else suffix
-    return f"{prefix}\n\n{body}" if prefix else body
+    image_registry: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    content_parts: list[dict[str, Any]] = []
+    if str(question).strip():
+        content_parts.append({"type": "text", "text": f"Question:\n{question.strip()}\n\n"})
+    content_parts.extend(_trajectory_content_parts(trajectory_messages, image_registry=image_registry))
+    content_parts.append(
+        {
+            "type": "text",
+            "text": "----- Target to be verified -----\n" f"Check whether the agent inferred '{source}'.",
+        }
+    )
+    return content_parts
 
 
 def _build_current_hop_check_prompt(
@@ -260,20 +309,63 @@ def _build_current_hop_check_prompt(
     trajectory_messages: list[dict[str, Any]],
     statement: str,
     target: str,
-) -> str:
-    transcript = _trajectory_text(trajectory_messages)
-    prefix = f"Question:\n{question.strip()}" if str(question).strip() else ""
-    suffix = (
-        "\n\n----- Target to be verified -----\n"
-        f"information statement: {statement}\n"
-        f"check whether the agent inferred the target: {target}"
+    image_registry: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    content_parts: list[dict[str, Any]] = []
+    if str(question).strip():
+        content_parts.append({"type": "text", "text": f"Question:\n{question.strip()}\n\n"})
+    content_parts.extend(_trajectory_content_parts(trajectory_messages, image_registry=image_registry))
+    content_parts.append(
+        {
+            "type": "text",
+            "text": (
+                "----- Target to be verified -----\n"
+                f"information statement: {statement}\n"
+                f"check whether the agent inferred the target: {target}"
+            ),
+        }
     )
-    body = f"{transcript}{suffix}" if transcript else suffix.lstrip()
-    return f"{prefix}\n\n{body}" if prefix else body
+    return content_parts
 
 
-def _is_image_target_hop(hop: dict[str, Any] | None) -> bool:
-    if not isinstance(hop, dict):
-        return False
-    dst_node_id = str(hop.get("dst_node_id") or "").strip().lower()
-    return dst_node_id.startswith("image_")
+def _build_image_part_from_source(
+    source: Any,
+    *,
+    image_registry: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    resolved = _resolve_image_payload(source, image_registry=image_registry)
+    image_url = _image_source_to_model_url(resolved)
+    if not image_url:
+        return None
+    return {"type": "image_url", "image_url": image_url}
+
+
+def _resolve_image_payload(source: Any, *, image_registry: dict[str, Any] | None = None) -> Any:
+    if isinstance(source, str) and image_registry and source in image_registry:
+        return image_registry[source]
+    if isinstance(source, dict) and "url" in source:
+        return source.get("url")
+    if isinstance(source, dict) and "image_url" in source:
+        image_url = source.get("image_url")
+        if isinstance(image_url, dict):
+            return image_url.get("url")
+        return image_url
+    return source
+
+
+def _image_source_to_model_url(source: Any) -> str | None:
+    if not source:
+        return None
+    if isinstance(source, str):
+        candidate = source.strip()
+        if not candidate:
+            return None
+        if candidate.startswith(("http://", "https://", "data:image")):
+            return candidate
+        path = Path(candidate)
+        if path.exists() and path.is_file():
+            mime_type, _ = mimetypes.guess_type(str(path))
+            mime_type = mime_type or "image/png"
+            payload = base64.b64encode(path.read_bytes()).decode("utf-8")
+            return f"data:{mime_type};base64,{payload}"
+    return None

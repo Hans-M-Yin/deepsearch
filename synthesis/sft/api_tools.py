@@ -1775,6 +1775,7 @@ class OpenAIToolAgent:
             maybe_advance_hop(
                 state=hop_state,
                 trajectory_messages=conversation_messages,
+                image_registry=context.image_registry,
             )
         else:
             final_text = "Max ReAct turns reached before the model produced a final answer."
