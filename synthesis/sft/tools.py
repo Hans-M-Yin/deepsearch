@@ -31,6 +31,12 @@ MAX_SEARCH_RESULTS = 5
 MAX_DOWNLOADED_IMAGE_LONG_EDGE = 1920
 MAX_DOWNLOADED_IMAGE_SHORT_EDGE = 1080
 RESIZED_IMAGE_LONG_EDGE = 1200
+AMBIGUOUS_CONTENT_TYPES = {
+    "",
+    "application/octet-stream",
+    "binary/octet-stream",
+    "text/plain",
+}
 T2I_BLOCKED_IMAGE_SEARCH_DOMAINS = (
     "facebook.com",
     "m.facebook.com",
@@ -299,6 +305,30 @@ def _guess_image_from_url(url: str) -> bool:
     guessed_type, _ = mimetypes.guess_type(urlparse(url).path)
     return bool(guessed_type and guessed_type.startswith("image/"))
 
+
+def _guess_image_content_type(url: str) -> str:
+    guessed_type, _ = mimetypes.guess_type(urlparse(url).path)
+    if guessed_type and guessed_type.startswith("image/"):
+        return guessed_type
+    return ""
+
+
+def _sniff_image_content_type(payload: bytes) -> str:
+    if payload.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if payload.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if payload.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif"
+    if payload.startswith(b"BM"):
+        return "image/bmp"
+    if len(payload) >= 12 and payload.startswith(b"RIFF") and payload[8:12] == b"WEBP":
+        return "image/webp"
+    normalized_payload = payload.lstrip().lower()
+    if normalized_payload.startswith(b"<svg") or b"<svg" in normalized_payload[:256]:
+        return "image/svg+xml"
+    return ""
+
 def _url_matches_blocked_domain(url: str) -> bool:
     normalized_url = str(url or "").strip()
     if not normalized_url:
@@ -325,27 +355,35 @@ def _sanitize_t2i_query(query: str) -> str:
 
 
 def _probe_content_type(url: str) -> str:
+    guessed_image_type = _guess_image_content_type(url)
+    if guessed_image_type:
+        return guessed_image_type
+
     try:
         response = requests.head(url, allow_redirects=True, timeout=20)
         content_type = response.headers.get("Content-Type", "")
         if content_type:
-            return content_type.split(";", 1)[0].strip().lower()
+            normalized = content_type.split(";", 1)[0].strip().lower()
+            if normalized not in AMBIGUOUS_CONTENT_TYPES:
+                return normalized
     except Exception:
         pass
 
     try:
         response = requests.get(url, allow_redirects=True, stream=True, timeout=20)
         content_type = response.headers.get("Content-Type", "")
+        normalized = content_type.split(";", 1)[0].strip().lower() if content_type else ""
+        sniffed_content_type = _sniff_image_content_type(response.raw.read(64, decode_content=True))
         response.close()
+        if sniffed_content_type:
+            return sniffed_content_type
         if content_type:
-            return content_type.split(";", 1)[0].strip().lower()
+            if normalized not in AMBIGUOUS_CONTENT_TYPES:
+                return normalized
     except Exception:
         pass
 
-    guessed_type = None
-    if _guess_image_from_url(url):
-        guessed_type, _ = mimetypes.guess_type(urlparse(url).path)
-    return guessed_type or "image/*"
+    return guessed_image_type or "text/html"
 
 
 def _maybe_resize_downloaded_image(
