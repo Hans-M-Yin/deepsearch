@@ -27,8 +27,6 @@ from synthesis.model_worker import LLM_WORKER
 from synthesis.model_worker import ModelMessage
 from synthesis.model_worker import ModelRequest
 from . import tools
-from .verification_guidance import build_hop_state
-from .verification_guidance import maybe_advance_hop
 import sys
 
 logger = logging.getLogger(__name__)
@@ -39,12 +37,11 @@ You are writing a full solution for a multi-hop knowledge question. Specifically
 
 Requirements:
 1. You may think freely during your internal reasoning phase, but the statements ultimately included in the written solution process must also follow rigorous logic, ensuring that the solution remains sound and error-free even if one reads only the written solution process and ignores your private thinking.
-2. While writing the solution process, the user may provide you with the answer or clues for the current intermediate step as verification guidance. This guidance is only for verifying whether your currently inferred intermediate answer is incorrect. If it is incorrect, then you must, from the perspective of someone who does not know that intermediate answer, analyze through self-correction why the intermediate answer you derived from your search results is insufficient and why it may be wrong, then replan your search until the evidence you obtain is sufficient to support the intermediate answer provided to you. Note that this guidance must not be revealed anywhere in your written solution process.
-3. In the solution you write, the following logic should be explicitly visible: after each tool call and its returned result, you must carefully analyze the new clues in detail, review the existing clues and the question, determine and plan the next step in detail, and then call a new tool as needed with an explanation.
-4. Your solution should be written from the perspective of someone with strong logical reasoning but POOR memory of world knowledge or history, so every statement must be evidence-based and no unsupported claims may appear. Every statement in your writing should be detailedly analysed or discussed. 
-5. Once you believe the evidence is sufficient and there are no remaining unclear or uncertain points, provide the final answer and end the solution.
-6. In your solution, DO NOT use tools to directly search for pages related to Wikipedia or Wiki Commons, in order to avoid shortcuts. However, you can read related Wikipedia or Wiki Commons pages which are the results of the search tools.
-7. When writing the solution, make full use of the tool results. For example, a searched URL may seem irrelevant to the clues, but you should still analyze whether the webpage may contain the clues needed to solve the problem based on any available snippets, and then use read_url to read it further.
+2. In the solution you write, the following logic should be explicitly visible: after each tool call and its returned result, you must carefully analyze the new clues in detail, review the existing clues and the question, determine and plan the next step in detail, and then call a new tool as needed with an explanation.
+3. Your solution should be written from the perspective of someone with strong logical reasoning but POOR memory of world knowledge or history, so every statement must be evidence-based and no unsupported claims may appear. Every statement in your writing should be detailedly analysed or discussed. 
+4. Once you believe the evidence is sufficient and there are no remaining unclear or uncertain points, provide the final answer and end the solution.
+5. In your solution, DO NOT use tools to directly search for pages related to Wikipedia or Wiki Commons, in order to avoid shortcuts. However, you can read related Wikipedia or Wiki Commons pages which are the results of the search tools.
+6. When writing the solution, make full use of the tool results. For example, a searched URL may seem irrelevant to the clues, but you should still analyze whether the webpage may contain the clues needed to solve the problem based on any available snippets, and then use read_url to read it further.
 
 **Examples**
 Bad writing:
@@ -107,6 +104,7 @@ _MANUAL_REACT_ACTIONS = {"t2t_search", "t2i_search", "i2i_search", "read_url", "
 _MANUAL_REACT_ACTION_RE = re.compile(r"<action>\s*(?P<json>\{.*?\})\s*</action>", re.DOTALL | re.IGNORECASE)
 _I2I_WRAPPER_DEFAULT_MODEL_ALIAS = "multimodal_process"
 _I2I_WRAPPER_MAX_TOKENS = 2048
+_SFT_TRAJECTORY_SESSION_ID = "1111202607042239"
 
 PROMPT_I2I_REWRITE_ASSISTANT = """
 I will give you an image and a passage containing analysis and tool-call process text for a certain question. This passage is missing context. Your goal is to determine, based only on this single passage, which object in the image the passage is focusing on. Then, summarize that object as a noun phrase (possibly with a descriptive referring expression). Finally, polish the parts of the passage that are related to tool calling so that the logic becomes tighter and more coherent.
@@ -406,7 +404,7 @@ def _worker_generate_json_message(
             ],
             response_format={"type": "json_object"},
             max_tokens=max_tokens,
-            metadata={"trace_label": trace_label},
+            metadata={"trace_label": trace_label, "session_id": _SFT_TRAJECTORY_SESSION_ID},
         )
     )
     parsed = _extract_json_object(response.content or "")
@@ -431,7 +429,7 @@ def _worker_generate_text_message(
                 ModelMessage(role="user", content=user_content),
             ],
             max_tokens=max_tokens,
-            metadata={"trace_label": trace_label},
+            metadata={"trace_label": trace_label, "session_id": _SFT_TRAJECTORY_SESSION_ID},
         )
     )
     return response.content or ""
@@ -898,8 +896,6 @@ def _build_manual_react_request_messages(
     conversation_messages: list[dict[str, Any]],
     context: ToolRuntimeContext,
     base_system_prompt: str,
-    *,
-    verification_guidance_text: str = "",
 ) -> list[dict[str, Any]]:
     system_seed = base_system_prompt
     for message in conversation_messages:
@@ -928,8 +924,6 @@ def _build_manual_react_request_messages(
             copied["content"] = full_system_prompt
             system_replaced = True
         request_messages.append(copied)
-    if verification_guidance_text:
-        request_messages.append({"role": "user", "content": verification_guidance_text})
     if not system_replaced:
         request_messages.insert(0, {"role": "system", "content": full_system_prompt})
     return request_messages
@@ -1632,6 +1626,7 @@ class OpenAIToolAgent:
             max_tokens=self.config.max_tokens,
             metadata={
                 "trace_label": trace_label,
+                "session_id": _SFT_TRAJECTORY_SESSION_ID,
                 **({"stop": stop} if stop else {}),
                 **({"extra_body": self.config.extra_body} if self.config.extra_body else {}),
             },
@@ -1684,13 +1679,6 @@ class OpenAIToolAgent:
             system_prompt=system_prompt,
             default_system_prompt=self.config.system_prompt,
         )
-        hop_state = build_hop_state(
-            question=str(context.metadata.get("question") or _latest_user_text(conversation_messages) or ""),
-            gold_answer=str(context.metadata.get("gold_answer") or ""),
-            hop_chain=list(context.metadata.get("hop_chain") or []),
-            judge_model_alias=str(context.metadata.get("hop_judge_model_alias") or ""),
-            judge_max_tokens=int(context.metadata.get("hop_judge_max_tokens") or 1024),
-        )
         tool_results: list[ToolExecutionResult] = []
         raw_responses: list[dict[str, Any]] = []
         final_text = ""
@@ -1705,7 +1693,6 @@ class OpenAIToolAgent:
                 conversation_messages,
                 context,
                 system_prompt or self.config.system_prompt,
-                verification_guidance_text=hop_state.verification_guidance(),
             )
             _, worker_response = self._call_worker_chat_completions(
                 messages=request_messages,
@@ -1771,11 +1758,6 @@ class OpenAIToolAgent:
                     "content": result.output_text,
                     "type": "manual_react_tool",
                 }
-            )
-            maybe_advance_hop(
-                state=hop_state,
-                trajectory_messages=conversation_messages,
-                image_registry=context.image_registry,
             )
         else:
             final_text = "Max ReAct turns reached before the model produced a final answer."

@@ -125,6 +125,32 @@ def _usage_int(value: Any) -> int:
         return 0
 
 
+def _merge_session_id_into_extra_body(extra_body: Any, session_id: Any) -> dict[str, Any] | None:
+    if not isinstance(extra_body, dict):
+        base: dict[str, Any] = {}
+    else:
+        base = dict(extra_body)
+    session_id_text = str(session_id or "").strip()
+    if not session_id_text:
+        return base or None
+
+    merged_extra: dict[str, Any] = {}
+    existing_extra = base.get("extra")
+    if isinstance(existing_extra, dict):
+        merged_extra = dict(existing_extra)
+    elif isinstance(existing_extra, str) and existing_extra.strip():
+        try:
+            parsed_extra = json.loads(existing_extra)
+        except json.JSONDecodeError:
+            parsed_extra = None
+        if isinstance(parsed_extra, dict):
+            merged_extra = dict(parsed_extra)
+
+    merged_extra["session_id"] = session_id_text
+    base["extra"] = json.dumps(merged_extra, ensure_ascii=False, separators=(",", ":"))
+    return base
+
+
 def _get_usage_value(payload: Any, *path: str) -> Any:
     current = payload
     for key in path:
@@ -200,7 +226,10 @@ class OpenAIModelWorkerClient:
             kwargs["stop"] = stop
         elif isinstance(stop, str) and stop:
             kwargs["stop"] = [stop]
-        extra_body = request.metadata.get("extra_body")
+        extra_body = _merge_session_id_into_extra_body(
+            request.metadata.get("extra_body"),
+            request.metadata.get("session_id"),
+        )
         if isinstance(extra_body, dict):
             kwargs["extra_body"] = extra_body
 
@@ -333,7 +362,10 @@ class AzureOpenAIModelWorkerClient:
             kwargs["stop"] = stop
         elif isinstance(stop, str) and stop:
             kwargs["stop"] = [stop]
-        extra_body = request.metadata.get("extra_body")
+        extra_body = _merge_session_id_into_extra_body(
+            request.metadata.get("extra_body"),
+            request.metadata.get("session_id"),
+        )
         if isinstance(extra_body, dict):
             kwargs["extra_body"] = extra_body
 

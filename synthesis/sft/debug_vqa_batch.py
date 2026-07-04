@@ -829,18 +829,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--headers-json", default=os.environ.get("SFT_OPENAI_HEADERS_JSON"))
     parser.add_argument("--extra-body-json", default=os.environ.get("SFT_OPENAI_EXTRA_BODY_JSON"))
     parser.add_argument(
-        "--hop-judge-model",
-        default=os.environ.get("SFT_HOP_JUDGE_MODEL") or "",
-        help="Registered model alias used to judge whether the current hop has been solved during manual_react.",
-    )
-    parser.add_argument(
-        "--hop-judge-max-tokens",
-        type=int,
-        default=_optional_env_int("SFT_HOP_JUDGE_MAX_TOKENS") or 1024,
-        help="Max tokens for the current-hop judge call.",
-    )
-
-    parser.add_argument(
         "--expert-model",
         default=os.environ.get("SFT_JUDGE_MODEL"),
         help="Expert judge model. Prefer a registered alias from synthesis/models.json.",
@@ -1011,8 +999,6 @@ def main(argv: list[str] | None = None) -> int:
                     "question": record.get("question"),
                     "gold_answer": record.get("gold_answer"),
                     "hop_chain": list(record.get("hop_chain") or []),
-                    "hop_judge_model_alias": args.hop_judge_model or args.expert_model or "",
-                    "hop_judge_max_tokens": args.hop_judge_max_tokens,
                 },
             )
             input_images: list[dict[str, str]] = []
