@@ -126,48 +126,33 @@ def _usage_int(value: Any) -> int:
         return 0
 
 
-def _merge_request_extra_fields(extra_body: Any, metadata: dict[str, Any] | None) -> dict[str, Any] | None:
+def _normalize_extra_body(extra_body: Any) -> dict[str, Any] | None:
     if not isinstance(extra_body, dict):
         base: dict[str, Any] = {}
     else:
         base = dict(extra_body)
-
-    merged_extra: dict[str, Any] = {}
-    existing_extra = base.get("extra")
-    if isinstance(existing_extra, dict):
-        merged_extra = dict(existing_extra)
-    elif isinstance(existing_extra, str) and existing_extra.strip():
-        try:
-            parsed_extra = json.loads(existing_extra)
-        except json.JSONDecodeError:
-            parsed_extra = None
-        if isinstance(parsed_extra, dict):
-            merged_extra = dict(parsed_extra)
-
-    metadata = dict(metadata or {})
-    for key in ("session_id", "prompt_cache_key", "user_id"):
-        value_text = str(metadata.get(key) or "").strip()
-        if value_text:
-            merged_extra[key] = value_text
-
-    if not merged_extra:
-        return base or None
-
-    base["extra"] = json.dumps(merged_extra, ensure_ascii=False, separators=(",", ":"))
     return base
 
 
 def _request_extra_headers(metadata: dict[str, Any] | None) -> dict[str, str] | None:
     metadata = dict(metadata or {})
+    headers: dict[str, str] = {}
+    extra_payload: dict[str, str] = {}
+    for key in ("session_id", "prompt_cache_key", "user_id"):
+        value_text = str(metadata.get(key) or "").strip()
+        if value_text:
+            extra_payload[key] = value_text
+    if extra_payload:
+        headers["extra"] = json.dumps(extra_payload, ensure_ascii=False, separators=(",", ":"))
     logid = (
         metadata.get("x_tt_logid")
         or metadata.get("X-TT-LOGID")
         or metadata.get("X-TT-logid")
     )
     logid_text = str(logid or "").strip()
-    if not logid_text:
-        return None
-    return {"X-TT-LOGID": logid_text}
+    if logid_text:
+        headers["X-TT-LOGID"] = logid_text
+    return headers or None
 
 
 def _get_usage_value(payload: Any, *path: str) -> Any:
@@ -245,10 +230,7 @@ class OpenAIModelWorkerClient:
             kwargs["stop"] = stop
         elif isinstance(stop, str) and stop:
             kwargs["stop"] = [stop]
-        extra_body = _merge_request_extra_fields(
-            request.metadata.get("extra_body"),
-            request.metadata,
-        )
+        extra_body = _normalize_extra_body(request.metadata.get("extra_body"))
         if isinstance(extra_body, dict):
             kwargs["extra_body"] = extra_body
         extra_headers = _request_extra_headers(request.metadata)
@@ -379,10 +361,7 @@ class AzureOpenAIModelWorkerClient:
             kwargs["stop"] = stop
         elif isinstance(stop, str) and stop:
             kwargs["stop"] = [stop]
-        extra_body = _merge_request_extra_fields(
-            request.metadata.get("extra_body"),
-            request.metadata,
-        )
+        extra_body = _normalize_extra_body(request.metadata.get("extra_body"))
         if isinstance(extra_body, dict):
             kwargs["extra_body"] = extra_body
         extra_headers = _request_extra_headers(request.metadata)
