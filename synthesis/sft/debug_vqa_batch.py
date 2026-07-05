@@ -888,13 +888,21 @@ def _config_from_model_arg(
     )
 
 
+def _build_user_prompt_text(record: dict[str, Any]) -> str:
+    question_text = str(record.get("question") or "").strip()
+    gold_answer = str(record.get("gold_answer") or "").strip()
+    if gold_answer:
+        return f"Question: {question_text}\nAnswer: {gold_answer}"
+    return question_text
+
+
 def _build_user_messages(record: dict[str, Any]) -> list[dict[str, Any]] | None:
     image_paths = [str(item).strip() for item in (record.get("image_paths") or []) if str(item).strip()]
     image_urls = [str(item).strip() for item in (record.get("image_urls") or []) if str(item).strip()]
     if not image_paths and not image_urls:
         return None
 
-    content: list[dict[str, Any]] = [{"type": "text", "text": str(record.get("question") or "")}]
+    content: list[dict[str, Any]] = [{"type": "text", "text": _build_user_prompt_text(record)}]
     for path in image_paths:
         content.append({"type": "image_path", "path": path})
     for url in image_urls:
@@ -1014,7 +1022,7 @@ def main(argv: list[str] | None = None) -> int:
 
             input_messages = _build_user_messages(record)
             messages = run_agent_loop(
-                prompt=None if input_messages is not None else str(record.get("question") or ""),
+                prompt=None if input_messages is not None else _build_user_prompt_text(record),
                 messages=input_messages,
                 config=agent_config,
                 context=context,

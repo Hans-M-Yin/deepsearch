@@ -38,12 +38,16 @@ You are writing a full solution for a multi-hop knowledge question. Specifically
 Requirements:
 1. You may think freely during your internal reasoning phase, but the statements ultimately included in the written solution process must also follow rigorous logic, ensuring that the solution remains sound and error-free even if one reads only the written solution process and ignores your private thinking.
 2. In the solution you write, the following logic should be explicitly visible: after each tool call and its returned result, you must carefully analyze the new clues in detail, review the existing clues and the question, determine and plan the next step in detail, and then call a new tool as needed with an explanation.
-3. Your solution should be written from the perspective of someone with strong logical reasoning but POOR memory of world knowledge or history, so every statement must be evidence-based and no unsupported claims may appear. Every statement in your writing should be detailedly analysed or discussed. 
+3. Your solution should be written from the perspective of someone with strong logical reasoning but POOR memory of world knowledge or history, so every statement must be evidence-based and no unsupported claims may appear. Every statement in your writing should be detailedly analysed or discussed. Do not use your inner world knowledge for the writing.
 4. Once you believe the evidence is sufficient and there are no remaining unclear or uncertain points, provide the final answer and end the solution.
 5. In your solution, DO NOT use tools to directly search for pages related to Wikipedia or Wiki Commons, in order to avoid shortcuts. However, you can read related Wikipedia or Wiki Commons pages which are the results of the search tools.
 6. When writing the solution, make full use of the tool results. For example, a searched URL may seem irrelevant to the clues, but you should still analyze whether the webpage may contain the clues needed to solve the problem based on any available snippets, and then use read_url to read it further.
+7. The reasoning final answer to the problem is provided to you, but you must not reveal that provided answer during your response. You may use it only to verify the correctness of your solution process. If you realize that your solution process contains an error, you may reflect on it logically (explaining why it is wrong) and then continue writing the solution process until your answer is correct.
 
-**Examples**
+Next, I will provide some excerpted examples, and you can learn from them how to write a high-quality answer process.
+
+** Example 1: Avoid using internal knowledge or other fabricated evidence.
+
 Bad writing:
 
 Based on the text and watermarks visible in the provided image, the stock photography agency is Alamy. The question asks about a specific photograph from a different media repository that Alamy is known to source content from. My first step is to identify this repository.
@@ -57,7 +61,7 @@ Based on the text and watermarks visible in the provided image, the stock photog
 }
 </action>
 
-Discuss: In this example, thee answer never mentioned Wiki Commons during the analysis stage, yet it directly searched whether Alamy is related to Wiki Commons. At that point, Wiki Commons was an unsupported clue that appeared out of nowhere, which violates Rule 4. A better version of the writing would be:
+Good writing: 
 
 Based on the text and watermarks visible in the provided image, the stock photography agency is Alamy. The question asks about a specific photograph from a different media repository that Alamy is known to source content from. My first step is to identify this repository. Since the clue given in the question is "a large, freely licensed media repository," Wiki Commons may be a possible answer, but there is no evidence yet. So for now, I should first search which repository Alamy sources content from.
 <action>
@@ -70,14 +74,59 @@ Based on the text and watermarks visible in the provided image, the stock photog
 }
 </action>
 
-Discuss: In this version, the answer is more logically rigorous, the reasoning is more careful, and there are no clues appearing from nowhere. You should learn from this style of writing and avoid bad writing like the earlier version.
+Discuss: In the bad version, the query target 'Wiki Commons' comes from nowhere, which is a typical knowledge leakage of the writer model. In good version, the answer is more logically rigorous, the reasoning is more careful, and there are no clues appearing from nowhere.
+Note that if there are clues in the question or in the prior context, you may also make a tentative guess first and then verify it through searching. For example, when the question mentions “largest, free licensed repository,” it is reasonable to hypothesize Wikimedia Commons first and then verify that hypothesis by searching for supporting clues.
+
+** Example 2: Effective Tool Use/Coordination
+
+Original question: In 2022, Messi, as captain, lifted the World Cup trophy on the podium, surrounded by his teammates. How many goals did the player standing immediately to Messi’s left score in the 2016–17 season?
+
+Good writing:
+To determine the goal total of the player standing to Messi’s left on the World Cup final podium, we can search for a photo of the *full Argentina team on the podium at the 2022 World Cup final award ceremony*. Then I can inspect the player standing to Messi’s left in the image and identify who he is. Once I know his identity, we can search his career history and find how many goals he scored in the 2016–17 season. Next, I will call t2t_search to search for that image.
+<action>
+{
+"tool_name": "t2t_search",
+"params": {
+"query": "2022 World Cup final Argentina team award ceremony photo"
+},
+"goal": "To check who the player on Messi's left side is."
+}
+</action>
+(...tool result omitted...)
+The tool returned several image links. Among them, the titles of the first, second, and fourth webpages all mention “Argentina winning the World Cup,” so the corresponding images are likely to be the celebration photo I am looking for from the final award ceremony. Next, I will inspect the first image to check whether it is indeed the target image and whether it can provide clues for the question. So I will now use read_url to download and inspect it.
+<action>
+{
+"tool_name": "read_url",
+"params": {
+"url": "... url omitted ..."
+},
+"goal": "Download the target image and check whether it is the correct image I am looking for"
+}
+</action>
+(... tool result omitted ...)
+The image has been successfully downloaded, and it is indeed a photo of the full Argentina team during the trophy presentation. In the image, Messi is wearing a black bisht and lifting the World Cup trophy. The player on his left is wearing the number 21 shirt. From this image alone, I cannot be fully certain who he is. My next step should be to use i2i_search, crop out this player, and see whether I can find similar images to determine his identity. In addition, since the image shows that he is wearing number 21, if i2i_search does not produce a satisfactory result, I can also directly search who wore number 21 for Argentina in the 2022 World Cup squad.
+<action>
+{
+"tool_name": "i2i_search",
+"params": {
+"region": [420,340,520,370]
+},
+"goal": "Find out who this number 21 player is."
+}
+</action>
+(... tool result omitted ...)
+Several of the search result titles mention Dybala, which suggests that this player is very likely Dybala. However, I still cannot be certain, because it is possible that the retrieved images are not actually of the same person as the cropped player. Therefore, I should download another image and compare it with the person in the original image to see whether they are indeed the same individual. So I will use read_url to download a new image. If it does turn out to be the same person, then I will only need to search Dybala’s historical goal records, and by reading the relevant sources I will be able to determine his goal total for the 2016–17 season.
+(... omitted below ...)
+
+Discuss: In the example above, the solution first analyzes the question and then describes the target image in a detailed and precise way, rather than simply searching for something like “Argentina championship celebration photo,” which could return many different images that fit that description. It then downloads the returned image URL and confirms that it is indeed the target photo. After that, it uses i2i_search on that photo for identification, and read_url to further verify the identity of a person who is not very familiar. The whole process is natural and rigorous, and it does not reveal any internal knowledge.
+
 """
 
 MANUAL_REACT_PROTOCOL = """
 When you writing the solution, you can use tools following these useful tips:
 
 1. t2t_search is a google search tool that returns a list of URLs for text pages. You should select the potentially useful ones using the returned snippets, and then use the read_url tool to access the page content to get new clues. Use this tool when you need to look up world knowledge or content information.
-2. i2i_search is a google lens tool that is very useful for identifying unfamiliar people or objects in the image. Note that the return results might be not related to your original image, so you should first select the search results that are likely to match your current image according to the textual title, then use `read_url` to download those images and inspect their content. Once you determine that the new image and the previous image depict the same object, you can then use `read_url` again to read the linked page of the new image to figure out who or what that object is. You should reflect this logic in the solution.
+2. i2i_search is a google lens tool that is very useful for identifying unfamiliar people or objects in the image. Note that the return results might be not related to your original image, so you should first select the search results that are likely to match your current image according to the textual title, then use `read_url` to download those images and inspect their conten to determine that the new image and the previous image depict the same object.
 3. t2i_search retrieves relevant images based on a text description. You should review the returned information and then use read_url to inspect those images. Use this tool when the missing clues require you to inspect relevant images, or when the images you find are likely to help you answer the question. Note that after using this tool, the searched images are still not provided to you, and you should use `read_url` to inspect the corresponding images.
 4. After using i2i_search and t2i_search, images still cannot be seen in the solution; you need to call read_url to view the thumbnail or the original image.
 
@@ -87,7 +136,7 @@ You must answer exactly one step at a time. Then end your response with exactly 
 {
   "tool_name": "tool_name",
   "params": {
-    "query": "your query here"
+    "parm1": "your param here"
   },
   "goal": "why this tool is the right next step"
 }
