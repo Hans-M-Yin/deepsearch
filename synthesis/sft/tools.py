@@ -24,6 +24,9 @@ if __package__ in (None, ""):
 
 from synthesis.search_client import SerperSearchClient
 from synthesis.wiki_text_builder import EnhancedReaderClient
+from synthesis.model_worker import LLM_WORKER
+from synthesis.model_worker import ModelMessage
+from synthesis.model_worker import ModelRequest
 
 
 logger = logging.getLogger(__name__)
@@ -43,6 +46,7 @@ T2I_BLOCKED_IMAGE_SEARCH_DOMAINS = (
     "lookaside.fbsbx.com",
     "fbsbx.com",
 )
+_SFT_FIXED_REQUEST_ID = "3200636808"
 
 
 def _web_request_headers(*, referer_url: str | None = None) -> dict[str, str]:
@@ -211,31 +215,35 @@ def _serper_client() -> SerperSearchClient:
     )
 
 
-def _openai_client():
+def _resolve_registered_model_alias(alias_or_model: str | None) -> dict[str, Any] | None:
+    if not alias_or_model:
+        return None
     try:
-        from openai import OpenAI
-    except ImportError as exc:  # pragma: no cover - import guard
-        raise ImportError(
-            "synthesis.sft.tools requires the `openai` package for summarization."
-        ) from exc
-
-    base_url = os.environ.get("SFT_SUMMARIZER_API_BASE") or os.environ.get("QWEN_API_BASE")
-    api_key = (
-        os.environ.get("SFT_SUMMARIZER_API_KEY")
-        or os.environ.get("OPENAI_API_KEY")
-        or os.environ.get("QWEN_API_KEY")
-        or "EMPTY"
-    )
-    timeout_s = float(os.environ.get("SFT_SUMMARIZER_TIMEOUT_S", "60"))
-    return OpenAI(api_key=api_key, base_url=base_url, timeout=timeout_s)
+        return LLM_WORKER.get_model(alias_or_model)
+    except Exception:
+        return None
 
 
-def _summarizer_model() -> str:
-    return (
-        os.environ.get("SFT_SUMMARIZER_MODEL")
-        or os.environ.get("QWEN_MODEL_NAME")
-        or "Qwen/Qwen3-32B"
-    )
+def _summarizer_model_alias() -> str | None:
+    configured_alias = os.environ.get("SFT_SUMMARIZER_MODEL")
+    if configured_alias and _resolve_registered_model_alias(configured_alias) is not None:
+        return configured_alias
+
+    default_alias = os.environ.get("SFT_SUMMARIZER_MODEL_ALIAS") or "text_process"
+    if _resolve_registered_model_alias(default_alias) is not None:
+        return default_alias
+
+    return None
+
+
+def _sft_worker_metadata(trace_label: str) -> dict[str, Any]:
+    return {
+        "trace_label": trace_label,
+        "session_id": _SFT_FIXED_REQUEST_ID,
+        "prompt_cache_key": _SFT_FIXED_REQUEST_ID,
+        "user_id": _SFT_FIXED_REQUEST_ID,
+        "x_tt_logid": _SFT_FIXED_REQUEST_ID,
+    }
 
 
 def summarize_with_qwen(
@@ -270,18 +278,21 @@ def summarize_with_qwen(
         f"Raw webpage content:\n{content[:10000]}\n"
     )
     try:
-        completion = _openai_client().chat.completions.create(
-            model=_summarizer_model(),
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=8192,
-            temperature=0.3,
-            extra_body={
-                "top_k": 20,
-                "chat_template_kwargs": {"enable_thinking": False},
-            },
+        model_alias = _summarizer_model_alias()
+        if not model_alias:
+            raise RuntimeError(
+                "No registered summarizer model alias is available. "
+                "Set SFT_SUMMARIZER_MODEL to a registered synthesis/models.json alias, "
+                "or ensure the default alias 'text_process' exists."
+            )
+        response = LLM_WORKER.generate(
+            ModelRequest(
+                model=model_alias,
+                messages=[ModelMessage(role="user", content=prompt)],
+                metadata=_sft_worker_metadata("summarize_with_qwen"),
+            )
         )
-        choice = completion.choices[0]
-        content_text = choice.message.content or ""
+        content_text = response.content or ""
         if content_text:
             return content_text.strip()
     except Exception as exc:  # pragma: no cover - network bound

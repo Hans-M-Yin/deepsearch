@@ -17,6 +17,7 @@ from ..model_worker import ModelRequest
 
 
 Message = dict[str, Any]
+_SFT_FIXED_REQUEST_ID = "3200636808"
 
 
 def _optional_env_float(name: str) -> float | None:
@@ -24,6 +25,19 @@ def _optional_env_float(name: str) -> float | None:
     if value is None or str(value).strip() == "":
         return None
     return float(value)
+
+
+def _sft_worker_metadata(trace_label: str, *, extra_body: dict[str, Any] | None = None) -> dict[str, Any]:
+    metadata: dict[str, Any] = {
+        "trace_label": trace_label,
+        "session_id": _SFT_FIXED_REQUEST_ID,
+        "prompt_cache_key": _SFT_FIXED_REQUEST_ID,
+        "user_id": _SFT_FIXED_REQUEST_ID,
+        "x_tt_logid": _SFT_FIXED_REQUEST_ID,
+    }
+    if extra_body:
+        metadata["extra_body"] = extra_body
+    return metadata
 
 
 def _optional_env_int(name: str) -> int | None:
@@ -442,10 +456,10 @@ def check_hop_chain_coverage(
             temperature=agent_config.temperature,
             max_tokens=agent_config.max_tokens,
             response_format={"type": "json_object"},
-            metadata={
-                "trace_label": "hop_chain_coverage",
-                **({"extra_body": agent_config.extra_body} if agent_config.extra_body else {}),
-            },
+            metadata=_sft_worker_metadata(
+                "hop_chain_coverage",
+                extra_body=agent_config.extra_body,
+            ),
         )
     )
     content = response.content or "{}"

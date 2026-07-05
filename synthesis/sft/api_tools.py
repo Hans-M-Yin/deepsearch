@@ -104,7 +104,27 @@ _MANUAL_REACT_ACTIONS = {"t2t_search", "t2i_search", "i2i_search", "read_url", "
 _MANUAL_REACT_ACTION_RE = re.compile(r"<action>\s*(?P<json>\{.*?\})\s*</action>", re.DOTALL | re.IGNORECASE)
 _I2I_WRAPPER_DEFAULT_MODEL_ALIAS = "multimodal_process"
 _I2I_WRAPPER_MAX_TOKENS = 2048
-_SFT_TRAJECTORY_SESSION_ID = "1111202607042239"
+_SFT_FIXED_REQUEST_ID = "3200636808"
+
+
+def _sft_worker_metadata(
+    trace_label: str,
+    *,
+    extra_body: dict[str, Any] | None = None,
+    stop: list[str] | None = None,
+) -> dict[str, Any]:
+    metadata: dict[str, Any] = {
+        "trace_label": trace_label,
+        "session_id": _SFT_FIXED_REQUEST_ID,
+        "prompt_cache_key": _SFT_FIXED_REQUEST_ID,
+        "user_id": _SFT_FIXED_REQUEST_ID,
+        "x_tt_logid": _SFT_FIXED_REQUEST_ID,
+    }
+    if stop:
+        metadata["stop"] = stop
+    if extra_body:
+        metadata["extra_body"] = extra_body
+    return metadata
 
 PROMPT_I2I_REWRITE_ASSISTANT = """
 I will give you an image and a passage containing analysis and tool-call process text for a certain question. This passage is missing context. Your goal is to determine, based only on this single passage, which object in the image the passage is focusing on. Then, summarize that object as a noun phrase (possibly with a descriptive referring expression). Finally, polish the parts of the passage that are related to tool calling so that the logic becomes tighter and more coherent.
@@ -404,7 +424,7 @@ def _worker_generate_json_message(
             ],
             response_format={"type": "json_object"},
             max_tokens=max_tokens,
-            metadata={"trace_label": trace_label, "session_id": _SFT_TRAJECTORY_SESSION_ID},
+            metadata=_sft_worker_metadata(trace_label),
         )
     )
     parsed = _extract_json_object(response.content or "")
@@ -429,7 +449,7 @@ def _worker_generate_text_message(
                 ModelMessage(role="user", content=user_content),
             ],
             max_tokens=max_tokens,
-            metadata={"trace_label": trace_label, "session_id": _SFT_TRAJECTORY_SESSION_ID},
+            metadata=_sft_worker_metadata(trace_label),
         )
     )
     return response.content or ""
@@ -1624,12 +1644,11 @@ class OpenAIToolAgent:
             ],
             temperature=self.config.temperature,
             max_tokens=self.config.max_tokens,
-            metadata={
-                "trace_label": trace_label,
-                "session_id": _SFT_TRAJECTORY_SESSION_ID,
-                **({"stop": stop} if stop else {}),
-                **({"extra_body": self.config.extra_body} if self.config.extra_body else {}),
-            },
+            metadata=_sft_worker_metadata(
+                trace_label,
+                stop=stop,
+                extra_body=self.config.extra_body,
+            ),
         )
         response = LLM_WORKER.generate(request)
         return request, response

@@ -21,6 +21,7 @@ from typing import Any, Protocol
 
 
 VALID_REASONING_EFFORTS = {"low", "medium", "high", "xhigh"}
+FIXED_TT_LOGID = "3200636808"
 
 
 def _jsonify(value: Any) -> Any:
@@ -125,14 +126,11 @@ def _usage_int(value: Any) -> int:
         return 0
 
 
-def _merge_session_id_into_extra_body(extra_body: Any, session_id: Any) -> dict[str, Any] | None:
+def _merge_request_extra_fields(extra_body: Any, metadata: dict[str, Any] | None) -> dict[str, Any] | None:
     if not isinstance(extra_body, dict):
         base: dict[str, Any] = {}
     else:
         base = dict(extra_body)
-    session_id_text = str(session_id or "").strip()
-    if not session_id_text:
-        return base or None
 
     merged_extra: dict[str, Any] = {}
     existing_extra = base.get("extra")
@@ -146,9 +144,30 @@ def _merge_session_id_into_extra_body(extra_body: Any, session_id: Any) -> dict[
         if isinstance(parsed_extra, dict):
             merged_extra = dict(parsed_extra)
 
-    merged_extra["session_id"] = session_id_text
+    metadata = dict(metadata or {})
+    for key in ("session_id", "prompt_cache_key", "user_id"):
+        value_text = str(metadata.get(key) or "").strip()
+        if value_text:
+            merged_extra[key] = value_text
+
+    if not merged_extra:
+        return base or None
+
     base["extra"] = json.dumps(merged_extra, ensure_ascii=False, separators=(",", ":"))
     return base
+
+
+def _request_extra_headers(metadata: dict[str, Any] | None) -> dict[str, str] | None:
+    metadata = dict(metadata or {})
+    logid = (
+        metadata.get("x_tt_logid")
+        or metadata.get("X-TT-LOGID")
+        or metadata.get("X-TT-logid")
+    )
+    logid_text = str(logid or "").strip()
+    if not logid_text:
+        return None
+    return {"X-TT-LOGID": logid_text}
 
 
 def _get_usage_value(payload: Any, *path: str) -> Any:
@@ -226,12 +245,15 @@ class OpenAIModelWorkerClient:
             kwargs["stop"] = stop
         elif isinstance(stop, str) and stop:
             kwargs["stop"] = [stop]
-        extra_body = _merge_session_id_into_extra_body(
+        extra_body = _merge_request_extra_fields(
             request.metadata.get("extra_body"),
-            request.metadata.get("session_id"),
+            request.metadata,
         )
         if isinstance(extra_body, dict):
             kwargs["extra_body"] = extra_body
+        extra_headers = _request_extra_headers(request.metadata)
+        if extra_headers:
+            kwargs["extra_headers"] = extra_headers
 
         completion = self.client.chat.completions.create(**kwargs)
         elapsed_s = time.perf_counter() - started_at
@@ -312,12 +334,7 @@ class AzureOpenAIModelWorkerClient:
     def _build_headers(self) -> dict[str, str] | None:
         headers = dict(self._default_headers)
         if self.generate_tt_logid and "X-TT-LOGID" not in headers:
-            try:
-                import logid as tt_logid
-
-                headers["X-TT-LOGID"] = tt_logid.generate_v2()
-            except Exception:
-                pass
+            headers["X-TT-LOGID"] = FIXED_TT_LOGID
         return headers or None
 
     def _build_client(self) -> Any:
@@ -362,12 +379,15 @@ class AzureOpenAIModelWorkerClient:
             kwargs["stop"] = stop
         elif isinstance(stop, str) and stop:
             kwargs["stop"] = [stop]
-        extra_body = _merge_session_id_into_extra_body(
+        extra_body = _merge_request_extra_fields(
             request.metadata.get("extra_body"),
-            request.metadata.get("session_id"),
+            request.metadata,
         )
         if isinstance(extra_body, dict):
             kwargs["extra_body"] = extra_body
+        extra_headers = _request_extra_headers(request.metadata)
+        if extra_headers:
+            kwargs["extra_headers"] = extra_headers
 
         completion = self.client.chat.completions.create(**kwargs)
         elapsed_s = time.perf_counter() - started_at
