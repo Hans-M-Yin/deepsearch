@@ -45,6 +45,21 @@ T2I_BLOCKED_IMAGE_SEARCH_DOMAINS = (
 )
 
 
+def _web_request_headers(*, referer_url: str | None = None) -> dict[str, str]:
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/126.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/*,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    if referer_url:
+        headers["Referer"] = referer_url
+    return headers
+
+
 def get_tool_definitions() -> list[dict[str, Any]]:
     """Return OpenAI-compatible function tool definitions."""
 
@@ -360,7 +375,12 @@ def _probe_content_type(url: str) -> str:
         return guessed_image_type
 
     try:
-        response = requests.head(url, allow_redirects=True, timeout=20)
+        response = requests.head(
+            url,
+            allow_redirects=True,
+            timeout=20,
+            headers=_web_request_headers(referer_url=url),
+        )
         content_type = response.headers.get("Content-Type", "")
         if content_type:
             normalized = content_type.split(";", 1)[0].strip().lower()
@@ -370,7 +390,13 @@ def _probe_content_type(url: str) -> str:
         pass
 
     try:
-        response = requests.get(url, allow_redirects=True, stream=True, timeout=20)
+        response = requests.get(
+            url,
+            allow_redirects=True,
+            stream=True,
+            timeout=20,
+            headers=_web_request_headers(referer_url=url),
+        )
         content_type = response.headers.get("Content-Type", "")
         normalized = content_type.split(";", 1)[0].strip().lower() if content_type else ""
         sniffed_content_type = _sniff_image_content_type(response.raw.read(64, decode_content=True))
@@ -497,26 +523,33 @@ def read_url(
 
     content_type = _probe_content_type(normalized_url)
     if content_type.startswith("image/"):
-        temp_dir = tempfile.mkdtemp(prefix="synthesis_sft_read_url_")
-        filename = os.path.basename(urlparse(normalized_url).path) or "downloaded_image"
-        response = requests.get(normalized_url, timeout=60)
-        response.raise_for_status()
-        image_bytes, resolved_content_type = _maybe_resize_downloaded_image(
-            response.content,
-            content_type=content_type,
-        )
-        extension = mimetypes.guess_extension(resolved_content_type) or os.path.splitext(filename)[1] or ".png"
-        stem = os.path.splitext(filename)[0] or "downloaded_image"
-        filename = f"{stem}{extension}"
-        save_path = os.path.join(temp_dir, filename)
-        with open(save_path, "wb") as handle:
-            handle.write(image_bytes)
-        return {
-            "ok": True,
-            "url": normalized_url,
-            "content_type": resolved_content_type,
-            "local_path": save_path,
-        }
+        try:
+            temp_dir = tempfile.mkdtemp(prefix="synthesis_sft_read_url_")
+            filename = os.path.basename(urlparse(normalized_url).path) or "downloaded_image"
+            response = requests.get(
+                normalized_url,
+                timeout=60,
+                headers=_web_request_headers(referer_url=normalized_url),
+            )
+            response.raise_for_status()
+            image_bytes, resolved_content_type = _maybe_resize_downloaded_image(
+                response.content,
+                content_type=content_type,
+            )
+            extension = mimetypes.guess_extension(resolved_content_type) or os.path.splitext(filename)[1] or ".png"
+            stem = os.path.splitext(filename)[0] or "downloaded_image"
+            filename = f"{stem}{extension}"
+            save_path = os.path.join(temp_dir, filename)
+            with open(save_path, "wb") as handle:
+                handle.write(image_bytes)
+            return {
+                "ok": True,
+                "url": normalized_url,
+                "content_type": resolved_content_type,
+                "local_path": save_path,
+            }
+        except Exception as exc:  # pragma: no cover - network bound
+            return {"ok": False, "error": f"read_url failed for {normalized_url}: {exc}"}
 
     try:
         document = _read_document(normalized_url)
