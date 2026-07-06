@@ -346,9 +346,18 @@ def _config_from_model_arg(
 def _build_user_prompt_text(record: dict[str, Any]) -> str:
     question_text = str(record.get("question") or "").strip()
     gold_answer = str(record.get("gold_answer") or "").strip()
+    statements = [
+        str(hop.get("statement") or "").strip()
+        for hop in (record.get("hop_chain") or [])
+        if isinstance(hop, dict) and str(hop.get("statement") or "").strip()
+    ]
+    statements_block = ""
+    if statements:
+        statements_lines = "\n".join(statements)
+        statements_block = f"\nFacts for intermediate verification:\n{statements_lines}"
     if gold_answer:
-        return f"Question: {question_text}\nAnswer: {gold_answer}"
-    return question_text
+        return f"Question: {question_text}\nAnswer: {gold_answer}{statements_block}"
+    return f"{question_text}{statements_block}"
 
 
 def _build_user_messages(record: dict[str, Any]) -> list[dict[str, Any]] | None:
