@@ -9,6 +9,7 @@ import os
 import re
 import sys
 import tempfile
+import threading
 import time
 from io import BytesIO
 from pathlib import Path
@@ -79,6 +80,91 @@ def _env_int(name: str, default: int) -> int:
 
 
 DEFAULT_SEARCH_TOP_K = _env_int("SEARCH_TOP_K", MAX_SEARCH_RESULTS)
+TOOL_STATS_PRINT_EVERY = max(1, _env_int("SFT_TOOL_STATS_PRINT_EVERY", 4))
+
+_TOOL_STATS_LOCK = threading.Lock()
+_TOOL_STATS: dict[str, Any] = {
+    "total_calls": 0,
+    "tools": {
+        "t2t_search": {"success": 0, "failure": 0, "total_results": 0},
+        "t2i_search": {"success": 0, "failure": 0, "total_results": 0},
+        "i2i_search": {"success": 0, "failure": 0, "total_results": 0},
+        "read_url": {
+            "success": 0,
+            "failure": 0,
+            "text_calls": 0,
+            "pdf_calls": 0,
+            "image_calls": 0,
+            "image_http_errors": 0,
+            "image_http_statuses": {},
+        },
+    },
+}
+
+
+def _tool_stats_snapshot_text() -> str:
+    stats = _TOOL_STATS
+    lines = [f"[tool-stats] total_calls={stats['total_calls']}"]
+    for tool_name in ("t2t_search", "t2i_search", "i2i_search"):
+        tool_stats = stats["tools"][tool_name]
+        lines.append(
+            f"[tool-stats] {tool_name} success={tool_stats['success']} "
+            f"failure={tool_stats['failure']} total_results={tool_stats['total_results']}"
+        )
+    read_stats = stats["tools"]["read_url"]
+    lines.append(
+        f"[tool-stats] read_url success={read_stats['success']} failure={read_stats['failure']} "
+        f"text_calls={read_stats['text_calls']} pdf_calls={read_stats['pdf_calls']} "
+        f"image_calls={read_stats['image_calls']} image_http_errors={read_stats['image_http_errors']} "
+        f"image_http_statuses={json.dumps(read_stats['image_http_statuses'], ensure_ascii=False, sort_keys=True)}"
+    )
+    return "\n".join(lines)
+
+
+def _record_search_tool_call(tool_name: str, *, success: bool, result_count: int = 0) -> None:
+    snapshot_text: str | None = None
+    with _TOOL_STATS_LOCK:
+        tool_stats = _TOOL_STATS["tools"][tool_name]
+        key = "success" if success else "failure"
+        tool_stats[key] += 1
+        tool_stats["total_results"] += max(0, int(result_count))
+        _TOOL_STATS["total_calls"] += 1
+        if _TOOL_STATS["total_calls"] % TOOL_STATS_PRINT_EVERY == 0:
+            snapshot_text = _tool_stats_snapshot_text()
+    if snapshot_text:
+        print(snapshot_text, file=sys.stderr, flush=True)
+
+
+def _extract_http_status_code(exc: Exception) -> int | None:
+    if isinstance(exc, requests.HTTPError) and exc.response is not None:
+        return exc.response.status_code
+    return None
+
+
+def _record_read_url_call(
+    *,
+    branch: str,
+    success: bool,
+    image_http_status: int | None = None,
+) -> None:
+    snapshot_text: str | None = None
+    with _TOOL_STATS_LOCK:
+        read_stats = _TOOL_STATS["tools"]["read_url"]
+        key = "success" if success else "failure"
+        read_stats[key] += 1
+        branch_key = f"{branch}_calls"
+        if branch_key in read_stats:
+            read_stats[branch_key] += 1
+        if branch == "image" and image_http_status is not None:
+            read_stats["image_http_errors"] += 1
+            status_key = str(image_http_status)
+            status_counts = read_stats["image_http_statuses"]
+            status_counts[status_key] = int(status_counts.get(status_key) or 0) + 1
+        _TOOL_STATS["total_calls"] += 1
+        if _TOOL_STATS["total_calls"] % TOOL_STATS_PRINT_EVERY == 0:
+            snapshot_text = _tool_stats_snapshot_text()
+    if snapshot_text:
+        print(snapshot_text, file=sys.stderr, flush=True)
 
 
 def _web_request_headers(*, referer_url: str | None = None) -> dict[str, str]:
@@ -355,12 +441,6 @@ def summarize_image_search(result_obj: object) -> object:
         return [normalized] if normalized is not None else []
 
     return []
-
-
-def _guess_image_from_url(url: str) -> bool:
-    guessed_type, _ = mimetypes.guess_type(urlparse(url).path)
-    return bool(guessed_type and guessed_type.startswith("image/"))
-
 
 def _guess_image_content_type(url: str) -> str:
     guessed_type, _ = mimetypes.guess_type(urlparse(url).path)
@@ -684,6 +764,7 @@ def read_url(
             save_path = os.path.join(temp_dir, filename)
             with open(save_path, "wb") as handle:
                 handle.write(image_bytes)
+            _record_read_url_call(branch="image", success=True)
             return {
                 "ok": True,
                 "url": normalized_url,
@@ -691,6 +772,11 @@ def read_url(
                 "local_path": save_path,
             }
         except Exception as exc:  # pragma: no cover - network bound
+            _record_read_url_call(
+                branch="image",
+                success=False,
+                image_http_status=_extract_http_status_code(exc),
+            )
             return {"ok": False, "error": f"read_url failed for {normalized_url}: {exc}"}
 
     if content_type in PDF_CONTENT_TYPES:
@@ -705,6 +791,7 @@ def read_url(
                 handle.write(pdf_bytes)
             content, title = _extract_pdf_text(save_path)
             if not content:
+                _record_read_url_call(branch="pdf", success=False)
                 return {
                     "ok": False,
                     "error": f"read_url failed for {normalized_url}: PDF text extraction returned empty content.",
@@ -718,6 +805,7 @@ def read_url(
                 if goal or assistant_output
                 else content[:500]
             )
+            _record_read_url_call(branch="pdf", success=True)
             return {
                 "ok": True,
                 "kind": "text",
@@ -727,11 +815,13 @@ def read_url(
                 "content_type": "application/pdf",
             }
         except Exception as exc:  # pragma: no cover - network bound
+            _record_read_url_call(branch="pdf", success=False)
             return {"ok": False, "error": f"read_url failed for {normalized_url}: {exc}"}
 
     try:
         document = _read_document(normalized_url)
     except Exception as exc:  # pragma: no cover - network bound
+        _record_read_url_call(branch="text", success=False)
         return {"ok": False, "error": f"read_url failed for {normalized_url}: {exc}"}
 
     content = document.get("content", "") or ""
@@ -745,6 +835,7 @@ def read_url(
         if goal or assistant_output
         else content[:500]
     )
+    _record_read_url_call(branch="text", success=True)
     return {
         "ok": True,
         "kind": "text",
@@ -756,55 +847,63 @@ def read_url(
 
 def t2t_search(query: str, lang: str = "en", top_k: int = DEFAULT_SEARCH_TOP_K) -> dict[str, Any]:
     """Search text pages and return search results only."""
-
-    top_k = max(1, min(int(top_k), MAX_SEARCH_RESULTS))
-    response = _serper_client().search_text(query, limit=top_k, hl=lang)
-    results: list[dict[str, Any]] = []
-    for item in response.results[:top_k]:
-        results.append(
-            {
-                "title": item.title or "",
-                "url": item.url or "",
-                "snippet": item.snippet or "",
-                "rank": item.rank,
-            }
-        )
-    return {
-        "ok": True,
-        "query": query,
-        "results": results,
-    }
+    try:
+        top_k = max(1, min(int(top_k), MAX_SEARCH_RESULTS))
+        response = _serper_client().search_text(query, limit=top_k, hl=lang)
+        results: list[dict[str, Any]] = []
+        for item in response.results[:top_k]:
+            results.append(
+                {
+                    "title": item.title or "",
+                    "url": item.url or "",
+                    "snippet": item.snippet or "",
+                    "rank": item.rank,
+                }
+            )
+        _record_search_tool_call("t2t_search", success=True, result_count=len(results))
+        return {
+            "ok": True,
+            "query": query,
+            "results": results,
+        }
+    except Exception:
+        _record_search_tool_call("t2t_search", success=False, result_count=0)
+        raise
 
 
 def t2i_search(query: str, lang: str = "en", top_k: int = DEFAULT_SEARCH_TOP_K) -> dict[str, Any]:
     """Search images from a text query."""
-
-    top_k = max(1, min(int(top_k), MAX_SEARCH_RESULTS))
-    fetch_limit = min(max(top_k * 3, top_k), 20)
-    effective_query = _sanitize_t2i_query(query)
-    response = _serper_client().search_image(effective_query, limit=fetch_limit, hl=lang)
-    results: list[dict[str, Any]] = []
-    for item in response.results:
-        if _url_matches_blocked_domain(item.image_url or ""):
-            continue
-        if _url_matches_blocked_domain(item.source_page_url or ""):
-            continue
-        results.append(
-            {
-                "title": item.title,
-                "image_url": item.image_url,
-                "source_page_url": item.source_page_url,
-                "snippet": item.snippet,
-                "rank": item.rank,
-            }
-        )
-        if len(results) >= top_k:
-            break
-    return {
-        "ok": True,
-        "query": query,
-        "results": results,
-    }
+    try:
+        top_k = max(1, min(int(top_k), MAX_SEARCH_RESULTS))
+        fetch_limit = min(max(top_k * 3, top_k), 20)
+        effective_query = _sanitize_t2i_query(query)
+        response = _serper_client().search_image(effective_query, limit=fetch_limit, hl=lang)
+        results: list[dict[str, Any]] = []
+        for item in response.results:
+            if _url_matches_blocked_domain(item.image_url or ""):
+                continue
+            if _url_matches_blocked_domain(item.source_page_url or ""):
+                continue
+            results.append(
+                {
+                    "title": item.title,
+                    "image_url": item.image_url,
+                    "source_page_url": item.source_page_url,
+                    "snippet": item.snippet,
+                    "rank": item.rank,
+                }
+            )
+            if len(results) >= top_k:
+                break
+        _record_search_tool_call("t2i_search", success=True, result_count=len(results))
+        return {
+            "ok": True,
+            "query": query,
+            "results": results,
+        }
+    except Exception:
+        _record_search_tool_call("t2i_search", success=False, result_count=0)
+        raise
 
 
 def _image_search_via_serper(image_url: str, top_k: int = MAX_SEARCH_RESULTS) -> object:
@@ -873,6 +972,8 @@ def i2i_search(
             if isinstance(result, dict) and "error" in result:
                 raise RuntimeError(str(result["error"]))
             matches = summarize_image_search(result)
+            result_count = len(matches) if isinstance(matches, list) else (1 if matches else 0)
+            _record_search_tool_call("i2i_search", success=True, result_count=result_count)
             return {
                 "ok": True,
                 "top_k": top_k,
@@ -889,6 +990,7 @@ def i2i_search(
             )
             if attempt < max_retries:
                 time.sleep(base_delay * (2 ** (attempt - 1)))
+    _record_search_tool_call("i2i_search", success=False, result_count=0)
     return {
         "ok": False,
         "top_k": top_k,

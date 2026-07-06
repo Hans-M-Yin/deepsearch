@@ -76,7 +76,7 @@ Based on the text and watermarks visible in the provided image, the stock photog
 </action>
 
 Discuss: In the bad version, the query target 'Wiki Commons' comes from nowhere, which is a typical knowledge leakage of the writer model. In good version, the answer is more logically rigorous, the reasoning is more careful, and there are no clues appearing from nowhere.
-Note that if there are clues in the question or in the prior context, you may also make a tentative guess first and then verify it through searching. For example, when the question mentions “largest, free licensed repository,” it is reasonable to hypothesize Wikimedia Commons first and then verify that hypothesis by searching for supporting clues. Note that ONLY THE COMMONSENSE can be used for this hypothesis.
+Note that if there are clues in the question or in the prior context, you may also make a tentative guess first and then verify it through searching. For example, when the question mentions “largest, free licensed repository,” it is reasonable to hypothesize Wikimedia Commons first and then verify that hypothesis by searching for supporting clues. Note that ONLY THE COMMONSENSE can be used for this hypothesis. Negative Example: “The blockade of Dyrrhachium during Caesar’s Civil War is a well-known event and may fit these conditions,” Dyrrhachium is not a widely known event. Use this strategy only when no enough clues are found after repeated search attempts.
 
 ** Example 2: Effective Tool Use/Coordination
 
@@ -797,21 +797,6 @@ def _normalize_content_part(part: Any, context: ToolRuntimeContext) -> dict[str,
     return dict(part)
 
 
-def _append_system_text(message: dict[str, Any], extra_text: str) -> dict[str, Any]:
-    content = message.get("content")
-    if isinstance(content, str):
-        updated = dict(message)
-        updated["content"] = f"{content}\n\n{extra_text}" if content else extra_text
-        return updated
-    if isinstance(content, list):
-        updated = dict(message)
-        updated["content"] = list(content) + [{"type": "text", "text": extra_text}]
-        return updated
-    updated = dict(message)
-    updated["content"] = extra_text
-    return updated
-
-
 def _tool_reference_text() -> str:
     lines = ["Available tools and their full definitions:"]
     for item in tools.get_tool_definitions():
@@ -843,113 +828,6 @@ def _tool_reference_text() -> str:
     return "\n".join(lines)
 
 
-def _latest_tool_message(messages: list[dict[str, Any]]) -> dict[str, Any] | None:
-    for message in reversed(messages):
-        if message.get("role") == "tool":
-            return message
-    return None
-
-
-def _contains_image_context(messages: list[dict[str, Any]], context: ToolRuntimeContext) -> bool:
-    if context.image_registry:
-        return True
-    for message in messages:
-        content = message.get("content")
-        if not isinstance(content, list):
-            continue
-        for part in content:
-            if not isinstance(part, dict):
-                continue
-            if str(part.get("type") or "") in {"image_url", "image", "input_image", "image_path", "image_ref"}:
-                return True
-    return False
-
-
-def _build_state_guidance(messages: list[dict[str, Any]], context: ToolRuntimeContext) -> str:
-    latest_tool = _latest_tool_message(messages)
-    has_images = _contains_image_context(messages, context)
-    guidance: list[str] = ["Recommendation for Tool Use:"]
-    if latest_tool is None:
-        if has_images:
-            guidance.extend(
-                [
-                    "- There is image context available.",
-                    "- You may inspect whether the current image already contains the target evidence.",
-                    "- If a specific local object matters, consider i2i_search with a region crop first. Then i2i_search will provide recognization of the object.",
-                    "- If the entity is generic or the question mainly asks for background knowledge, a text search may be better than reverse image search.",
-                ]
-            )
-        else:
-            guidance.extend(
-                [
-                    "- Start by identifying the first missing piece of evidence.",
-                    "- Prefer t2t_search for textual evidence gathering and read_url for inspecting a specific result.",
-                ]
-            )
-        return "\n".join(guidance)
-
-    tool_name = str(latest_tool.get("name") or "")
-    output_text = str(latest_tool.get("content") or "")
-    output_obj: Any = None
-    try:
-        output_obj = json.loads(output_text)
-    except Exception:
-        output_obj = None
-
-    if isinstance(output_obj, dict) and output_obj.get("ok") is False:
-        guidance.extend(
-            [
-                f"- The previous tool `{tool_name}` failed.",
-                "- Fix the parameter problem instead of repeating the same invalid action.",
-                "- Explain briefly why the previous call failed before choosing the next action.",
-            ]
-        )
-        return "\n".join(guidance)
-
-    if tool_name == "t2t_search":
-        guidance.extend(
-            [
-                "- You now have a list of text-search results.",
-                "- Prefer selecting one promising URL and using read_url, rather than repeating a very similar search immediately.",
-                "- Only search again if the returned results are clearly off-target or ambiguous.",
-            ]
-        )
-    elif tool_name == "t2i_search":
-        guidance.extend(
-            [
-                "- You now have image-search results.",
-                "- You may inspect the image result pages with read_url or use the new clues to refine the search.",
-                "- If the question is really about a specific pictured object, consider whether reverse image search is needed next.",
-            ]
-        )
-    elif tool_name == "i2i_search":
-        guidance.extend(
-            [
-                "- You now have reverse-image matches.",
-                "- Use the matched titles and source URLs to decide whether to inspect a specific source with read_url.",
-                "- If the reverse-image results are too noisy, fall back to text search with the strongest visual clue.",
-            ]
-        )
-    elif tool_name == "read_url":
-        if isinstance(output_obj, dict) and output_obj.get("kind") == "image":
-            guidance.extend(
-                [
-                    "- The last URL resolved to an image.",
-                    "- Decide whether this image itself contains the target evidence.",
-                    "- If a local object matters, i2i_search on the image or a cropped region may help.",
-                ]
-            )
-        else:
-            guidance.extend(
-                [
-                    "- The last URL provided page content.",
-                    "- Decide whether the page already supports the current claim strongly enough.",
-                    "- If not, either inspect another URL or run a refined search to fill the remaining gap.",
-                ]
-            )
-    else:
-        guidance.append("- Choose the next action based on the strongest remaining evidence gap.")
-    return "\n".join(guidance)
 
 
 def _build_manual_react_system_prompt(
