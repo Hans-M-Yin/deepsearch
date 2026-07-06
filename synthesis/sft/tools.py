@@ -149,7 +149,7 @@ def get_tool_definitions() -> list[dict[str, Any]]:
                 "description": (
                     "Read a URL. If it returns text, fetch content through a "
                     "reader backend and optionally summarize only the part "
-                    "relevant to the given query. If it returns an image, the image will be downloaded for you. "
+                    "relevant to the current tool goal. If it returns an image, the image will be downloaded for you. "
                     "NOTICE, only the URLs you have got from search tools can be read. Wikipedia and Wiki commons is excluded for safety reasons."
                 ),
                 "parameters": {
@@ -158,11 +158,6 @@ def get_tool_definitions() -> list[dict[str, Any]]:
                         "url": {
                             "type": "string",
                             "description": "The URL to read.",
-                        },
-                        "query": {
-                            "type": "string",
-                            "description": "Optional query for focused summarization.",
-                            "default": "",
                         },
                     },
                     "required": ["url"],
@@ -203,8 +198,11 @@ def normalize_tool_arguments(name: str, arguments: dict[str, Any]) -> dict[str, 
             params["query"] = params.pop("q")
         if "hl" in params and "lang" not in params:
             params["lang"] = params.pop("hl")
-    if name == "read_url" and "URL" in params and "url" not in params:
-        params["url"] = params.pop("URL")
+    if name == "read_url":
+        if "URL" in params and "url" not in params:
+            params["url"] = params.pop("URL")
+        if "query" in params:
+            params.pop("query")
     if name == "i2i_search" and isinstance(params.get("region"), str):
         raw_region = params["region"].strip()
         if raw_region.startswith(("[", "{")):
@@ -257,34 +255,25 @@ def _sft_worker_metadata(trace_label: str) -> dict[str, Any]:
 
 def summarize_with_qwen(
     content: str,
-    query: str,
-    title: str,
-    question_text: str = "",
+    goal: str,
     assistant_output: str = "",
 ) -> str:
     """Compress webpage content while preserving information relevant to the current task."""
 
     prompt = (
-        "You are cleaning and compressing raw webpage content for a multi-hop question-answering agent.\n\n"
-        "Your job is NOT to write a short abstract. Your job is to produce a cleaned, compressed version of the "
-        "page that preserves all information relevant to the current question and the agent's current reasoning step, "
-        "while aggressively removing noise.\n\n"
-        "Compression rules:\n"
-        "1. Keep all facts that may help answer the current question or the agent's current sub-goal.\n"
-        "2. Preserve important details exactly when possible, including names, dates, numbers, relationships, quotes, "
-        "titles, roles, locations, and qualifiers.\n"
-        "3. If a paragraph is relevant, keep its meaning complete. Do not over-compress it into vague statements.\n"
-        "4. Remove noise completely when it is not relevant: navigation text, menus, repeated headers, footer text, "
-        "social buttons, unrelated recommendations, boilerplate, tracking text, and raw URL lists.\n"
-        "5. If a section is only partially relevant, keep the relevant sentences and shorten the rest.\n"
-        "6. Do not add outside knowledge. Do not infer missing facts. Do not rewrite the article into bullet points "
-        "unless the source itself is structured that way.\n"
-        "7. Output only the cleaned article text.\n\n"
-        f"Original question:\n{question_text or query}\n\n"
-        f"Agent's current output:\n{assistant_output or '(empty)'}\n\n"
-        f"Focused query for this URL:\n{query or '(empty)'}\n\n"
-        f"Webpage title:\n{title or '(untitled)'}\n\n"
-        f"Raw webpage content:\n{content[:10000]}\n"
+f"""
+Below you will receive a piece of raw webpage content. Your goal is to preserve the relevant parts from this raw content as the search result, based on the user's objective and reasoning process. The extraction must remain faithful to the original text and must not add anything that is not present in the source.
+Rules:
+1. Based on the user's provided reasoning and goal, analyze which content may be useful and which content is definitely not useful. All content that may be useful should be preserved in detail. Also retain enough original context so that the evidence still makes sense on its own when presented separately. Do not over-compress it into vague paraphrases.
+2. Preserve the most relevant evidence in an extractive way whenever possible. When important, keep names, dates, numbers, quotations, titles, roles, locations, formulas, and qualifiers exactly as they appear.
+3. Remove obvious noise: navigation text, menus, repeated headers, footer text, social buttons, login or subscription prompts, unrelated recommendations, boilerplate, tracking text, and raw URL lists.
+4. Perform content extraction only. Do not add extra content, and do not use or introduce any world knowledge.
+5. If multiple parts of the raw text may be related, you may extract them in separate segments.
+
+Agent's current output:\n{assistant_output or '(empty)'}\n
+Tool goal:\n{goal or '(empty)'}\n
+Raw webpage content:\n{content[:100000]}\n
+"""
     )
     try:
         model_alias = _summarizer_model_alias()
@@ -576,8 +565,7 @@ def _read_document(url: str) -> dict[str, Any]:
 
 def read_url(
     url: str,
-    query: str = "",
-    question_text: str = "",
+    goal: str = "",
     assistant_output: str = "",
 ) -> dict[str, Any]:
     """Read a URL as either text content or a downloadable image."""
@@ -632,12 +620,10 @@ def read_url(
             summarized_content = (
                 summarize_with_qwen(
                     content=content,
-                    query=query,
-                    title=title or filename,
-                    question_text=question_text,
+                    goal=goal,
                     assistant_output=assistant_output,
                 )
-                if query or question_text or assistant_output
+                if goal or assistant_output
                 else content[:500]
             )
             return {
@@ -661,12 +647,10 @@ def read_url(
     summarized_content = (
         summarize_with_qwen(
             content=content,
-            query=query,
-            title=title,
-            question_text=question_text,
+            goal=goal,
             assistant_output=assistant_output,
         )
-        if query or question_text or assistant_output
+        if goal or assistant_output
         else content[:500]
     )
     return {

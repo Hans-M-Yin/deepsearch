@@ -373,6 +373,7 @@ class ManualReActStep:
     thought: str
     action: str
     action_input: dict[str, Any]
+    goal: str
     raw_text: str
 
 
@@ -1073,12 +1074,11 @@ def _parse_manual_react_step(text: str) -> ManualReActStep | None:
     if action not in _MANUAL_REACT_ACTIONS or not isinstance(params, dict):
         return None
     normalized_text = stripped[: match.end()].strip()
-    if goal:
-        thought = f"{thought}\n\nGoal: {goal}".strip() if thought else f"Goal: {goal}"
     return ManualReActStep(
         thought=thought,
         action=action,
         action_input=params,
+        goal=goal,
         raw_text=normalized_text,
     )
 
@@ -1510,6 +1510,7 @@ def execute_tool_call(
     context: ToolRuntimeContext,
     question_text: str = "",
     assistant_text: str = "",
+    tool_goal: str = "",
 ) -> ToolExecutionResult:
     """Execute one tool call against the runtime context."""
 
@@ -1546,8 +1547,7 @@ def execute_tool_call(
             return ToolExecutionResult(name=name, arguments=params, output=output, output_text=_json_text(output))
         output = tools.read_url(
             url=url,
-            query=params.get("query", "") or "",
-            question_text=question_text,
+            goal=tool_goal,
             assistant_output=assistant_text,
         )
         new_images: dict[str, Any] = {}
@@ -1816,6 +1816,7 @@ class OpenAIToolAgent:
                 context,
                 question_text=_latest_user_text(conversation_messages),
                 assistant_text=_strip_action_blocks(repaired_step_text),
+                tool_goal=step.goal,
             )
             tool_results.append(result)
             conversation_messages.append(
