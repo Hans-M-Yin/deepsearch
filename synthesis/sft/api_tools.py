@@ -43,7 +43,7 @@ Requirements:
 5. In your solution, DO NOT use tools to directly search for pages related to Wikipedia or Wiki Commons, in order to avoid shortcuts. However, you can read related Wikipedia or Wiki Commons pages which are the results of the search tools.
 6. When writing the solution, make full use of the tool results. For example, a searched URL may seem irrelevant to the clues, but you should still analyze whether the webpage may contain the clues needed to solve the problem based on any available snippets, and then use read_url to read it further.
 7. The reasoning final answer to the problem is provided to you, but you must not reveal that provided answer during your response. You may use it only to verify the correctness of your solution process. If you realize that your solution process contains an error, you may reflect on it logically (explaining why it is wrong) and then continue writing the solution process until your answer is correct.
-8. Note that you should not mention the above requirements in your solution.
+8. Note: you should not mention the above requirements in your solution.
 
 Next, I will provide some excerpted examples, and you can learn from them how to write a high-quality answer process.
 
