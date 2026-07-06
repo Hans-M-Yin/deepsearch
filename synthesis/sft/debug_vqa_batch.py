@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import os
 from pathlib import Path
+import traceback
 from typing import Any
 
 from .pipeline import (
@@ -199,7 +201,6 @@ def _build_raw_trajectory_record(
     record: dict[str, Any],
     input_images: list[dict[str, str]],
     messages: list[dict[str, Any]],
-    formatted_trajectory: dict[str, Any],
     extracted_answer: str,
     answer_judge: dict[str, Any],
     hop_chain_coverage: dict[str, Any] | None,
@@ -214,7 +215,6 @@ def _build_raw_trajectory_record(
         "input_images": input_images,
         "source_metadata": _build_source_metadata(record, vqa_dir=vqa_dir),
         "raw_messages": messages,
-        "raw_trajectory": formatted_trajectory,
         "extracted_answer": extracted_answer,
         "answer_judge": answer_judge,
         "hop_chain": list(record.get("hop_chain") or []),
@@ -232,6 +232,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--image-url", action="append", help="Attach a remote image URL to the user input.")
     parser.add_argument("--limit", type=int, default=5, help="How many questions to run in batch mode.")
     parser.add_argument("--offset", type=int, default=0, help="Start offset in batch mode.")
+    parser.add_argument("--workers", type=int, default=1, help="How many records to process concurrently.")
     parser.add_argument("--workdir", default=os.path.join(os.getcwd(), "synthesis_sft_runs"))
     parser.add_argument("--output-jsonl", help="Optional path to save raw trajectory records.")
     parser.add_argument(
@@ -381,6 +382,91 @@ def _optional_env_int(name: str) -> int | None:
     return int(value)
 
 
+def _process_record(
+    *,
+    index: int,
+    record: dict[str, Any],
+    agent_config: Any,
+    expert_config: Any,
+    workdir: str,
+    vqa_dir: str | None,
+) -> dict[str, Any]:
+    context = build_runtime_context(
+        working_dir=os.path.join(workdir, f"debug_{index:04d}_{record.get('question_id') or 'question'}"),
+        case_id=str(record.get("question_id") or f"debug_{index:04d}"),
+        metadata={
+            "question_id": record.get("question_id"),
+            "sample_id": record.get("sample_id"),
+            "path_id": record.get("path_id"),
+            "question": record.get("question"),
+            "gold_answer": record.get("gold_answer"),
+            "hop_chain": list(record.get("hop_chain") or []),
+        },
+    )
+    input_images: list[dict[str, str]] = []
+    for image_path in record.get("image_paths") or []:
+        normalized_path = os.path.abspath(str(image_path))
+        context.register_image(normalized_path)
+        input_images.append({"image_path": normalized_path})
+    for image_url in record.get("image_urls") or []:
+        normalized_url = str(image_url).strip()
+        if normalized_url:
+            context.register_image(normalized_url)
+            input_images.append({"image_url": normalized_url})
+
+    input_messages = _build_user_messages(record)
+    messages = run_agent_loop(
+        prompt=None if input_messages is not None else _build_user_prompt_text(record),
+        messages=input_messages,
+        config=agent_config,
+        context=context,
+    )
+    extracted_answer = extract_answer(messages)
+    answer_judge = judge(
+        question=str(record.get("question") or ""),
+        answer=str(record.get("gold_answer") or ""),
+        extracted_answer=extracted_answer,
+    )
+    formatted_trajectory = format_messages(messages)
+    hop_chain = list(record.get("hop_chain") or [])
+    hop_chain_coverage = (
+        check_hop_chain_coverage(messages, hop_chain, config=expert_config)
+        if hop_chain and expert_config is not None
+        else None
+    )
+
+    result_record = {
+        "question_id": record.get("question_id"),
+        "sample_id": record.get("sample_id"),
+        "path_id": record.get("path_id"),
+        "question": record.get("question"),
+        "gold_answer": record.get("gold_answer"),
+        "input_images": input_images,
+        "extracted_answer": extracted_answer,
+        "answer_judge": answer_judge,
+        "hop_chain": hop_chain,
+        "hop_chain_coverage": hop_chain_coverage,
+        "formatted_trajectory": formatted_trajectory,
+        "messages": messages,
+    }
+    raw_record = _build_raw_trajectory_record(
+        record=record,
+        input_images=input_images,
+        messages=messages,
+        extracted_answer=extracted_answer,
+        answer_judge=answer_judge,
+        hop_chain_coverage=hop_chain_coverage,
+        vqa_dir=vqa_dir,
+    )
+    is_correct = bool((answer_judge or {}).get("is_correct"))
+    return {
+        "index": index,
+        "result_record": result_record,
+        "raw_record": raw_record,
+        "is_correct": is_correct,
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
@@ -391,6 +477,8 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--model is required in single-question mode unless SFT_OPENAI_MODEL / OPENAI_MODEL is set.")
     if args.vqa_dir and not args.model:
         parser.error("--model is required in batch mode unless SFT_OPENAI_MODEL / OPENAI_MODEL is set.")
+    if args.workers <= 0:
+        parser.error("--workers must be positive.")
 
     if args.vqa_dir:
         all_records = _load_vqa_records(Path(args.vqa_dir))
@@ -458,87 +546,58 @@ def main(argv: list[str] | None = None) -> int:
     total_count = 0
     correct_count = 0
     incorrect_count = 0
+    failed_count = 0
 
     try:
-        for index, record in enumerate(records, start=1):
-            context = build_runtime_context(
-                working_dir=os.path.join(args.workdir, f"debug_{index:04d}_{record.get('question_id') or 'question'}"),
-                case_id=str(record.get("question_id") or f"debug_{index:04d}"),
-                metadata={
-                    "question_id": record.get("question_id"),
-                    "sample_id": record.get("sample_id"),
-                    "path_id": record.get("path_id"),
-                    "question": record.get("question"),
-                    "gold_answer": record.get("gold_answer"),
-                    "hop_chain": list(record.get("hop_chain") or []),
-                },
-            )
-            input_images: list[dict[str, str]] = []
-            for image_path in record.get("image_paths") or []:
-                normalized_path = os.path.abspath(str(image_path))
-                context.register_image(normalized_path)
-                input_images.append({"image_path": normalized_path})
-            for image_url in record.get("image_urls") or []:
-                normalized_url = str(image_url).strip()
-                if normalized_url:
-                    context.register_image(normalized_url)
-                    input_images.append({"image_url": normalized_url})
-
-            input_messages = _build_user_messages(record)
-            messages = run_agent_loop(
-                prompt=None if input_messages is not None else _build_user_prompt_text(record),
-                messages=input_messages,
-                config=agent_config,
-                context=context,
-            )
-            extracted_answer = extract_answer(messages)
-            answer_judge = judge(
-                question=str(record.get("question") or ""),
-                answer=str(record.get("gold_answer") or ""),
-                extracted_answer=extracted_answer,
-            )
-            formatted_trajectory = format_messages(messages)
-            hop_chain = list(record.get("hop_chain") or [])
-            hop_chain_coverage = (
-                check_hop_chain_coverage(messages, hop_chain, config=expert_config)
-                if hop_chain and expert_config is not None
-                else None
-            )
-
-            result_record = {
-                "question_id": record.get("question_id"),
-                "sample_id": record.get("sample_id"),
-                "path_id": record.get("path_id"),
-                "question": record.get("question"),
-                "gold_answer": record.get("gold_answer"),
-                "input_images": input_images,
-                "extracted_answer": extracted_answer,
-                "answer_judge": answer_judge,
-                "hop_chain": hop_chain,
-                "hop_chain_coverage": hop_chain_coverage,
-                "formatted_trajectory": formatted_trajectory,
-                "messages": messages,
+        resolved_vqa_dir = str(Path(args.vqa_dir).resolve()) if args.vqa_dir else None
+        with ThreadPoolExecutor(max_workers=args.workers) as executor:
+            future_to_context = {
+                executor.submit(
+                    _process_record,
+                    index=index,
+                    record=record,
+                    agent_config=agent_config,
+                    expert_config=expert_config,
+                    workdir=args.workdir,
+                    vqa_dir=resolved_vqa_dir,
+                ): {
+                    "index": index,
+                    "record": record,
+                }
+                for index, record in enumerate(records, start=1)
             }
-            _print_record_result(result_record)
-            raw_record = _build_raw_trajectory_record(
-                record=record,
-                input_images=input_images,
-                messages=messages,
-                formatted_trajectory=formatted_trajectory,
-                extracted_answer=extracted_answer,
-                answer_judge=answer_judge,
-                hop_chain_coverage=hop_chain_coverage,
-                vqa_dir=str(Path(args.vqa_dir).resolve()) if args.vqa_dir else None,
-            )
-            if raw_output_handle is not None:
-                _write_jsonl_record(raw_output_handle, raw_record)
+            for future in as_completed(future_to_context):
+                task_context = future_to_context[future]
+                record = task_context["record"]
+                try:
+                    payload = future.result()
+                except Exception as exc:
+                    failed_count += 1
+                    total_count += 1
+                    print("\n" + "=" * 100)
+                    print(f"question_id: {record.get('question_id')}")
+                    if record.get("sample_id") is not None:
+                        print(f"sample_id: {record.get('sample_id')}")
+                    if record.get("path_id") is not None:
+                        print(f"path_id: {record.get('path_id')}")
+                    print("status: failed")
+                    print(f"error: {exc.__class__.__name__}: {exc}")
+                    print("traceback:")
+                    print("".join(traceback.format_exception(exc)).rstrip())
+                    continue
 
-            is_correct = bool((answer_judge or {}).get("is_correct"))
-            total_count += 1
-            if is_correct:
-                correct_count += 1
-            else:
-                incorrect_count += 1
+                result_record = payload["result_record"]
+                raw_record = payload["raw_record"]
+                is_correct = bool(payload["is_correct"])
+                _print_record_result(result_record)
+                if raw_output_handle is not None:
+                    _write_jsonl_record(raw_output_handle, raw_record)
+
+                total_count += 1
+                if is_correct:
+                    correct_count += 1
+                else:
+                    incorrect_count += 1
     finally:
         if raw_output_handle is not None:
             raw_output_handle.close()
@@ -548,6 +607,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"total: {total_count}")
     print(f"correct: {correct_count}")
     print(f"incorrect: {incorrect_count}")
+    print(f"failed: {failed_count}")
 
     return 0
 
