@@ -55,7 +55,6 @@ def _augment_query_with_literal_exclusion(query: str, exclusion: str) -> str:
 
 def _augment_text_query(query: str) -> str:
     query = _augment_query_with_site_exclusion(query, "wikipedia.org")
-    query = _augment_query_with_literal_exclusion(query, "-filetype:pdf")
     return query
 
 
@@ -1158,7 +1157,7 @@ def _smoke_test() -> None:
         5,
         {"hl": "en", "gl": "us", "location": "Austin, Texas, United States"},
     )
-    assert serper_body["q"] == "Coffee -site:wikipedia.org -filetype:pdf"
+    assert serper_body["q"] == "Coffee -site:wikipedia.org"
     assert serper_body["num"] == 5
     assert serper_body["hl"] == "en"
     assert serper_body["gl"] == "us"

@@ -18,6 +18,11 @@ from urllib.parse import urlparse
 import requests
 from PIL import Image, ImageOps
 
+try:
+    import fitz
+except ImportError:  # pragma: no cover - optional dependency
+    fitz = None
+
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     __package__ = "synthesis.sft"
@@ -39,6 +44,10 @@ AMBIGUOUS_CONTENT_TYPES = {
     "application/octet-stream",
     "binary/octet-stream",
     "text/plain",
+}
+PDF_CONTENT_TYPES = {
+    "application/pdf",
+    "application/x-pdf",
 }
 T2I_BLOCKED_IMAGE_SEARCH_DOMAINS = (
     "facebook.com",
@@ -339,6 +348,13 @@ def _guess_image_content_type(url: str) -> str:
     return ""
 
 
+def _guess_pdf_content_type(url: str) -> str:
+    guessed_type, _ = mimetypes.guess_type(urlparse(url).path)
+    if guessed_type in PDF_CONTENT_TYPES:
+        return guessed_type
+    return ""
+
+
 def _sniff_image_content_type(payload: bytes) -> str:
     if payload.startswith(b"\xff\xd8\xff"):
         return "image/jpeg"
@@ -354,6 +370,10 @@ def _sniff_image_content_type(payload: bytes) -> str:
     if normalized_payload.startswith(b"<svg") or b"<svg" in normalized_payload[:256]:
         return "image/svg+xml"
     return ""
+
+
+def _sniff_pdf_content_type(payload: bytes) -> str:
+    return "application/pdf" if payload.startswith(b"%PDF-") else ""
 
 def _url_matches_blocked_domain(url: str) -> bool:
     normalized_url = str(url or "").strip()
@@ -384,6 +404,9 @@ def _probe_content_type(url: str) -> str:
     guessed_image_type = _guess_image_content_type(url)
     if guessed_image_type:
         return guessed_image_type
+    guessed_pdf_type = _guess_pdf_content_type(url)
+    if guessed_pdf_type:
+        return guessed_pdf_type
 
     try:
         response = requests.head(
@@ -410,7 +433,8 @@ def _probe_content_type(url: str) -> str:
         )
         content_type = response.headers.get("Content-Type", "")
         normalized = content_type.split(";", 1)[0].strip().lower() if content_type else ""
-        sniffed_content_type = _sniff_image_content_type(response.raw.read(64, decode_content=True))
+        first_bytes = response.raw.read(64, decode_content=True)
+        sniffed_content_type = _sniff_image_content_type(first_bytes) or _sniff_pdf_content_type(first_bytes)
         response.close()
         if sniffed_content_type:
             return sniffed_content_type
@@ -421,6 +445,38 @@ def _probe_content_type(url: str) -> str:
         pass
 
     return guessed_image_type or "text/html"
+
+
+def _download_binary(url: str, *, timeout: int = 60) -> tuple[bytes, str]:
+    response = requests.get(
+        url,
+        timeout=timeout,
+        headers=_web_request_headers(referer_url=url),
+    )
+    response.raise_for_status()
+    content_type = response.headers.get("Content-Type", "")
+    normalized = content_type.split(";", 1)[0].strip().lower() if content_type else ""
+    return response.content, normalized
+
+
+def _extract_pdf_text(pdf_path: str) -> tuple[str, str]:
+    if fitz is None:
+        raise RuntimeError(
+            "PyMuPDF is required for PDF reading in read_url. "
+            "Install it with `pip install PyMuPDF`."
+        )
+
+    text_parts: list[str] = []
+    title = ""
+    with fitz.open(pdf_path) as document:
+        metadata = document.metadata or {}
+        title = str(metadata.get("title") or "").strip()
+        for page in document:
+            page_text = page.get_text("text") or ""
+            cleaned = page_text.strip()
+            if cleaned:
+                text_parts.append(cleaned)
+    return "\n\n".join(text_parts).strip(), title
 
 
 def _maybe_resize_downloaded_image(
@@ -537,14 +593,9 @@ def read_url(
         try:
             temp_dir = tempfile.mkdtemp(prefix="synthesis_sft_read_url_")
             filename = os.path.basename(urlparse(normalized_url).path) or "downloaded_image"
-            response = requests.get(
-                normalized_url,
-                timeout=60,
-                headers=_web_request_headers(referer_url=normalized_url),
-            )
-            response.raise_for_status()
+            response_content, _ = _download_binary(normalized_url, timeout=60)
             image_bytes, resolved_content_type = _maybe_resize_downloaded_image(
-                response.content,
+                response_content,
                 content_type=content_type,
             )
             extension = mimetypes.guess_extension(resolved_content_type) or os.path.splitext(filename)[1] or ".png"
@@ -558,6 +609,44 @@ def read_url(
                 "url": normalized_url,
                 "content_type": resolved_content_type,
                 "local_path": save_path,
+            }
+        except Exception as exc:  # pragma: no cover - network bound
+            return {"ok": False, "error": f"read_url failed for {normalized_url}: {exc}"}
+
+    if content_type in PDF_CONTENT_TYPES:
+        try:
+            temp_dir = tempfile.mkdtemp(prefix="synthesis_sft_read_pdf_")
+            filename = os.path.basename(urlparse(normalized_url).path) or "downloaded.pdf"
+            if not filename.lower().endswith(".pdf"):
+                filename = f"{os.path.splitext(filename)[0] or 'downloaded'}.pdf"
+            save_path = os.path.join(temp_dir, filename)
+            pdf_bytes, _ = _download_binary(normalized_url, timeout=60)
+            with open(save_path, "wb") as handle:
+                handle.write(pdf_bytes)
+            content, title = _extract_pdf_text(save_path)
+            if not content:
+                return {
+                    "ok": False,
+                    "error": f"read_url failed for {normalized_url}: PDF text extraction returned empty content.",
+                }
+            summarized_content = (
+                summarize_with_qwen(
+                    content=content,
+                    query=query,
+                    title=title or filename,
+                    question_text=question_text,
+                    assistant_output=assistant_output,
+                )
+                if query or question_text or assistant_output
+                else content[:500]
+            )
+            return {
+                "ok": True,
+                "kind": "text",
+                "url": normalized_url,
+                "title": title or filename,
+                "content": summarized_content,
+                "content_type": "application/pdf",
             }
         except Exception as exc:  # pragma: no cover - network bound
             return {"ok": False, "error": f"read_url failed for {normalized_url}: {exc}"}
