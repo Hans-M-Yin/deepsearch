@@ -268,6 +268,13 @@ def get_tool_definitions() -> list[dict[str, Any]]:
                             "type": "string",
                             "description": "The URL to read.",
                         },
+                        "goal": {
+                            "type": "string",
+                            "description": (
+                                "Why reading this URL is the right next step, and what "
+                                "specific evidence should be extracted from it."
+                            ),
+                        },
                     },
                     "required": ["url"],
                 },

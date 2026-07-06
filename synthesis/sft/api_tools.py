@@ -55,10 +55,9 @@ Based on the text and watermarks visible in the provided image, the stock photog
 <action>
 {
   "tool_name": "t2t_search",
-  "params": {
+  "arguments": {
     "query": "Alamy sources content from Wikimedia Commons"
   },
-  "goal": "To determine if Alamy sources content from the freely licensed media repository, Wikimedia Commons, as suggested by the question's description."
 }
 </action>
 
@@ -68,10 +67,9 @@ Based on the text and watermarks visible in the provided image, the stock photog
 <action>
 {
 "tool_name": "t2t_search",
-"params": {
+"arguments": {
 "query": "The large repository Alamy sources content from"
-},
-"goal": "Confirm which large freely licensed media repository Alamy sources content from."
+}
 }
 </action>
 
@@ -86,10 +84,9 @@ To determine the goal total of the player standing to Messi’s left on the Worl
 <action>
 {
 "tool_name": "t2t_search",
-"params": {
+"arguments": {
 "query": "2022 World Cup final Argentina team award ceremony photo"
-},
-"goal": "To check who the player on Messi's left side is."
+}
 }
 </action>
 (...tool result omitted...)
@@ -97,10 +94,10 @@ The tool returned several image links. Among them, the titles of the first, seco
 <action>
 {
 "tool_name": "read_url",
-"params": {
-"url": "... url omitted ..."
-},
-"goal": "Download the target image and check whether it is the correct image I am looking for"
+"arguments": {
+ "url": "... url omitted ...",
+ "goal": "Download the target image and check whether it is the correct image I am looking for"
+}
 }
 </action>
 (... tool result omitted ...)
@@ -108,10 +105,9 @@ The image has been successfully downloaded, and it is indeed a photo of the full
 <action>
 {
 "tool_name": "i2i_search",
-"params": {
+"arguments": {
 "region": [420,340,520,370]
-},
-"goal": "Find out who this number 21 player is."
+}
 }
 </action>
 (... tool result omitted ...)
@@ -135,17 +131,18 @@ You must answer exactly one step at a time. Then end your response with exactly 
 <action>
 {
   "tool_name": "tool_name",
-  "params": {
+  "arguments": {
     "parm1": "your param here"
-  },
-  "goal": "why this tool is the right next step"
+  }
 }
 </action>
 
 Rules:
 - Output exactly one <action>...</action> block in each round.
 - The content inside <action> must be valid JSON.
-- The JSON must contain exactly these top-level keys: tool_name, params, goal.
+- The JSON must contain exactly these top-level keys: tool_name, arguments.
+- For most tools, put only the real execution arguments inside arguments.
+- Only for read_url, include the focused reading intention as arguments.goal.
 
 """
 
@@ -195,8 +192,7 @@ My first step is to use the provided image to identify the celestial body.
 <action>
 {
   "tool_name": "i2i_search",
-  "params": {},
-  "goal": "Identify the celestial body in the image, which will help in identifying the orbiter that discovered the equatorial ridge."
+  "arguments": {...ignored...}
 }
 </action>"
 Your output:
@@ -207,8 +203,7 @@ Your output:
 <action>
 {
   "tool_name": "i2i_search",
-  "params": {},
-  "goal": "Identify the celestial body in the image, which will help in identifying the orbiter that discovered the equatorial ridge."
+  "arguments": {...ignored...}
 }
 </action></refined>
 """
@@ -546,6 +541,11 @@ def _parse_manual_react_goal(text: str) -> str:
     action_payload = _extract_json_object(matches[-1].group("json"))
     if not isinstance(action_payload, dict):
         return ""
+    arguments = action_payload.get("arguments")
+    if isinstance(arguments, dict):
+        nested_goal = str(arguments.get("goal") or "").strip()
+        if nested_goal:
+            return nested_goal
     return str(action_payload.get("goal") or "").strip()
 
 
@@ -553,13 +553,15 @@ def _render_manual_react_text(
     *,
     thought: str,
     action: str,
-    params: dict[str, Any],
+    arguments: dict[str, Any],
     goal: str,
 ) -> str:
+    normalized_arguments = dict(arguments)
+    if action == "read_url" and goal and "goal" not in normalized_arguments:
+        normalized_arguments["goal"] = goal
     payload = {
         "tool_name": action,
-        "params": params,
-        "goal": goal,
+        "arguments": normalized_arguments,
     }
     action_text = json.dumps(payload, ensure_ascii=False, indent=2)
     cleaned_thought = thought.strip()
@@ -947,15 +949,20 @@ def _parse_manual_react_step(text: str) -> ManualReActStep | None:
     if not isinstance(action_payload, dict):
         return None
     action = str(action_payload.get("tool_name") or "").strip()
-    params = action_payload.get("params")
-    goal = str(action_payload.get("goal") or "").strip()
-    if action not in _MANUAL_REACT_ACTIONS or not isinstance(params, dict):
+    arguments = action_payload.get("arguments")
+    if not isinstance(arguments, dict):
+        arguments = action_payload.get("params")
+    nested_goal = ""
+    if isinstance(arguments, dict):
+        nested_goal = str(arguments.get("goal") or "").strip()
+    goal = nested_goal or str(action_payload.get("goal") or "").strip()
+    if action not in _MANUAL_REACT_ACTIONS or not isinstance(arguments, dict):
         return None
     normalized_text = stripped[: match.end()].strip()
     return ManualReActStep(
         thought=thought,
         action=action,
-        action_input=params,
+        action_input=arguments,
         goal=goal,
         raw_text=normalized_text,
     )
@@ -1423,9 +1430,10 @@ def execute_tool_call(
         if not url:
             output = {"ok": False, "error": "url is required for read_url"}
             return ToolExecutionResult(name=name, arguments=params, output=output, output_text=_json_text(output))
+        effective_goal = str(params.get("goal") or tool_goal or "").strip()
         output = tools.read_url(
             url=url,
-            goal=tool_goal,
+            goal=effective_goal,
             assistant_output=assistant_text,
         )
         new_images: dict[str, Any] = {}
@@ -1679,7 +1687,7 @@ class OpenAIToolAgent:
                     repaired_step_text = _render_manual_react_text(
                         thought=repaired.assistant_text,
                         action=step.action,
-                        params=repaired.display_arguments,
+                        arguments=repaired.display_arguments,
                         goal=_parse_manual_react_goal(step.raw_text),
                     )
                     execution_action_input = repaired.execution_arguments
