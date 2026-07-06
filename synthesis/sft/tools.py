@@ -396,6 +396,61 @@ def _sniff_image_content_type(payload: bytes) -> str:
 def _sniff_pdf_content_type(payload: bytes) -> str:
     return "application/pdf" if payload.startswith(b"%PDF-") else ""
 
+
+def _should_retry_http_status(status_code: int) -> bool:
+    return status_code in {429, 500, 502, 503, 504}
+
+
+def _request_with_retry(
+    method: str,
+    url: str,
+    *,
+    timeout: int,
+    max_retries: int = 3,
+    retry_sleep_s: int = 20,
+    **kwargs: Any,
+) -> requests.Response:
+    last_error: Exception | None = None
+    attempts = max(1, int(max_retries))
+    for attempt in range(1, attempts + 1):
+        response: requests.Response | None = None
+        try:
+            response = requests.request(method, url, timeout=timeout, **kwargs)
+            if _should_retry_http_status(response.status_code) and attempt < attempts:
+                response.close()
+                time.sleep(retry_sleep_s)
+                continue
+            response.raise_for_status()
+            return response
+        except (requests.Timeout, requests.ConnectionError) as exc:
+            last_error = exc
+            if response is not None:
+                response.close()
+            if attempt < attempts:
+                time.sleep(retry_sleep_s)
+                continue
+            raise
+        except requests.HTTPError as exc:
+            last_error = exc
+            if response is not None:
+                response.close()
+            if (
+                exc.response is not None
+                and _should_retry_http_status(exc.response.status_code)
+                and attempt < attempts
+            ):
+                time.sleep(retry_sleep_s)
+                continue
+            raise
+        except Exception as exc:
+            last_error = exc
+            if response is not None:
+                response.close()
+            raise
+    assert last_error is not None
+    raise last_error
+
+
 def _url_matches_blocked_domain(url: str) -> bool:
     normalized_url = str(url or "").strip()
     if not normalized_url:
@@ -430,13 +485,15 @@ def _probe_content_type(url: str) -> str:
         return guessed_pdf_type
 
     try:
-        response = requests.head(
+        response = _request_with_retry(
+            "HEAD",
             url,
             allow_redirects=True,
             timeout=20,
             headers=_web_request_headers(referer_url=url),
         )
         content_type = response.headers.get("Content-Type", "")
+        response.close()
         if content_type:
             normalized = content_type.split(";", 1)[0].strip().lower()
             if normalized not in AMBIGUOUS_CONTENT_TYPES:
@@ -445,7 +502,8 @@ def _probe_content_type(url: str) -> str:
         pass
 
     try:
-        response = requests.get(
+        response = _request_with_retry(
+            "GET",
             url,
             allow_redirects=True,
             stream=True,
@@ -469,15 +527,17 @@ def _probe_content_type(url: str) -> str:
 
 
 def _download_binary(url: str, *, timeout: int = 60) -> tuple[bytes, str]:
-    response = requests.get(
+    response = _request_with_retry(
+        "GET",
         url,
         timeout=timeout,
         headers=_web_request_headers(referer_url=url),
     )
-    response.raise_for_status()
     content_type = response.headers.get("Content-Type", "")
     normalized = content_type.split(";", 1)[0].strip().lower() if content_type else ""
-    return response.content, normalized
+    payload = response.content
+    response.close()
+    return payload, normalized
 
 
 def _extract_pdf_text(pdf_path: str) -> tuple[str, str]:
