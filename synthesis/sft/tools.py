@@ -68,6 +68,19 @@ def _jsonify(value: Any) -> Any:
     return value
 
 
+def _env_int(name: str, default: int) -> int:
+    raw = str(os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+DEFAULT_SEARCH_TOP_K = _env_int("SEARCH_TOP_K", MAX_SEARCH_RESULTS)
+
+
 def _web_request_headers(*, referer_url: str | None = None) -> dict[str, str]:
     headers = {
         "User-Agent": (
@@ -282,6 +295,7 @@ Rules:
 6. Output format must be exactly:
 <thinking>your analysis</thinking>
 <result>the complete extracted content</result>
+If the webpage content has been blocked or has no related information, put 'This webpage has no related information about your goal, try others.'
 7. The final extracted content that will be used downstream is only the content inside the <result> tag. Therefore, all content that should be preserved must appear inside <result>.
 
 Agent's current output:\n{assistant_output or '(empty)'}\n
@@ -681,7 +695,7 @@ def read_url(
     }
 
 
-def t2t_search(query: str, lang: str = "en", top_k: int = 5) -> dict[str, Any]:
+def t2t_search(query: str, lang: str = "en", top_k: int = DEFAULT_SEARCH_TOP_K) -> dict[str, Any]:
     """Search text pages and return search results only."""
 
     top_k = max(1, min(int(top_k), MAX_SEARCH_RESULTS))
@@ -703,7 +717,7 @@ def t2t_search(query: str, lang: str = "en", top_k: int = 5) -> dict[str, Any]:
     }
 
 
-def t2i_search(query: str, lang: str = "en", top_k: int = 5) -> dict[str, Any]:
+def t2i_search(query: str, lang: str = "en", top_k: int = DEFAULT_SEARCH_TOP_K) -> dict[str, Any]:
     """Search images from a text query."""
 
     top_k = max(1, min(int(top_k), MAX_SEARCH_RESULTS))
@@ -772,7 +786,7 @@ def _image_search_via_serper(image_url: str, top_k: int = MAX_SEARCH_RESULTS) ->
 def i2i_search(
     image_url: str,
     visual_lookup: Callable[..., object] | None = None,
-    top_k: int = MAX_SEARCH_RESULTS,
+    top_k: int = DEFAULT_SEARCH_TOP_K,
     max_retries: int = 3,
     base_delay: int = 2,
 ) -> dict[str, Any]:

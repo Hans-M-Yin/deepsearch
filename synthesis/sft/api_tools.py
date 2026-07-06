@@ -1525,7 +1525,7 @@ def execute_tool_call(
             output = tools.t2t_search(
                 query=query,
                 lang=params.get("lang") or params.get("hl") or "en",
-                top_k=int(params.get("top_k", 5)),
+                top_k=int(params.get("top_k", tools.DEFAULT_SEARCH_TOP_K)),
             )
         return ToolExecutionResult(name=name, arguments=params, output=output, output_text=_json_text(output))
 
@@ -1537,7 +1537,7 @@ def execute_tool_call(
             output = tools.t2i_search(
                 query=query,
                 lang=params.get("lang") or params.get("hl") or "en",
-                top_k=int(params.get("top_k", 5)),
+                top_k=int(params.get("top_k", tools.DEFAULT_SEARCH_TOP_K)),
             )
         return ToolExecutionResult(name=name, arguments=params, output=output, output_text=_json_text(output))
 
@@ -1598,7 +1598,7 @@ def execute_tool_call(
             output = tools.i2i_search(
                 image_url=uploaded_url,
                 visual_lookup=context.visual_lookup,
-                top_k=int(params.get("top_k", 5)),
+                top_k=int(params.get("top_k", tools.DEFAULT_SEARCH_TOP_K)),
             )
             output = dict(output)
             output["cropped_image_url"] = uploaded_url
@@ -1611,7 +1611,7 @@ def execute_tool_call(
         output = tools.i2i_search(
             image_url=remote_url or "",
             visual_lookup=context.visual_lookup,
-            top_k=int(params.get("top_k", 5)),
+            top_k=int(params.get("top_k", tools.DEFAULT_SEARCH_TOP_K)),
         )
         return ToolExecutionResult(name=name, arguments=params, output=output, output_text=_json_text(output))
 
