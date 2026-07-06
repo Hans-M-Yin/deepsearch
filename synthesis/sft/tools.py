@@ -58,6 +58,16 @@ T2I_BLOCKED_IMAGE_SEARCH_DOMAINS = (
 _SFT_FIXED_REQUEST_ID = "3200636808"
 
 
+def _jsonify(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {key: _jsonify(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonify(item) for item in value]
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return value
+
+
 def _web_request_headers(*, referer_url: str | None = None) -> dict[str, str]:
     headers = {
         "User-Agent": (
