@@ -797,6 +797,13 @@ def i2i_search(
             }
         except Exception as exc:  # pragma: no cover - network bound
             last_error = exc
+            print(
+                "[i2i_search debug] error "
+                f"attempt={attempt} error_type={type(exc).__name__} "
+                f"error={exc}",
+                file=sys.stderr,
+                flush=True,
+            )
             if attempt < max_retries:
                 time.sleep(base_delay * (2 ** (attempt - 1)))
     return {
