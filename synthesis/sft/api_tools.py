@@ -76,7 +76,6 @@ Based on the text and watermarks visible in the provided image, the stock photog
 </action>
 
 Discuss: In the bad version, the query target 'Wiki Commons' comes from nowhere, which is a typical knowledge leakage of the writer model. In good version, the answer is more logically rigorous, the reasoning is more careful, and there are no clues appearing from nowhere.
-Note that if there are clues in the question or in the prior context, you may also make a tentative guess first and then verify it through searching. For example, when the question mentions “largest, free licensed repository,” it is reasonable to hypothesize Wikimedia Commons first and then verify that hypothesis by searching for supporting clues. Note that ONLY THE COMMONSENSE can be used for this hypothesis. Negative Example: “The blockade of Dyrrhachium during Caesar’s Civil War is a well-known event and may fit these conditions,” Dyrrhachium is not a widely known event. Use this strategy only when no enough clues are found after repeated search attempts.
 
 ** Example 2: Effective Tool Use/Coordination
 
