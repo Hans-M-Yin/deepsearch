@@ -77,7 +77,7 @@ export SFT_SUMMARIZER_API_KEY="EMPTY"
 export REVERSE_IMAGE_CROP_COORDS="true"
 
 
-export SERPER_API_KEY="7f1dbdcbe6f551e113a1a394fdd60b5b186ae0f3"
+export SERPER_API_KEY="65c83034889f9d2d2a9f0c2afa9eb470f346f9b8"
 export SERPER_SEARCH_URL="https://google.serper.dev/search"
 export SERPER_IMAGES_URL="https://google.serper.dev/images"
 export SEARCH_TOP_K=6
