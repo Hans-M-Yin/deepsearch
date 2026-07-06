@@ -63,7 +63,7 @@ Based on the text and watermarks visible in the provided image, the stock photog
 
 Good writing: 
 
-Based on the text and watermarks visible in the provided image, the stock photography agency is Alamy. The question asks about a specific photograph from a different media repository that Alamy is known to source content from. My first step is to identify this repository. Since the clue given in the question is "a large, freely licensed media repository," Wiki Commons may be a possible answer, but there is no evidence yet. So for now, I should first search which repository Alamy sources content from.
+Based on the text and watermarks visible in the provided image, the stock photography agency is Alamy. The question asks about a specific photograph from a different media repository that Alamy is known to source content from. My first step is to identify this repository.  I should first search which repository Alamy sources content from.
 <action>
 {
 "tool_name": "t2t_search",
@@ -75,7 +75,7 @@ Based on the text and watermarks visible in the provided image, the stock photog
 </action>
 
 Discuss: In the bad version, the query target 'Wiki Commons' comes from nowhere, which is a typical knowledge leakage of the writer model. In good version, the answer is more logically rigorous, the reasoning is more careful, and there are no clues appearing from nowhere.
-Note that if there are clues in the question or in the prior context, you may also make a tentative guess first and then verify it through searching. For example, when the question mentions “largest, free licensed repository,” it is reasonable to hypothesize Wikimedia Commons first and then verify that hypothesis by searching for supporting clues.
+Note that if there are clues in the question or in the prior context, you may also make a tentative guess first and then verify it through searching. For example, when the question mentions “largest, free licensed repository,” it is reasonable to hypothesize Wikimedia Commons first and then verify that hypothesis by searching for supporting clues. Note that ONLY THE COMMONSENSE can be used for this hypothesis.
 
 ** Example 2: Effective Tool Use/Coordination
 
