@@ -773,13 +773,25 @@ def i2i_search(
     last_error: Exception | None = None
     for attempt in range(1, max_retries + 1):
         try:
+            print(
+                "[i2i_search debug] start "
+                f"attempt={attempt} image_url={image_url!r} top_k={top_k} "
+                f"max_retries={max_retries} base_delay={base_delay} "
+                f"visual_lookup={getattr(visual_lookup, '__name__', type(visual_lookup).__name__)}",
+                file=sys.stderr,
+                flush=True,
+            )
             result = visual_lookup(image_url=image_url, top_k=top_k)
+            print(
+                f"[i2i_search debug] raw_output={json.dumps(_jsonify(result), ensure_ascii=False)}",
+                file=sys.stderr,
+                flush=True,
+            )
             if isinstance(result, dict) and "error" in result:
                 raise RuntimeError(str(result["error"]))
             matches = summarize_image_search(result)
             return {
                 "ok": True,
-                "image_url": image_url,
                 "top_k": top_k,
                 "matches": matches[:top_k] if isinstance(matches, list) else matches,
             }
@@ -789,7 +801,6 @@ def i2i_search(
                 time.sleep(base_delay * (2 ** (attempt - 1)))
     return {
         "ok": False,
-        "image_url": image_url,
         "top_k": top_k,
         "error": f"i2i_search failed after {max_retries} retries: {last_error}",
     }
