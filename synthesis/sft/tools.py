@@ -295,8 +295,7 @@ Rules:
 6. Output format must be exactly:
 <thinking>your analysis</thinking>
 <result>the complete extracted content</result>
-If the webpage content has been blocked or has no related information, put 'This webpage has no related information about your goal, try others.'
-7. The final extracted content that will be used downstream is only the content inside the <result> tag. Therefore, all content that should be preserved must appear inside <result>.
+If there is no relevant content, directly place the denoised original text in full, compressed to within 3,000 words, inside <result></result>.7. The final extracted content that will be used downstream is only the content inside the <result> tag. Therefore, all content that should be preserved must appear inside <result>.
 
 Agent's current output:\n{assistant_output or '(empty)'}\n
 Tool goal:\n{goal or '(empty)'}\n
