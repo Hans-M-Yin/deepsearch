@@ -269,6 +269,10 @@ Rules:
 3. Remove obvious noise: navigation text, menus, repeated headers, footer text, social buttons, login or subscription prompts, unrelated recommendations, boilerplate, tracking text, and raw URL lists.
 4. Perform content extraction only. Do not add extra content, and do not use or introduce any world knowledge.
 5. If multiple parts of the raw text may be related, you may extract them in separate segments.
+6. Output format must be exactly:
+<thinking>your analysis</thinking>
+<result>the complete extracted content</result>
+7. The final extracted content that will be used downstream is only the content inside the <result> tag. Therefore, all content that should be preserved must appear inside <result>.
 
 Agent's current output:\n{assistant_output or '(empty)'}\n
 Tool goal:\n{goal or '(empty)'}\n
@@ -292,6 +296,11 @@ Raw webpage content:\n{content[:100000]}\n
         )
         content_text = response.content or ""
         if content_text:
+            match = re.search(r"<result>(.*?)</result>", content_text, flags=re.DOTALL | re.IGNORECASE)
+            if match:
+                extracted = match.group(1).strip()
+                if extracted:
+                    return extracted
             return content_text.strip()
     except Exception as exc:  # pragma: no cover - network bound
         logger.warning("Summarization failed: %s", exc)
