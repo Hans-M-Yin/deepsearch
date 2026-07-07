@@ -24,4 +24,5 @@ vllm serve "${MODEL_PATH}" \
   --max-model-len 48000 \
   --port "${PORT}" \
   --gpu-memory-utilization 0.85 \
-  --trust-remote-code
+  --trust-remote-code \
+  --allowed-local-media-path
