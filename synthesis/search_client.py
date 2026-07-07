@@ -7,6 +7,7 @@ import json
 import os
 import re
 import sys
+import tempfile
 import time
 from dataclasses import asdict, dataclass, field
 from enum import Enum
@@ -38,6 +39,13 @@ def _jsonify(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return [_jsonify(item) for item in value]
     return value
+
+
+def _local_lock_path_for_state(state_path: Path) -> Path:
+    state_path_str = str(state_path.resolve())
+    state_hash = hashlib.sha256(state_path_str.encode("utf-8")).hexdigest()[:16]
+    lock_name = f"serper_pool_state_{state_hash}.lock"
+    return Path(tempfile.gettempdir()) / lock_name
 
 
 def _augment_query_with_site_exclusion(query: str, domain: str) -> str:
@@ -266,7 +274,7 @@ class SerperApiKeyPool:
         return state
 
     def _with_locked_state(self, callback) -> dict[str, Any]:
-        lock_path = self.state_path.with_suffix(self.state_path.suffix + ".lock")
+        lock_path = _local_lock_path_for_state(self.state_path)
         lock_path.parent.mkdir(parents=True, exist_ok=True)
         with lock_path.open("a+", encoding="utf-8") as lock_handle:
             if fcntl is not None:
