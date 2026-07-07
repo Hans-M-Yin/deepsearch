@@ -25,4 +25,4 @@ vllm serve "${MODEL_PATH}" \
   --port "${PORT}" \
   --gpu-memory-utilization 0.85 \
   --trust-remote-code \
-  --allowed-local-media-path
+  --allowed-local-media-path /mnt/hdfs/byte_ai_sales/user/user/yinzhihan/agent/OpenSearch-VL
