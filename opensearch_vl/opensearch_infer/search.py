@@ -31,6 +31,7 @@ import requests
 
 from . import config
 from . import image_io
+from synthesis.search_client import acquire_serper_api_key
 
 
 logger = logging.getLogger(__name__)
@@ -355,13 +356,9 @@ def _search_via_gateway(query: str, lang: str, top_k: int) -> List[dict]:
 
 
 def _search_via_serper(query: str, lang: str, top_k: int) -> List[dict]:
-    if not config.SERPER_API_KEY:
-        raise RuntimeError(
-            "Serper is not configured. Either set API_HOST/API_USER/API_KEY "
-            "for the gateway, or set SERPER_API_KEY for direct access."
-        )
+    serper_api_key, _ = acquire_serper_api_key()
     headers = {
-        "X-API-KEY": config.SERPER_API_KEY,
+        "X-API-KEY": serper_api_key,
         "Content-Type": "application/json",
     }
     body = {
@@ -381,15 +378,10 @@ def _search_via_serper(query: str, lang: str, top_k: int) -> List[dict]:
 
 def _image_search_via_serper(image_url: str) -> object:
     """Run reverse-image search against Serper's Google Lens endpoint."""
-
-    if not config.SERPER_API_KEY:
-        raise RuntimeError(
-            "Serper Lens is not configured. Set SERPER_API_KEY "
-            "to enable built-in image_search."
-        )
+    serper_api_key, _ = acquire_serper_api_key()
 
     headers = {
-        "X-API-KEY": config.SERPER_API_KEY,
+        "X-API-KEY": serper_api_key,
         "Content-Type": "application/json",
     }
     response = requests.post(

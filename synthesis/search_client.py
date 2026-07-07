@@ -22,6 +22,14 @@ except ImportError:  # pragma: no cover
     fcntl = None
 
 
+_FIXED_SERPER_KEYS_FILE = Path(__file__).resolve().parent / "serper_keys.txt.example"
+_FIXED_SERPER_POOL_STATE_FILE = (
+    Path(__file__).resolve().parent / "ignore" / "serper_pool_state.json"
+)
+_FIXED_SERPER_POOL_MIN_REMAINING = 10
+_FIXED_SERPER_POOL_DEFAULT_CREDITS = 2500
+
+
 def _jsonify(value: Any) -> Any:
     if isinstance(value, Enum):
         return value.value
@@ -120,7 +128,7 @@ class SerperApiKeyPool:
         keys: list[str],
         state_path: str | Path | None = None,
         default_credits: int = 2500,
-        min_remaining: int = 100,
+        min_remaining: int = 10,
     ) -> None:
         cleaned = [key.strip() for key in keys if key and key.strip()]
         if not cleaned:
@@ -151,7 +159,16 @@ class SerperApiKeyPool:
             keys=keys,
             state_path=os.environ.get("SERPER_API_POOL_STATE_FILE"),
             default_credits=int(os.environ.get("SERPER_API_POOL_DEFAULT_CREDITS") or 2500),
-            min_remaining=int(os.environ.get("SERPER_API_POOL_MIN_REMAINING") or 100),
+            min_remaining=int(os.environ.get("SERPER_API_POOL_MIN_REMAINING") or 10),
+        )
+
+    @classmethod
+    def from_fixed_pool(cls) -> "SerperApiKeyPool":
+        return cls(
+            keys=cls._load_keys_from_file(_FIXED_SERPER_KEYS_FILE),
+            state_path=_FIXED_SERPER_POOL_STATE_FILE,
+            default_credits=_FIXED_SERPER_POOL_DEFAULT_CREDITS,
+            min_remaining=_FIXED_SERPER_POOL_MIN_REMAINING,
         )
 
     @staticmethod
@@ -162,6 +179,21 @@ class SerperApiKeyPool:
         if not keys_file:
             return []
         path = Path(keys_file)
+        if not path.is_absolute():
+            path = Path.cwd() / path
+        if not path.exists():
+            raise FileNotFoundError(f"Serper API keys file does not exist: {path}")
+        keys: list[str] = []
+        for raw_line in path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            keys.append(line)
+        return keys
+
+    @staticmethod
+    def _load_keys_from_file(path_like: str | Path) -> list[str]:
+        path = Path(path_like)
         if not path.is_absolute():
             path = Path.cwd() / path
         if not path.exists():
@@ -551,17 +583,17 @@ class SerperSearchClient:
         pool_default_credits: int | None = None,
         pool_min_remaining: int | None = None,
     ) -> None:
-        self.api_key = api_key or os.environ.get("SERPER_API_KEY")
+        self.api_key = None
         self.key_pool: SerperApiKeyPool | None = None
         if api_keys:
             self.key_pool = SerperApiKeyPool(
                 keys=api_keys,
-                state_path=pool_state_path,
-                default_credits=pool_default_credits or int(os.environ.get("SERPER_API_POOL_DEFAULT_CREDITS") or 2500),
-                min_remaining=pool_min_remaining or int(os.environ.get("SERPER_API_POOL_MIN_REMAINING") or 100),
+                state_path=pool_state_path or _FIXED_SERPER_POOL_STATE_FILE,
+                default_credits=pool_default_credits or _FIXED_SERPER_POOL_DEFAULT_CREDITS,
+                min_remaining=pool_min_remaining or _FIXED_SERPER_POOL_MIN_REMAINING,
             )
-        elif not self.api_key:
-            self.key_pool = SerperApiKeyPool.from_env()
+        else:
+            self.key_pool = SerperApiKeyPool.from_fixed_pool()
         self.search_url = search_url or os.environ.get("SERPER_SEARCH_URL") or "https://google.serper.dev/search"
         self.images_url = images_url or os.environ.get("SERPER_IMAGES_URL") or "https://google.serper.dev/images"
         self.timeout_s = timeout_s
@@ -594,7 +626,10 @@ class SerperSearchClient:
         if self.key_pool is not None:
             api_key, pool_metadata = self.key_pool.acquire_key()
         if not api_key:
-            raise ValueError("Serper API key is required. Set SERPER_API_KEY or pass api_key explicitly.")
+            raise ValueError(
+                "Serper API key is required. Populate the fixed pool file "
+                f"at {_FIXED_SERPER_KEYS_FILE}."
+            )
 
         payload = json.dumps(body).encode("utf-8")
         request = Request(
@@ -716,6 +751,12 @@ class SerperSearchClient:
             return int(item.get("position"))
         except (TypeError, ValueError):
             return fallback
+
+
+def acquire_serper_api_key() -> tuple[str, dict[str, Any]]:
+    """Acquire one Serper API key from the fixed cross-process pool."""
+
+    return SerperApiKeyPool.from_fixed_pool().acquire_key()
 
 
 class SerpApiSearchClient:

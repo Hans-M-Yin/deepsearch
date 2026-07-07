@@ -114,12 +114,8 @@ def has_serpapi_credentials() -> bool:
 
 
 def has_serper_credentials() -> bool:
-    keys_file = os.environ.get("SERPER_API_KEYS_FILE")
-    return bool(
-        os.environ.get("SERPER_API_KEY")
-        or os.environ.get("SERPER_API_KEYS")
-        or (keys_file and Path(keys_file).expanduser().exists())
-    )
+    keys_file = Path("synthesis/serper_keys.txt.example").resolve()
+    return keys_file.exists()
 
 
 def directory_size_bytes(path: Path) -> int:

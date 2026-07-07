@@ -28,7 +28,7 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     __package__ = "synthesis.sft"
 
-from synthesis.search_client import SerperSearchClient
+from synthesis.search_client import SerperSearchClient, acquire_serper_api_key
 from synthesis.wiki_text_builder import EnhancedReaderClient
 from synthesis.model_worker import LLM_WORKER
 from synthesis.model_worker import ModelMessage
@@ -331,7 +331,6 @@ def normalize_tool_arguments(name: str, arguments: dict[str, Any]) -> dict[str, 
 
 def _serper_client() -> SerperSearchClient:
     return SerperSearchClient(
-        api_key=os.environ.get("SERPER_API_KEY"),
         search_url=os.environ.get("SERPER_SEARCH_URL") or "https://google.serper.dev/search",
         images_url=os.environ.get("SERPER_IMAGES_URL") or "https://google.serper.dev/images",
         timeout_s=float(os.environ.get("SFT_SERPER_TIMEOUT_S", "60")),
@@ -914,9 +913,7 @@ def t2i_search(query: str, lang: str = "en", top_k: int = DEFAULT_SEARCH_TOP_K) 
 
 
 def _image_search_via_serper(image_url: str, top_k: int = MAX_SEARCH_RESULTS) -> object:
-    serper_api_key = os.environ.get("SERPER_API_KEY")
-    if not serper_api_key:
-        raise RuntimeError("SERPER_API_KEY is required for reverse image search.")
+    serper_api_key, _ = acquire_serper_api_key()
 
     response = requests.post(
         os.environ.get("SERPER_LENS_URL") or "https://google.serper.dev/lens",
