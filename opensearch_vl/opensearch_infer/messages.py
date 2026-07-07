@@ -33,6 +33,43 @@ def _normalize_image_url_reference(url: str) -> str:
     return url
 
 
+def _local_image_path_from_reference(url: str) -> Optional[Path]:
+    """Return a local filesystem path for a local image reference."""
+
+    if not url:
+        return None
+    if url.startswith("file://"):
+        parsed = urllib.parse.urlparse(url)
+        if not parsed.path:
+            return None
+        return Path(parsed.path)
+
+    candidate = Path(url).expanduser()
+    if candidate.is_absolute():
+        return candidate
+    return None
+
+
+def _maybe_inline_local_image_url(url: str) -> str:
+    """Inline local image files as data URLs for OpenAI-compatible backends."""
+
+    local_path = _local_image_path_from_reference(url)
+    if local_path is None or not local_path.exists():
+        return url
+
+    try:
+        data = local_path.read_bytes()
+    except OSError as exc:
+        logger.warning("Failed to read local image %s: %s", local_path, exc)
+        return url
+
+    payload = image_io.image_to_base64(data)
+    if not payload:
+        return url
+    mime = image_io.detect_image_format(payload)
+    return f"data:{mime};base64,{payload}"
+
+
 def to_claude_messages(contents: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Convert Gemini-style ``contents`` to Claude content blocks."""
 
@@ -47,6 +84,7 @@ def to_claude_messages(contents: Iterable[Dict[str, Any]]) -> List[Dict[str, Any
                 url = value.get("url", "") if isinstance(value, dict) else str(value)
                 if url:
                     url = _normalize_image_url_reference(url)
+                    url = _maybe_inline_local_image_url(url)
                     block.append({"type": "image_url", "value": url})
             elif "inline_data" in part:
                 data = part["inline_data"]
@@ -75,14 +113,19 @@ def _resolve_image_url_to_pil(url: str) -> Image.Image | None:
 
     if url.startswith("file://"):
         try:
-            local_path = Path(urllib.parse.urlparse(url).path)
+            local_path = _local_image_path_from_reference(url)
+            if local_path is None:
+                return None
             return Image.open(local_path)
         except Exception as exc:
             logger.warning("Failed to read file URL image %s: %s", url, exc)
 
     if os.path.isabs(url):
         try:
-            return Image.open(url)
+            local_path = _local_image_path_from_reference(url)
+            if local_path is None:
+                return None
+            return Image.open(local_path)
         except Exception as exc:
             logger.warning("Failed to read local image %s: %s", url, exc)
 
@@ -169,6 +212,7 @@ def to_openai_messages(
                 url = value.get("url", "") if isinstance(value, dict) else str(value)
                 if url:
                     url = _normalize_image_url_reference(url)
+                    url = _maybe_inline_local_image_url(url)
                     block.append(
                         {"type": "image_url", "image_url": {"url": url}}
                     )
