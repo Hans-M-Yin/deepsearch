@@ -1,5 +1,5 @@
 #!/bin/bash
-# Evaluation harness for BrowseComp-VL, HLE and VDR-Bench using a GPT-4o judge.
+# Evaluation harness for BrowseComp-VL, HLE and VDR-Bench using the unified LLM judge.
 #
 # Configure the trajectory directories (and optional VDR answer parquet)
 # through environment variables before running:
@@ -15,12 +15,10 @@
 #   --limit N    - evaluate only the first N trajectories (default: all)
 #   --workers N  - judge concurrency (default: 20)
 #
-# Required env vars for the GPT-4o judge:
-#   JUDGE_API_BASE_URL / JUDGE_APP_ID / JUDGE_APP_KEY (see eval_with_gpt4o.py)
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-EVAL_SCRIPT="${SCRIPT_DIR}/eval_with_gpt4o.py"
+EVAL_SCRIPT="${SCRIPT_DIR}/eval_infer_with_llm.py"
 
 LIMIT=${LIMIT:-0}
 WORKERS=${WORKERS:-20}
@@ -40,8 +38,7 @@ done
 run_eval() {
     local label="$1"
     local traj_dir="$2"
-    local benchmark="$3"
-    local extra_args="${4:-}"
+    local extra_args="${3:-}"
 
     if [[ -z "${traj_dir}" ]]; then
         echo ">>> [skip] ${label}: trajectory directory env var is not set"
@@ -56,9 +53,8 @@ run_eval() {
     echo ">>> ${label} -> ${traj_dir}"
     # shellcheck disable=SC2086
     python3 "${EVAL_SCRIPT}" \
-        --traj_dir "${traj_dir}" \
-        --benchmark "${benchmark}" \
-        --max_workers "${WORKERS}" \
+        --traj-dir "${traj_dir}" \
+        --max-workers "${WORKERS}" \
         --limit "${LIMIT}" \
         ${extra_args}
 }
@@ -69,16 +65,16 @@ echo "  Limit:   ${LIMIT} (0 = all)"
 echo "  Workers: ${WORKERS}"
 echo "============================================"
 
-run_eval "BrowseComp-VL Level 1"  "${TRAJ_BC_VL_LEVEL1:-}" bc_vl
-run_eval "BrowseComp-VL Level 2"  "${TRAJ_BC_VL_LEVEL2:-}" bc_vl
-run_eval "HLE"                    "${TRAJ_HLE:-}"          hle
+run_eval "BrowseComp-VL Level 1"  "${TRAJ_BC_VL_LEVEL1:-}"
+run_eval "BrowseComp-VL Level 2"  "${TRAJ_BC_VL_LEVEL2:-}"
+run_eval "HLE"                    "${TRAJ_HLE:-}"
 
 VDR_EXTRA=""
 if [[ -n "${VDR_ANSWER_PARQUET:-}" ]]; then
-    VDR_EXTRA="--answer_file ${VDR_ANSWER_PARQUET}"
+    VDR_EXTRA="--answer-file ${VDR_ANSWER_PARQUET}"
 fi
-run_eval "VDR-Bench primary"   "${TRAJ_VDR_PRIMARY:-}"   vdr "${VDR_EXTRA}"
-run_eval "VDR-Bench secondary" "${TRAJ_VDR_SECONDARY:-}" vdr "${VDR_EXTRA}"
+run_eval "VDR-Bench primary"   "${TRAJ_VDR_PRIMARY:-}"   "${VDR_EXTRA}"
+run_eval "VDR-Bench secondary" "${TRAJ_VDR_SECONDARY:-}" "${VDR_EXTRA}"
 
 echo ""
 echo "============================================"

@@ -15,7 +15,7 @@ opensearch_vl/
 |-- run_eval_set.py           # Directory/file evaluation-set runner for API backends
 |-- run_eval_set.sh           # Env-driven evaluation-set wrapper
 |-- run_eval.sh               # Judge harness for BC-VL / HLE / VDR-Bench
-|-- eval_with_gpt4o.py        # GPT-4o judge implementation
+|-- eval_infer_with_llm.py    # Unified LLM judge implementation
 |-- .env.example              # Environment variables consumed by everything below
 `-- opensearch_infer/
     |-- __init__.py
@@ -123,12 +123,10 @@ opensearch_vl/
    `run_infer.sh` is a thin wrapper that sources environment variables
    such as `MODEL`, `DATA_PATH`, `OUTPUT_DIR`, `GPUS`, `LIMIT`, etc.
 
-4. Evaluate trajectories against a GPT-4o judge:
+4. Evaluate trajectories against the unified LLM judge:
 
    ```bash
-   export JUDGE_API_BASE_URL=...
-   export JUDGE_APP_ID=...
-   export JUDGE_APP_KEY=...
+   export JUDGE_MODEL_ALIAS=gpt54_internal_azure
    export TRAJ_HLE=./outputs/hle
    export TRAJ_BC_VL_LEVEL1=./outputs/bc_vl_level1
    export TRAJ_VDR_PRIMARY=./outputs/vdr_primary
