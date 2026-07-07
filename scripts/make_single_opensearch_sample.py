@@ -48,8 +48,21 @@ SAMPLE = {
 }
 
 
+def _normalize_image_reference(image_url: str) -> str:
+    """Convert local absolute paths to ``file://`` URLs for vLLM/OpenAI APIs."""
+
+    if image_url.startswith(("http://", "https://", "data:", "file://")):
+        return image_url
+
+    candidate = Path(image_url).expanduser()
+    if candidate.is_absolute():
+        return candidate.resolve().as_uri()
+    return image_url
+
+
 def build_row() -> dict[str, object]:
     question = SAMPLE["final_question"]
+    image_url = _normalize_image_reference(SAMPLE["image_url"])
     return {
         "data_id": SAMPLE["sample_id"],
         "question_id": SAMPLE["question_id"],
@@ -59,13 +72,15 @@ def build_row() -> dict[str, object]:
         "data_source": "manual_single_sample",
         "question": question,
         "prompt": [{"content": question}],
-        "images": [{"url": SAMPLE["image_url"]}],
+        "images": [{"url": image_url}],
         "answer": SAMPLE["answer"],
         "draft_question": SAMPLE["draft_question"],
         "final_question": SAMPLE["final_question"],
         "polished_question": SAMPLE["polished_question"],
         "status": SAMPLE["status"],
-        "source_metadata": json.dumps(SAMPLE, ensure_ascii=False),
+        "source_metadata": json.dumps(
+            {**SAMPLE, "image_url": image_url}, ensure_ascii=False
+        ),
     }
 
 

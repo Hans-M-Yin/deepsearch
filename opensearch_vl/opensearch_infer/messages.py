@@ -6,6 +6,7 @@ import base64
 import io
 import logging
 import os
+from pathlib import Path
 import urllib.parse
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -16,6 +17,20 @@ from . import image_io
 
 
 logger = logging.getLogger(__name__)
+
+
+def _normalize_image_url_reference(url: str) -> str:
+    """Normalize local absolute paths to ``file://`` URLs for API backends."""
+
+    if not url:
+        return url
+    if url.startswith(("http://", "https://", "data:", "file://")):
+        return url
+
+    candidate = Path(url).expanduser()
+    if candidate.is_absolute():
+        return candidate.resolve().as_uri()
+    return url
 
 
 def to_claude_messages(contents: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -31,6 +46,7 @@ def to_claude_messages(contents: Iterable[Dict[str, Any]]) -> List[Dict[str, Any
                 value = part["image_url"]
                 url = value.get("url", "") if isinstance(value, dict) else str(value)
                 if url:
+                    url = _normalize_image_url_reference(url)
                     block.append({"type": "image_url", "value": url})
             elif "inline_data" in part:
                 data = part["inline_data"]
@@ -56,6 +72,19 @@ def to_claude_messages(contents: Iterable[Dict[str, Any]]) -> List[Dict[str, Any
 
 def _resolve_image_url_to_pil(url: str) -> Image.Image | None:
     """Try the network first, then fall back to ``FVQA_IMAGE_DIR``."""
+
+    if url.startswith("file://"):
+        try:
+            local_path = Path(urllib.parse.urlparse(url).path)
+            return Image.open(local_path)
+        except Exception as exc:
+            logger.warning("Failed to read file URL image %s: %s", url, exc)
+
+    if os.path.isabs(url):
+        try:
+            return Image.open(url)
+        except Exception as exc:
+            logger.warning("Failed to read local image %s: %s", url, exc)
 
     fetch_url = image_io.cos_url_to_internal(url)
     data = image_io.download_image_bytes(fetch_url)
@@ -103,6 +132,7 @@ def to_qwen3vl_messages(contents: Iterable[Dict[str, Any]]) -> List[Dict[str, An
                 url = value.get("url", "") if isinstance(value, dict) else str(value)
                 if not url:
                     continue
+                url = _normalize_image_url_reference(url)
                 pil_image = _resolve_image_url_to_pil(url)
                 if pil_image is not None:
                     block.append({"type": "image", "image": pil_image})
@@ -138,6 +168,7 @@ def to_openai_messages(
                 value = part["image_url"]
                 url = value.get("url", "") if isinstance(value, dict) else str(value)
                 if url:
+                    url = _normalize_image_url_reference(url)
                     block.append(
                         {"type": "image_url", "image_url": {"url": url}}
                     )
