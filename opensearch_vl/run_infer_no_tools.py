@@ -13,7 +13,12 @@ import sys
 import traceback
 from typing import Optional
 
-from run_infer import _build_arg_parser, _configure_logging
+from run_infer import (
+    _build_arg_parser,
+    _completed_case_ids,
+    _configure_logging,
+    _row_to_case_id,
+)
 
 
 def main(argv: Optional[list[str]] = None) -> int:
@@ -100,8 +105,24 @@ def main(argv: Optional[list[str]] = None) -> int:
             traceback.print_exc()
             return idx, False, str(exc)
 
-    success, failure = 0, 0
-    indices = list(range(start, end))
+    success, failure, skipped = 0, 0, 0
+    completed_case_ids = _completed_case_ids(args.output_dir)
+    all_indices = list(range(start, end))
+    indices = []
+    for idx in all_indices:
+        case_id = _row_to_case_id(df.iloc[idx], idx)
+        if case_id in completed_case_ids:
+            skipped += 1
+            continue
+        indices.append(idx)
+
+    if skipped:
+        logger.info(
+            "Resume detected: skipped %d completed case(s) already present in %s",
+            skipped,
+            args.output_dir,
+        )
+
     if workers == 1:
         for idx in indices:
             _, ok, _ = _run_one(idx)
@@ -131,9 +152,10 @@ def main(argv: Optional[list[str]] = None) -> int:
                     )
 
     logger.info(
-        "Done. success=%d failure=%d output=%s",
+        "Done. success=%d failure=%d skipped=%d output=%s",
         success,
         failure,
+        skipped,
         args.output_dir,
     )
     return 0

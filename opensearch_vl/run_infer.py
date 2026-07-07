@@ -36,7 +36,7 @@ import logging
 import os
 import sys
 import traceback
-from typing import Optional
+from typing import Any, Optional
 
 from opensearch_infer import config
 
@@ -202,6 +202,36 @@ def _configure_logging(level: str) -> None:
     )
 
 
+def _row_to_case_id(row: Any, idx: int) -> str:
+    if hasattr(row, "to_dict"):
+        try:
+            row_dict = row.to_dict()
+        except Exception:
+            row_dict = {}
+    elif isinstance(row, dict):
+        row_dict = row
+    else:
+        row_dict = {}
+
+    if isinstance(row_dict, dict):
+        for key in ("data_id", "id", "idx", "_id"):
+            value = row_dict.get(key)
+            if value is not None:
+                return str(value)
+    return f"case_{idx}"
+
+
+def _completed_case_ids(output_dir: str) -> set[str]:
+    completed: set[str] = set()
+    if not os.path.isdir(output_dir):
+        return completed
+    suffix = "_trajectory.json"
+    for name in os.listdir(output_dir):
+        if name.endswith(suffix):
+            completed.add(name[: -len(suffix)])
+    return completed
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     parser = _build_arg_parser()
     args = parser.parse_args(argv)
@@ -286,8 +316,24 @@ def main(argv: Optional[list[str]] = None) -> int:
             traceback.print_exc()
             return idx, False, str(exc)
 
-    success, failure = 0, 0
-    indices = list(range(start, end))
+    success, failure, skipped = 0, 0, 0
+    completed_case_ids = _completed_case_ids(args.output_dir)
+    all_indices = list(range(start, end))
+    indices = []
+    for idx in all_indices:
+        case_id = _row_to_case_id(df.iloc[idx], idx)
+        if case_id in completed_case_ids:
+            skipped += 1
+            continue
+        indices.append(idx)
+
+    if skipped:
+        logger.info(
+            "Resume detected: skipped %d completed case(s) already present in %s",
+            skipped,
+            args.output_dir,
+        )
+
     if workers == 1:
         for idx in indices:
             _, ok, _ = _run_one(idx)
@@ -317,9 +363,10 @@ def main(argv: Optional[list[str]] = None) -> int:
                     )
 
     logger.info(
-        "Done. success=%d failure=%d output=%s",
+        "Done. success=%d failure=%d skipped=%d output=%s",
         success,
         failure,
+        skipped,
         args.output_dir,
     )
     return 0
