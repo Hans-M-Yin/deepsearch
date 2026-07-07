@@ -782,6 +782,14 @@ class VqaBatchRunner:
                 "polished": VqaBatchRunner._compact_writer_stage(sample.get("polished") or {}),
                 "obfuscated": VqaBatchRunner._compact_writer_stage(sample.get("obfuscated") or {}),
             },
+            "opening_package": VqaBatchRunner._extract_stage_metadata_value(
+                sample,
+                field_name="opening_package",
+            ),
+            "target_ask": VqaBatchRunner._extract_stage_metadata_value(
+                sample,
+                field_name="target_ask",
+            ),
             "verification": sample.get("verification") or {},
             "progress": sample.get("progress") or {},
             "metadata": {
@@ -803,6 +811,30 @@ class VqaBatchRunner:
             "answer_type": stage.get("answer_type"),
             "used_evidence_ids": stage.get("used_evidence_ids") or [],
         }
+
+    @staticmethod
+    def _extract_stage_metadata_value(
+        sample: dict[str, Any],
+        *,
+        field_name: str,
+    ) -> dict[str, Any] | list[Any] | str | None:
+        for stage_name in ("obfuscated", "polished", "draft"):
+            stage = sample.get(stage_name) or {}
+            stage_metadata = stage.get("metadata") or {}
+            value = stage_metadata.get(field_name)
+            if value is None:
+                continue
+            if isinstance(value, dict):
+                return dict(value)
+            if isinstance(value, list):
+                return list(value)
+            if isinstance(value, str):
+                stripped = value.strip()
+                if stripped:
+                    return stripped
+                continue
+            return value
+        return None
 
     @staticmethod
     def _extract_input_image_url(sample: dict[str, Any]) -> str | None:
