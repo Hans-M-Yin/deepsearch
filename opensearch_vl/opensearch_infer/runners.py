@@ -256,12 +256,6 @@ class OpenAICompatibleRunner(BaseRunner):
         last_error: Optional[Exception] = None
         for attempt in range(1, self.max_retries + 1):
             try:
-                logger.info(
-                    "OpenAI-compatible request: model=%s max_tokens=%s attempt=%d",
-                    self.model,
-                    payload.get("max_tokens"),
-                    attempt,
-                )
                 response = requests.post(
                     url,
                     json=payload,
