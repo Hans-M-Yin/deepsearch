@@ -80,3 +80,4 @@ synthesis/ignore/
 synthesis/.serper_pool_state.json
 synthesis/.serper_pool_state.json.lock
 data/*
+opensearch_infer/*
