@@ -25,6 +25,23 @@ _BASE64_ALPHABET = set(
 )
 
 
+def local_image_path_from_reference(value: object) -> Optional[str]:
+    """Resolve ``file://`` or absolute-path image references to a local path."""
+
+    if not isinstance(value, str) or not value:
+        return None
+
+    if value.startswith("file://"):
+        parsed = urllib.parse.urlparse(value)
+        if not parsed.path:
+            return None
+        return parsed.path
+
+    if os.path.isabs(value):
+        return value
+    return None
+
+
 def looks_like_base64(value: object) -> bool:
     """Heuristically detect a base64 image payload.
 
@@ -142,6 +159,21 @@ def download_to_temp(
             logger.warning("Failed to save base64 image: %s", exc)
             return None
 
+    local_path = local_image_path_from_reference(url_or_b64)
+    if local_path and os.path.exists(local_path):
+        if not filename:
+            filename = os.path.basename(local_path) or "local_image.jpg"
+        save_path = os.path.join(temp_dir, filename)
+        if os.path.exists(save_path):
+            return save_path
+        try:
+            with open(local_path, "rb") as src, open(save_path, "wb") as dst:
+                dst.write(src.read())
+            return save_path
+        except OSError as exc:
+            logger.warning("Failed to copy local image %s: %s", local_path, exc)
+            return None
+
     parsed = urllib.parse.urlparse(url_or_b64)
     if not filename:
         filename = os.path.basename(parsed.path)
@@ -222,8 +254,14 @@ def ensure_image_local(
             except Exception as exc:
                 logger.warning("Failed to decode base64 image: %s", exc)
                 return None, None
-        if len(image_data) < 500 and os.path.exists(image_data):
-            return image_data, image_data
+        local_path = local_image_path_from_reference(image_data)
+        if (
+            len(image_data) < 500
+            and local_path
+            and os.path.exists(local_path)
+        ):
+            image_paths_dict[image_ref] = local_path
+            return local_path, local_path
 
     if isinstance(image_data, str) and image_data.startswith(("http://", "https://")):
         temp_dir = os.path.join(intermediate_dir, "temp_images")
@@ -287,8 +325,9 @@ def load_pil_from_any(source: Union[str, bytes, Image.Image]) -> Optional[Image.
                 from io import BytesIO
 
                 return Image.open(BytesIO(base64.b64decode(payload)))
-            if os.path.exists(source):
-                return Image.open(source)
+            local_path = local_image_path_from_reference(source)
+            if local_path and os.path.exists(local_path):
+                return Image.open(local_path)
     except Exception as exc:
         logger.warning("Failed to load PIL image: %s", exc)
     return None

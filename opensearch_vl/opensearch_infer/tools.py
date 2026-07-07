@@ -194,20 +194,18 @@ def _resolve_image_for_search(
             ("http://", "https://")
         ):
             return image_data, None
-        if (
-            isinstance(image_data, str)
-            and len(image_data) < 500
-            and os.path.exists(image_data)
-        ):
-            with open(image_data, "rb") as fh:
-                pil_img = Image.open(io.BytesIO(fh.read()))
-            url = cos_upload.upload_pil_image(
-                pil_img, filename_prefix, case_idx, turn_num, "image_search"
-            )
-            return (url, None) if url else (
-                None,
-                "Failed to upload local image to COS for image_search.",
-            )
+        if isinstance(image_data, str) and len(image_data) < 500:
+            local_path = image_io.local_image_path_from_reference(image_data)
+            if local_path and os.path.exists(local_path):
+                with open(local_path, "rb") as fh:
+                    pil_img = Image.open(io.BytesIO(fh.read()))
+                url = cos_upload.upload_pil_image(
+                    pil_img, filename_prefix, case_idx, turn_num, "image_search"
+                )
+                return (url, None) if url else (
+                    None,
+                    "Failed to upload local image to COS for image_search.",
+                )
         if isinstance(image_data, bytes):
             pil_img = Image.open(io.BytesIO(image_data))
             url = cos_upload.upload_pil_image(

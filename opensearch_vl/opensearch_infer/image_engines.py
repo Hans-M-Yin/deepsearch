@@ -43,8 +43,9 @@ class ImageToolEngine:
                 raise ValueError(
                     "Received a base64 string where a path was expected."
                 )
-            if os.path.exists(source):
-                self.current_image = Image.open(source)
+            local_path = image_io.local_image_path_from_reference(source)
+            if local_path and os.path.exists(local_path):
+                self.current_image = Image.open(local_path)
                 return self
             raise FileNotFoundError(f"Image file not found: {source}")
         raise TypeError(f"Unsupported image source: {type(source)!r}")
@@ -114,9 +115,10 @@ class ImageEnhancementEngine:
                 raise ValueError(
                     "Received a base64 string where a path was expected."
                 )
-            if not os.path.exists(source):
+            local_path = image_io.local_image_path_from_reference(source)
+            if not local_path or not os.path.exists(local_path):
                 raise FileNotFoundError(f"Image file not found: {source}")
-            buf = np.fromfile(source, dtype=np.uint8)
+            buf = np.fromfile(local_path, dtype=np.uint8)
             self.current_image = cv2.imdecode(buf, -1)
             return self
         raise TypeError(f"Unsupported image source: {type(source)!r}")
