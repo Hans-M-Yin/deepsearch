@@ -1323,6 +1323,7 @@ class QuestionWriter:
                     "session_id": _VQA_FIXED_REQUEST_ID,
                     "prompt_cache_key": _VQA_FIXED_REQUEST_ID,
                     "user_id": _VQA_FIXED_REQUEST_ID,
+                    "x_tt_logid": _VQA_FIXED_REQUEST_ID,
                 },
             )
             try:
