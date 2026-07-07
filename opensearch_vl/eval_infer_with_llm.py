@@ -263,6 +263,51 @@ def process_single_trajectory(path: Path, answer_map: dict[str, str]) -> dict[st
     }
 
 
+def _trajectory_case_id(path: Path) -> str:
+    name = path.name
+    suffix = "_trajectory.json"
+    if name.endswith(suffix):
+        return name[: -len(suffix)]
+    return path.stem
+
+
+def _load_existing_results(details_path: Path) -> dict[str, dict[str, Any]]:
+    if not details_path.exists():
+        return {}
+    results_by_case: dict[str, dict[str, Any]] = {}
+    with details_path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                item = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            case_id = str(item.get("case_id", "") or "").strip()
+            if case_id:
+                results_by_case[case_id] = item
+    return results_by_case
+
+
+def _order_results(
+    traj_files: list[Path],
+    results_by_case: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    ordered: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for path in traj_files:
+        case_id = _trajectory_case_id(path)
+        item = results_by_case.get(case_id)
+        if item is not None:
+            ordered.append(item)
+            seen.add(case_id)
+    for case_id, item in results_by_case.items():
+        if case_id not in seen:
+            ordered.append(item)
+    return ordered
+
+
 def run_eval(
     traj_dir: str,
     *,
@@ -278,28 +323,53 @@ def run_eval(
     if limit > 0:
         traj_files = traj_files[:limit]
 
-    answer_map = load_answer_map(answer_file) if answer_file else {}
-    results: list[dict[str, Any]] = []
+    if output_path is None:
+        output_path = os.path.join(traj_dir, "llm_eval_report.json")
+    details_path = Path(output_path.replace(".json", "_details.jsonl"))
 
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_map = {
-            executor.submit(process_single_trajectory, path, answer_map): path
-            for path in traj_files
-        }
-        for future in tqdm(as_completed(future_map), total=len(traj_files), desc="Judge"):
-            path = future_map[future]
-            try:
-                results.append(future.result())
-            except Exception as exc:
-                results.append(
-                    {
-                        "case_id": path.stem,
-                        "acc": 0,
-                        "reasoning": "",
-                        "raw_judge": "",
-                        "error": str(exc),
-                    }
-                )
+    answer_map = load_answer_map(answer_file) if answer_file else {}
+    results_by_case = _load_existing_results(details_path)
+    completed_case_ids = {
+        case_id
+        for case_id, item in results_by_case.items()
+        if not item.get("error")
+    }
+    pending_files = [
+        path for path in traj_files if _trajectory_case_id(path) not in completed_case_ids
+    ]
+
+    if completed_case_ids:
+        print(
+            f"[resume] Reusing {len(completed_case_ids)} completed evaluation result(s) "
+            f"from {details_path}"
+        )
+
+    if pending_files:
+        with details_path.open("a", encoding="utf-8") as append_handle:
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_map = {
+                    executor.submit(process_single_trajectory, path, answer_map): path
+                    for path in pending_files
+                }
+                for future in tqdm(as_completed(future_map), total=len(pending_files), desc="Judge"):
+                    path = future_map[future]
+                    try:
+                        result = future.result()
+                    except Exception as exc:
+                        result = {
+                            "case_id": _trajectory_case_id(path),
+                            "acc": 0,
+                            "reasoning": "",
+                            "raw_judge": "",
+                            "error": str(exc),
+                        }
+                    results_by_case[str(result.get("case_id", ""))] = result
+                    append_handle.write(json.dumps(result, ensure_ascii=False) + "\n")
+                    append_handle.flush()
+    else:
+        print("[resume] No pending trajectories to evaluate.")
+
+    results = _order_results(traj_files, results_by_case)
 
     total = len(results)
     correct = sum(int(item.get("acc", 0)) for item in results)
@@ -317,14 +387,10 @@ def run_eval(
         "label_distribution": dict(acc_counter),
     }
 
-    if output_path is None:
-        output_path = os.path.join(traj_dir, "llm_eval_report.json")
-
     with open(output_path, "w", encoding="utf-8") as handle:
         json.dump(report, handle, ensure_ascii=False, indent=2)
 
-    details_path = output_path.replace(".json", "_details.jsonl")
-    with open(details_path, "w", encoding="utf-8") as handle:
+    with details_path.open("w", encoding="utf-8") as handle:
         for item in results:
             handle.write(json.dumps(item, ensure_ascii=False) + "\n")
 
