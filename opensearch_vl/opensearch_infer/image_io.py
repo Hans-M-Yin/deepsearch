@@ -39,7 +39,16 @@ def local_image_path_from_reference(value: object) -> Optional[str]:
 
     if os.path.isabs(value):
         return value
-    return None
+
+    parsed = urllib.parse.urlparse(value)
+    if parsed.scheme in {"http", "https", "data"}:
+        return None
+    if parsed.scheme:
+        return None
+
+    # Preserve repo-relative/intermediate paths such as
+    # ``opensearch_infer/outputs/.../temp_images/foo.png``.
+    return value
 
 
 def looks_like_base64(value: object) -> bool:
