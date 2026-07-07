@@ -391,7 +391,7 @@ If there is no relevant content, directly place the denoised original text in fu
 
 Agent's current output:\n{assistant_output or '(empty)'}\n
 Tool goal:\n{goal or '(empty)'}\n
-Raw webpage content:\n{content[:100000]}\n
+Raw webpage content:\n{content[:80000]}\n
 """
     )
     try:
