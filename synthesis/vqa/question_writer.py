@@ -146,6 +146,29 @@ Important constraints:
    - Base the question and answer only on the supplied image material.
    - Do not invent details that are not visibly supported.
 
+**Example 1:
+A photo of Argentina defender Montiel scoring the penalty in the World Cup final.
+
+Reasonable question examples:
+1. Which side of the goal did the player kick the ball toward when taking the penalty in the World Cup final?
+2. Which side of the goal did the goalkeeper dive toward?
+3. What number jersey was the goalkeeper wearing?
+
+Unreasonable question:
+What number was the penalty taker wearing?
+(Reason: this can be answered directly by searching for Montiel based on the image description, so the image itself is unnecessary.)
+
+**Example 2:
+An aerial photo of the University of Chicago.
+
+Reasonable question examples:
+1. What is the main color of the roofs of the campus buildings?
+2. What is the nearest building next to the tallest building on campus?
+
+Unreasonable question:
+1. What two colors are on the roof of the building in the lower-left corner of the image?
+(Reason: this is ambiguous because it depends on the orientation of the photo.)
+
 Return valid JSON with exactly these fields:
 {
   "ask_target": "one complete question about the target image",
