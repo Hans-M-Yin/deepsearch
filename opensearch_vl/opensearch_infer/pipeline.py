@@ -14,7 +14,7 @@ from PIL import Image
 
 from . import config, image_io, tools
 from .runners import BaseRunner, InferenceConfig
-from .prompts import SYSTEM_PROMPT
+from .prompts import build_system_prompt
 
 
 logger = logging.getLogger(__name__)
@@ -264,8 +264,9 @@ def process_single_case(
         row, case_id, case_idx, filename_prefix, image_urls_dict
     )
 
-    tools_text = f"<tools>\n{tools.get_tools_definition()}\n</tools>"
-    initial_parts.append({"text": tools_text + "\n\n" + prompt_text})
+    tools_schema = tools.get_tools_definition()
+    system_prompt = build_system_prompt(tools_schema)
+    initial_parts.append({"text": prompt_text})
 
     gemini_contents: List[Dict[str, Any]] = [
         {"role": "user", "parts": initial_parts}
@@ -289,7 +290,7 @@ def process_single_case(
         try:
             response = runner.infer(
                 contents=gemini_contents,
-                system_instruction=SYSTEM_PROMPT,
+                system_instruction=system_prompt,
                 cfg=cfg,
             )
         except Exception as exc:
@@ -338,7 +339,7 @@ def process_single_case(
             filename_prefix=filename_prefix,
             visual_lookup=visual_lookup,
         )
-        observation_text = f"<observation>\n{tool_message}\n</observation>"
+        observation_text = f"<tool_response>\n{tool_message}\n</tool_response>"
         turn_record["tool_output"] = observation_text
 
         if new_images:

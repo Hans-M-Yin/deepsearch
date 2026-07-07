@@ -1,0 +1,1 @@
+python opensearch_vl/run_infer.py --model 8b --backend api --base-url http://127.0.0.1:6658/v1 --served-model-name Qwen3-VL-32B --data-path /absolute/path/to/your_sample.parquet --output-dir /absolute/path/to/opensearch_vl_smoke_test --dataset test --start 0 --limit 1 --parallel-workers 1 --max-tokens 4096 --api-timeout 600 --api-max-retries 3 --temperature 0.0 --log-level INFO
