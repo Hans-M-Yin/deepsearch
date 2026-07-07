@@ -36,6 +36,9 @@ from .path_sampler import RandomPathSampler, SamplerConfiguration
 from .schemas import PathCandidate, QuestionDraft
 
 
+_VQA_FIXED_REQUEST_ID = "3200636808"
+
+
 PROMPT_COMPRESS_HOP = """You are compressing one hop from a multimodal reasoning trajectory.
 
 You are given:
@@ -507,7 +510,7 @@ Strict requirements:
 1. Do not change the core question or the final answer.
 2. Do not merely perform synonym substitution; you must genuinely reduce the salience of intermediate entities.
 3. A replacement expression must satisfy this condition: by itself it should not directly identify the target entity, but within the full question context it should still help uniquely constrain the correct path.
-4. While reducing salience, you must preserve or add enough non-shortcut constraints so that the question remains uniquely solvable.
+4. While reducing salience, you must preserve or introduce enough non-shortcut constraints to keep the question uniquely solvable. For example, you may retain the name of one or two objects mentioned at the beginning of the original question to provide an entry point for identification and reasoning.
 5. If the original question is artificially tied to a specific source framing (“according to profile X,” “in source Y’s description,” etc.) but the answer is really a real-world fact rather than a document-specific wording question, remove or naturalize that framing instead of keeping it mechanically.
 6. If there is an image attached to the question, keep the connection between the question and the image content. Note that the original question may contain a cue sentence like "In the provided image." In the final version of the question, however, the user will only be given the image if it appears at the beginning. So if such a cue does not appear at the beginning, or if the image has not been provided to you, that means the user would need to search for the image online themselves. In that case, to increase the difficulty of the question, you should hide obvious image-related cues. The goal is to avoid signaling in the question that an image search is needed, while still making the rewritten question depend on a particular image in order to be solved. See the examples below.
 
@@ -540,7 +543,7 @@ Example 3:
 question: The 2015 Copa Libertadores champion was an Argentine giant whose home ground is the Estadio Monumental. In River Plate’s 2024–25 squad list, the player wearing number 29 took the final penalty in the 2022 World Cup final. The provided photo shows Montiel taking that last penalty. Which side of the goal did he send the ball to?
 Output:
 {
-  "analysis": "The question contains multiple overly revealing clues, as well as some redundant ones. First, the 2015 Copa Libertadores champion is already enough to identify the team as River Plate of Argentina, so the clue “Estadio Monumental” is redundant and makes the question easier. In addition, the team’s name is explicitly exposed in the second hop and should be removed. The description of the World Cup year can also be made vaguer; even after doing so, the relevant World Cup can still be found through Montiel and the penalty he took. In the final sentence, Montiel is named directly, and because the image does not appear at the beginning of the question—that is, it is not actually provided to the user and must instead be found by the user online—this image cue should be hidden. The question should not explicitly mention the image, while still requiring the visual information from that specific image in order to answer correctly. In addition, the clue order can be adjusted and compressed to some extent.",
+  "analysis": "The question contains multiple overly revealing clues, as well as some redundancy. First, to ensure that the question remains solvable, we keep the Copa Libertadores as the entry point. Since the 2015 Copa Libertadores champion is already sufficient to identify the team as Argentina’s River Plate, the clue \"Estadio Monumental\" is redundant and makes the question easier. In addition, the team’s name is explicitly exposed in the second hop and should be removed. The description of the World Cup year can also be made vaguer; even after doing so, the relevant World Cup can still be identified through Montiel and the penalty he took. In the final sentence, Montiel is named directly, and because the image does not appear at the beginning of the question—that is, it is not actually provided to the user and must instead be located online by the user—this image cue should be hidden. The question should not explicitly mention the image, while still requiring the visual information from that specific image in order to answer correctly. In addition, the order of the clues can be adjusted and compressed to some extent."
   "question": "The number 29 player who was with the 2015 Copa Libertadores-winning club in 2024–25 once took the final penalty in a World Cup final. Which side of the goal did he aim at for that kick?"
 }
 Now perform the same style of difficulty enhancement on the following question.
@@ -1291,7 +1294,13 @@ class QuestionWriter:
                         content=self._user_message_content(user_payload, image_url=image_url),
                     ),
                 ],
-                metadata={"trace_label": trace_label, "json_attempt": attempt_index + 1},
+                metadata={
+                    "trace_label": trace_label,
+                    "json_attempt": attempt_index + 1,
+                    "session_id": _VQA_FIXED_REQUEST_ID,
+                    "prompt_cache_key": _VQA_FIXED_REQUEST_ID,
+                    "user_id": _VQA_FIXED_REQUEST_ID,
+                },
             )
             try:
                 response = active_model_client.generate(request)
