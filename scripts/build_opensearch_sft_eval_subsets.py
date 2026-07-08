@@ -22,45 +22,25 @@ DEFAULT_OUTPUT_ROOT = Path("data/opensearch_vl_sft")
 
 SUBSET_SPECS = {
     "fvqa": {
-        "dataset_key": "new_fvqa_agent_sft",
-        "json_relpath": Path("new_fvqa/fvqa_llama_factory_clean.json"),
-        "alt_json_relpaths": [
-            Path("fvqa/fvqa_llama_factory_clean.json"),
-        ],
+        "json_relpath": Path("fvqa/fvqa_llama_factory_clean.json"),
     },
     "palace": {
-        "dataset_key": "palace_agent_sft",
         "json_relpath": Path("palace/palace_llama_factory_filtered.json"),
-        "alt_json_relpaths": [],
     },
     "webqa": {
-        "dataset_key": "webqa_agent_sft",
-        "json_relpath": Path("WebQA/webqa_llama_factory_filtered.json"),
-        "alt_json_relpaths": [
-            Path("webqa/webqa_llama_factory_filtered.json"),
-        ],
+        "json_relpath": Path("webqa/webqa_llama_factory_filtered.json"),
     },
     "livevqa": {
-        "dataset_key": "livevqa_agent_sft",
-        "json_relpath": Path("new_livevqa/livevqa_llama_factory_filtered.json"),
-        "alt_json_relpaths": [
-            Path("livevqa/livevqa_llama_factory_filtered.json"),
-        ],
+        "json_relpath": Path("livevqa/livevqa_llama_factory_filtered.json"),
     },
-    "wikiart": {
-        "dataset_key": "wikiart_agent_sft",
-        "json_relpath": Path("wikiart/wikiart_llama_factory_filtered.json"),
-        "alt_json_relpaths": [],
+    "wiki_art": {
+        "json_relpath": Path("wiki_art/wiki_art_llama_factory_filtered.json"),
     },
     "wiki_en": {
-        "dataset_key": "wiki_en_agent_sft",
         "json_relpath": Path("wiki_en/wiki_en_llama_factory_filtered.json"),
-        "alt_json_relpaths": [],
     },
     "wiki_zh": {
-        "dataset_key": "wiki_zh_agent_sft",
         "json_relpath": Path("wiki_zh/wiki_zh_llama_factory_filtered.json"),
-        "alt_json_relpaths": [],
     },
 }
 
@@ -243,48 +223,16 @@ def _write_manifest(payload: dict[str, Any], output_path: Path) -> None:
     )
 
 
-def _load_dataset_info(dataset_info_path: Path) -> dict[str, Any]:
-    if not dataset_info_path.exists():
-        return {}
-    payload = json.loads(dataset_info_path.read_text(encoding="utf-8"))
-    if not isinstance(payload, dict):
-        raise ValueError(f"Expected JSON object in {dataset_info_path}")
-    return payload
-
-
 def _resolve_subset_json_path(
     subset_name: str,
     sft_root: Path,
-    dataset_info: dict[str, Any],
 ) -> Path:
     spec = SUBSET_SPECS[subset_name]
-    candidates: list[Path] = []
-    dataset_key = spec["dataset_key"]
-
-    if dataset_key in dataset_info:
-        dataset_entry = dataset_info[dataset_key]
-        candidates.append(Path(dataset_entry["file_name"]))
-
-    candidates.append(spec["json_relpath"])
-    candidates.extend(spec.get("alt_json_relpaths", []))
-
-    seen: set[str] = set()
-    deduped_candidates: list[Path] = []
-    for relpath in candidates:
-        marker = str(relpath)
-        if marker in seen:
-            continue
-        seen.add(marker)
-        deduped_candidates.append(relpath)
-
-    for relpath in deduped_candidates:
-        json_path = (sft_root / relpath).resolve()
-        if json_path.exists():
-            return json_path
-
-    attempted = ", ".join(str((sft_root / relpath).resolve()) for relpath in deduped_candidates)
+    json_path = (sft_root / spec["json_relpath"]).resolve()
+    if json_path.exists():
+        return json_path
     raise FileNotFoundError(
-        f"Subset JSON not found for {subset_name}. Tried: {attempted}. "
+        f"Subset JSON not found for {subset_name}: {json_path}. "
         "Pass --sft-root to the extracted Search-VL-SFT-36K directory."
     )
 
@@ -352,12 +300,6 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
-        "--dataset-info",
-        type=str,
-        default="SFT/data/dataset_info.json",
-        help="Path to dataset_info.json used to resolve subset JSON files.",
-    )
-    parser.add_argument(
         "--output-root",
         type=str,
         default=str(DEFAULT_OUTPUT_ROOT),
@@ -391,12 +333,10 @@ def main() -> None:
 
     subsets = _parse_subsets(args.subsets)
     sft_root = Path(args.sft_root).expanduser().resolve()
-    dataset_info_path = Path(args.dataset_info).expanduser().resolve()
     output_root = Path(args.output_root).expanduser().resolve()
-    dataset_info = _load_dataset_info(dataset_info_path)
 
     for subset_name in subsets:
-        json_path = _resolve_subset_json_path(subset_name, sft_root, dataset_info)
+        json_path = _resolve_subset_json_path(subset_name, sft_root)
         rows, manifest = build_subset_rows(
             subset_name=subset_name,
             json_path=json_path,
