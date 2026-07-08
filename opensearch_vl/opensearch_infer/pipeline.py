@@ -127,6 +127,17 @@ def _bootstrap_images(
     image_paths_dict: Dict[str, Any] = {}
     initial_parts: List[Dict[str, Any]] = []
 
+    def _normalize_image_entries(value: Any) -> List[Any]:
+        if value is None:
+            return []
+        if isinstance(value, list):
+            return value
+        if isinstance(value, tuple):
+            return list(value)
+        if isinstance(value, np.ndarray):
+            return value.tolist()
+        return [value]
+
     if image_urls_dict and case_id in image_urls_dict:
         for entry in image_urls_dict[case_id]:
             if isinstance(entry, dict):
@@ -147,8 +158,8 @@ def _bootstrap_images(
                 logger.warning("Failed to read local image %s: %s", local, exc)
 
     if not initial_parts:
-        images = row.get("images", []) if hasattr(row, "get") else []
-        for entry in images or []:
+        images = row.get("images", None) if hasattr(row, "get") else None
+        for entry in _normalize_image_entries(images):
             if entry is None:
                 continue
             url: Optional[str] = None
