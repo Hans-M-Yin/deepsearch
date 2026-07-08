@@ -61,7 +61,7 @@ export SFT_GEMINI35_FLASH_API_VERSION="2024-03-01-preview"
 # Reader backend
 # ---------------------------------------------------------------------------
 
-export ENHANCED_READER_URL="http://10.124.137.137:8004"
+export ENHANCED_READER_URL="http://localhost:8004"
 
 
 # ---------------------------------------------------------------------------
