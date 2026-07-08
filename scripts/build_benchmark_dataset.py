@@ -436,7 +436,13 @@ def _load_dataset_records(
     kwargs: dict[str, Any] = {"split": split}
     if cache_dir:
         kwargs["cache_dir"] = cache_dir
-    dataset = load_dataset(dataset_name, **kwargs)
+
+    if benchmark == "mmsearch":
+        # MMSearch requires an explicit config name, and the config should stay
+        # aligned with the requested split such as end2end/rerank/summarization.
+        dataset = load_dataset(dataset_name, split, **kwargs)
+    else:
+        dataset = load_dataset(dataset_name, **kwargs)
 
     if benchmark == "mmsearch_plus":
         decrypt_script = (
