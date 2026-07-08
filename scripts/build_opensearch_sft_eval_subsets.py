@@ -34,7 +34,7 @@ SUBSET_SPECS = {
         "json_relpath": Path("livevqa/livevqa_llama_factory_filtered.json"),
     },
     "wiki_art": {
-        "json_relpath": Path("wiki_art/wiki_art_llama_factory_filtered.json"),
+        "json_relpath": Path("wiki_art/wikiart_llama_factory_filtered.json"),
     },
     "wiki_en": {
         "json_relpath": Path("wiki_en/wiki_en_llama_factory_filtered.json"),
