@@ -906,8 +906,7 @@ class WikiTextBuilder:
                     quality_reasons=reasons,
                 )
             )
-            if len(candidates) >= self.max_raw_links:
-                break
+        candidates = self._uniformly_sample_candidates(candidates, self.max_raw_links)
         candidates = self._filter_links_with_llm(source_url=source_url, candidates=candidates)
         return self._select_position_diverse_links(candidates)
 
@@ -1771,13 +1770,6 @@ class WikiTextBuilder:
 
         score = 1.0
         reasons = ["base"]
-        if rank <= 30:
-            score += 1.0
-            reasons.append("early_link")
-        elif rank <= 100:
-            score += 0.4
-            reasons.append("middle_link")
-
         if WikiTextBuilder._looks_like_named_entity(title_clean):
             score += 1.2
             reasons.append("named_entity_title")
@@ -1919,6 +1911,26 @@ class WikiTextBuilder:
         snippet = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r"\1", snippet)
         snippet = re.sub(r"https?://[^\s)]+", "", snippet)
         return re.sub(r"\s+", " ", snippet).strip()
+
+    @staticmethod
+    def _uniformly_sample_candidates(
+        candidates: list[WikiLinkCandidate],
+        limit: int | None,
+    ) -> list[WikiLinkCandidate]:
+        if limit is None or limit <= 0 or len(candidates) <= limit:
+            return candidates
+
+        total = len(candidates)
+        if limit == 1:
+            picked = [candidates[total // 2]]
+        else:
+            indices = [int(round(i * (total - 1) / (limit - 1))) for i in range(limit)]
+            picked = [candidates[index] for index in indices]
+
+        for candidate in picked:
+            if "uniform_raw_sampled" not in candidate.quality_reasons:
+                candidate.quality_reasons.append("uniform_raw_sampled")
+        return picked
 
 
 def _smoke_test() -> None:

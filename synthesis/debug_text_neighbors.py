@@ -405,8 +405,7 @@ def main(argv: list[str] | None = None) -> int:
                 quality_reasons=reasons,
             )
         )
-        if len(rule_candidates) >= builder.max_raw_links:
-            break
+    rule_candidates = builder._uniformly_sample_candidates(rule_candidates, builder.max_raw_links)
 
     ranked_candidates = sorted(rule_candidates, key=lambda item: (-item.score, item.rank or 10**9))
     llm_result = _run_llm_filter_debug(builder, source_url=page_url, candidates=rule_candidates)
