@@ -342,7 +342,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch-size", type=int, default=None, help="Tasks popped from the queue per parallel expansion round.")
     parser.add_argument("--max-depth", type=int, default=1, help="Maximum text-neighbor BFS depth.")
     parser.add_argument("--max-neighbors", type=int, default=5, help="Text neighbors queued per text node.")
-    parser.add_argument("--max-links", type=int, default=5, help="Wiki links extracted per page before queue slicing.")
+    parser.add_argument("--max-links", type=int, default=60, help="Wiki links extracted per page before queue slicing.")
     parser.add_argument("--link-window-size", type=int, default=1200, help="Character window size for wiki-link diversity.")
     parser.add_argument("--max-links-per-window", type=int, default=2, help="Maximum selected wiki links per character window.")
     parser.add_argument("--min-link-char-distance", type=int, default=500, help="Minimum character distance between selected wiki links.")
@@ -351,7 +351,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-content-chars", type=int, default=70000, help="Max cleaned markdown chars stored in each text node/evidence. <=0 disables truncation.")
     parser.add_argument("--max-link-markdown-chars", type=int, default=100000, help="Max raw markdown chars used for wiki-link extraction. <=0 disables truncation.")
     parser.add_argument("--max-llm-neighbor-candidates", type=int, default=60, help="Maximum rule-recalled wiki links sent to WIKI_NEIGHBOR_MODEL per page.")
-    parser.add_argument("--max-qa-neighbor-candidates", type=int, default=20, help="Maximum reranked wiki links sent through neighbor familiarity QA penalty per page.")
+    parser.add_argument("--max-qa-neighbor-candidates", type=int, default=0, help="Maximum reranked wiki links sent through neighbor familiarity QA penalty per page. <=0 means use all kept neighbors.")
     parser.add_argument("--per-query-image-limit", type=int, default=3, help="Image search results per visual query.")
     parser.add_argument("--max-images-per-plan", type=int, default=5, help="Accepted images per visual plan.")
     parser.add_argument(

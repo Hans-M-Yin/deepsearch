@@ -215,7 +215,10 @@ def _run_qa_penalty_debug(
         or os.environ.get("WIKI_NEIGHBOR_MODEL")
     )
     ranked_candidates = sorted(candidates, key=lambda item: (-item.score, item.rank or 10**9))
-    qa_candidates = ranked_candidates[: max(1, builder.max_qa_neighbor_candidates)]
+    if builder.max_qa_neighbor_candidates and builder.max_qa_neighbor_candidates > 0:
+        qa_candidates = ranked_candidates[: builder.max_qa_neighbor_candidates]
+    else:
+        qa_candidates = ranked_candidates
     if not answer_model or not judge_model or not qa_candidates:
         return {
             "enabled": False,
@@ -328,10 +331,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--reader-base-url", default="http://127.0.0.1:8004", help="Enhanced Reader base URL.")
     parser.add_argument("--skip-reader-check", action="store_true", help="Skip the preflight reader availability check.")
     parser.add_argument("--reader-check-timeout", type=float, default=60.0, help="Seconds to wait for reader preflight.")
-    parser.add_argument("--max-links", type=int, default=5, help="Maximum links retained after position diversity.")
+    parser.add_argument("--max-links", type=int, default=60, help="Maximum links retained after position diversity.")
     parser.add_argument("--max-raw-links", type=int, default=0, help="Maximum raw Wikipedia links to score before filtering. <=0 uses builder default.")
     parser.add_argument("--max-llm-candidates", type=int, default=60, help="Maximum rule-ranked candidates shown to the LLM.")
-    parser.add_argument("--max-qa-candidates", type=int, default=20, help="Maximum reranked candidates sent through QA penalty.")
+    parser.add_argument("--max-qa-candidates", type=int, default=0, help="Maximum reranked candidates sent through QA penalty. <=0 means use all kept neighbors.")
     parser.add_argument("--show-rule-top", type=int, default=60, help="How many rule-ranked candidates to print.")
     parser.add_argument("--show-final-top", type=int, default=30, help="How many final candidates to print.")
     parser.add_argument("--context-chars", type=int, default=180, help="Characters of local context shown per candidate.")

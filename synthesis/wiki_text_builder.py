@@ -212,9 +212,9 @@ Examples we should keep:
 
 - Source: Kobe Bryant
   Candidate: 2000 NBA Finals
-  keep: no
+  keep: yes
   relation: championship series whose final game marked the beginning of Kobe Bryant's first three-peat dynasty
-  reason: Although Kobe won 5 NBA Finals, but the year represent the begining of the three-peat dynasty is 2000.
+  reason: Although Kobe won 5 NBA Finals, but the year represent the begining of the three-peat dynasty is 2000, so this is a unique game.
 
 - Source: Los Angeles Lakers
   Candidate: CJ CheilJedang
@@ -451,7 +451,7 @@ class WikiTextBuilder:
         max_content_chars: int | None = 50000,
         max_link_markdown_chars: int | None = 80000,
         max_llm_neighbor_candidates: int = 60,
-        max_qa_neighbor_candidates: int = 20,
+        max_qa_neighbor_candidates: int = 0,
     ) -> None:
         self.reader = reader
         self.store = store
@@ -1068,7 +1068,10 @@ class WikiTextBuilder:
             return
 
         ranked = sorted(candidates, key=lambda item: (-item.score, item.rank or 10**9))
-        qa_candidates = ranked[: max(1, self.max_qa_neighbor_candidates)]
+        if self.max_qa_neighbor_candidates and self.max_qa_neighbor_candidates > 0:
+            qa_candidates = ranked[: self.max_qa_neighbor_candidates]
+        else:
+            qa_candidates = ranked
         if not qa_candidates:
             return
 
