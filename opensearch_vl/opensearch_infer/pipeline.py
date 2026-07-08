@@ -176,22 +176,12 @@ def _bootstrap_images(
                 _add_image_url(image_paths_dict, initial_parts, url)
                 continue
             if payload:
-                pil_image = Image.open(io.BytesIO(payload))
-                from . import cos_upload
-
-                cos_url = cos_upload.upload_pil_image(
-                    pil_image,
-                    filename_prefix,
-                    case_idx,
-                    0,
-                    "original_image",
+                # For benchmark/parquet inputs, inline the bytes directly.
+                # External upload is only needed later for search tools that
+                # require a publicly reachable URL.
+                _add_inline_image(
+                    image_paths_dict, initial_parts, payload, payload
                 )
-                if cos_url:
-                    _add_image_url(image_paths_dict, initial_parts, cos_url)
-                else:
-                    _add_inline_image(
-                        image_paths_dict, initial_parts, payload, payload
-                    )
     return image_paths_dict, initial_parts
 
 

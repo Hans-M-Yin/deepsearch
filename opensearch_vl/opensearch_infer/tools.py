@@ -282,7 +282,12 @@ def _crop_region_for_i2i_search(
     intermediate_dir: str,
     filename_prefix: str,
 ) -> Tuple[Optional[str], Dict[str, str], Optional[str]]:
-    """Crop a region and return ``(search_url_or_path, new_images, error)``."""
+    """Crop a region and return ``(search_url, new_images, error)``.
+
+    The cropped image is persisted locally for subsequent model turns.
+    Reverse-image search still requires a public URL, so upload is attempted
+    only for the search request itself.
+    """
 
     bbox, err = _normalize_region_bbox(region)
     if err:
@@ -310,7 +315,7 @@ def _crop_region_for_i2i_search(
     engine = ImageToolEngine()
     engine.load_image(image_data)
     cropped = engine.crop(x, y, width, height)
-    new_id, location = _persist_new_image(
+    new_id, local_path = _persist_new_image(
         cropped,
         intermediate_dir,
         filename_prefix,
@@ -319,7 +324,20 @@ def _crop_region_for_i2i_search(
         "i2i_search_region",
         image_paths_dict,
     )
-    return location, {new_id: location}, None
+    search_url = cos_upload.upload_pil_image(
+        cropped,
+        filename_prefix,
+        case_idx,
+        turn_num,
+        "i2i_search_region",
+    )
+    if not search_url:
+        return (
+            None,
+            {new_id: local_path},
+            "Failed to upload cropped image to COS for i2i_search.",
+        )
+    return search_url, {new_id: local_path}, None
 
 
 def _persist_new_image(
@@ -331,7 +349,7 @@ def _persist_new_image(
     tool_name: str,
     image_paths_dict: dict,
 ) -> Tuple[str, str]:
-    """Persist a freshly produced image and return ``(image_id, url_or_path)``."""
+    """Persist a freshly produced image and return ``(image_id, local_path)``."""
 
     os.makedirs(intermediate_dir, exist_ok=True)
     new_id = f"img_{len(image_paths_dict) + 1}"
@@ -341,14 +359,7 @@ def _persist_new_image(
     )
     pil_image.save(save_path)
 
-    cos_url = cos_upload.upload_pil_image(
-        pil_image,
-        filename_prefix,
-        case_idx,
-        turn_num,
-        tool_name,
-    )
-    return new_id, cos_url or save_path
+    return new_id, save_path
 
 
 def execute_tool(
