@@ -1472,7 +1472,7 @@ class WikiTextBuilder:
                     f"URL: {candidate.url}",
                     f"Anchor: {candidate.anchor_text}",
                     f"Rule score: {candidate.score:.2f}",
-                    f"Local context: {context[:500]}",
+                    f"Local context: {context[:2000]}",
                     "",
                 ]
             )
@@ -1912,10 +1912,13 @@ class WikiTextBuilder:
         return None
 
     @staticmethod
-    def _context(text: str, start: int, end: int, *, window: int = 500) -> str:
+    def _context(text: str, start: int, end: int, *, window: int = 2000) -> str:
         left = max(0, start - window)
         right = min(len(text), end + window)
-        return re.sub(r"\s+", " ", text[left:right]).strip()
+        snippet = text[left:right]
+        snippet = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r"\1", snippet)
+        snippet = re.sub(r"https?://[^\s)]+", "", snippet)
+        return re.sub(r"\s+", " ", snippet).strip()
 
 
 def _smoke_test() -> None:
