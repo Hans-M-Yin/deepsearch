@@ -110,20 +110,58 @@ def _extract_answer(record: dict[str, Any]) -> str:
     return ""
 
 
-def _resolve_images(record: dict[str, Any], json_path: Path) -> list[dict[str, str]]:
+def _resolve_image_path(
+    image_ref: str,
+    *,
+    json_path: Path,
+    sft_root: Path,
+) -> Path:
+    candidate = Path(image_ref)
+    if candidate.is_absolute():
+        resolved = candidate.resolve()
+        if resolved.exists():
+            return resolved
+        raise FileNotFoundError(
+            f"Absolute image path referenced by {json_path.name} does not exist: {resolved}"
+        )
+
+    candidates = [
+        (sft_root / candidate).resolve(),
+        (json_path.parent / candidate).resolve(),
+    ]
+
+    # Some records redundantly prefix the subset folder, e.g. `fvqa/images/...`.
+    # If the path is already rooted at the subset dir, dropping the first segment
+    # recovers the actual relative image location under the JSON directory.
+    if len(candidate.parts) > 1:
+        candidates.append((json_path.parent / Path(*candidate.parts[1:])).resolve())
+
+    seen: set[str] = set()
+    for path in candidates:
+        marker = str(path)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        if path.exists():
+            return path
+
+    attempted = ", ".join(seen)
+    raise FileNotFoundError(
+        f"Image referenced by {json_path.name} does not exist. Tried: {attempted}"
+    )
+
+
+def _resolve_images(
+    record: dict[str, Any],
+    json_path: Path,
+    *,
+    sft_root: Path,
+) -> list[dict[str, str]]:
     resolved: list[dict[str, str]] = []
-    base_dir = json_path.parent
     for item in record.get("images") or []:
         if not isinstance(item, str):
             continue
-        candidate = Path(item)
-        if not candidate.is_absolute():
-            candidate = base_dir / candidate
-        candidate = candidate.resolve()
-        if not candidate.exists():
-            raise FileNotFoundError(
-                f"Image referenced by {json_path.name} does not exist: {candidate}"
-            )
+        candidate = _resolve_image_path(item, json_path=json_path, sft_root=sft_root)
         resolved.append({"url": _normalize_image_reference(str(candidate))})
     return resolved
 
@@ -146,11 +184,12 @@ def _record_to_row(
     subset_name: str,
     source_index: int,
     json_path: Path,
+    sft_root: Path,
     record: dict[str, Any],
 ) -> dict[str, object]:
     question = _extract_question(record)
     answer = _extract_answer(record)
-    images = _resolve_images(record, json_path)
+    images = _resolve_images(record, json_path, sft_root=sft_root)
     if not question:
         raise ValueError(
             f"Could not find a human question for {subset_name} index={source_index}"
@@ -254,6 +293,7 @@ def build_subset_rows(
     *,
     subset_name: str,
     json_path: Path,
+    sft_root: Path,
     sample_size: int,
     seed: int,
 ) -> tuple[list[dict[str, object]], dict[str, Any]]:
@@ -272,6 +312,7 @@ def build_subset_rows(
             subset_name=subset_name,
             source_index=source_index,
             json_path=json_path,
+            sft_root=sft_root,
             record=records[source_index],
         )
         rows.append(row)
@@ -340,6 +381,7 @@ def main() -> None:
         rows, manifest = build_subset_rows(
             subset_name=subset_name,
             json_path=json_path,
+            sft_root=sft_root,
             sample_size=args.sample_size,
             seed=args.seed,
         )
