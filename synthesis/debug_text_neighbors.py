@@ -182,6 +182,113 @@ def _print_llm_debug(result: dict[str, Any], *, context_chars: int) -> None:
         print(f"    context={_truncate(row['context'], context_chars)}")
 
 
+def _run_qa_penalty_debug(
+    builder: WikiTextBuilder,
+    *,
+    source_url: str,
+    candidates: list[WikiLinkCandidate],
+    relations_by_url: dict[str, str],
+) -> dict[str, Any]:
+    answer_model = os.environ.get("WIKI_NEIGHBOR_QA_MODEL") or os.environ.get("WIKI_NEIGHBOR_MODEL")
+    judge_model = (
+        os.environ.get("WIKI_NEIGHBOR_QA_JUDGE_MODEL")
+        or os.environ.get("WIKI_NEIGHBOR_QA_MODEL")
+        or os.environ.get("WIKI_NEIGHBOR_MODEL")
+    )
+    ranked_candidates = sorted(candidates, key=lambda item: (-item.score, item.rank or 10**9))
+    qa_candidates = ranked_candidates[: max(1, builder.max_qa_neighbor_candidates)]
+    if not answer_model or not judge_model or not qa_candidates:
+        return {
+            "enabled": False,
+            "answer_model": answer_model,
+            "judge_model": judge_model,
+            "qa_candidates": qa_candidates,
+            "rows": [],
+            "error": None,
+            "fallback": "model_disabled" if not (answer_model and judge_model) else "no_candidates",
+        }
+
+    source_title = builder._title_from_url(source_url) or source_url
+    before_scores = {candidate.url: candidate.score for candidate in qa_candidates}
+    relations_used = {
+        candidate.url: (relations_by_url.get(candidate.url) or candidate.anchor_text or "").strip()
+        for candidate in qa_candidates
+    }
+    started_at = time.perf_counter()
+    try:
+        builder._apply_neighbor_familiarity_penalty(
+            source_title=source_title,
+            candidates=candidates,
+            relations_by_url=relations_by_url,
+        )
+        elapsed_s = time.perf_counter() - started_at
+    except Exception as exc:
+        return {
+            "enabled": True,
+            "answer_model": answer_model,
+            "judge_model": judge_model,
+            "qa_candidates": qa_candidates,
+            "rows": [],
+            "error": f"{exc.__class__.__name__}: {exc}",
+            "fallback": "qa_error",
+        }
+
+    rows: list[dict[str, Any]] = []
+    for candidate in qa_candidates:
+        before = before_scores.get(candidate.url, candidate.score)
+        after = candidate.score
+        penalty = max(0.0, before - after)
+        rows.append(
+            {
+                "title": candidate.title,
+                "url": candidate.url,
+                "relation": relations_used.get(candidate.url) or "-",
+                "before_score": before,
+                "after_score": after,
+                "penalty": penalty,
+                "context": re.sub(r"\s+", " ", candidate.context or "").strip()[:220],
+            }
+        )
+
+    return {
+        "enabled": True,
+        "answer_model": answer_model,
+        "judge_model": judge_model,
+        "qa_candidates": qa_candidates,
+        "rows": rows,
+        "error": None,
+        "elapsed_s": elapsed_s,
+        "fallback": None,
+    }
+
+
+def _print_qa_debug(result: dict[str, Any], *, context_chars: int) -> None:
+    print("\n=== QA Penalty ===")
+    if not result["enabled"]:
+        print(
+            "QA penalty disabled. "
+            f"WIKI_NEIGHBOR_QA_MODEL={result.get('answer_model') or '<disabled>'} "
+            f"WIKI_NEIGHBOR_QA_JUDGE_MODEL={result.get('judge_model') or '<disabled>'}"
+        )
+        return
+    if result.get("error"):
+        print(f"QA penalty failed: {result['error']}")
+        return
+
+    print(
+        f"answer_model={result['answer_model']} judge_model={result['judge_model']} "
+        f"qa_candidates={len(result['qa_candidates'])} elapsed_s={result.get('elapsed_s', 0.0):.2f}"
+    )
+    for index, row in enumerate(result["rows"], start=1):
+        print(
+            f"{index:>2}. penalty={row['penalty']:.2f} "
+            f"before={row['before_score']:.2f} after={row['after_score']:.2f} "
+            f"title={row['title']!r}"
+        )
+        print(f"    relation={row['relation']}")
+        print(f"    context={_truncate(row['context'], context_chars)}")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Debug text-neighbor ranking and LLM filtering for one Wikipedia URL.")
     parser.add_argument("--url", required=True, help="Wikipedia page URL to inspect.")
@@ -190,9 +297,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--reader-base-url", default="http://127.0.0.1:8004", help="Enhanced Reader base URL.")
     parser.add_argument("--skip-reader-check", action="store_true", help="Skip the preflight reader availability check.")
     parser.add_argument("--reader-check-timeout", type=float, default=60.0, help="Seconds to wait for reader preflight.")
-    parser.add_argument("--max-links", type=int, default=80, help="Maximum links retained after position diversity.")
+    parser.add_argument("--max-links", type=int, default=5, help="Maximum links retained after position diversity.")
     parser.add_argument("--max-raw-links", type=int, default=0, help="Maximum raw Wikipedia links to score before filtering. <=0 uses builder default.")
-    parser.add_argument("--max-llm-candidates", type=int, default=40, help="Maximum rule-ranked candidates shown to the LLM.")
+    parser.add_argument("--max-llm-candidates", type=int, default=60, help="Maximum rule-ranked candidates shown to the LLM.")
+    parser.add_argument("--max-qa-candidates", type=int, default=20, help="Maximum reranked candidates sent through QA penalty.")
     parser.add_argument("--show-rule-top", type=int, default=60, help="How many rule-ranked candidates to print.")
     parser.add_argument("--show-final-top", type=int, default=30, help="How many final candidates to print.")
     parser.add_argument("--context-chars", type=int, default=180, help="Characters of local context shown per candidate.")
@@ -220,6 +328,7 @@ def main(argv: list[str] | None = None) -> int:
         max_links=args.max_links,
         max_raw_links=args.max_raw_links if args.max_raw_links > 0 else None,
         max_llm_neighbor_candidates=args.max_llm_candidates,
+        max_qa_neighbor_candidates=args.max_qa_candidates,
     )
 
     document = reader.read(args.url)
@@ -271,6 +380,17 @@ def main(argv: list[str] | None = None) -> int:
     ranked_candidates = sorted(rule_candidates, key=lambda item: (-item.score, item.rank or 10**9))
     llm_result = _run_llm_filter_debug(builder, source_url=page_url, candidates=rule_candidates)
     final_input = llm_result["kept"] if llm_result.get("kept") else rule_candidates
+    relations_by_url = {
+        row["url"]: row["relation"]
+        for row in llm_result.get("rows", [])
+        if row.get("url")
+    }
+    qa_result = _run_qa_penalty_debug(
+        builder,
+        source_url=page_url,
+        candidates=final_input,
+        relations_by_url=relations_by_url,
+    )
     final_candidates = builder._select_position_diverse_links(final_input)
 
     print(f"URL: {page_url}")
@@ -278,6 +398,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"raw_markdown_chars: {len(document.raw_markdown or document.content)}")
     print(f"rule_candidates: {len(rule_candidates)}")
     print(f"llm_enabled: {'yes' if llm_result['enabled'] else 'no'}")
+    print(f"qa_enabled: {'yes' if qa_result['enabled'] else 'no'}")
     print(f"final_candidates_after_diversity: {len(final_candidates)}")
 
     _print_candidates(
@@ -287,6 +408,7 @@ def main(argv: list[str] | None = None) -> int:
         context_chars=args.context_chars,
     )
     _print_llm_debug(llm_result, context_chars=args.context_chars)
+    _print_qa_debug(qa_result, context_chars=args.context_chars)
     _print_candidates(
         "Final Candidates After Diversity",
         final_candidates,

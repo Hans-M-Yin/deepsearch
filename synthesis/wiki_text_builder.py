@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import re
 import json
 import os
@@ -277,6 +278,39 @@ Scores are 0.0 to 5.0. Use keep="yes" only for candidates with score >= 3.0.
 """
 
 
+PROMPT_NEIGHBOR_QA_ANSWER = """You are answering a knowledge graph edge query.
+
+You will be given:
+- a source Wikipedia entity
+- a relation phrase describing a target Wikipedia page from the source side
+
+Task:
+Infer the target Wikipedia page title.
+
+Rules:
+- Output only the answer entity/page title.
+- Do not explain your reasoning.
+- Do not output multiple guesses.
+- If you are unsure, output exactly: UNKNOWN
+"""
+
+
+PROMPT_NEIGHBOR_QA_JUDGE = """You are judging how many model answers correctly identify the target Wikipedia page.
+
+You will be given:
+- a source entity
+- a relation phrase
+- the canonical target Wikipedia page title
+- three model answers
+
+Count how many of the three answers refer to the same Wikipedia entity as the canonical target.
+Accept close aliases only when they clearly refer to the same entity/page.
+Do not give partial credit for broad categories, related entities, or near misses.
+
+Output exactly one digit: 0, 1, 2, or 3
+"""
+
+
 def _jsonify(value: Any) -> Any:
     if isinstance(value, Enum):
         return value.value
@@ -418,7 +452,8 @@ class WikiTextBuilder:
         lead_max_links_per_window: int = 4,
         max_content_chars: int | None = 50000,
         max_link_markdown_chars: int | None = 80000,
-        max_llm_neighbor_candidates: int = 40,
+        max_llm_neighbor_candidates: int = 60,
+        max_qa_neighbor_candidates: int = 20,
     ) -> None:
         self.reader = reader
         self.store = store
@@ -434,6 +469,7 @@ class WikiTextBuilder:
         self.max_content_chars = max_content_chars
         self.max_link_markdown_chars = max_link_markdown_chars
         self.max_llm_neighbor_candidates = max_llm_neighbor_candidates
+        self.max_qa_neighbor_candidates = max_qa_neighbor_candidates
 
     def build_from_url(
         self,
@@ -1001,9 +1037,172 @@ class WikiTextBuilder:
                     total_candidates=len(candidates),
                     prompt_candidates=len(prompt_candidates),
                 )
-            return candidates
+            reranked = candidates
+        else:
+            reranked = kept
 
-        return kept
+        self._apply_neighbor_familiarity_penalty(
+            source_title=source_title,
+            candidates=reranked,
+            relations_by_url={
+                candidate.url: (
+                    (decisions.get(index) or {}).get("relation") or candidate.anchor_text
+                )
+                for index, candidate in enumerate(prompt_candidates, start=1)
+            },
+        )
+        return reranked
+
+    def _apply_neighbor_familiarity_penalty(
+        self,
+        *,
+        source_title: str,
+        candidates: list[WikiLinkCandidate],
+        relations_by_url: dict[str, str],
+    ) -> None:
+        answer_model = os.environ.get("WIKI_NEIGHBOR_QA_MODEL") or os.environ.get("WIKI_NEIGHBOR_MODEL")
+        judge_model = (
+            os.environ.get("WIKI_NEIGHBOR_QA_JUDGE_MODEL")
+            or os.environ.get("WIKI_NEIGHBOR_QA_MODEL")
+            or os.environ.get("WIKI_NEIGHBOR_MODEL")
+        )
+        if not answer_model or not judge_model or not candidates:
+            return
+
+        ranked = sorted(candidates, key=lambda item: (-item.score, item.rank or 10**9))
+        qa_candidates = ranked[: max(1, self.max_qa_neighbor_candidates)]
+        if not qa_candidates:
+            return
+
+        max_workers = min(len(qa_candidates), max(1, int(os.environ.get("WIKI_NEIGHBOR_QA_MAX_WORKERS", "8"))))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_map = {
+                executor.submit(
+                    self._neighbor_familiarity_correct_count,
+                    source_title=source_title,
+                    relation=(relations_by_url.get(candidate.url) or candidate.anchor_text or "").strip(),
+                    target_title=candidate.title,
+                    answer_model=answer_model,
+                    judge_model=judge_model,
+                ): candidate
+                for candidate in qa_candidates
+            }
+            for future in as_completed(future_map):
+                candidate = future_map[future]
+                try:
+                    correct_count = future.result()
+                except Exception:
+                    continue
+                penalty = float(correct_count)
+                if penalty <= 0:
+                    continue
+                candidate.score = max(0.0, candidate.score - penalty)
+
+    def _neighbor_familiarity_correct_count(
+        self,
+        *,
+        source_title: str,
+        relation: str,
+        target_title: str,
+        answer_model: str,
+        judge_model: str,
+    ) -> int:
+        relation_text = re.sub(r"\s+", " ", relation or "").strip()
+        if not relation_text:
+            relation_text = "related to"
+        answers = [
+            self._answer_neighbor_target(
+                source_title=source_title,
+                relation=relation_text,
+                model_alias=answer_model,
+                trial_index=trial_index,
+            )
+            for trial_index in range(3)
+        ]
+        return self._judge_neighbor_answers(
+            source_title=source_title,
+            relation=relation_text,
+            target_title=target_title,
+            answers=answers,
+            model_alias=judge_model,
+        )
+
+    def _answer_neighbor_target(
+        self,
+        *,
+        source_title: str,
+        relation: str,
+        model_alias: str,
+        trial_index: int,
+    ) -> str:
+        temperature = float(os.environ.get("WIKI_NEIGHBOR_QA_TEMPERATURE", "0.6"))
+        response = self.model_client.generate(
+            ModelRequest(
+                model=model_alias,
+                messages=[
+                    ModelMessage(role="system", content=PROMPT_NEIGHBOR_QA_ANSWER),
+                    ModelMessage(
+                        role="user",
+                        content=(
+                            f"Source entity: {source_title}\n"
+                            f"Relation: {relation}\n\n"
+                            "Return only the target Wikipedia page title."
+                        ),
+                    ),
+                ],
+                temperature=temperature,
+                max_tokens=64,
+                metadata={"trace_label": f"neighbor_qa_answer:{source_title}:{trial_index}"},
+            )
+        )
+        return self._normalize_neighbor_answer_text(response.content)
+
+    def _judge_neighbor_answers(
+        self,
+        *,
+        source_title: str,
+        relation: str,
+        target_title: str,
+        answers: list[str],
+        model_alias: str,
+    ) -> int:
+        answer_blob = " ||| ".join(answer or "UNKNOWN" for answer in answers)
+        response = self.model_client.generate(
+            ModelRequest(
+                model=model_alias,
+                messages=[
+                    ModelMessage(role="system", content=PROMPT_NEIGHBOR_QA_JUDGE),
+                    ModelMessage(
+                        role="user",
+                        content=(
+                            f"Source entity: {source_title}\n"
+                            f"Relation: {relation}\n"
+                            f"Canonical target: {target_title}\n"
+                            f"Model answers: {answer_blob}\n\n"
+                            "Output only one digit: 0, 1, 2, or 3."
+                        ),
+                    ),
+                ],
+                temperature=0.0,
+                max_tokens=8,
+                metadata={"trace_label": f"neighbor_qa_judge:{source_title}:{target_title}"},
+            )
+        )
+        return self._parse_neighbor_judge_count(response.content)
+
+    @staticmethod
+    def _normalize_neighbor_answer_text(text: str) -> str:
+        compact = re.sub(r"\s+", " ", str(text or "").strip())
+        if not compact:
+            return "UNKNOWN"
+        return compact.strip("`\"' ")
+
+    @staticmethod
+    def _parse_neighbor_judge_count(text: str) -> int:
+        match = re.search(r"\b([0-3])\b", str(text or ""))
+        if match is None:
+            return 0
+        return int(match.group(1))
 
     def _probe_neighbor_filter_model(
         self,
@@ -1751,6 +1950,7 @@ def _smoke_test() -> None:
             assert parsed_neighbors[1]["keep"] == "yes"
             assert parsed_neighbors[1]["title"] == "Los Angeles Lakers"
             assert WikiTextBuilder._parse_neighbor_score(parsed_neighbors[1]["score"]) == 4.2
+            assert WikiTextBuilder._parse_neighbor_judge_count("2") == 2
             nearby_markdown = (
                 "[1950](https://en.wikipedia.org/wiki/1950_NBA_Finals) "
                 "[1951](https://en.wikipedia.org/wiki/1951_NBA_Finals) "
