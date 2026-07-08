@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import binascii
 import io
 import importlib.util
 import json
@@ -29,6 +30,80 @@ def _normalize_image_reference(image_url: str) -> str:
     if candidate.is_absolute():
         return candidate.resolve().as_uri()
     return image_url
+
+
+def _optional_numpy() -> Any:
+    try:
+        import numpy as np  # type: ignore
+    except ModuleNotFoundError:
+        return None
+    return np
+
+
+def _maybe_decode_base64_image(value: str) -> Optional[bytes]:
+    stripped = value.strip()
+    if not stripped:
+        return None
+    if stripped.startswith(("http://", "https://", "file://", "data:")):
+        return None
+    if "\n" in stripped or "\r" in stripped:
+        stripped = "".join(stripped.split())
+    try:
+        decoded = base64.b64decode(stripped, validate=True)
+    except (binascii.Error, ValueError):
+        return None
+
+    if decoded.startswith(
+        (
+            b"\xff\xd8\xff",  # jpeg
+            b"\x89PNG\r\n\x1a\n",  # png
+            b"GIF87a",
+            b"GIF89a",
+            b"RIFF",  # webp container, validated below
+        )
+    ):
+        if decoded.startswith(b"RIFF") and decoded[8:12] != b"WEBP":
+            return None
+        return decoded
+    return None
+
+
+def _numeric_sequence_to_bytes(value: Any) -> Optional[bytes]:
+    if not isinstance(value, list) or not value:
+        return None
+    if not all(isinstance(item, int) and 0 <= item <= 255 for item in value):
+        return None
+    return bytes(value)
+
+
+def _numpy_array_to_bytes(value: Any) -> Optional[bytes]:
+    np = _optional_numpy()
+    if np is None or not isinstance(value, np.ndarray):
+        return None
+
+    if value.ndim == 1:
+        try:
+            return bytes(value.astype("uint8").tolist())
+        except Exception as exc:
+            raise TypeError(f"Failed to convert 1D numpy image buffer: {exc}") from exc
+
+    if value.ndim in (2, 3):
+        try:
+            from PIL import Image
+        except ModuleNotFoundError as exc:
+            raise RuntimeError(
+                "Converting numpy pixel arrays to encoded images requires Pillow."
+            ) from exc
+
+        array = value
+        if str(array.dtype) != "uint8":
+            array = array.astype("uint8")
+        image = Image.fromarray(array)
+        buffer = io.BytesIO()
+        image.save(buffer, format="PNG")
+        return buffer.getvalue()
+
+    return None
 
 
 def _write_parquet(rows: list[dict[str, object]], output_path: Path) -> None:
@@ -118,7 +193,16 @@ def _image_bytes_from_object(value: Any) -> bytes:
     if isinstance(value, bytearray):
         return bytes(value)
     if isinstance(value, str):
+        decoded = _maybe_decode_base64_image(value)
+        if decoded is not None:
+            return decoded
         return base64.b64decode(value)
+    numeric_bytes = _numeric_sequence_to_bytes(value)
+    if numeric_bytes is not None:
+        return numeric_bytes
+    numpy_bytes = _numpy_array_to_bytes(value)
+    if numpy_bytes is not None:
+        return numpy_bytes
     if isinstance(value, dict):
         if isinstance(value.get("bytes"), (bytes, bytearray)):
             return bytes(value["bytes"])
@@ -142,6 +226,9 @@ def _image_entry_from_value(value: Any) -> Optional[dict[str, object]]:
         stripped = value.strip()
         if not stripped:
             return None
+        decoded = _maybe_decode_base64_image(stripped)
+        if decoded is not None:
+            return {"bytes": decoded}
         return {"url": _normalize_image_reference(stripped)}
     if isinstance(value, dict):
         if "url" in value and str(value["url"]).strip():
@@ -180,6 +267,7 @@ class BenchmarkAdapter:
     benchmark: str
     default_dataset: str
     default_split: str
+    dataset_split: str = "train"
     data_source: str
     question_keys: tuple[str, ...]
     answer_keys: tuple[str, ...]
@@ -285,7 +373,8 @@ ADAPTERS: dict[str, BenchmarkAdapter] = {
     "mmsearch": BenchmarkAdapter(
         benchmark="mmsearch",
         default_dataset="CaraJ/MMSearch",
-        default_split="train",
+        default_split="end2end",
+        dataset_split="train",
         data_source="MMSearch",
         question_keys=("question", "query", "prompt"),
         answer_keys=("answer", "answers", "gt_answer"),
@@ -298,6 +387,7 @@ ADAPTERS: dict[str, BenchmarkAdapter] = {
         benchmark="mmsearch_plus",
         default_dataset="Cie1/MMSearch-Plus",
         default_split="train",
+        dataset_split="train",
         data_source="MMSearch-Plus",
         question_keys=("question", "query", "prompt"),
         answer_keys=("answer", "answers", "gt_answer", "acceptable_answers"),
@@ -311,6 +401,7 @@ ADAPTERS: dict[str, BenchmarkAdapter] = {
         benchmark="vdr_bench",
         default_dataset="Osilly/VDR-Bench",
         default_split="train",
+        dataset_split="train",
         data_source="VDR-Bench",
         question_keys=("question", "query", "prompt"),
         answer_keys=("answer", "answers"),
@@ -324,6 +415,7 @@ ADAPTERS: dict[str, BenchmarkAdapter] = {
         benchmark="vdr_bench_testmini",
         default_dataset="Osilly/VDR-Bench-testmini",
         default_split="train",
+        dataset_split="train",
         data_source="VDR-Bench-testmini",
         question_keys=("question", "query", "prompt"),
         answer_keys=("answer", "answers"),
@@ -339,6 +431,7 @@ ADAPTERS: dict[str, BenchmarkAdapter] = {
 def _load_dataset_records(
     dataset_name: str,
     split: str,
+    dataset_split: str = "train",
     cache_dir: Optional[str] = None,
     benchmark: Optional[str] = None,
     mmsearch_plus_decrypt_script: Optional[str] = None,
@@ -346,10 +439,13 @@ def _load_dataset_records(
 ) -> list[dict[str, Any]]:
     from datasets import load_dataset
 
-    kwargs: dict[str, Any] = {"split": split}
+    kwargs: dict[str, Any] = {"split": dataset_split}
     if cache_dir:
         kwargs["cache_dir"] = cache_dir
-    dataset = load_dataset(dataset_name, **kwargs)
+    if benchmark == "mmsearch":
+        dataset = load_dataset(dataset_name, split, **kwargs)
+    else:
+        dataset = load_dataset(dataset_name, **kwargs)
 
     if benchmark == "mmsearch_plus":
         decrypt_script = (
@@ -443,7 +539,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--split",
         default=None,
-        help="Dataset split to load. Defaults to the adapter default.",
+        help=(
+            "For MMSearch, this selects the dataset config "
+            "(end2end/rerank/summarization). For other benchmarks, this is the "
+            "dataset split to load."
+        ),
     )
     parser.add_argument(
         "--output",
@@ -494,6 +594,9 @@ def main() -> None:
     adapter = ADAPTERS[args.benchmark]
     dataset_name = args.dataset or adapter.default_dataset
     split = args.split or adapter.default_split
+    dataset_split = adapter.dataset_split
+    if args.benchmark != "mmsearch":
+        dataset_split = split
     output_path = (
         Path(args.output).expanduser()
         if args.output
@@ -503,6 +606,7 @@ def main() -> None:
     records = _load_dataset_records(
         dataset_name=dataset_name,
         split=split,
+        dataset_split=dataset_split,
         cache_dir=args.cache_dir,
         benchmark=args.benchmark,
         mmsearch_plus_decrypt_script=args.mmsearch_plus_decrypt_script,
