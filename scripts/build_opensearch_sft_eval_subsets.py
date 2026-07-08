@@ -24,30 +24,43 @@ SUBSET_SPECS = {
     "fvqa": {
         "dataset_key": "new_fvqa_agent_sft",
         "json_relpath": Path("new_fvqa/fvqa_llama_factory_clean.json"),
+        "alt_json_relpaths": [
+            Path("fvqa/fvqa_llama_factory_clean.json"),
+        ],
     },
     "palace": {
         "dataset_key": "palace_agent_sft",
         "json_relpath": Path("palace/palace_llama_factory_filtered.json"),
+        "alt_json_relpaths": [],
     },
     "webqa": {
         "dataset_key": "webqa_agent_sft",
         "json_relpath": Path("WebQA/webqa_llama_factory_filtered.json"),
+        "alt_json_relpaths": [
+            Path("webqa/webqa_llama_factory_filtered.json"),
+        ],
     },
     "livevqa": {
         "dataset_key": "livevqa_agent_sft",
         "json_relpath": Path("new_livevqa/livevqa_llama_factory_filtered.json"),
+        "alt_json_relpaths": [
+            Path("livevqa/livevqa_llama_factory_filtered.json"),
+        ],
     },
     "wikiart": {
         "dataset_key": "wikiart_agent_sft",
         "json_relpath": Path("wikiart/wikiart_llama_factory_filtered.json"),
+        "alt_json_relpaths": [],
     },
     "wiki_en": {
         "dataset_key": "wiki_en_agent_sft",
         "json_relpath": Path("wiki_en/wiki_en_llama_factory_filtered.json"),
+        "alt_json_relpaths": [],
     },
     "wiki_zh": {
         "dataset_key": "wiki_zh_agent_sft",
         "json_relpath": Path("wiki_zh/wiki_zh_llama_factory_filtered.json"),
+        "alt_json_relpaths": [],
     },
 }
 
@@ -245,20 +258,35 @@ def _resolve_subset_json_path(
     dataset_info: dict[str, Any],
 ) -> Path:
     spec = SUBSET_SPECS[subset_name]
+    candidates: list[Path] = []
     dataset_key = spec["dataset_key"]
+
     if dataset_key in dataset_info:
         dataset_entry = dataset_info[dataset_key]
-        relpath = Path(dataset_entry["file_name"])
-    else:
-        relpath = spec["json_relpath"]
+        candidates.append(Path(dataset_entry["file_name"]))
 
-    json_path = (sft_root / relpath).resolve()
-    if not json_path.exists():
-        raise FileNotFoundError(
-            f"Subset JSON not found for {subset_name}: {json_path}. "
-            "Pass --sft-root to the extracted Search-VL-SFT-36K directory."
-        )
-    return json_path
+    candidates.append(spec["json_relpath"])
+    candidates.extend(spec.get("alt_json_relpaths", []))
+
+    seen: set[str] = set()
+    deduped_candidates: list[Path] = []
+    for relpath in candidates:
+        marker = str(relpath)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        deduped_candidates.append(relpath)
+
+    for relpath in deduped_candidates:
+        json_path = (sft_root / relpath).resolve()
+        if json_path.exists():
+            return json_path
+
+    attempted = ", ".join(str((sft_root / relpath).resolve()) for relpath in deduped_candidates)
+    raise FileNotFoundError(
+        f"Subset JSON not found for {subset_name}. Tried: {attempted}. "
+        "Pass --sft-root to the extracted Search-VL-SFT-36K directory."
+    )
 
 
 def _parse_subsets(raw: str) -> list[str]:
