@@ -274,7 +274,6 @@ class BenchmarkAdapter:
     sample_id_keys: tuple[str, ...]
     category_keys: tuple[str, ...]
     image_keys: tuple[str, ...]
-    dataset_split: str = "train"
     row_builder: Optional[Callable[[dict[str, Any], "BenchmarkAdapter"], dict[str, object]]] = None
 
 
@@ -374,7 +373,6 @@ ADAPTERS: dict[str, BenchmarkAdapter] = {
         benchmark="mmsearch",
         default_dataset="CaraJ/MMSearch",
         default_split="end2end",
-        dataset_split="train",
         data_source="MMSearch",
         question_keys=("question", "query", "prompt"),
         answer_keys=("answer", "answers", "gt_answer"),
@@ -387,7 +385,6 @@ ADAPTERS: dict[str, BenchmarkAdapter] = {
         benchmark="mmsearch_plus",
         default_dataset="Cie1/MMSearch-Plus",
         default_split="train",
-        dataset_split="train",
         data_source="MMSearch-Plus",
         question_keys=("question", "query", "prompt"),
         answer_keys=("answer", "answers", "gt_answer", "acceptable_answers"),
@@ -401,7 +398,6 @@ ADAPTERS: dict[str, BenchmarkAdapter] = {
         benchmark="vdr_bench",
         default_dataset="Osilly/VDR-Bench",
         default_split="train",
-        dataset_split="train",
         data_source="VDR-Bench",
         question_keys=("question", "query", "prompt"),
         answer_keys=("answer", "answers"),
@@ -415,7 +411,6 @@ ADAPTERS: dict[str, BenchmarkAdapter] = {
         benchmark="vdr_bench_testmini",
         default_dataset="Osilly/VDR-Bench-testmini",
         default_split="train",
-        dataset_split="train",
         data_source="VDR-Bench-testmini",
         question_keys=("question", "query", "prompt"),
         answer_keys=("answer", "answers"),
@@ -431,7 +426,6 @@ ADAPTERS: dict[str, BenchmarkAdapter] = {
 def _load_dataset_records(
     dataset_name: str,
     split: str,
-    dataset_split: str = "train",
     cache_dir: Optional[str] = None,
     benchmark: Optional[str] = None,
     mmsearch_plus_decrypt_script: Optional[str] = None,
@@ -439,13 +433,10 @@ def _load_dataset_records(
 ) -> list[dict[str, Any]]:
     from datasets import load_dataset
 
-    kwargs: dict[str, Any] = {"split": dataset_split}
+    kwargs: dict[str, Any] = {"split": split}
     if cache_dir:
         kwargs["cache_dir"] = cache_dir
-    if benchmark == "mmsearch":
-        dataset = load_dataset(dataset_name, split, **kwargs)
-    else:
-        dataset = load_dataset(dataset_name, **kwargs)
+    dataset = load_dataset(dataset_name, **kwargs)
 
     if benchmark == "mmsearch_plus":
         decrypt_script = (
@@ -520,6 +511,8 @@ def _default_output_path(
     output_format: str,
 ) -> Path:
     suffix = "json" if output_format == "json" else "parquet"
+    if benchmark == "mmsearch":
+        return Path("data") / "benchmarks" / benchmark / split / f"data.{suffix}"
     return Path("data") / "benchmarks" / benchmark / f"{split}.{suffix}"
 
 
@@ -539,11 +532,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--split",
         default=None,
-        help=(
-            "For MMSearch, this selects the dataset config "
-            "(end2end/rerank/summarization). For other benchmarks, this is the "
-            "dataset split to load."
-        ),
+        help="Dataset split to load. For MMSearch this is typically end2end/rerank/summarization.",
     )
     parser.add_argument(
         "--output",
@@ -594,9 +583,6 @@ def main() -> None:
     adapter = ADAPTERS[args.benchmark]
     dataset_name = args.dataset or adapter.default_dataset
     split = args.split or adapter.default_split
-    dataset_split = adapter.dataset_split
-    if args.benchmark != "mmsearch":
-        dataset_split = split
     output_path = (
         Path(args.output).expanduser()
         if args.output
@@ -606,7 +592,6 @@ def main() -> None:
     records = _load_dataset_records(
         dataset_name=dataset_name,
         split=split,
-        dataset_split=dataset_split,
         cache_dir=args.cache_dir,
         benchmark=args.benchmark,
         mmsearch_plus_decrypt_script=args.mmsearch_plus_decrypt_script,
