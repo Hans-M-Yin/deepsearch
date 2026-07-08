@@ -73,6 +73,8 @@ def _run_llm_filter_debug(
             "model": model_alias,
             "ranked_candidates": ranked_candidates,
             "prompt_candidates": prompt_candidates,
+            "system_prompt": PROMPT_FILTER_WIKI_NEIGHBORS,
+            "prompt_input": None,
             "rows": [],
             "kept": [],
             "raw_output": None,
@@ -106,6 +108,8 @@ def _run_llm_filter_debug(
             "model": model_alias,
             "ranked_candidates": ranked_candidates,
             "prompt_candidates": prompt_candidates,
+            "system_prompt": PROMPT_FILTER_WIKI_NEIGHBORS,
+            "prompt_input": prompt_input,
             "rows": [],
             "kept": [],
             "raw_output": None,
@@ -145,6 +149,8 @@ def _run_llm_filter_debug(
         "model": model_alias,
         "ranked_candidates": ranked_candidates,
         "prompt_candidates": prompt_candidates,
+        "system_prompt": PROMPT_FILTER_WIKI_NEIGHBORS,
+        "prompt_input": prompt_input,
         "rows": rows,
         "kept": kept,
         "raw_output": response.content,
@@ -170,6 +176,19 @@ def _print_llm_debug(result: dict[str, Any], *, context_chars: int) -> None:
     )
     if result.get("fallback") == "llm_kept_none":
         print("LLM kept no candidates; pipeline would fall back to the rule-ranked list.")
+
+    system_prompt = result.get("system_prompt")
+    prompt_input = result.get("prompt_input")
+    raw_output = result.get("raw_output")
+    if system_prompt:
+        print("\n--- PROMPT_FILTER_WIKI_NEIGHBORS / system ---")
+        print(system_prompt)
+    if prompt_input:
+        print("\n--- PROMPT_FILTER_WIKI_NEIGHBORS / user ---")
+        print(prompt_input)
+    if raw_output is not None:
+        print("\n--- PROMPT_FILTER_WIKI_NEIGHBORS / raw output ---")
+        print(raw_output)
 
     for row in result["rows"]:
         print(

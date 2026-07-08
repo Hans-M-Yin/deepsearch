@@ -1141,7 +1141,7 @@ class WikiTextBuilder:
 
     @staticmethod
     def _neighbor_familiarity_answer_prompt_text(*, source_title: str, relation: str) -> str:
-        return f"对于 {source_title}，推测下面这句话指代的是什么？\n{relation}"
+        return f"For {source_title}, what does the following description refer to?\n{relation}"
 
     @staticmethod
     def _neighbor_familiarity_judge_prompt_text(
