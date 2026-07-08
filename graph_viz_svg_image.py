@@ -160,9 +160,13 @@ def _render_text_block(svg, x, y, title, items, width_chars, max_lines, empty_te
         )
 
 
-def render_svg(run_dir, images):
+def render_svg(run_dir, images, total_images=None):
     row_count = max(1, len(images))
     height = HEADER_H + MARGIN_Y * 2 + row_count * ROW_H + max(0, row_count - 1) * ROW_GAP
+    total_count = len(images) if total_images is None else total_images
+    count_text = f"image_nodes={len(images)}"
+    if total_count != len(images):
+        count_text = f"image_nodes={len(images)}/{total_count}"
 
     svg = [
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{PAGE_WIDTH}" height="{height}" viewBox="0 0 {PAGE_WIDTH} {height}">',
@@ -170,7 +174,7 @@ def render_svg(run_dir, images):
         '<rect x="0" y="0" width="100%" height="96" fill="#0F172A"/>',
         '<rect x="0" y="96" width="100%" height="26" fill="#E6ECF5"/>',
         '<text x="28" y="40" font-family="Arial, sans-serif" font-size="28" font-weight="bold" fill="#FFFFFF">Image Node Overview</text>',
-        f'<text x="28" y="68" font-family="Arial, sans-serif" font-size="15" fill="#CBD5E1">run: {esc(run_dir)}   image_nodes={len(images)}</text>',
+        f'<text x="28" y="68" font-family="Arial, sans-serif" font-size="15" fill="#CBD5E1">run: {esc(run_dir)}   {esc(count_text)}</text>',
         '<text x="28" y="112" font-family="Arial, sans-serif" font-size="13" fill="#475569">One row per image node. This view shows title, primary image, upstream source nodes, and downstream linked nodes.</text>',
     ]
 
@@ -286,6 +290,12 @@ def parse_args():
         "--output",
         help="Optional output SVG path. Defaults to <run_dir>/graph_image_overview.svg.",
     )
+    parser.add_argument(
+        "--max-images",
+        type=int,
+        default=0,
+        help="Optional cap on how many image nodes to render after sorting. 0 means no limit.",
+    )
     return parser.parse_args()
 
 
@@ -298,9 +308,16 @@ def main():
         raise SystemExit(f"no nodes found in {run_dir}")
 
     images = image_records(nodes, edges)
-    svg = render_svg(run_dir, images)
+    total_images = len(images)
+    if args.max_images < 0:
+        raise SystemExit("--max-images must be >= 0")
+    if args.max_images:
+        images = images[: args.max_images]
+    svg = render_svg(run_dir, images, total_images=total_images)
     output_path = Path(args.output) if args.output else run_dir / "graph_image_overview.svg"
     output_path.write_text(svg, encoding="utf-8")
+    if args.max_images:
+        print(f"rendered {len(images)} of {total_images} image nodes")
     print(f"wrote: {output_path}")
 
 
