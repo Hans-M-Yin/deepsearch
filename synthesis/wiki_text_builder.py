@@ -1059,6 +1059,7 @@ class WikiTextBuilder:
         source_title: str,
         candidates: list[WikiLinkCandidate],
         relations_by_url: dict[str, str],
+        debug_records_by_url: dict[str, dict[str, Any]] | None = None,
     ) -> None:
         answer_model = os.environ.get("WIKI_NEIGHBOR_QA_MODEL") or os.environ.get("WIKI_NEIGHBOR_MODEL")
         judge_model = (
@@ -1078,7 +1079,7 @@ class WikiTextBuilder:
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_map = {
                 executor.submit(
-                    self._neighbor_familiarity_correct_count,
+                    self._neighbor_familiarity_eval,
                     source_title=source_title,
                     relation=(relations_by_url.get(candidate.url) or candidate.anchor_text or "").strip(),
                     target_title=candidate.title,
@@ -1090,15 +1091,18 @@ class WikiTextBuilder:
             for future in as_completed(future_map):
                 candidate = future_map[future]
                 try:
-                    correct_count = future.result()
+                    evaluation = future.result()
                 except Exception:
                     continue
+                if debug_records_by_url is not None:
+                    debug_records_by_url[candidate.url] = evaluation
+                correct_count = int(evaluation.get("correct_count") or 0)
                 penalty = float(correct_count)
                 if penalty <= 0:
                     continue
                 candidate.score = max(0.0, candidate.score - penalty)
 
-    def _neighbor_familiarity_correct_count(
+    def _neighbor_familiarity_eval(
         self,
         *,
         source_title: str,
@@ -1106,10 +1110,14 @@ class WikiTextBuilder:
         target_title: str,
         answer_model: str,
         judge_model: str,
-    ) -> int:
+    ) -> dict[str, Any]:
         relation_text = re.sub(r"\s+", " ", relation or "").strip()
         if not relation_text:
             relation_text = "related to"
+        question_text = self._neighbor_familiarity_answer_prompt_text(
+            source_title=source_title,
+            relation=relation_text,
+        )
         answers = [
             self._answer_neighbor_target(
                 source_title=source_title,
@@ -1119,12 +1127,43 @@ class WikiTextBuilder:
             )
             for trial_index in range(3)
         ]
-        return self._judge_neighbor_answers(
+        correct_count = self._judge_neighbor_answers(
             source_title=source_title,
             relation=relation_text,
             target_title=target_title,
             answers=answers,
             model_alias=judge_model,
+        )
+        return {
+            "relation": relation_text,
+            "question": question_text,
+            "answers": answers,
+            "correct_count": correct_count,
+        }
+
+    @staticmethod
+    def _neighbor_familiarity_answer_prompt_text(*, source_title: str, relation: str) -> str:
+        return (
+            f"Source entity: {source_title}\n"
+            f"Relation: {relation}\n\n"
+            "Return only the target Wikipedia page title."
+        )
+
+    @staticmethod
+    def _neighbor_familiarity_judge_prompt_text(
+        *,
+        source_title: str,
+        relation: str,
+        target_title: str,
+        answers: list[str],
+    ) -> str:
+        answer_blob = " ||| ".join(answer or "UNKNOWN" for answer in answers)
+        return (
+            f"Source entity: {source_title}\n"
+            f"Relation: {relation}\n"
+            f"Canonical target: {target_title}\n"
+            f"Model answers: {answer_blob}\n\n"
+            "Output only one digit: 0, 1, 2, or 3."
         )
 
     def _answer_neighbor_target(
@@ -1143,10 +1182,9 @@ class WikiTextBuilder:
                     ModelMessage(role="system", content=PROMPT_NEIGHBOR_QA_ANSWER),
                     ModelMessage(
                         role="user",
-                        content=(
-                            f"Source entity: {source_title}\n"
-                            f"Relation: {relation}\n\n"
-                            "Return only the target Wikipedia page title."
+                        content=self._neighbor_familiarity_answer_prompt_text(
+                            source_title=source_title,
+                            relation=relation,
                         ),
                     ),
                 ],
@@ -1166,7 +1204,6 @@ class WikiTextBuilder:
         answers: list[str],
         model_alias: str,
     ) -> int:
-        answer_blob = " ||| ".join(answer or "UNKNOWN" for answer in answers)
         response = self.model_client.generate(
             ModelRequest(
                 model=model_alias,
@@ -1174,12 +1211,11 @@ class WikiTextBuilder:
                     ModelMessage(role="system", content=PROMPT_NEIGHBOR_QA_JUDGE),
                     ModelMessage(
                         role="user",
-                        content=(
-                            f"Source entity: {source_title}\n"
-                            f"Relation: {relation}\n"
-                            f"Canonical target: {target_title}\n"
-                            f"Model answers: {answer_blob}\n\n"
-                            "Output only one digit: 0, 1, 2, or 3."
+                        content=self._neighbor_familiarity_judge_prompt_text(
+                            source_title=source_title,
+                            relation=relation,
+                            target_title=target_title,
+                            answers=answers,
                         ),
                     ),
                 ],

@@ -215,11 +215,13 @@ def _run_qa_penalty_debug(
         for candidate in qa_candidates
     }
     started_at = time.perf_counter()
+    debug_records_by_url: dict[str, dict[str, Any]] = {}
     try:
         builder._apply_neighbor_familiarity_penalty(
             source_title=source_title,
             candidates=candidates,
             relations_by_url=relations_by_url,
+            debug_records_by_url=debug_records_by_url,
         )
         elapsed_s = time.perf_counter() - started_at
     except Exception as exc:
@@ -238,14 +240,18 @@ def _run_qa_penalty_debug(
         before = before_scores.get(candidate.url, candidate.score)
         after = candidate.score
         penalty = max(0.0, before - after)
+        debug_record = debug_records_by_url.get(candidate.url) or {}
         rows.append(
             {
                 "title": candidate.title,
                 "url": candidate.url,
-                "relation": relations_used.get(candidate.url) or "-",
+                "relation": debug_record.get("relation") or relations_used.get(candidate.url) or "-",
                 "before_score": before,
                 "after_score": after,
                 "penalty": penalty,
+                "question": debug_record.get("question") or "",
+                "answers": list(debug_record.get("answers") or []),
+                "correct_count": int(debug_record.get("correct_count") or 0),
                 "context": re.sub(r"\s+", " ", candidate.context or "").strip()[:220],
             }
         )
@@ -286,6 +292,12 @@ def _print_qa_debug(result: dict[str, Any], *, context_chars: int) -> None:
             f"title={row['title']!r}"
         )
         print(f"    relation={row['relation']}")
+        print(f"    question={row['question'] or '-'}")
+        answers = list(row.get("answers") or [])
+        for answer_index in range(3):
+            answer_text = answers[answer_index] if answer_index < len(answers) else "UNKNOWN"
+            print(f"    answer_{answer_index + 1}={answer_text}")
+        print(f"    judged_correct_count={row.get('correct_count', 0)}")
         print(f"    context={_truncate(row['context'], context_chars)}")
 
 
