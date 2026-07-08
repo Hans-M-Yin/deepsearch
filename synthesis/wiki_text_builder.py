@@ -198,6 +198,7 @@ Relation is open-ended.
 Do not force the relation into a fixed taxonomy, and do not overuse a small set of generic predicates.
 The relation should be written from the source to this candidate in a way that is as uniquely target-identifying as possible.
 If a broad predicate would fit multiple candidates for the same source, add qualifiers so the relation becomes more discriminative.
+Do not reveal the target directly in the relation. Do not copy the candidate title, and do not include the target's name, aliases, abbreviations, or obvious answer-revealing lexical spans inside the relation text.
 If rejecting a candidate, relation can be a short rejection label such as too_generic, too_close, too_far, ambiguous_entity, list_page, reference_noise, or templatic_edition.
 When in doubt, prefer a canonical specific target page over an explanatory overview page.
 
@@ -206,25 +207,25 @@ Examples we should keep:
 - Source: Lionel Messi
   Candidate: FC Barcelona
   keep: yes
-  relation: Messi played for this team and won the UEFA Champions League here
+  relation: club where Messi spent most of his early senior career and won multiple UEFA Champions League titles
   reason: Specific team central to career, useful bridge. The Source + relation only leads to the Candidate (FCB).  
 
 - Source: Kobe Bryant
   Candidate: 2000 NBA Finals
   keep: no
-  relation: Kobe Bryant won the NBA Finals, and the final game of this year marked the beginning of his first three-peat dynasty.
+  relation: championship series whose final game marked the beginning of Kobe Bryant's first three-peat dynasty
   reason: Although Kobe won 5 NBA Finals, but the year represent the begining of the three-peat dynasty is 2000.
 
 - Source: Los Angeles Lakers
   Candidate: CJ CheilJedang
   keep: yes
-  relation: This is the only Korean main sponsors of Los Angeles Lakers.
+  relation: only major South Korean corporate sponsor associated with the Los Angeles Lakers in this context
   reason: CJ CheilJedang is the unique sponsors from Korean of LAL.
 
 - Source: Apple Inc.
   Candidate: iPhone 3GS
   keep: yes
-  relation: smartphone model introduced by Apple in 2009
+  relation: smartphone model Apple introduced in 2009 as the faster successor to its previous flagship
   reason: Specific canonical product model; stable graph node even though many units were manufactured.
 
 Examples we should ignore:
@@ -232,13 +233,13 @@ Examples we should ignore:
 - Source: Lionel Messi
   Candidate: FC Barcelona
   keep: no
-  relation: Messi once played for this team.
+  relation: team Messi once played for
   reason: Using Source + relation, multiple candidates is suitable for the source + relation (not unique), for instance, FC Bracelona, Saint Paris... and Argentina national football team. 
 
 - Source: Kobe Bryant
   Candidate: basketball
   keep: no
-  relation: Kobe play this.
+  relation: sport Kobe played
   reason: broad category, not a unique entity. And the realtion is vague (Kobe not only play basketball but also video games.) 
 
 - Source: NBA Finals
@@ -250,13 +251,13 @@ Examples we should ignore:
 - Source: Los Angeles Lakers
   Candidate: CJ CheilJedang
   keep: no
-  relation: This sponsors Lakers.
+  relation: sponsor of the Los Angeles Lakers
   reason: Many companies are sponsors of the Los Angeles Lakers.
   
 - Source: Kobe Bryant
   Candidate: 2001 NBA Finals
   keep: no
-  relation: Kobe won NBA Finals this year.
+  relation: championship series Kobe Bryant won in this year
   reason: Not unique. Given Kobe Bryant and the relation 'kobe won NBA Finals this year', we can infer the candidates including 2000, 2001, 2002...
 
 - Source: Apple Inc.
@@ -278,34 +279,31 @@ Scores are 0.0 to 5.0. Use keep="yes" only for candidates with score >= 3.0.
 """
 
 
-PROMPT_NEIGHBOR_QA_ANSWER = """You are answering a knowledge graph edge query.
-
-You will be given:
-- a source Wikipedia entity
-- a relation phrase describing a target Wikipedia page from the source side
+PROMPT_NEIGHBOR_QA_ANSWER = """You are resolving the referent of a short description.
 
 Task:
-Infer the target Wikipedia page title.
+Infer what specific entity, object, event, work, organization, award, or Wikipedia-style page the description refers to.
 
 Rules:
-- Output only the answer entity/page title.
+- Output only one answer.
+- Use the most natural entity/page title or name.
 - Do not explain your reasoning.
 - Do not output multiple guesses.
 - If you are unsure, output exactly: UNKNOWN
 """
 
 
-PROMPT_NEIGHBOR_QA_JUDGE = """You are judging how many model answers correctly identify the target Wikipedia page.
+PROMPT_NEIGHBOR_QA_JUDGE = """You are judging referential equivalence.
 
 You will be given:
-- a source entity
-- a relation phrase
-- the canonical target Wikipedia page title
+- one description
+- one reference target title
 - three model answers
 
-Count how many of the three answers refer to the same Wikipedia entity as the canonical target.
-Accept close aliases only when they clearly refer to the same entity/page.
-Do not give partial credit for broad categories, related entities, or near misses.
+Count how many of the three model answers refer to the same underlying entity/page/object as the reference target.
+The wording does not need to match exactly.
+Accept aliases, alternate surface forms, abbreviations, transliterations, or descriptive names only when they clearly point to the same referent.
+Do not give credit for broad categories, parent classes, nearby entities, related events, partial matches, or ambiguous near misses.
 
 Output exactly one digit: 0, 1, 2, or 3
 """
@@ -1143,11 +1141,7 @@ class WikiTextBuilder:
 
     @staticmethod
     def _neighbor_familiarity_answer_prompt_text(*, source_title: str, relation: str) -> str:
-        return (
-            f"Source entity: {source_title}\n"
-            f"Relation: {relation}\n\n"
-            "Return only the target Wikipedia page title."
-        )
+        return f"对于 {source_title}，推测下面这句话指代的是什么？\n{relation}"
 
     @staticmethod
     def _neighbor_familiarity_judge_prompt_text(
@@ -1157,11 +1151,11 @@ class WikiTextBuilder:
         target_title: str,
         answers: list[str],
     ) -> str:
+        _ = source_title
         answer_blob = " ||| ".join(answer or "UNKNOWN" for answer in answers)
         return (
-            f"Source entity: {source_title}\n"
-            f"Relation: {relation}\n"
-            f"Canonical target: {target_title}\n"
+            f"Description: {relation}\n"
+            f"Reference target: {target_title}\n"
             f"Model answers: {answer_blob}\n\n"
             "Output only one digit: 0, 1, 2, or 3."
         )
