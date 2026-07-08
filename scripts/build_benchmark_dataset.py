@@ -267,7 +267,6 @@ class BenchmarkAdapter:
     benchmark: str
     default_dataset: str
     default_split: str
-    dataset_split: str = "train"
     data_source: str
     question_keys: tuple[str, ...]
     answer_keys: tuple[str, ...]
@@ -275,6 +274,7 @@ class BenchmarkAdapter:
     sample_id_keys: tuple[str, ...]
     category_keys: tuple[str, ...]
     image_keys: tuple[str, ...]
+    dataset_split: str = "train"
     row_builder: Optional[Callable[[dict[str, Any], "BenchmarkAdapter"], dict[str, object]]] = None
 
 
