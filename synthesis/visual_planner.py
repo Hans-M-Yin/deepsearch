@@ -266,7 +266,7 @@ class LLMVisualSearchPlanner:
         max_queries_per_target: int = 4,
         min_query_terms: int = 3,
         target_chars_per_budget: int = 8000,
-        min_content_chars_for_images: int = 2500,
+        min_content_chars_for_images: int = 1000,
     ) -> None:
         self.model_client = model_client or LLM_WORKER
         self.model_alias = model_alias

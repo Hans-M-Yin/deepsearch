@@ -207,6 +207,10 @@ def main(argv: list[str] | None = None) -> int:
         model_alias=args.model_alias,
         max_targets=args.max_targets,
         max_queries_per_target=args.max_queries_per_target,
+        min_content_chars_for_images=min(
+            1000,
+            args.max_content_chars if args.max_content_chars and args.max_content_chars > 0 else 1000,
+        ),
     )
 
     records: list[dict[str, Any]] = []

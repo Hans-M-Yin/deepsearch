@@ -208,7 +208,7 @@ class OfflineVqaVerifier:
         question_index: int,
         question_fingerprint: str,
     ) -> dict[str, Any]:
-        question = str(question_record.get("question") or "").strip()
+        question = self._question_text(question_record)
         gold_answer = str(question_record.get("answer") or "").strip()
         hop_chain = list((sample_record or {}).get("hop_chain") or [])
         node_types = list(((sample_record or {}).get("path") or {}).get("node_types") or [])
@@ -432,12 +432,20 @@ class OfflineVqaVerifier:
             "sample_id": question_record.get("sample_id"),
             "path_id": question_record.get("path_id"),
             "status": question_record.get("status"),
-            "question": question_record.get("question"),
+            "question": self._question_text(question_record),
             "answer": question_record.get("answer"),
             "hop_chain": list((sample_record or {}).get("hop_chain") or []),
         }
         raw = json.dumps(payload, ensure_ascii=False, sort_keys=True)
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _question_text(question_record: dict[str, Any]) -> str:
+        for field_name in ("question", "final_question", "polished_question", "draft_question"):
+            value = str(question_record.get(field_name) or "").strip()
+            if value:
+                return value
+        return ""
 
     def _verifier_config(self) -> dict[str, Any]:
         return {

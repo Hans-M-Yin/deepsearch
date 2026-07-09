@@ -725,6 +725,7 @@ class VqaBatchRunner:
             "sample_id": sample.get("sample_id"),
             "path_id": path.get("path_id"),
             "status": sample.get("status"),
+            "question": final_question.get("question"),
             "draft_question": draft_question.get("question"),
             "polished_question": polished_question.get("question"),
             "final_question": final_question.get("question"),

@@ -1688,7 +1688,10 @@ class QuestionWriter:
         if retrieval_query:
             cleaned_query = cls._remove_forbidden_labels(retrieval_query, forbidden_labels)
             if cleaned_query:
-                return f"A well-known image related to {source_clue} provides the next clue."
+                return (
+                    f"An image associated with {source_clue} can be located using the clue "
+                    f"\"{cleaned_query}\"."
+                )
         if not statement:
             return f"{source_clue}."
         packaged = cls._remove_forbidden_labels(statement, forbidden_labels, replacement=source_clue)
