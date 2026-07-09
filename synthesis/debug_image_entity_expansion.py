@@ -384,11 +384,11 @@ def _debug_entity_statuses(
         label = (entity.get("name") or "").strip()
         record["normalized_label"] = builder._normalize_entity_label(label)
         record["query_overlap_entity"] = builder._is_query_implied_entity(entity, blocked)
-        record["existing_match_debug"] = _debug_existing_text_node_matches(builder=builder, label=label)
         record["resolver_debug"] = _debug_resolver_candidates(
             builder=builder,
             entity=entity,
             source_node_title=source_node_title,
+            source_query_text=source_query_text,
             image_caption=image_node.caption,
         )
         if not builder._should_expand_entity(entity):
@@ -399,28 +399,27 @@ def _debug_entity_statuses(
             record["status"] = "filtered_by_query_entity_overlap"
             statuses.append(record)
             continue
-        matched_node = builder._match_text_node(entity.get("name"))
+        resolution = builder._resolve_grounded_entity_link_target(
+            entity,
+            source_node_title=source_node_title,
+            source_query_text=source_query_text,
+            image_caption=image_node.caption,
+        )
+        if resolution is None:
+            record["status"] = "unresolved"
+            statuses.append(record)
+            continue
+        matched_node = resolution.get("matched_node")
+        resolved_target = resolution.get("resolved_target")
+        record["resolution_debug"] = resolution.get("debug")
         if matched_node is not None:
-            record["status"] = "matched_existing_node"
+            record["status"] = "matched_existing_node_by_url_llm"
             record["matched_node_id"] = matched_node.get("node_id")
             record["matched_title"] = matched_node.get("title")
             statuses.append(record)
             continue
-        resolved_target = builder._resolve_grounded_entity(
-            entity,
-            source_node_title=source_node_title,
-            image_caption=image_node.caption,
-        )
         if resolved_target is None:
             record["status"] = "unresolved"
-            statuses.append(record)
-            continue
-        existing_by_url = builder._find_text_node_by_url(resolved_target["url"])
-        if existing_by_url is not None:
-            record["status"] = "matched_existing_node_by_url"
-            record["matched_node_id"] = existing_by_url.get("node_id")
-            record["matched_title"] = existing_by_url.get("title")
-            record["resolved_target"] = resolved_target
             statuses.append(record)
             continue
         record["status"] = "queued_for_expansion"
@@ -489,6 +488,7 @@ def _debug_resolver_candidates(
     builder: ImageDiscoveryBuilder,
     entity: dict[str, Any],
     source_node_title: str,
+    source_query_text: str,
     image_caption: str | None,
 ) -> dict[str, Any]:
     resolver = builder.wiki_resolver
@@ -504,7 +504,6 @@ def _debug_resolver_candidates(
         source_title=source_node_title,
         context=context,
     )
-    candidates_by_url: dict[str, Any] = {}
     per_query: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
 
@@ -518,10 +517,6 @@ def _debug_resolver_candidates(
                     "candidates": [candidate.to_dict() for candidate in query_candidates],
                 }
             )
-            for candidate in query_candidates:
-                existing = candidates_by_url.get(candidate.url)
-                if existing is None or candidate.score > existing.score:
-                    candidates_by_url[candidate.url] = candidate
         except Exception as exc:
             errors.append(
                 {
@@ -530,36 +525,33 @@ def _debug_resolver_candidates(
                 }
             )
 
-    ranked = sorted(candidates_by_url.values(), key=lambda item: item.score, reverse=True)
-    chosen = resolver.resolve(
+    ranked = resolver.search_candidates(
         label,
         entity_type=entity.get("type"),
         source_title=source_node_title,
         context=context,
         limit=5,
     )
-    top = ranked[0] if ranked else None
-    runner_up = ranked[1] if len(ranked) > 1 else None
-    if not ranked:
-        decision_reason = "no_candidates"
-    elif len(ranked) == 1 and ranked[0].score >= 2.5:
-        decision_reason = "single_candidate_pass"
-    elif top is not None and top.score >= 4.0 and (runner_up is None or top.score - runner_up.score >= 0.75):
-        decision_reason = "top_candidate_margin_pass"
-    else:
-        decision_reason = "threshold_not_met_or_ambiguous"
+    local_candidates = builder._find_text_nodes_by_candidate_urls(ranked)
+    resolution = builder._resolve_grounded_entity_link_target(
+        entity,
+        source_node_title=source_node_title,
+        source_query_text=source_query_text,
+        image_caption=image_caption,
+    )
 
     return {
         "label": label,
         "entity_type": entity.get("type"),
         "source_node_title": source_node_title,
+        "source_query_text": source_query_text,
         "context": context,
         "queries": queries,
         "per_query_candidates": per_query,
         "errors": errors,
         "merged_ranked_candidates": [candidate.to_dict() for candidate in ranked[:10]],
-        "chosen_candidate": chosen.to_dict() if chosen is not None else None,
-        "decision_reason": decision_reason,
+        "local_url_matched_candidates": local_candidates,
+        "resolution_result": resolution,
     }
 
 

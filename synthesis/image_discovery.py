@@ -182,6 +182,62 @@ entity: candidate name | block|keep | short reason
 """
 
 
+PROMPT_IMAGE_ENTITY_RESOLUTION = """You are selecting the best Wikipedia candidate for linking one image-grounded entity into the multimodal graph.
+
+Given one grounded entity from an image and a candidate list, decide whether one candidate can be confidently selected.
+
+The goal is not to force a match.
+Only select when the grounded entity and the candidate clearly refer to the same real-world target.
+If the candidate list is ambiguous, too broad, partially related, or insufficiently supported by the visual evidence, return none.
+
+You may receive:
+- the grounded entity name
+- the grounded entity type
+- the relation_to_image and visual evidence
+- the image caption
+- the source text node title
+- the source query text
+- a candidate list
+
+Selection rules:
+- Prefer candidates that denote the exact same canonical Wikipedia target as the grounded entity.
+- Use the visual evidence and image caption as the primary evidence.
+- Use the source node title and source query text only as disambiguation hints.
+- Be conservative. If multiple candidates remain plausible, return none.
+- Do not select a candidate that is only loosely related to the grounded entity.
+- Do not invent a candidate outside the provided list.
+
+For local_existing mode:
+- The candidates are existing local text nodes whose Wikipedia URLs matched the retrieved Wikipedia candidates.
+- Select one local node only if its matched Wikipedia candidate is clearly the same entity as the grounded target.
+
+For wiki_candidate mode:
+- The candidates are Wikipedia search results that do not yet exist in the local graph.
+- Select one candidate only if it is specific enough to be expanded as a new text node.
+
+Examples:
+- Grounded entity: Meta Orion
+  Candidate 0: Ray-Ban Meta
+  Candidate 1: Orion (mythology)
+  decision: none
+  reason: No candidate is clearly the same AR product shown in the image.
+
+- Grounded entity: Los Angeles Lakers
+  Candidate 0: Los Angeles Lakers
+  Candidate 1: Lakers
+  decision: select
+  candidate_index: 0
+  reason: Exact canonical team entity supported by the grounded name and image evidence.
+
+Output exactly one block:
+<selection>
+decision: select|none
+candidate_index: integer or none
+reason: short reason
+</selection>
+"""
+
+
 @dataclass(slots=True)
 class ImageDiscoveryConfig:
     """Cheap gates and retrieval limits for image discovery."""
@@ -2099,35 +2155,37 @@ class ImageDiscoveryBuilder:
                         "status": "query_overlap_entity",
                     }
                 )
-            matched_node = self._match_text_node(entity.get("name"))
+            resolution = self._resolve_grounded_entity_link_target(
+                entity,
+                source_node_title=source_node_title,
+                source_query_text=source_query_text,
+                image_caption=image_node.caption,
+            )
+            if resolution is None:
+                unresolved.append({**entity, "status": "unresolved"})
+                continue
+            matched_node = resolution.get("matched_node")
+            resolved_target = resolution.get("resolved_target")
             if matched_node is None:
-                resolved_target = self._resolve_grounded_entity(
-                    entity,
-                    source_node_title=source_node_title,
-                    image_caption=image_node.caption,
-                )
                 if resolved_target is None:
                     unresolved.append({**entity, "status": "unresolved"})
                     continue
-                existing_by_url = self._find_text_node_by_url(resolved_target["url"])
-                if existing_by_url is not None:
-                    matched_node = existing_by_url
-                else:
-                    queued_tasks.append(
-                        {
-                            "url": resolved_target["url"],
-                            "title": resolved_target.get("title") or entity.get("name"),
-                            "pending_link": {
-                                "link_type": "image_entity",
-                                "parent_node_id": image_node.node_id,
-                                "source_evidence_id": image_evidence.evidence_id,
-                                "entity": entity,
-                                "resolved_target": resolved_target,
-                                "query_overlap_entity": query_overlap_entity,
-                            },
-                        }
-                    )
-                    continue
+                queued_tasks.append(
+                    {
+                        "url": resolved_target["url"],
+                        "title": resolved_target.get("title") or entity.get("name"),
+                        "pending_link": {
+                            "link_type": "image_entity",
+                            "parent_node_id": image_node.node_id,
+                            "source_evidence_id": image_evidence.evidence_id,
+                            "entity": entity,
+                            "resolved_target": resolved_target,
+                            "query_overlap_entity": query_overlap_entity,
+                            "entity_resolution": resolution.get("debug"),
+                        },
+                    }
+                )
+                continue
             relation = entity.get("relation_to_image") or "depicts"
             edge = Edge.create(
                 image_node.node_id,
@@ -2159,6 +2217,7 @@ class ImageDiscoveryBuilder:
                     "entity_type": entity.get("type"),
                     "match_method": matched_node.get("_match_method"),
                     "query_overlap_entity": query_overlap_entity,
+                    "entity_resolution": resolution.get("debug"),
                 },
                 evidence_key=f"{image_evidence.evidence_id}:{entity.get('name')}:{matched_node['node_id']}",
             )
@@ -2307,19 +2366,283 @@ class ImageDiscoveryBuilder:
         source_node_title: str | None,
         image_caption: str | None,
     ) -> dict[str, Any] | None:
+        resolution = self._resolve_grounded_entity_link_target(
+            entity,
+            source_node_title=source_node_title,
+            source_query_text=None,
+            image_caption=image_caption,
+        )
+        if resolution is None:
+            return None
+        if resolution.get("resolved_target") is not None:
+            return resolution["resolved_target"]
+        matched_node = resolution.get("matched_node")
+        if matched_node is None:
+            return None
+        source = matched_node.get("source") or {}
+        url = source.get("url") if isinstance(source, dict) else None
+        if not url:
+            return None
+        return {
+            "title": matched_node.get("title") or entity.get("name"),
+            "url": url,
+            "canonical_id": matched_node.get("canonical_id") or f"wikipedia:{matched_node.get('title') or entity.get('name')}",
+        }
+
+    def _resolve_grounded_entity_link_target(
+        self,
+        entity: dict[str, Any],
+        *,
+        source_node_title: str | None,
+        source_query_text: str | None,
+        image_caption: str | None,
+    ) -> dict[str, Any] | None:
         label = (entity.get("name") or "").strip()
         if not label:
             return None
         context_parts = [part for part in (entity.get("evidence"), image_caption, source_node_title) if part]
-        resolved = self.wiki_resolver.resolve(
+        context = " ".join(context_parts)
+        wiki_candidates = self.wiki_resolver.search_candidates(
             label,
             entity_type=entity.get("type"),
             source_title=source_node_title,
-            context=" ".join(context_parts),
+            context=context,
         )
-        if resolved is None:
+        if not wiki_candidates:
             return None
-        return resolved.to_dict()
+
+        local_candidates = self._find_text_nodes_by_candidate_urls(wiki_candidates)
+        if local_candidates:
+            selection = self._select_entity_resolution_candidate(
+                entity=entity,
+                source_node_title=source_node_title,
+                source_query_text=source_query_text,
+                image_caption=image_caption,
+                wiki_candidates=wiki_candidates,
+                local_candidates=local_candidates,
+                mode="local_existing",
+            )
+            if selection is None:
+                return None
+            matched_node = selection.get("matched_node")
+            if matched_node is None:
+                return None
+            matched = dict(matched_node)
+            matched["_match_method"] = "wiki_url_llm_select_existing"
+            return {
+                "matched_node": matched,
+                "resolved_target": None,
+                "debug": selection.get("debug"),
+            }
+
+        selection = self._select_entity_resolution_candidate(
+            entity=entity,
+            source_node_title=source_node_title,
+            source_query_text=source_query_text,
+            image_caption=image_caption,
+            wiki_candidates=wiki_candidates,
+            local_candidates=[],
+            mode="wiki_candidate",
+        )
+        if selection is None:
+            return None
+        resolved_target = selection.get("resolved_target")
+        if resolved_target is None:
+            return None
+        return {
+            "matched_node": None,
+            "resolved_target": resolved_target,
+            "debug": selection.get("debug"),
+        }
+
+    def _find_text_nodes_by_candidate_urls(
+        self,
+        candidates: list[Any],
+    ) -> list[dict[str, Any]]:
+        if self.store is None or not candidates:
+            return []
+        candidate_by_url = {
+            candidate.url: candidate
+            for candidate in candidates
+            if getattr(candidate, "url", None)
+        }
+        if not candidate_by_url:
+            return []
+        matches: list[dict[str, Any]] = []
+        for node in self.store.list_nodes():
+            if node.get("node_type") != NodeType.TEXT.value:
+                continue
+            source = node.get("source") or {}
+            url = source.get("url") if isinstance(source, dict) else None
+            if not url or url not in candidate_by_url:
+                continue
+            candidate = candidate_by_url[url]
+            matches.append(
+                {
+                    "node": dict(node),
+                    "url": url,
+                    "candidate": candidate.to_dict(),
+                }
+            )
+        return matches
+
+    def _select_entity_resolution_candidate(
+        self,
+        *,
+        entity: dict[str, Any],
+        source_node_title: str | None,
+        source_query_text: str | None,
+        image_caption: str | None,
+        wiki_candidates: list[Any],
+        local_candidates: list[dict[str, Any]],
+        mode: str,
+    ) -> dict[str, Any] | None:
+        model_alias = (
+            os.environ.get("IMAGE_ENTITY_RESOLVE_MODEL")
+            or os.environ.get("TEXT_PROCESS_MODEL")
+            or os.environ.get("IMAGE_GROUND_MODEL")
+            or self.image_check_model_alias
+        )
+        if not model_alias:
+            return None
+
+        user_text = self._build_entity_resolution_prompt_input(
+            entity=entity,
+            source_node_title=source_node_title,
+            source_query_text=source_query_text,
+            image_caption=image_caption,
+            wiki_candidates=wiki_candidates,
+            local_candidates=local_candidates,
+            mode=mode,
+        )
+        try:
+            response = self.model_client.generate(
+                ModelRequest(
+                    model=model_alias,
+                    messages=[
+                        ModelMessage(role="system", content=PROMPT_IMAGE_ENTITY_RESOLUTION),
+                        ModelMessage(role="user", content=user_text),
+                    ],
+                    temperature=0.0,
+                    metadata={
+                        "trace_label": f"image_entity_resolution:{mode}:{entity.get('name') or ''}:{source_node_title or ''}"
+                    },
+                )
+            )
+        except Exception:
+            return None
+        decision = self._parse_entity_resolution_response(response.content)
+        debug = {
+            "mode": mode,
+            "model_alias": model_alias,
+            "prompt_user_text": user_text,
+            "raw_model_output": response.content,
+            "decision": decision,
+            "wiki_candidates": [candidate.to_dict() for candidate in wiki_candidates],
+            "local_candidates": local_candidates,
+        }
+        if decision["decision"] != "select":
+            return None
+        index = decision["candidate_index"]
+        if index is None:
+            return None
+        if mode == "local_existing":
+            if index < 0 or index >= len(local_candidates):
+                return None
+            chosen = local_candidates[index]
+            return {
+                "matched_node": dict(chosen["node"]),
+                "resolved_target": None,
+                "debug": debug,
+            }
+        if index < 0 or index >= len(wiki_candidates):
+            return None
+        chosen = wiki_candidates[index]
+        return {
+            "matched_node": None,
+            "resolved_target": chosen.to_dict(),
+            "debug": debug,
+        }
+
+    @staticmethod
+    def _build_entity_resolution_prompt_input(
+        *,
+        entity: dict[str, Any],
+        source_node_title: str | None,
+        source_query_text: str | None,
+        image_caption: str | None,
+        wiki_candidates: list[Any],
+        local_candidates: list[dict[str, Any]],
+        mode: str,
+    ) -> str:
+        lines = [
+            f"Mode: {mode}",
+            "",
+            "Grounded entity:",
+            f"name: {entity.get('name') or ''}",
+            f"type: {entity.get('type') or ''}",
+            f"relation_to_image: {entity.get('relation_to_image') or ''}",
+            f"evidence: {entity.get('evidence') or ''}",
+            "",
+            "Context:",
+            f"source node title: {source_node_title or ''}",
+            f"source query text: {source_query_text or ''}",
+            f"image caption: {image_caption or ''}",
+            "",
+        ]
+        if mode == "local_existing":
+            lines.append("Candidate local text nodes (choose by candidate_index):")
+            for idx, item in enumerate(local_candidates):
+                node = item.get("node") or {}
+                candidate = item.get("candidate") or {}
+                source = node.get("source") or {}
+                lines.extend(
+                    [
+                        f"[{idx}] local_title: {node.get('title') or ''}",
+                        f"    local_node_id: {node.get('node_id') or ''}",
+                        f"    local_url: {source.get('url') if isinstance(source, dict) else ''}",
+                        f"    wiki_candidate_title: {candidate.get('title') or ''}",
+                        f"    wiki_candidate_url: {candidate.get('url') or ''}",
+                        f"    wiki_candidate_snippet: {candidate.get('snippet') or ''}",
+                    ]
+                )
+        else:
+            lines.append("Wikipedia candidates (choose by candidate_index):")
+            for idx, candidate in enumerate(wiki_candidates):
+                lines.extend(
+                    [
+                        f"[{idx}] title: {candidate.title or ''}",
+                        f"    url: {candidate.url or ''}",
+                        f"    snippet: {candidate.snippet or ''}",
+                        f"    score: {candidate.score}",
+                    ]
+                )
+        return "\n".join(lines)
+
+    @staticmethod
+    def _parse_entity_resolution_response(text: str) -> dict[str, Any]:
+        match = re.search(r"<selection>(.*?)</selection>", text, flags=re.DOTALL | re.IGNORECASE)
+        block = match.group(1) if match else text
+        fields: dict[str, str] = {}
+        for raw_line in block.splitlines():
+            line = raw_line.strip()
+            if not line or ":" not in line:
+                continue
+            key, value = line.split(":", 1)
+            fields[key.strip().lower()] = value.strip()
+        decision = (fields.get("decision") or "").strip().lower()
+        raw_index = (fields.get("candidate_index") or "").strip().lower()
+        candidate_index: int | None = None
+        if raw_index and raw_index != "none":
+            try:
+                candidate_index = int(raw_index)
+            except ValueError:
+                candidate_index = None
+        return {
+            "decision": decision,
+            "candidate_index": candidate_index,
+            "reason": fields.get("reason") or "",
+        }
 
     def _find_text_node_by_url(self, url: str | None) -> dict[str, Any] | None:
         if self.store is None or not url:
@@ -2500,6 +2823,40 @@ def _smoke_test() -> None:
                 ],
             )
 
+    class MockWikiResolver:
+        def search_candidates(
+            self,
+            label: str,
+            *,
+            entity_type: str | None = None,
+            source_title: str | None = None,
+            context: str | None = None,
+            limit: int = 5,
+        ) -> list[Any]:
+            del entity_type, source_title, context, limit
+            if label.strip().lower() != "los angeles lakers":
+                return []
+            return [
+                type(
+                    "MockCandidate",
+                    (),
+                    {
+                        "title": "Los Angeles Lakers",
+                        "url": "https://en.wikipedia.org/wiki/Los_Angeles_Lakers",
+                        "canonical_id": "wikidata:Q121783",
+                        "snippet": "American professional basketball team based in Los Angeles.",
+                        "score": 5.0,
+                        "to_dict": lambda self: {
+                            "title": self.title,
+                            "url": self.url,
+                            "canonical_id": self.canonical_id,
+                            "snippet": self.snippet,
+                            "score": self.score,
+                        },
+                    },
+                )()
+            ]
+
     class MockModel:
         def generate(self, request: ModelRequest) -> ModelResponse:
             system = request.messages[0].content
@@ -2511,6 +2868,14 @@ confidence: 0.9
 reason: visible player in uniform
 visual_fact: Kobe Bryant is visible
 </check>"""
+                )
+            if "selecting the best Wikipedia entity candidate" in system:
+                return ModelResponse(
+                    content="""<selection>
+decision: select
+candidate_index: 0
+reason: exact local Wikipedia match
+</selection>"""
                 )
             return ModelResponse(
                 content="""<ground>
@@ -2567,6 +2932,7 @@ entity: Los Angeles Lakers | jersey logo | visible team branding on the uniform
                     precheck_image_urls=False,
                 ),
                 model_client=MockModel(),
+                wiki_resolver=MockWikiResolver(),
             )
             result = builder.discover_for_plan(plan, run_id="run_smoke")
             assert len(result.accepted_images()) == 1

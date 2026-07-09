@@ -216,6 +216,7 @@ def print_startup_config(
         "SERPER_API_KEYS",
         "SERPER_API_KEYS_FILE",
         "IMAGE_GROUND_MODEL",
+        "IMAGE_ENTITY_RESOLVE_MODEL",
         "IMAGE_QUERY_ENTITY_FILTER_MODEL",
         "SYNTHESIS_TRACE_TIMING",
         "VQA_WRITER_MODEL",

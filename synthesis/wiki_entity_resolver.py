@@ -63,15 +63,13 @@ class WikiEntityResolver:
         if not label:
             return None
 
-        queries = self._build_queries(label, entity_type=entity_type, source_title=source_title, context=context)
-        candidates: dict[str, WikiEntityCandidate] = {}
-        for query in queries:
-            for candidate in self._safe_search(query, limit=limit):
-                existing = candidates.get(candidate.url)
-                if existing is None or candidate.score > existing.score:
-                    candidates[candidate.url] = candidate
-
-        ranked = sorted(candidates.values(), key=lambda item: item.score, reverse=True)
+        ranked = self.search_candidates(
+            label,
+            entity_type=entity_type,
+            source_title=source_title,
+            context=context,
+            limit=limit,
+        )
         if not ranked:
             return None
         if len(ranked) == 1 and ranked[0].score >= 2.5:
@@ -81,6 +79,28 @@ class WikiEntityResolver:
         if top.score >= 4.0 and (runner_up is None or top.score - runner_up.score >= 0.75):
             return top
         return None
+
+    def search_candidates(
+        self,
+        label: str,
+        *,
+        entity_type: str | None = None,
+        source_title: str | None = None,
+        context: str | None = None,
+        limit: int = 5,
+    ) -> list[WikiEntityCandidate]:
+        label = (label or "").strip()
+        if not label:
+            return []
+
+        queries = self._build_queries(label, entity_type=entity_type, source_title=source_title, context=context)
+        candidates: dict[str, WikiEntityCandidate] = {}
+        for query in queries:
+            for candidate in self._safe_search(query, limit=limit):
+                existing = candidates.get(candidate.url)
+                if existing is None or candidate.score > existing.score:
+                    candidates[candidate.url] = candidate
+        return sorted(candidates.values(), key=lambda item: item.score, reverse=True)
 
     def _build_queries(
         self,
