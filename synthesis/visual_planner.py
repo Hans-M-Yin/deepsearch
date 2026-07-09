@@ -75,7 +75,9 @@ The query must not contain any explicit URL, domain name, filename, image identi
 
 3. The number of unique image materials corresponding to the subject is uncertain. If you believe no suitable image exists, you may output nothing.
 
-4. We will directly use your rewritten text for image search. Please strictly follow the format below:
+4. When suitable images exist, output 1 to 3 visual plans. The plans must be meaningfully different from one another: do not output multiple plans that point to the same underlying event, the same object, or near-duplicate visual targets described with slightly different wording.
+
+5. We will directly use your rewritten text for image search. Please strictly follow the format below:
 
 You can validate your query as follows: for photographs of a specific event, check whether the event's date or time is included; for photographs of a specific object or entity, check whether the object or entity is unique in the world.
 
@@ -84,7 +86,7 @@ You can validate your query as follows: for photographs of a specific event, che
 <reason>Explain why this text satisfies the requirements, including how it fulfills the three conditions above.</reason>
 ```
 
-Repeat the format for multiple results.
+Repeat the format for multiple results. Output 1 to 3 results when suitable images exist; otherwise output nothing.
 
 # Example
 
