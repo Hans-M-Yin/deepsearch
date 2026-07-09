@@ -428,6 +428,64 @@ def _debug_entity_statuses(
     return statuses, blocked
 
 
+def _build_link_or_expand_summary(
+    *,
+    statuses: list[dict[str, Any]],
+    queued_tasks: list[dict[str, Any]],
+    simulated_nodes: list[dict[str, Any]],
+    simulated_edges: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    simulated_node_by_url = {
+        (node.get("source") or {}).get("url"): node
+        for node in simulated_nodes
+        if isinstance(node.get("source"), dict) and (node.get("source") or {}).get("url")
+    }
+    simulated_edge_by_target = {
+        item.get("target_node_id"): item
+        for item in simulated_edges
+        if item.get("target_node_id")
+    }
+    queued_by_url = {
+        task.get("url"): task
+        for task in queued_tasks
+        if task.get("url")
+    }
+    summary: list[dict[str, Any]] = []
+    for record in statuses:
+        entity = record.get("entity") or {}
+        item = {
+            "entity_name": entity.get("name"),
+            "status": record.get("status"),
+            "query_overlap_entity": record.get("query_overlap_entity"),
+        }
+        status = record.get("status")
+        if status == "matched_existing_node_by_url_llm":
+            item["action"] = "connect_existing_text_node"
+            item["target_node_id"] = record.get("matched_node_id")
+            item["target_title"] = record.get("matched_title")
+        elif status == "queued_for_expansion":
+            resolved_target = record.get("resolved_target") or {}
+            queued = queued_by_url.get(resolved_target.get("url"))
+            simulated_node = simulated_node_by_url.get(resolved_target.get("url"))
+            item["action"] = "queue_text_node_expansion"
+            item["target_url"] = resolved_target.get("url")
+            item["target_title"] = resolved_target.get("title")
+            item["queued_task_present"] = queued is not None
+            item["simulated_expanded_node_id"] = (simulated_node or {}).get("node_id")
+            item["simulated_expanded_title"] = (simulated_node or {}).get("title")
+            if simulated_node is not None:
+                simulated_edge = simulated_edge_by_target.get(simulated_node.get("node_id"))
+                item["simulated_materialized_edge"] = simulated_edge
+        elif status == "filtered_by_query_entity_overlap":
+            item["action"] = "skip_query_overlap"
+        elif status == "filtered_out":
+            item["action"] = "skip_filtered_out"
+        else:
+            item["action"] = "no_link_or_expansion"
+        summary.append(item)
+    return summary
+
+
 def _debug_existing_text_node_matches(
     *,
     builder: ImageDiscoveryBuilder,
@@ -698,6 +756,12 @@ def main() -> None:
                 item.get("target_node_id") for item in simulated_edges
             ],
         },
+        "link_or_expand_summary": _build_link_or_expand_summary(
+            statuses=statuses,
+            queued_tasks=queued_tasks,
+            simulated_nodes=simulated_nodes,
+            simulated_edges=simulated_edges,
+        ),
         "timing": {
             "image_check_s": validation_elapsed_s,
             "image_ground_s": grounding_elapsed_s,

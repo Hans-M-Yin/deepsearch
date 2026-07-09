@@ -197,7 +197,7 @@ You may receive:
 - the image caption
 - the source text node title
 - the source query text
-- a candidate list
+- a candidate list, where some candidates may already exist as local text nodes in the graph
 
 Selection rules:
 - Prefer candidates that denote the exact same canonical Wikipedia target as the grounded entity.
@@ -206,14 +206,8 @@ Selection rules:
 - Be conservative. If multiple candidates remain plausible, return none.
 - Do not select a candidate that is only loosely related to the grounded entity.
 - Do not invent a candidate outside the provided list.
-
-For local_existing mode:
-- The candidates are existing local text nodes whose Wikipedia URLs matched the retrieved Wikipedia candidates.
-- Select one local node only if its matched Wikipedia candidate is clearly the same entity as the grounded target.
-
-For wiki_candidate mode:
-- The candidates are Wikipedia search results that do not yet exist in the local graph.
-- Select one candidate only if it is specific enough to be expanded as a new text node.
+- If a selected candidate already exists in the local graph, it will be linked to that existing node.
+- If a selected candidate does not exist in the local graph, it will be queued for text-node expansion.
 
 Examples:
 - Grounded entity: Meta Orion
@@ -2412,21 +2406,18 @@ class ImageDiscoveryBuilder:
             return None
 
         local_candidates = self._find_text_nodes_by_candidate_urls(wiki_candidates)
-        if local_candidates:
-            selection = self._select_entity_resolution_candidate(
-                entity=entity,
-                source_node_title=source_node_title,
-                source_query_text=source_query_text,
-                image_caption=image_caption,
-                wiki_candidates=wiki_candidates,
-                local_candidates=local_candidates,
-                mode="local_existing",
-            )
-            if selection is None:
-                return None
-            matched_node = selection.get("matched_node")
-            if matched_node is None:
-                return None
+        selection = self._select_entity_resolution_candidate(
+            entity=entity,
+            source_node_title=source_node_title,
+            source_query_text=source_query_text,
+            image_caption=image_caption,
+            wiki_candidates=wiki_candidates,
+            local_candidates=local_candidates,
+        )
+        if selection is None:
+            return None
+        matched_node = selection.get("matched_node")
+        if matched_node is not None:
             matched = dict(matched_node)
             matched["_match_method"] = "wiki_url_llm_select_existing"
             return {
@@ -2434,18 +2425,6 @@ class ImageDiscoveryBuilder:
                 "resolved_target": None,
                 "debug": selection.get("debug"),
             }
-
-        selection = self._select_entity_resolution_candidate(
-            entity=entity,
-            source_node_title=source_node_title,
-            source_query_text=source_query_text,
-            image_caption=image_caption,
-            wiki_candidates=wiki_candidates,
-            local_candidates=[],
-            mode="wiki_candidate",
-        )
-        if selection is None:
-            return None
         resolved_target = selection.get("resolved_target")
         if resolved_target is None:
             return None
@@ -2495,7 +2474,6 @@ class ImageDiscoveryBuilder:
         image_caption: str | None,
         wiki_candidates: list[Any],
         local_candidates: list[dict[str, Any]],
-        mode: str,
     ) -> dict[str, Any] | None:
         model_alias = (
             os.environ.get("IMAGE_ENTITY_RESOLVE_MODEL")
@@ -2513,27 +2491,30 @@ class ImageDiscoveryBuilder:
             image_caption=image_caption,
             wiki_candidates=wiki_candidates,
             local_candidates=local_candidates,
-            mode=mode,
         )
         try:
             response = self.model_client.generate(
                 ModelRequest(
                     model=model_alias,
                     messages=[
-                        ModelMessage(role="system", content=PROMPT_IMAGE_ENTITY_RESOLUTION),
-                        ModelMessage(role="user", content=user_text),
-                    ],
-                    temperature=0.0,
-                    metadata={
-                        "trace_label": f"image_entity_resolution:{mode}:{entity.get('name') or ''}:{source_node_title or ''}"
-                    },
-                )
+                    ModelMessage(role="system", content=PROMPT_IMAGE_ENTITY_RESOLUTION),
+                    ModelMessage(role="user", content=user_text),
+                ],
+                temperature=0.0,
+                metadata={
+                        "trace_label": f"image_entity_resolution:{entity.get('name') or ''}:{source_node_title or ''}"
+                },
             )
+        )
         except Exception:
             return None
         decision = self._parse_entity_resolution_response(response.content)
+        local_candidate_by_url = {
+            item.get("url"): item
+            for item in local_candidates
+            if item.get("url")
+        }
         debug = {
-            "mode": mode,
             "model_alias": model_alias,
             "prompt_user_text": user_text,
             "raw_model_output": response.content,
@@ -2546,18 +2527,16 @@ class ImageDiscoveryBuilder:
         index = decision["candidate_index"]
         if index is None:
             return None
-        if mode == "local_existing":
-            if index < 0 or index >= len(local_candidates):
-                return None
-            chosen = local_candidates[index]
-            return {
-                "matched_node": dict(chosen["node"]),
-                "resolved_target": None,
-                "debug": debug,
-            }
         if index < 0 or index >= len(wiki_candidates):
             return None
         chosen = wiki_candidates[index]
+        matched_local = local_candidate_by_url.get(getattr(chosen, "url", None))
+        if matched_local is not None:
+            return {
+                "matched_node": dict(matched_local["node"]),
+                "resolved_target": None,
+                "debug": debug,
+            }
         return {
             "matched_node": None,
             "resolved_target": chosen.to_dict(),
@@ -2573,11 +2552,13 @@ class ImageDiscoveryBuilder:
         image_caption: str | None,
         wiki_candidates: list[Any],
         local_candidates: list[dict[str, Any]],
-        mode: str,
     ) -> str:
+        local_candidate_by_url = {
+            item.get("url"): item
+            for item in local_candidates
+            if item.get("url")
+        }
         lines = [
-            f"Mode: {mode}",
-            "",
             "Grounded entity:",
             f"name: {entity.get('name') or ''}",
             f"type: {entity.get('type') or ''}",
@@ -2589,34 +2570,22 @@ class ImageDiscoveryBuilder:
             f"source query text: {source_query_text or ''}",
             f"image caption: {image_caption or ''}",
             "",
+            "Candidate list (choose by candidate_index):",
         ]
-        if mode == "local_existing":
-            lines.append("Candidate local text nodes (choose by candidate_index):")
-            for idx, item in enumerate(local_candidates):
-                node = item.get("node") or {}
-                candidate = item.get("candidate") or {}
-                source = node.get("source") or {}
-                lines.extend(
-                    [
-                        f"[{idx}] local_title: {node.get('title') or ''}",
-                        f"    local_node_id: {node.get('node_id') or ''}",
-                        f"    local_url: {source.get('url') if isinstance(source, dict) else ''}",
-                        f"    wiki_candidate_title: {candidate.get('title') or ''}",
-                        f"    wiki_candidate_url: {candidate.get('url') or ''}",
-                        f"    wiki_candidate_snippet: {candidate.get('snippet') or ''}",
-                    ]
-                )
-        else:
-            lines.append("Wikipedia candidates (choose by candidate_index):")
-            for idx, candidate in enumerate(wiki_candidates):
-                lines.extend(
-                    [
-                        f"[{idx}] title: {candidate.title or ''}",
-                        f"    url: {candidate.url or ''}",
-                        f"    snippet: {candidate.snippet or ''}",
-                        f"    score: {candidate.score}",
-                    ]
-                )
+        for idx, candidate in enumerate(wiki_candidates):
+            local_item = local_candidate_by_url.get(getattr(candidate, "url", None))
+            local_node = (local_item or {}).get("node") or {}
+            lines.extend(
+                [
+                    f"[{idx}] title: {candidate.title or ''}",
+                    f"    url: {candidate.url or ''}",
+                    f"    snippet: {candidate.snippet or ''}",
+                    f"    score: {candidate.score}",
+                    f"    exists_in_local_graph: {'yes' if local_item is not None else 'no'}",
+                    f"    local_node_id: {local_node.get('node_id') or ''}",
+                    f"    local_title: {local_node.get('title') or ''}",
+                ]
+            )
         return "\n".join(lines)
 
     @staticmethod
@@ -2869,7 +2838,7 @@ reason: visible player in uniform
 visual_fact: Kobe Bryant is visible
 </check>"""
                 )
-            if "selecting the best Wikipedia entity candidate" in system:
+            if "selecting the best Wikipedia candidate" in system:
                 return ModelResponse(
                     content="""<selection>
 decision: select
