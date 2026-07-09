@@ -205,6 +205,10 @@ def _image_entry_to_data_uri(image_entry: Any, timeout: float) -> tuple[str | No
     if image_entry is None:
         return None, "missing_image"
 
+    unwrapped = _unwrap_container_ndarray(image_entry)
+    if unwrapped is not image_entry:
+        return _image_entry_to_data_uri(unwrapped, timeout)
+
     if isinstance(image_entry, dict):
         if "url" in image_entry and image_entry["url"]:
             return _string_image_to_data_uri(str(image_entry["url"]), timeout)
@@ -248,9 +252,26 @@ def _coerce_bytes(value: Any) -> bytes:
     raise TypeError(f"Unsupported bytes payload: {type(value)!r}")
 
 
+def _unwrap_container_ndarray(value: Any) -> Any:
+    np = _optional_numpy()
+    if np is None or not isinstance(value, np.ndarray):
+        return value
+
+    current = value
+    while isinstance(current, np.ndarray) and current.ndim == 1 and current.size == 1:
+        try:
+            current = current.reshape(-1)[0]
+        except Exception:
+            break
+    return current
+
+
 def _numpy_array_to_png_bytes(value: Any) -> bytes | None:
     np = _optional_numpy()
     if np is None or not isinstance(value, np.ndarray):
+        return None
+
+    if value.dtype == object:
         return None
 
     try:
