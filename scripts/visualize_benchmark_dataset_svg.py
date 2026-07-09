@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import ast
 import base64
+import io
 import json
 import textwrap
 import urllib.error
@@ -60,6 +61,14 @@ def _read_parquet(path: Path) -> list[dict[str, Any]]:
 
     df = pd.read_parquet(path)
     return df.to_dict(orient="records")
+
+
+def _optional_numpy() -> Any:
+    try:
+        import numpy as np  # type: ignore
+    except ModuleNotFoundError:
+        return None
+    return np
 
 
 def _maybe_json_loads(value: str) -> Any:
@@ -209,6 +218,10 @@ def _image_entry_to_data_uri(image_entry: Any, timeout: float) -> tuple[str | No
     if isinstance(image_entry, (bytes, bytearray)):
         return _bytes_to_data_uri(bytes(image_entry)), None
 
+    numpy_data = _numpy_array_to_png_bytes(image_entry)
+    if numpy_data is not None:
+        return _bytes_to_data_uri(numpy_data), None
+
     if isinstance(image_entry, str):
         return _string_image_to_data_uri(image_entry, timeout)
 
@@ -227,7 +240,39 @@ def _coerce_bytes(value: Any) -> bytes:
             payload = value.split("base64,", 1)[-1]
             return base64.b64decode(payload)
         return base64.b64decode("".join(value.split()))
+
+    numpy_data = _numpy_array_to_png_bytes(value)
+    if numpy_data is not None:
+        return numpy_data
+
     raise TypeError(f"Unsupported bytes payload: {type(value)!r}")
+
+
+def _numpy_array_to_png_bytes(value: Any) -> bytes | None:
+    np = _optional_numpy()
+    if np is None or not isinstance(value, np.ndarray):
+        return None
+
+    try:
+        from PIL import Image
+    except ModuleNotFoundError as exc:
+        raise RuntimeError("Rendering ndarray images requires Pillow.") from exc
+
+    array = value
+    if array.ndim == 2:
+        pass
+    elif array.ndim == 3 and array.shape[2] in (1, 3, 4):
+        pass
+    else:
+        raise TypeError(f"Unsupported ndarray image shape: {array.shape!r}")
+
+    if str(array.dtype) != "uint8":
+        array = array.astype("uint8")
+
+    image = Image.fromarray(array)
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    return buffer.getvalue()
 
 
 def _bytes_to_data_uri(data: bytes) -> str:
