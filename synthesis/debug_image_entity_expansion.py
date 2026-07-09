@@ -395,10 +395,6 @@ def _debug_entity_statuses(
             record["status"] = "filtered_out"
             statuses.append(record)
             continue
-        if builder._is_query_implied_entity(entity, blocked):
-            record["status"] = "filtered_by_query_entity_overlap"
-            statuses.append(record)
-            continue
         resolution = builder._resolve_grounded_entity_link_target(
             entity,
             source_node_title=source_node_title,
@@ -428,13 +424,88 @@ def _debug_entity_statuses(
     return statuses, blocked
 
 
+def _build_entity_resolution_diagnostics(
+    *,
+    statuses: list[dict[str, Any]],
+    edges: list[Edge],
+    queued_tasks: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    edge_by_entity_name: dict[str, Edge] = {}
+    for edge in edges:
+        metadata = edge.metadata or {}
+        entity_name = metadata.get("entity_name")
+        if entity_name:
+            edge_by_entity_name[entity_name] = edge
+
+    queued_by_entity_name: dict[str, dict[str, Any]] = {}
+    for task in queued_tasks:
+        pending = task.get("pending_link") or {}
+        entity = pending.get("entity") or {}
+        entity_name = entity.get("name")
+        if entity_name:
+            queued_by_entity_name[entity_name] = task
+
+    diagnostics: list[dict[str, Any]] = []
+    for record in statuses:
+        entity = record.get("entity") or {}
+        entity_name = entity.get("name")
+        resolver_debug = record.get("resolver_debug") or {}
+        resolution_debug = record.get("resolution_debug") or {}
+        selection_debug = (resolution_debug or {}).get("decision") or {}
+        edge = edge_by_entity_name.get(entity_name)
+        queued_task = queued_by_entity_name.get(entity_name)
+
+        item: dict[str, Any] = {
+            "entity_name": entity_name,
+            "query_overlap_entity": record.get("query_overlap_entity"),
+            "status": record.get("status"),
+            "llm_selected_candidate": selection_debug.get("decision") == "select",
+            "llm_selected_candidate_index": selection_debug.get("candidate_index"),
+            "llm_selection_reason": selection_debug.get("reason"),
+        }
+
+        if edge is not None:
+            item["final_outcome"] = "connected_existing_text_node"
+            item["connected_node_id"] = edge.dst_node_id
+            item["connected_node_title"] = record.get("matched_title")
+            item["edge_query_overlap_entity"] = (edge.metadata or {}).get("query_overlap_entity")
+        elif queued_task is not None:
+            resolved_target = (queued_task.get("pending_link") or {}).get("resolved_target") or {}
+            item["final_outcome"] = "queued_text_node_expansion"
+            item["queued_url"] = resolved_target.get("url") or queued_task.get("url")
+            item["queued_title"] = resolved_target.get("title") or queued_task.get("title")
+            item["edge_query_overlap_entity"] = (queued_task.get("pending_link") or {}).get("query_overlap_entity")
+        else:
+            item["final_outcome"] = "no_edge_and_no_expansion"
+            if record.get("status") == "filtered_out":
+                item["failure_reason"] = "entity_filtered_out_before_resolution"
+            elif not resolver_debug.get("merged_ranked_candidates"):
+                item["failure_reason"] = "no_wikipedia_candidates_found"
+            elif selection_debug.get("decision") != "select":
+                item["failure_reason"] = "llm_did_not_select_any_candidate"
+            elif record.get("status") == "unresolved":
+                item["failure_reason"] = "selection_or_resolution_failed_after_candidate_retrieval"
+            else:
+                item["failure_reason"] = "unknown"
+
+        diagnostics.append(item)
+    return diagnostics
+
+
 def _build_link_or_expand_summary(
     *,
     statuses: list[dict[str, Any]],
+    edges: list[Edge],
     queued_tasks: list[dict[str, Any]],
     simulated_nodes: list[dict[str, Any]],
     simulated_edges: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
+    edge_by_entity_name: dict[str, Edge] = {}
+    for edge in edges:
+        metadata = edge.metadata or {}
+        entity_name = metadata.get("entity_name")
+        if entity_name:
+            edge_by_entity_name[entity_name] = edge
     simulated_node_by_url = {
         (node.get("source") or {}).get("url"): node
         for node in simulated_nodes
@@ -453,16 +524,19 @@ def _build_link_or_expand_summary(
     summary: list[dict[str, Any]] = []
     for record in statuses:
         entity = record.get("entity") or {}
+        entity_name = entity.get("name")
+        created_edge = edge_by_entity_name.get(entity_name)
         item = {
-            "entity_name": entity.get("name"),
+            "entity_name": entity_name,
             "status": record.get("status"),
             "query_overlap_entity": record.get("query_overlap_entity"),
         }
         status = record.get("status")
-        if status == "matched_existing_node_by_url_llm":
+        if created_edge is not None:
             item["action"] = "connect_existing_text_node"
-            item["target_node_id"] = record.get("matched_node_id")
+            item["target_node_id"] = created_edge.dst_node_id
             item["target_title"] = record.get("matched_title")
+            item["edge_query_overlap_entity"] = (created_edge.metadata or {}).get("query_overlap_entity")
         elif status == "queued_for_expansion":
             resolved_target = record.get("resolved_target") or {}
             queued = queued_by_url.get(resolved_target.get("url"))
@@ -471,13 +545,14 @@ def _build_link_or_expand_summary(
             item["target_url"] = resolved_target.get("url")
             item["target_title"] = resolved_target.get("title")
             item["queued_task_present"] = queued is not None
+            item["edge_query_overlap_entity"] = (
+                (queued.get("pending_link") or {}).get("query_overlap_entity") if queued is not None else None
+            )
             item["simulated_expanded_node_id"] = (simulated_node or {}).get("node_id")
             item["simulated_expanded_title"] = (simulated_node or {}).get("title")
             if simulated_node is not None:
                 simulated_edge = simulated_edge_by_target.get(simulated_node.get("node_id"))
                 item["simulated_materialized_edge"] = simulated_edge
-        elif status == "filtered_by_query_entity_overlap":
-            item["action"] = "skip_query_overlap"
         elif status == "filtered_out":
             item["action"] = "skip_filtered_out"
         else:
@@ -756,8 +831,14 @@ def main() -> None:
                 item.get("target_node_id") for item in simulated_edges
             ],
         },
+        "entity_resolution_diagnostics": _build_entity_resolution_diagnostics(
+            statuses=statuses,
+            edges=edges,
+            queued_tasks=queued_tasks,
+        ),
         "link_or_expand_summary": _build_link_or_expand_summary(
             statuses=statuses,
+            edges=edges,
             queued_tasks=queued_tasks,
             simulated_nodes=simulated_nodes,
             simulated_edges=simulated_edges,
