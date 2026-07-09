@@ -381,6 +381,16 @@ def _debug_entity_statuses(
     statuses: list[dict[str, Any]] = []
     for entity in grounded_entities:
         record = {"entity": entity}
+        label = (entity.get("name") or "").strip()
+        record["normalized_label"] = builder._normalize_entity_label(label)
+        record["query_overlap_entity"] = builder._is_query_implied_entity(entity, blocked)
+        record["existing_match_debug"] = _debug_existing_text_node_matches(builder=builder, label=label)
+        record["resolver_debug"] = _debug_resolver_candidates(
+            builder=builder,
+            entity=entity,
+            source_node_title=source_node_title,
+            image_caption=image_node.caption,
+        )
         if not builder._should_expand_entity(entity):
             record["status"] = "filtered_out"
             statuses.append(record)
@@ -417,6 +427,140 @@ def _debug_entity_statuses(
         record["resolved_target"] = resolved_target
         statuses.append(record)
     return statuses, blocked
+
+
+def _debug_existing_text_node_matches(
+    *,
+    builder: ImageDiscoveryBuilder,
+    label: str,
+) -> dict[str, Any]:
+    if builder.store is None:
+        return {"label": label, "reason": "missing_store"}
+    needle = builder._normalize_entity_label(label)
+    if not needle:
+        return {"label": label, "reason": "empty_normalized_label"}
+
+    exact_matches: list[dict[str, Any]] = []
+    contains_matches: list[dict[str, Any]] = []
+    scanned_count = 0
+    for node in builder.store.list_nodes():
+        if node.get("node_type") != "text":
+            continue
+        scanned_count += 1
+        title = node.get("title") or ""
+        aliases = node.get("aliases") or []
+        labels = [title, *aliases]
+        normalized_labels = [builder._normalize_entity_label(item) for item in labels if item]
+        if needle in normalized_labels:
+            exact_matches.append(
+                {
+                    "node_id": node.get("node_id"),
+                    "title": node.get("title"),
+                    "aliases": aliases,
+                    "matched_labels": [item for item, normalized in zip(labels, normalized_labels) if normalized == needle],
+                }
+            )
+            continue
+        for raw_label, normalized_label in zip(labels, normalized_labels):
+            if builder._is_unique_contains_match(needle, normalized_label):
+                contains_matches.append(
+                    {
+                        "node_id": node.get("node_id"),
+                        "title": node.get("title"),
+                        "aliases": aliases,
+                        "matched_label": raw_label,
+                        "normalized_matched_label": normalized_label,
+                    }
+                )
+                break
+    return {
+        "label": label,
+        "normalized_label": needle,
+        "scanned_text_node_count": scanned_count,
+        "exact_match_count": len(exact_matches),
+        "contains_match_count": len(contains_matches),
+        "exact_matches": exact_matches[:10],
+        "contains_matches": contains_matches[:10],
+    }
+
+
+def _debug_resolver_candidates(
+    *,
+    builder: ImageDiscoveryBuilder,
+    entity: dict[str, Any],
+    source_node_title: str,
+    image_caption: str | None,
+) -> dict[str, Any]:
+    resolver = builder.wiki_resolver
+    label = (entity.get("name") or "").strip()
+    context_parts = [part for part in (entity.get("evidence"), image_caption, source_node_title) if part]
+    context = " ".join(context_parts)
+    if not label:
+        return {"label": label, "reason": "empty_label"}
+
+    queries = resolver._build_queries(
+        label,
+        entity_type=entity.get("type"),
+        source_title=source_node_title,
+        context=context,
+    )
+    candidates_by_url: dict[str, Any] = {}
+    per_query: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] = []
+
+    for query in queries:
+        try:
+            query_candidates = resolver._search(query, limit=5)
+            per_query.append(
+                {
+                    "query": query,
+                    "candidate_count": len(query_candidates),
+                    "candidates": [candidate.to_dict() for candidate in query_candidates],
+                }
+            )
+            for candidate in query_candidates:
+                existing = candidates_by_url.get(candidate.url)
+                if existing is None or candidate.score > existing.score:
+                    candidates_by_url[candidate.url] = candidate
+        except Exception as exc:
+            errors.append(
+                {
+                    "query": query,
+                    "error": f"{exc.__class__.__name__}: {exc}",
+                }
+            )
+
+    ranked = sorted(candidates_by_url.values(), key=lambda item: item.score, reverse=True)
+    chosen = resolver.resolve(
+        label,
+        entity_type=entity.get("type"),
+        source_title=source_node_title,
+        context=context,
+        limit=5,
+    )
+    top = ranked[0] if ranked else None
+    runner_up = ranked[1] if len(ranked) > 1 else None
+    if not ranked:
+        decision_reason = "no_candidates"
+    elif len(ranked) == 1 and ranked[0].score >= 2.5:
+        decision_reason = "single_candidate_pass"
+    elif top is not None and top.score >= 4.0 and (runner_up is None or top.score - runner_up.score >= 0.75):
+        decision_reason = "top_candidate_margin_pass"
+    else:
+        decision_reason = "threshold_not_met_or_ambiguous"
+
+    return {
+        "label": label,
+        "entity_type": entity.get("type"),
+        "source_node_title": source_node_title,
+        "context": context,
+        "queries": queries,
+        "per_query_candidates": per_query,
+        "errors": errors,
+        "merged_ranked_candidates": [candidate.to_dict() for candidate in ranked[:10]],
+        "chosen_candidate": chosen.to_dict() if chosen is not None else None,
+        "decision_reason": decision_reason,
+    }
 
 
 def main() -> None:
