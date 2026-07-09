@@ -53,7 +53,7 @@ However, the event itself must be **specific and unambiguous**.
 
 For example:
 - “Los Angeles Lakers championship parade” is ambiguous because it could refer to multiple years.
-- “Photo of the 2008 Los Angeles Lakers championship parade” clearly points to Lakers players celebrating on parade buses in 2008.
+- “Photo of the 2008 Los Angeles Lakers championship celebrating on parade bus” clearly points to Lakers players celebrating on parade buses in 2008.
 
 Another example:
 - “1960 Los Angeles Lakers vs Boston Celtics game” is still ambiguous because many completely different moments from the game could satisfy the description, even though everyone would retrieve images from the same game.
@@ -63,7 +63,8 @@ For example:
 - “The final shot of the 1960 Lakers vs Boston Celtics game” may point to a unique historical moment, but there may be no surviving image of that exact moment online.
 
 3. Naive or trivial images should be ignored.
-Do not output images that are too visually simple or too semantically shallow to support useful multi-hop reasoning. In particular, avoid pure logos, wordmarks, icons, generic portraits, UI screenshots, plain document scans, text-dominant posters, flags, simple maps, default profile photos, standard ID-style headshots, and plain white-background product shots. These images are usually only useful for basic identity recognition and do not provide rich enough visual content for follow-up reasoning.X
+Do not output images that are too visually simple or too semantically shallow to support useful multi-hop reasoning. In particular, avoid pure logos, wordmarks, icons, generic portraits, UI screenshots, plain document scans, text-dominant posters, flags, simple maps, default profile photos, standard ID-style headshots, and plain white-background product shots. These images are usually only useful for basic identity recognition and do not provide rich enough visual content for follow-up reasoning.Encourage photographs of complex scenes or events.
+
 The query must not contain any explicit URL, domain name, filename, image identifier, or other direct locator of the image. It must contain only semantic information. The query should stand on its own: a user who searches by the query alone, without seeing the URL, should be able to retrieve the same image or an equivalent depiction of the same unique visual target. Do not rely on the URL itself to make the target appear unique.
 
 # Goals
@@ -76,7 +77,6 @@ The query must not contain any explicit URL, domain name, filename, image identi
 
 4. We will directly use your rewritten text for image search. Please strictly follow the format below:
 
-The query must not contain any explicit URL, domain name, filename, image identifier, or other direct locator of the image. It must contain only semantic information. The query should stand on its own: a user who searches by the query alone, without seeing the URL, should be able to retrieve the same image or an equivalent depiction of the same unique visual target. 
 You can validate your query as follows: for photographs of a specific event, check whether the event's date or time is included; for photographs of a specific object or entity, check whether the object or entity is unique in the world.
 
 ```text
@@ -350,7 +350,7 @@ class LLMVisualSearchPlanner:
         )
 
     @staticmethod
-    def _numbered_passages(page_text: str, *, max_passages: int = 80, max_chars_per_passage: int = 1200) -> str:
+    def _numbered_passages(page_text: str, *, max_passages: int = 80, max_chars_per_passage: int = 12000) -> str:
         blocks = [block.strip() for block in re.split(r"\n\s*\n", page_text or "") if block.strip()]
         passages: list[str] = []
         for block in blocks:
