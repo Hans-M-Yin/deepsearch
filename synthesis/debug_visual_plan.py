@@ -112,10 +112,63 @@ def _print_candidate_list(title: str, candidates: list[dict[str, Any]]) -> None:
         print(f"   reason: {validation.get('reason') or ''}")
 
 
+def _enum_value(value: Any) -> Any:
+    return getattr(value, "value", value)
+
+
+def _print_search_snapshots(snapshots: list[Any]) -> None:
+    print("\n=== Serper Search Snapshots ===")
+    if not snapshots:
+        print("(none)")
+        return
+    for index, snapshot in enumerate(snapshots, start=1):
+        metadata = getattr(snapshot, "metadata", {}) or {}
+        print(f"{index}. engine: {_enum_value(getattr(snapshot, 'engine', ''))}")
+        print(f"   raw_engine: {metadata.get('raw_engine') or '-'}")
+        print(f"   query: {getattr(snapshot, 'query', '') or ''}")
+        print(f"   status: {_enum_value(getattr(snapshot, 'status', ''))}")
+        print(f"   status_code: {getattr(snapshot, 'status_code', None)}")
+        print(f"   result_count: {getattr(snapshot, 'result_count', None)}")
+        print(f"   error: {getattr(snapshot, 'error', None) or ''}")
+        print(f"   response_preview: {_short(getattr(snapshot, 'response_preview', None), 1200)}")
+
+
+def _print_candidate_decisions(decisions: list[dict[str, Any]]) -> None:
+    print("\n=== Search Decision Log ===")
+    if not decisions:
+        print("(none)")
+        return
+    for index, decision in enumerate(decisions, start=1):
+        print(f"{index}. kind: {decision.get('kind') or ''}")
+        print(f"   query: {decision.get('query') or ''}")
+        if "returned" in decision:
+            print(f"   returned: {decision.get('returned')}")
+        if "fallback_used" in decision:
+            print(f"   fallback_used: {decision.get('fallback_used')}")
+        if "reason" in decision:
+            print(f"   reason: {decision.get('reason') or ''}")
+        if "status" in decision:
+            print(f"   status: {decision.get('status') or ''}")
+        if "result_index" in decision:
+            print(f"   result_index: {decision.get('result_index')}")
+        if "rank" in decision:
+            print(f"   rank: {decision.get('rank')}")
+        if "title" in decision:
+            print(f"   title: {decision.get('title') or ''}")
+        if "url" in decision:
+            print(f"   url: {decision.get('url') or ''}")
+        if "check" in decision:
+            print(f"   check: {decision.get('check') or ''}")
+        if "raw_model_output" in decision:
+            print(f"   raw_model_output: {_short(decision.get('raw_model_output'), 800)}")
+
+
 def _print_image_result(plan_index: int, plan: Any, result: Any) -> None:
     print(f"\n{'=' * 16} Image Pipeline: Plan {plan_index} {'=' * 16}")
     print(f"query: {plan.target.content or ''}")
     metadata = result.metadata or {}
+    _print_search_snapshots(list(result.snapshots or []))
+    _print_candidate_decisions(list(metadata.get("candidate_decisions") or []))
     _print_candidate_list(
         "Serper Results After Per-Image Content Check",
         list(metadata.get("content_checked_candidates") or []),
