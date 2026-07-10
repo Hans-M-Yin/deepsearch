@@ -719,7 +719,6 @@ def _smoke_test() -> None:
     request = ModelRequest(
         model="text_process",
         messages=[ModelMessage(role="user", content="hello")],
-        temperature=0.0,
     )
     assert request.to_dict()["messages"][0]["content"] == "hello"
 

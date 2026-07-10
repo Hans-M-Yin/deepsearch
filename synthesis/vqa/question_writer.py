@@ -123,7 +123,7 @@ Write a question that can only be answered reliably by finding and inspecting th
 
 Important constraints:
 1. The question must require looking at the image.
-   - Do not ask for facts that can be answered from general knowledge, the image description alone, or a Wikipedia page about the subject.
+   - Do not ask for facts that can be answered from general knowledge, the image description alone, or a Wikipedia page about the subject. Bad Example: ask what accessory was in the breast pocket of the suit jacket as the answer should be a white pocket square based on common sense.
    - Prefer questions about visible objects, spatial relations, counts, relative positions, gestures, clothing, text appearing in the image, composition, or other stable visual properties.
 
 2. Handle image ambiguity carefully.

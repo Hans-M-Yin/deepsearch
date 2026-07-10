@@ -16,12 +16,19 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     __package__ = "synthesis"
 
-from .evidence import Evidence
+from .evidence import Evidence, EvidenceType
 from .edges import Edge, EdgeSource, EdgeType, EvidenceRef
 from .image_discovery import ImageDiscoveryBuilder, ImageDiscoveryResult
 from .store import JsonlGraphStore
-from .visual_planner import VisualSearchPlan, VisualSearchPlanner
-from .wiki_text_builder import InvalidWikiPageError, WikiLinkCandidate, WikiTextBuilder, WikiTextBuildResult
+from .visual_planner import SearchQuerySpec, VisualSearchPlan, VisualSearchPlanner
+from .wiki_text_builder import (
+    InvalidWikiPageError,
+    RawMarkdownReaderClient,
+    WikiInlineImageCandidate,
+    WikiLinkCandidate,
+    WikiTextBuildResult,
+    WikiTextBuilder,
+)
 
 
 def _trace_timing_enabled() -> bool:
@@ -234,6 +241,10 @@ class GraphExpansionStrategy:
         self._seen_task_keys: set[str] = set()
         self._pending_parent_links_by_url: dict[str, list[dict[str, Any]]] = {}
         self._lock = RLock()
+        self._raw_markdown_reader = RawMarkdownReaderClient(
+            base_url=os.environ.get("WIKI_INLINE_IMAGE_READER_BASE_URL", "http://127.0.0.1:8002"),
+            timeout_s=float(os.environ.get("WIKI_INLINE_IMAGE_READER_TIMEOUT_S") or 180.0),
+        )
 
     def add_seed(
         self,
@@ -990,22 +1001,35 @@ class GraphExpansionStrategy:
         if self.visual_planner is None or self.image_builder is None:
             return [], [], []
 
-        plans = self.visual_planner.plan(
+        visual_plans = self.visual_planner.plan(
             node=text_result.node.to_dict(),
             page_text=text_result.node.description or "",
             source_evidence_ids=[text_result.text_evidence.evidence_id],
             run_id=run_id,
         )
+        wiki_plans = self._build_wiki_inline_image_plans(text_result, run_id=run_id)
+        plans = list(visual_plans) + list(wiki_plans)
         self._log_image_plan_start(text_result, plans)
         image_results: list[ImageDiscoveryResult] = []
         for index, plan in enumerate(plans, start=1):
             self._log_image_plan_execute_start(text_result, plan_index=index, plan=plan)
             try:
-                image_result = self.image_builder.discover_for_plan(
-                    plan,
-                    run_id=run_id,
-                    persist=self.config.persist,
-                )
+                if self._is_wiki_inline_image_plan(plan):
+                    search_result = self._wiki_inline_image_search_result(plan)
+                    if search_result is None:
+                        continue
+                    image_result = self.image_builder.discover_for_wiki_inline_image(
+                        plan,
+                        search_result=search_result,
+                        run_id=run_id,
+                        persist=self.config.persist,
+                    )
+                else:
+                    image_result = self.image_builder.discover_for_plan(
+                        plan,
+                        run_id=run_id,
+                        persist=self.config.persist,
+                    )
             except Exception as exc:
                 self._log_image_plan_execute_failure(
                     text_result,
@@ -1028,6 +1052,116 @@ class GraphExpansionStrategy:
                 if task is not None:
                     queued_tasks.append(task)
         return plans, image_results, queued_tasks
+
+    def _build_wiki_inline_image_plans(
+        self,
+        text_result: WikiTextBuildResult,
+        *,
+        run_id: str | None,
+    ) -> list[VisualSearchPlan]:
+        source_url = text_result.node.source.url if text_result.node.source else None
+        if not source_url or "wikipedia.org" not in source_url:
+            return []
+        try:
+            document = self._raw_markdown_reader.read(source_url)
+        except Exception:
+            return []
+        markdown = document.raw_markdown or document.content or ""
+        candidates = WikiTextBuilder.extract_wiki_inline_images(markdown, source_url=source_url)
+        plans: list[VisualSearchPlan] = []
+        for candidate in candidates:
+            plan = self._wiki_inline_image_plan(text_result, candidate, run_id=run_id)
+            if plan is not None:
+                plans.append(plan)
+        return plans
+
+    @staticmethod
+    def _wiki_inline_image_plan(
+        text_result: WikiTextBuildResult,
+        candidate: WikiInlineImageCandidate,
+        *,
+        run_id: str | None,
+    ) -> VisualSearchPlan | None:
+        caption = str(candidate.caption or "").strip()
+        if not caption:
+            return None
+        target = Evidence.create(
+            EvidenceType.VISUAL_TARGET,
+            content=caption,
+            node_ids=[text_result.node.node_id],
+            url=candidate.image_url,
+            extractor="wikipedia_inline_image_planner",
+            metadata={
+                "source_evidence_ids": [text_result.text_evidence.evidence_id],
+                "run_id": run_id,
+                "source_page_url": candidate.source_page_url,
+                "file_page_url": candidate.file_page_url,
+                "image_url": candidate.image_url,
+                "caption": caption,
+                "rank": candidate.rank,
+            },
+            evidence_key=f"{text_result.node.node_id}:wiki_inline:{candidate.rank}:{candidate.image_url}",
+        )
+        query = SearchQuerySpec.create(
+            caption,
+            target.evidence_id,
+            expected_visual=caption,
+            source="wikipedia_inline_image",
+            metadata={
+                "source_page_url": candidate.source_page_url,
+                "file_page_url": candidate.file_page_url,
+                "image_url": candidate.image_url,
+                "rank": candidate.rank,
+            },
+        )
+        return VisualSearchPlan.create(
+            target,
+            queries=[query],
+            source_node_id=text_result.node.node_id,
+            source_evidence_ids=[text_result.text_evidence.evidence_id],
+            planner="wikipedia_inline_image_planner",
+            metadata={
+                "plan_source": "wikipedia_inline_image",
+                "image_url": candidate.image_url,
+                "source_page_url": candidate.source_page_url,
+                "file_page_url": candidate.file_page_url,
+                "caption": caption,
+                "raw_caption": candidate.raw_caption,
+                "alt_text": candidate.alt_text,
+                "rank": candidate.rank,
+            },
+        )
+
+    @staticmethod
+    def _is_wiki_inline_image_plan(plan: VisualSearchPlan) -> bool:
+        return (plan.metadata or {}).get("plan_source") == "wikipedia_inline_image"
+
+    @staticmethod
+    def _wiki_inline_image_search_result(plan: VisualSearchPlan):
+        from .search_client import ImageSearchResult
+
+        metadata = plan.metadata or {}
+        image_url = metadata.get("image_url")
+        if not image_url:
+            return None
+        caption = metadata.get("caption") or plan.target.content
+        source_page_url = metadata.get("source_page_url")
+        file_page_url = metadata.get("file_page_url")
+        title = metadata.get("alt_text") or caption or file_page_url or image_url
+        return ImageSearchResult(
+            title=title,
+            image_url=image_url,
+            source_page_url=source_page_url,
+            snippet=caption,
+            source="wikipedia_inline",
+            rank=metadata.get("rank"),
+            raw={
+                "file_page_url": file_page_url,
+                "raw_caption": metadata.get("raw_caption"),
+                "alt_text": metadata.get("alt_text"),
+                "plan_source": "wikipedia_inline_image",
+            },
+        )
 
     @staticmethod
     def _log_image_plan_start(

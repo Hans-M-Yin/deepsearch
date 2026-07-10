@@ -232,6 +232,53 @@ reason: short reason
 """
 
 
+PROMPT_WIKI_INLINE_IMAGE_QUESTION = """
+I’m determining whether a user recognizes a particular image or its main content, and I need you to help me come up with a question to ask the user.
+You will be given the image, a brief description of the image, and the Wikipedia page the image comes from. The question you propose should focus on the semantic content of the image rather than purely visual details. In other words, it should require world knowledge to answer, such as identifying people, scenes, objects, and so on.
+
+Requirements:
+1. The question must point to a clearly defined target and be unambiguous.
+2. Since you may also be unable to directly identify the people, objects, or scene in the image, you should use the provided image description and the subject of the associated Wikipedia page to make a reliable inference about the people and objects shown.
+3. Output format: please follow the format below exactly:
+<thinking>Your reasoning process</thinking>
+<question>The question you propose</question>
+<answer>The answer to the question</answer>
+
+Example 1:
+(a photo of Trump taking the oath of office)
+Wikipedia: Donald Trump
+description: Taking the presidential oath of office, administered by Chief Justice John Roberts, on January 20, 2017
+<thinking>Based on the image, the man in the foreground wearing a red tie can be identified as Trump. Standing next to him is his wife Melania, and his youngest son Barron, wearing a dark blue tie, is also beside them. The man with a balding hairstyle, seen from behind and administering the oath, can be inferred from the description and world knowledge to be John Roberts. Now I can ask a question to determine whether the user recognizes the main figures and the event shown in the image.</thinking>
+<question>What event is taking place in this photo, who is the man in the foreground wearing the red tie, and who is the balding man seen from behind?</question>
+<answer>Donald Trump’s presidential inauguration oath ceremony; Donald Trump; John Roberts</answer>
+
+Example 2:
+(a gameplay screenshot)
+Wikipedia: City-building game
+description: Lincity is a city-building game.
+<thinking>The image shows a video game screenshot that appears to be from a city-building simulation game. The description states that “Lincity is a city-building game,” which suggests that this screenshot is from Lincity. So I can directly ask the user what game this is.</thinking>
+<question>Which game is shown in this image?</question>
+<answer>Lincity, a city-building simulation game</answer>
+"""
+
+
+PROMPT_WIKI_INLINE_IMAGE_ANSWER = """You are answering a question about an image content.
+
+Rules:.
+- Answer as specifically as possible.
+- Do not explain your reasoning.
+- If you are unsure, output exactly: UNKNOWN
+"""
+
+
+PROMPT_WIKI_INLINE_IMAGE_JUDGE = """
+You are judging whether an answer correctly identifies the key information in an image caption. The question and the answer are both provided to you, but the corresponding image is not. Please determine whether a user's response is correct. If the meaning is the same or mostly the same, it should be considered TRUE; the wording does not need to match exactly. If the user's response clearly shows that they do not recognize one of the people, objects, or events in the image, then output FALSE.
+Output format:
+<thinking>Your reasoning process</thinking>
+<answer>TRUE/FALSE</answer>
+"""
+
+
 @dataclass(slots=True)
 class ImageDiscoveryConfig:
     """Cheap gates and retrieval limits for image discovery."""
@@ -249,7 +296,7 @@ class ImageDiscoveryConfig:
     precheck_timeout_s: float = 15.0
     precheck_max_bytes: int = 262144
     model_image_max_bytes: int | None = None
-    model_image_max_edge: int | None = 1280
+    model_image_max_edge: int | None = 2000
     precheck_retries: int = 3
     host_min_interval_s: float = 0.35
     wikimedia_host_min_interval_s: float = 1.25
@@ -505,6 +552,83 @@ class ImageDiscoveryBuilder:
             self.store.maybe_flush()
         _trace_timing(
             f"[image-discovery] phase=done plan_id={plan.plan_id} elapsed_s={time.perf_counter() - total_started:.3f} accepted={len(result.accepted_images())} kept={'yes' if result.image_node is not None else 'no'}"
+        )
+        return result
+
+    def discover_for_wiki_inline_image(
+        self,
+        plan: VisualSearchPlan,
+        *,
+        search_result: ImageSearchResult,
+        run_id: str | None = None,
+        persist: bool = True,
+    ) -> ImageDiscoveryResult:
+        total_started = time.perf_counter()
+        result = ImageDiscoveryResult(plan_id=plan.plan_id)
+        validation = self._wiki_inline_image_check(
+            plan=plan,
+            search_result=search_result,
+            run_id=run_id,
+        )
+        snapshot = self._snapshot_from_wiki_inline_result(search_result, plan=plan, run_id=run_id)
+        result.snapshots.append(snapshot)
+        if persist:
+            self._persist_snapshot(snapshot)
+
+        if not validation.drop_candidate:
+            candidate = ImageSearchCandidate(
+                candidate_id=self._candidate_record_id(search_result),
+                source_query=(plan.queries or [SearchQuerySpec.create("", plan.target.evidence_id)])[0],
+                source_snapshot=snapshot,
+                search_result=search_result,
+                validation=validation,
+                used_fallback=False,
+            )
+            result.candidates = [candidate]
+            if validation.status == ImageCandidateStatus.ACCEPTED:
+                self._materialize_primary_candidate(
+                    result=result,
+                    plan=plan,
+                    candidate=candidate,
+                    run_id=run_id,
+                    persist=persist,
+                    create_source_edge=False,
+                )
+                if result.image_node is not None and result.image_node.source is not None:
+                    result.image_node.source.source_type = "wikipedia_inline_image"
+                if result.image_node is not None:
+                    result.image_node.metadata = dict(result.image_node.metadata or {})
+                    result.image_node.metadata.update(
+                        {
+                            "image_origin": "wikipedia_inline",
+                            "source_text_node_id": plan.source_node_id,
+                            "source_evidence_ids": list(plan.source_evidence_ids),
+                        }
+                    )
+        result.metadata.update(
+            {
+                "query_count": len(plan.queries),
+                "image_count": len(result.candidates),
+                "usable_image_count": len(result.usable_images()),
+                "accepted_image_count": len(result.accepted_images()),
+                "queued_task_count": len(result.queued_tasks),
+                "candidate_decisions": [
+                    {
+                        "kind": "wiki_inline_image",
+                        "query": (plan.queries[0].query if plan.queries else ""),
+                        "title": search_result.title,
+                        "url": search_result.image_url,
+                        "status": validation.status.value,
+                        "reason": validation.reason,
+                        "check": (validation.metadata or {}).get("check"),
+                    }
+                ],
+            }
+        )
+        if persist and self.store is not None:
+            self.store.maybe_flush()
+        _trace_timing(
+            f"[image-discovery] phase=done_wiki_inline plan_id={plan.plan_id} elapsed_s={time.perf_counter() - total_started:.3f} accepted={len(result.accepted_images())} kept={'yes' if result.image_node is not None else 'no'}"
         )
         return result
 
@@ -771,6 +895,7 @@ class ImageDiscoveryBuilder:
         candidate: ImageSearchCandidate,
         run_id: str | None,
         persist: bool,
+        create_source_edge: bool = True,
     ) -> None:
         resolved_asset = self._resolved_image_from_validation(candidate.validation)
         provisional_node = self._image_node_from_result(
@@ -873,16 +998,18 @@ class ImageDiscoveryBuilder:
             evidence_key=f"image_bundle:{candidate.candidate_id}",
         )
 
-        edge = self._edge_from_plan_to_image(
-            plan=plan,
-            query=candidate.source_query,
-            image_node=image_node,
-            search_evidence=search_evidence,
-            image_evidence=image_evidence,
-            search_result=candidate.search_result,
-            run_id=run_id,
-            used_fallback=candidate.used_fallback,
-        )
+        edge = None
+        if create_source_edge:
+            edge = self._edge_from_plan_to_image(
+                plan=plan,
+                query=candidate.source_query,
+                image_node=image_node,
+                search_evidence=search_evidence,
+                image_evidence=image_evidence,
+                search_result=candidate.search_result,
+                run_id=run_id,
+                used_fallback=candidate.used_fallback,
+            )
         grounded_edges, queued_tasks = self._link_or_queue_grounded_entities(
             image_node=image_node,
             grounded_entities=candidate.grounded_entities,
@@ -1019,7 +1146,6 @@ class ImageDiscoveryBuilder:
                             ],
                         ),
                     ],
-                    temperature=0.0,
                     metadata={"trace_label": f"image_ground:{plan.plan_id}:{search_result.title or ''}"},
                 )
             )
@@ -1254,39 +1380,14 @@ class ImageDiscoveryBuilder:
         semantic validation. Keeping them together makes the discovery flow only
         depend on one accept/reject decision.
         """
-
-        if not search_result.image_url:
-            return self._reject("missing_image_url")
-        extension = self._extension(search_result.image_url)
-        if extension and extension in self.config.rejected_extensions:
-            return self._reject(f"rejected_extension:{extension}")
-        if (
-            self.config.min_width is not None
-            and search_result.width is not None
-            and search_result.width < self.config.min_width
-        ):
-            return self._reject(f"width_below_min:{search_result.width}")
-        if (
-            self.config.min_height is not None
-            and search_result.height is not None
-            and search_result.height < self.config.min_height
-        ):
-            return self._reject(f"height_below_min:{search_result.height}")
-        content_type = self._content_type(search_result)
-        if self.config.allowed_content_types and content_type:
-            if content_type not in self.config.allowed_content_types:
-                return self._reject(f"content_type_not_allowed:{content_type}")
+        resolved_asset, rejection = self._precheck_candidate_for_processing(
+            search_result,
+            stage="image_check",
+        )
+        if rejection is not None:
+            return rejection
 
         model_alias = self.image_check_model_alias or os.environ.get("IMAGE_CHECK_MODEL")
-        resolved_asset: ResolvedImageAsset | None = None
-        if self.config.precheck_image_urls:
-            resolved_asset, precheck_error = self._resolve_image_asset(search_result)
-            if precheck_error is not None or resolved_asset is None:
-                self._log_invalid_image_url(search_result.image_url, precheck_error, stage="image_check")
-                return self._reject(
-                    f"image_url_precheck_failed:{precheck_error}",
-                    drop_candidate=True,
-                )
 
         if self.config.force_accept_images:
             metadata: dict[str, Any] = {
@@ -1330,6 +1431,190 @@ class ImageDiscoveryBuilder:
             status=ImageCandidateStatus.ACCEPTED,
             confidence=None,
             metadata={"check": "basic_url_format_size"},
+        )
+
+    def _precheck_candidate_for_processing(
+        self,
+        search_result: ImageSearchResult,
+        *,
+        stage: str,
+    ) -> tuple[ResolvedImageAsset | None, ImageValidationResult | None]:
+        if not search_result.image_url:
+            return None, self._reject("missing_image_url")
+        extension = self._extension(search_result.image_url)
+        if extension and extension in self.config.rejected_extensions:
+            return None, self._reject(f"rejected_extension:{extension}")
+        if (
+            self.config.min_width is not None
+            and search_result.width is not None
+            and search_result.width < self.config.min_width
+        ):
+            return None, self._reject(f"width_below_min:{search_result.width}")
+        if (
+            self.config.min_height is not None
+            and search_result.height is not None
+            and search_result.height < self.config.min_height
+        ):
+            return None, self._reject(f"height_below_min:{search_result.height}")
+        content_type = self._content_type(search_result)
+        if self.config.allowed_content_types and content_type and content_type not in self.config.allowed_content_types:
+            return None, self._reject(f"content_type_not_allowed:{content_type}")
+
+        resolved_asset: ResolvedImageAsset | None = None
+        if self.config.precheck_image_urls:
+            resolved_asset, precheck_error = self._resolve_image_asset(search_result)
+            if precheck_error is not None or resolved_asset is None:
+                self._log_invalid_image_url(search_result.image_url, precheck_error, stage=stage)
+                return None, self._reject(
+                    f"image_url_precheck_failed:{precheck_error}",
+                    drop_candidate=True,
+                )
+        return resolved_asset, None
+
+    def _wiki_inline_image_check(
+        self,
+        *,
+        plan: VisualSearchPlan,
+        search_result: ImageSearchResult,
+        run_id: str | None,
+    ) -> ImageValidationResult:
+        del run_id
+        resolved_asset, rejection = self._precheck_candidate_for_processing(
+            search_result,
+            stage="wiki_inline_image_check",
+        )
+        if rejection is not None:
+            return rejection
+
+        caption = str(search_result.snippet or "").strip()
+        if not caption:
+            return self._reject("missing_wiki_inline_caption", drop_candidate=True)
+
+        question_model = (
+            os.environ.get("TEXT_PROCESS_MODEL")
+            or os.environ.get("IMAGE_CHECK_MODEL")
+            or os.environ.get("IMAGE_GROUND_MODEL")
+        )
+        answer_model = (
+            os.environ.get("WIKI_INLINE_IMAGE_QA_MODEL")
+            or os.environ.get("IMAGE_GROUND_MODEL")
+            or os.environ.get("IMAGE_CHECK_MODEL")
+            or os.environ.get("TEXT_PROCESS_MODEL")
+        )
+        judge_model = (
+            os.environ.get("WIKI_INLINE_IMAGE_QA_JUDGE_MODEL")
+            or os.environ.get("WIKI_INLINE_IMAGE_QA_MODEL")
+            or answer_model
+        )
+        if not question_model or not answer_model or not judge_model:
+            return self._reject("missing_wiki_inline_image_models", drop_candidate=True)
+
+        try:
+            wiki_title = self._source_node_title(plan.source_node_id) or ""
+            image_for_model = resolved_asset.model_url if resolved_asset is not None else search_result.image_url
+            question_response = self.model_client.generate(
+                ModelRequest(
+                    model=question_model,
+                    messages=[
+                        ModelMessage(role="system", content=PROMPT_WIKI_INLINE_IMAGE_QUESTION),
+                        ModelMessage(
+                            role="user",
+                            content=[
+                                {
+                                    "type": "text",
+                                    "text": self._wiki_inline_question_prompt_input(
+                                        caption=caption,
+                                        wikipedia_title=wiki_title,
+                                    ),
+                                },
+                                {"type": "image_url", "image_url": {"url": image_for_model}},
+                            ],
+                        ),
+                    ],
+                    metadata={"trace_label": f"wiki_inline_question:{plan.plan_id}"},
+                )
+            )
+            question_payload = self._parse_wiki_inline_question(question_response.content)
+            question = question_payload["question"]
+            expected_answer = question_payload.get("answer", "")
+            answer_response = self.model_client.generate(
+                ModelRequest(
+                    model=answer_model,
+                    messages=[
+                        ModelMessage(role="system", content=PROMPT_WIKI_INLINE_IMAGE_ANSWER),
+                        ModelMessage(
+                            role="user",
+                            content=[
+                                {"type": "text", "text": question},
+                                {"type": "image_url", "image_url": {"url": image_for_model}},
+                            ],
+                        ),
+                    ],
+                    metadata={"trace_label": f"wiki_inline_answer:{plan.plan_id}"},
+                )
+            )
+            answer = self._parse_wiki_inline_answer(answer_response.content)
+            judge_response = self.model_client.generate(
+                ModelRequest(
+                    model=judge_model,
+                    messages=[
+                        ModelMessage(role="system", content=PROMPT_WIKI_INLINE_IMAGE_JUDGE),
+                        ModelMessage(
+                            role="user",
+                            content=[
+                                {
+                                    "type": "text",
+                                    "text": (
+                                        f"Caption:\n{caption}\n\n"
+                                        f"Wikipedia:\n{wiki_title}\n\n"
+                                        f"Question:\n{question}\n\n"
+                                        f"Expected answer:\n{expected_answer}\n\n"
+                                        f"Answer:\n{answer}"
+                                    ),
+                                },
+                                {"type": "image_url", "image_url": {"url": image_for_model}},
+                            ],
+                        ),
+                    ],
+                    metadata={"trace_label": f"wiki_inline_judge:{plan.plan_id}"},
+                )
+            )
+        except Exception as exc:
+            return self._reject(
+                f"wiki_inline_image_model_error:{exc.__class__.__name__}:{exc}",
+                drop_candidate=True,
+            )
+
+        decision, judge_reason = self._parse_wiki_inline_judge(judge_response.content)
+        metadata = {
+            "check": "wiki_inline_identifiability",
+            "question_model": question_model,
+            "answer_model": answer_model,
+            "judge_model": judge_model,
+            "question": question,
+            "expected_answer": expected_answer,
+            "answer": answer,
+            "judge_reason": judge_reason,
+            "question_raw_output": question_response.content,
+            "answer_raw_output": answer_response.content,
+            "judge_raw_output": judge_response.content,
+        }
+        if resolved_asset is not None:
+            metadata["resolved_image_key"] = resolved_asset.cache_key
+            metadata["resolved_image"] = resolved_asset.to_metadata()
+        if decision == "true":
+            return ImageValidationResult(
+                status=ImageCandidateStatus.REJECTED,
+                confidence=1.0,
+                reason="wiki_inline_judge_true_drop",
+                drop_candidate=True,
+                metadata=metadata,
+            )
+        return ImageValidationResult(
+            status=ImageCandidateStatus.ACCEPTED,
+            confidence=1.0,
+            reason="wiki_inline_judge_false_keep",
+            metadata=metadata,
         )
 
     def _resolve_image_asset(
@@ -1405,14 +1690,7 @@ class ImageDiscoveryBuilder:
                 return None, f"{image_url} -> non_image_content_type:{content_type}"
 
         try:
-            from PIL import Image
-
-            with Image.open(BytesIO(payload)) as image:
-                width, height = image.size
-                image.verify()
-        except ImportError:
-            width = None
-            height = None
+            width, height = self._image_dimensions(payload, verify=True)
         except Exception as exc:
             return None, f"{image_url} -> decode_error:{exc.__class__.__name__}:{exc}"
 
@@ -1421,14 +1699,20 @@ class ImageDiscoveryBuilder:
             if normalized_content_type == "application/octet-stream" and sniffed_content_type
             else content_type or sniffed_content_type or "image/jpeg"
         )
-        cache_path = self._write_image_cache_file(cache_key, payload, content_type)
-        asset_uri = self._maybe_upload_cached_image(cache_path, cache_key) or cache_path
-        model_content_type, model_payload = self._prepare_model_payload(
+        resized_content_type, resized_payload = self._prepare_model_payload(
             payload=payload,
             content_type=content_type,
             max_edge=self.config.model_image_max_edge,
         )
-        model_url = self._data_url(model_content_type, model_payload)
+        resized_width, resized_height = self._image_dimensions(resized_payload)
+        if resized_width is not None:
+            width = resized_width
+        if resized_height is not None:
+            height = resized_height
+
+        cache_path = self._write_image_cache_file(cache_key, resized_payload, resized_content_type)
+        asset_uri = self._maybe_upload_cached_image(cache_path, cache_key) or cache_path
+        model_url = self._data_url(resized_content_type, resized_payload)
         return (
             ResolvedImageAsset(
                 cache_key=cache_key,
@@ -1438,7 +1722,7 @@ class ImageDiscoveryBuilder:
                 model_url=model_url,
                 asset_uri=asset_uri,
                 cache_path=cache_path,
-                content_type=content_type,
+                content_type=resized_content_type,
                 width=width,
                 height=height,
                 strategy=strategy,
@@ -1657,6 +1941,18 @@ class ImageDiscoveryBuilder:
         except Exception:
             return content_type, payload
 
+    @staticmethod
+    def _image_dimensions(payload: bytes, *, verify: bool = False) -> tuple[int | None, int | None]:
+        try:
+            from PIL import Image
+        except ImportError:
+            return None, None
+        with Image.open(BytesIO(payload)) as image:
+            width, height = image.size
+            if verify:
+                image.verify()
+            return width, height
+
     def _maybe_upload_cached_image(self, cache_path: str, cache_key: str) -> str | None:
         try:
             from PIL import Image
@@ -1840,7 +2136,6 @@ class ImageDiscoveryBuilder:
                         ],
                     ),
                 ],
-                temperature=0.0,
                 metadata={"trace_label": f"image_check:{plan.plan_id}:{search_result.title or ''}"},
             )
         )
@@ -1885,6 +2180,17 @@ class ImageDiscoveryBuilder:
             f"title: {search_result.title or ''}\n"
             f"caption/snippet: {search_result.snippet or ''}\n"
             f"source_page_url: {search_result.source_page_url or ''}\n"
+        )
+
+    @staticmethod
+    def _wiki_inline_question_prompt_input(
+        *,
+        caption: str,
+        wikipedia_title: str,
+    ) -> str:
+        return (
+            f"Wikipedia: {wikipedia_title or ''}\n"
+            f"description: {caption or ''}"
         )
 
     @staticmethod
@@ -1934,6 +2240,73 @@ class ImageDiscoveryBuilder:
         )
 
     @staticmethod
+    def _parse_wiki_inline_question(text: str) -> dict[str, str]:
+        payload = str(text or "")
+        question_match = re.search(r"<question>(.*?)</question>", payload, flags=re.DOTALL | re.IGNORECASE)
+        answer_match = re.search(r"<answer>(.*?)</answer>", payload, flags=re.DOTALL | re.IGNORECASE)
+        question = re.sub(r"\s+", " ", question_match.group(1)).strip() if question_match else ""
+        answer = re.sub(r"\s+", " ", answer_match.group(1)).strip() if answer_match else ""
+        if not question:
+            for raw_line in payload.splitlines():
+                line = raw_line.strip()
+                if not line:
+                    continue
+                if line.lower().startswith("question:"):
+                    question = line.split(":", 1)[1].strip()
+                    if question:
+                        break
+                if not question and line.endswith("?"):
+                    question = line
+        if not answer:
+            for raw_line in payload.splitlines():
+                line = raw_line.strip()
+                if line.lower().startswith("answer:"):
+                    answer = line.split(":", 1)[1].strip()
+                    if answer:
+                        break
+        if not question:
+            raise ValueError(f"Failed to parse wiki-inline question from: {text[:500]}")
+        result = {"question": question}
+        if answer:
+            result["answer"] = answer
+        return result
+
+    @staticmethod
+    def _parse_wiki_inline_answer(text: str) -> str:
+        answer = re.sub(r"\s+", " ", str(text or "")).strip()
+        if not answer:
+            raise ValueError("Empty wiki-inline answer output.")
+        return answer
+
+    @staticmethod
+    def _parse_wiki_inline_judge(text: str) -> tuple[str, str | None]:
+        payload = str(text or "")
+        answer_match = re.search(r"<answer>(.*?)</answer>", payload, flags=re.DOTALL | re.IGNORECASE)
+        decision = re.sub(r"\s+", " ", answer_match.group(1)).strip() if answer_match else ""
+        reason: str | None = None
+        thinking_match = re.search(r"<thinking>(.*?)</thinking>", payload, flags=re.DOTALL | re.IGNORECASE)
+        if thinking_match:
+            reason = re.sub(r"\s+", " ", thinking_match.group(1)).strip() or None
+        if not decision:
+            for raw_line in payload.splitlines():
+                line = raw_line.strip()
+                if not line:
+                    continue
+                upper = line.upper()
+                if upper in {"TRUE", "FALSE"}:
+                    decision = upper
+                    break
+                if ":" in line:
+                    key, value = line.split(":", 1)
+                    if key.strip().lower() == "answer":
+                        decision = value.strip()
+                        break
+        normalized = decision.lower()
+        if normalized not in {"true", "false"}:
+            raise ValueError(f"Failed to parse wiki-inline judge decision from: {text[:500]}")
+        return normalized, reason
+
+    @staticmethod
     def _parse_confidence(value: Any) -> float | None:
         try:
             confidence = float(value)
@@ -1948,6 +2321,29 @@ class ImageDiscoveryBuilder:
             confidence=0.0,
             reason=reason,
             drop_candidate=drop_candidate,
+        )
+
+    @staticmethod
+    def _snapshot_from_wiki_inline_result(
+        search_result: ImageSearchResult,
+        *,
+        plan: VisualSearchPlan,
+        run_id: str | None,
+    ) -> SearchSnapshot:
+        query = (plan.queries[0].query if plan.queries else search_result.snippet or search_result.title or search_result.image_url or "")
+        return SearchSnapshot.create(
+            SearchEngine.WIKIPEDIA,
+            query=query,
+            request={
+                "query": query,
+                "engine": "wikipedia_inline_image",
+                "source_page_url": search_result.source_page_url,
+            },
+            response_preview=repr(search_result.to_dict()),
+            result_count=1,
+            status_code=200,
+            run_id=run_id,
+            metadata={"raw_engine": "wikipedia_inline_image"},
         )
 
     @staticmethod
@@ -2319,7 +2715,6 @@ class ImageDiscoveryBuilder:
                             ),
                         ),
                     ],
-                    temperature=0.0,
                     metadata={"trace_label": f"image_query_entity_filter:{source_node_title or ''}:{query_text[:80]}"},
                 )
             )
@@ -2497,15 +2892,14 @@ class ImageDiscoveryBuilder:
                 ModelRequest(
                     model=model_alias,
                     messages=[
-                    ModelMessage(role="system", content=PROMPT_IMAGE_ENTITY_RESOLUTION),
-                    ModelMessage(role="user", content=user_text),
-                ],
-                temperature=0.0,
-                metadata={
+                        ModelMessage(role="system", content=PROMPT_IMAGE_ENTITY_RESOLUTION),
+                        ModelMessage(role="user", content=user_text),
+                    ],
+                    metadata={
                         "trace_label": f"image_entity_resolution:{entity.get('name') or ''}:{source_node_title or ''}"
-                },
+                    },
+                )
             )
-        )
         except Exception:
             return None
         decision = self._parse_entity_resolution_response(response.content)

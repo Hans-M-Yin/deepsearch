@@ -333,6 +333,23 @@ class ReaderDocument:
         return _jsonify(asdict(self))
 
 
+@dataclass(slots=True)
+class WikiInlineImageCandidate:
+    """One inline Wikipedia image parsed from raw markdown."""
+
+    image_url: str
+    source_page_url: str
+    file_page_url: str | None = None
+    caption: str | None = None
+    raw_caption: str | None = None
+    alt_text: str | None = None
+    rank: int | None = None
+    block_index: int | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return _jsonify(asdict(self))
+
+
 class ReaderClient(Protocol):
     """Minimal webpage reader interface."""
 
@@ -373,6 +390,36 @@ class EnhancedReaderClient:
             content=document.get("content") or "",
             raw_markdown=document.get("raw_markdown") or None,
             raw=data,
+        )
+
+
+class RawMarkdownReaderClient:
+    """Minimal client for the raw 8002 markdown reader endpoint."""
+
+    def __init__(
+        self,
+        *,
+        base_url: str = "http://127.0.0.1:8002",
+        timeout_s: float = 180.0,
+    ) -> None:
+        self.base_url = base_url.rstrip("/")
+        self.timeout_s = timeout_s
+
+    def read(self, url: str, **kwargs: Any) -> ReaderDocument:
+        del kwargs
+        target = url if url.startswith(("http://", "https://")) else f"https://{url}"
+        request = Request(
+            f"{self.base_url}/{target}",
+            headers={"Accept": "text/plain"},
+        )
+        with urlopen(request, timeout=self.timeout_s) as response:
+            markdown = response.read().decode("utf-8")
+        return ReaderDocument(
+            url=target,
+            title=WikiTextBuilder._title_from_url(target),
+            content=markdown,
+            raw_markdown=markdown,
+            raw={"reader": "raw_markdown_reader"},
         )
 
 
@@ -810,7 +857,6 @@ class WikiTextBuilder:
                     ModelMessage(role="system", content=PROMPT_EXTRACT_ATTRIBUTE),
                     ModelMessage(role="user", content=self._attribute_prompt_input(node, content)),
                 ],
-                temperature=0.0,
                 metadata={"trace_label": f"attribute_extract:{node.title or node.node_id}"},
             )
         )
@@ -910,6 +956,39 @@ class WikiTextBuilder:
         candidates = self._filter_links_with_llm(source_url=source_url, candidates=candidates)
         return self._select_position_diverse_links(candidates)
 
+    @classmethod
+    def extract_wiki_inline_images(
+        cls,
+        markdown: str,
+        *,
+        source_url: str,
+    ) -> list[WikiInlineImageCandidate]:
+        blocks = cls._markdown_blocks(markdown)
+        images: list[WikiInlineImageCandidate] = []
+        rank = 0
+        for index, block in enumerate(blocks):
+            parsed = cls._parse_nested_image_block(block, source_url=source_url)
+            if parsed is None:
+                continue
+            caption_block = cls._next_nonempty_block(blocks, start=index + 1)
+            caption_text = cls._clean_markdown_text(caption_block) if caption_block else None
+            if not caption_text:
+                caption_text = cls._clean_markdown_text(parsed.get("alt_text"))
+            rank += 1
+            images.append(
+                WikiInlineImageCandidate(
+                    image_url=parsed["image_url"],
+                    source_page_url=source_url,
+                    file_page_url=parsed.get("file_page_url") or None,
+                    caption=caption_text or None,
+                    raw_caption=caption_block,
+                    alt_text=parsed.get("alt_text") or None,
+                    rank=rank,
+                    block_index=index,
+                )
+            )
+        return images
+
     def _filter_links_with_llm(
         self,
         *,
@@ -947,7 +1026,6 @@ class WikiTextBuilder:
                             content=prompt_input,
                         ),
                     ],
-                    temperature=0.0,
                     max_tokens=2048,
                     metadata={"trace_label": f"neighbor_filter:{source_title}"},
                 )
@@ -1215,7 +1293,6 @@ class WikiTextBuilder:
                         ),
                     ),
                 ],
-                temperature=0.0,
                 max_tokens=8,
                 metadata={"trace_label": f"neighbor_qa_judge:{source_title}:{target_title}"},
             )
@@ -1251,7 +1328,6 @@ class WikiTextBuilder:
                         ModelMessage(role="system", content="You are a health check. Reply with exactly: OK"),
                         ModelMessage(role="user", content="Return exactly: OK"),
                     ],
-                    temperature=0.0,
                     max_tokens=16,
                 )
             )
@@ -1551,6 +1627,53 @@ class WikiTextBuilder:
             else:
                 break
 
+    @staticmethod
+    def _markdown_blocks(markdown: str) -> list[str]:
+        return [block.strip() for block in re.split(r"\n\s*\n", markdown or "") if block.strip()]
+
+    @classmethod
+    def _next_nonempty_block(cls, blocks: list[str], *, start: int) -> str | None:
+        for index in range(start, len(blocks)):
+            block = str(blocks[index] or "").strip()
+            if block:
+                return block
+        return None
+
+    @classmethod
+    def _parse_nested_image_block(
+        cls,
+        block: str,
+        *,
+        source_url: str,
+    ) -> dict[str, str] | None:
+        compact = str(block or "").strip()
+        match = re.fullmatch(r"\[!\[([^\]]*)\]\(([^)]+)\)\]\(([^)]+)\)", compact)
+        if match is None:
+            return None
+        image_url = cls._clean_markdown_href(match.group(2))
+        if not image_url:
+            return None
+        alt_text = cls._clean_markdown_text(match.group(1))
+        file_page_url = cls._wiki_url_from_href(match.group(3), source_url=source_url)
+        return {
+            "image_url": image_url,
+            "file_page_url": file_page_url or "",
+            "alt_text": alt_text,
+        }
+
+    @classmethod
+    def _clean_markdown_text(cls, text: str | None) -> str:
+        if not text:
+            return ""
+        cleaned = str(text)
+        cleaned = re.sub(r"!\[([^\]]*)\]\(([^)]+)\)", r"\1", cleaned)
+        cleaned = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r"\1", cleaned)
+        cleaned = re.sub(r"https?://\S+", "", cleaned)
+        cleaned = re.sub(r"[`*_~]+", "", cleaned)
+        cleaned = re.sub(r"\s+", " ", cleaned)
+        cleaned = re.sub(r"\s+([,.;:!?])", r"\1", cleaned)
+        return cleaned.strip()
+
     def _select_position_diverse_links(
         self,
         candidates: list[WikiLinkCandidate],
@@ -1690,7 +1813,6 @@ class WikiTextBuilder:
                         content=self._relation_prompt_input(source_node, candidate),
                     ),
                 ],
-                temperature=0.0,
             )
         )
         try:

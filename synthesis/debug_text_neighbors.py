@@ -95,7 +95,6 @@ def _run_llm_filter_debug(
                     ModelMessage(role="system", content=PROMPT_FILTER_WIKI_NEIGHBORS),
                     ModelMessage(role="user", content=prompt_input),
                 ],
-                temperature=0.0,
                 max_tokens=2048,
                 metadata={"trace_label": f"neighbor_filter_debug:{source_title}"},
             )

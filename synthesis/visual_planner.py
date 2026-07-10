@@ -301,7 +301,6 @@ class LLMVisualSearchPlanner:
                     ModelMessage(role="system", content=PROMPT_VISUAL_SEARCH_PLANNER),
                     ModelMessage(role="user", content=self._prompt_input(node, page_text, target_budget)),
                 ],
-                temperature=0.0,
                 metadata={"trace_label": f"visual_planner:{node.get('title') or node.get('node_id') or ''}"},
             )
         )
