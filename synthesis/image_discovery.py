@@ -260,6 +260,14 @@ description: Lincity is a city-building game.
 <thinking>The image shows a video game screenshot that appears to be from a city-building simulation game. The description states that “Lincity is a city-building game,” which suggests that this screenshot is from Lincity. So I can directly ask the user what game this is.</thinking>
 <question>Which game is shown in this image?</question>
 <answer>Lincity, a city-building simulation game</answer>
+
+Example 3:
+(a photo of a bus with 'R.I.P Kobe')
+Wikipedia: Kobe Byrant
+description: Metro Bus in Los Angeles with "RIP Kobe" banner, January 2020
+<thinking> This image shows a metro bus in LA, with a 'RIP Kobe' banner. This indicates that the bus is mourning Kobe’s death, so you can directly ask who the bus in this image is commemorating.</thinking>
+<question>Who is the bus in the image mourning?</question>
+<answer>Kobe Byrant</answer>
 """
 
 
