@@ -19,6 +19,7 @@ from enum import Enum
 from hashlib import sha256
 from pathlib import Path
 import sys
+import traceback
 from typing import Any
 from urllib.parse import urlparse
 from urllib.error import HTTPError, URLError
@@ -1580,6 +1581,16 @@ class ImageDiscoveryBuilder:
                 )
             )
         except Exception as exc:
+            print(
+                "[wiki-inline-image] model request failed "
+                f"plan_id={plan.plan_id} "
+                f"question_model={question_model!r} "
+                f"answer_model={answer_model!r} "
+                f"judge_model={judge_model!r}",
+                file=sys.stderr,
+                flush=True,
+            )
+            traceback.print_exc(file=sys.stderr)
             return self._reject(
                 f"wiki_inline_image_model_error:{exc.__class__.__name__}:{exc}",
                 drop_candidate=True,
