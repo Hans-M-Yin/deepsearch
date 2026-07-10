@@ -510,6 +510,11 @@ class ModelRouterWorkerClient:
             else:
                 raise ValueError("ModelRequest.model must be a registered alias.")
 
+        if alias == "gemini25pro_internal_azure":
+            raise RuntimeError(
+                "Debug guard triggered: request routed to gemini25pro_internal_azure"
+            )
+
         config = self._configs.get(alias)
         if config is None:
             raise KeyError(f"Model alias is not registered: {alias}")
