@@ -90,6 +90,35 @@ visual_fact: visible fact 2
 """
 
 
+PROMPT_IMAGE_RETRIEVAL_CONSISTENCY = """You are judging whether several image-search results converge on the same visual content.
+
+All candidate images were returned for one search query and have already passed an individual check that they are relevant to the query. However, relevance alone is not enough. Keep this query only when at least half of the candidate images depict approximately the same main visual content.
+
+For an event photograph, images count as consistent only when they show the same particular event and approximately the same sub-scene, main people/group, and action. Images from the same broad event but different moments, locations, crowds, performances, or camera situations do not count as consistent.
+
+For a canonical object, artwork, building, album cover, or product, images count as consistent when the same main object is clearly depicted. Different normal views may count only if the object itself remains the stable main content.
+
+Examples:
+
+Query: healthcare workers in protective clothing during the 2003 Hong Kong SARS outbreak
+Candidate images: doctors in different hospitals, at different dates, and in different protective-clothing scenes.
+Answer: FALSE
+Reason: They concern the same outbreak but do not depict one consistent visual scene.
+
+Query: 12 Years a Slave cast and producers accepting the Best Picture Oscar at the 86th Academy Awards in 2014
+Candidate images: several photographs of the film's group on the Oscar stage during the acceptance.
+Answer: TRUE
+Consistent images: 1, 2, 4
+Reason: A majority depict the same award-acceptance scene with the same main group and stage context.
+
+Output exactly:
+<thinking>Your reasoning process</thinking>
+<answer>TRUE/FALSE</answer>
+<consistent_images>comma-separated candidate numbers, or none</consistent_images>
+<reason>short reason</reason>
+"""
+
+
 PROMPT_IMAGE_GROUND = """You are analyzing an accepted image for multimodal graph construction.
 
 Task:
@@ -249,7 +278,7 @@ Example 1:
 (a photo of Trump taking the oath of office)
 Wikipedia: Donald Trump
 description: Taking the presidential oath of office, administered by Chief Justice John Roberts, on January 20, 2017
-<thinking>Based on the image, the man in the foreground wearing a red tie can be identified as Trump. Standing next to him is his wife Melania, and his youngest son Barron, wearing a dark blue tie, is also beside them. The man with a balding hairstyle, seen from behind and administering the oath, can be inferred from the description and world knowledge to be John Roberts. Now I can ask a question to determine whether the user recognizes the main figures and the event shown in the image.</thinking>
+<thinking>Based on the image, the man in the foreground wearing a red tie can be identified as Trump. Standing next to him is his wife Melania, and his youngest son Barron, wearing a dark blue tie, is also beside them. The man with a balding hairstyle, seen from behind and administering the oath, can be inferred from the description and world knowledge to be John Roberts. Now I can ask a question to determine whether the user recognizes the main figures shown in the image.</thinking>
 <question>Who is the man in the foreground wearing the red tie, and who is the balding man seen from behind?</question>
 <answer>Donald Trump; John Roberts</answer>
 
@@ -294,6 +323,9 @@ class ImageDiscoveryConfig:
 
     per_query_limit: int = 10
     max_images_per_plan: int = 8
+    enable_retrieval_consistency_check: bool = True
+    retrieval_consistency_max_images: int = 6
+    retrieval_consistency_min_images: int = 2
     persist_search_snapshots: bool = False
     min_width: int | None = 120
     min_height: int | None = 120
@@ -312,6 +344,7 @@ class ImageDiscoveryConfig:
     wikimedia_429_retry_after_s: float = 15.0
     user_agent: str | None = None
     cache_dir: str | None = None
+    upload_cached_images: bool = True
     try_source_page_recovery: bool = True
     source_page_timeout_s: float = 20.0
     image_grounding_context_backend: str = "source_page_reader"
@@ -499,6 +532,7 @@ class ImageDiscoveryBuilder:
             timeout_s=self.config.image_grounding_reader_timeout_s,
         )
         self._resolved_image_cache: dict[str, ResolvedImageAsset] = {}
+        self._transient_image_cache: dict[str, ResolvedImageAsset] = {}
         self._grounding_context_cache: dict[str, ImageGroundingContext] = {}
         self._host_not_before: dict[str, float] = {}
         self._host_locks: dict[str, threading.Lock] = {}
@@ -532,37 +566,47 @@ class ImageDiscoveryBuilder:
         _trace_timing(
             f"[image-discovery] stage=search_and_check plan_id={plan.plan_id} elapsed_s={time.perf_counter() - started:.3f} candidates={len(result.candidates)}"
         )
-        result.candidates = result.candidates[: self.config.max_images_per_plan]
-        result.fallback_used = any(candidate.used_fallback for candidate in result.candidates)
-        primary_candidate = self._select_primary_candidate(result.candidates)
-        if primary_candidate is not None:
-            started = time.perf_counter()
-            self._materialize_primary_candidate(
-                result=result,
+        try:
+            result.candidates = result.candidates[: self.config.max_images_per_plan]
+            content_checked_candidates = [candidate.to_dict() for candidate in result.candidates]
+            consistency = self._apply_retrieval_consistency_check(
                 plan=plan,
-                candidate=primary_candidate,
-                run_id=run_id,
-                persist=persist,
+                candidates=result.candidates,
             )
+            result.fallback_used = any(candidate.used_fallback for candidate in result.candidates)
+            primary_candidate = self._select_primary_candidate(result.candidates)
+            if primary_candidate is not None:
+                started = time.perf_counter()
+                self._materialize_primary_candidate(
+                    result=result,
+                    plan=plan,
+                    candidate=primary_candidate,
+                    run_id=run_id,
+                    persist=persist,
+                )
+                _trace_timing(
+                    f"[image-discovery] stage=materialize_primary plan_id={plan.plan_id} elapsed_s={time.perf_counter() - started:.3f} primary_title={primary_candidate.search_result.title!r}"
+                )
+            result.metadata.update(
+                {
+                    "query_count": len(plan.queries),
+                    "image_count": len(result.candidates),
+                    "usable_image_count": len(result.usable_images()),
+                    "accepted_image_count": len(result.accepted_images()),
+                    "queued_task_count": len(result.queued_tasks),
+                    "candidate_decisions": decision_log,
+                    "content_checked_candidates": content_checked_candidates,
+                    "retrieval_consistency": consistency,
+                }
+            )
+            if persist and self.store is not None:
+                self.store.maybe_flush()
             _trace_timing(
-                f"[image-discovery] stage=materialize_primary plan_id={plan.plan_id} elapsed_s={time.perf_counter() - started:.3f} primary_title={primary_candidate.search_result.title!r}"
+                f"[image-discovery] phase=done plan_id={plan.plan_id} elapsed_s={time.perf_counter() - total_started:.3f} accepted={len(result.accepted_images())} kept={'yes' if result.image_node is not None else 'no'}"
             )
-        result.metadata.update(
-            {
-                "query_count": len(plan.queries),
-                "image_count": len(result.candidates),
-                "usable_image_count": len(result.usable_images()),
-                "accepted_image_count": len(result.accepted_images()),
-                "queued_task_count": len(result.queued_tasks),
-                "candidate_decisions": decision_log,
-            }
-        )
-        if persist and self.store is not None:
-            self.store.maybe_flush()
-        _trace_timing(
-            f"[image-discovery] phase=done plan_id={plan.plan_id} elapsed_s={time.perf_counter() - total_started:.3f} accepted={len(result.accepted_images())} kept={'yes' if result.image_node is not None else 'no'}"
-        )
-        return result
+            return result
+        finally:
+            self._clear_transient_assets(result.candidates)
 
     def discover_for_wiki_inline_image(
         self,
@@ -741,6 +785,7 @@ class ImageDiscoveryBuilder:
                     run_id=run_id,
                 )
                 if validation.drop_candidate:
+                    self._clear_transient_asset_from_validation(validation)
                     decision_log.append(
                         self._candidate_decision_record(
                             kind="candidate_drop",
@@ -765,6 +810,7 @@ class ImageDiscoveryBuilder:
                     validation.status == ImageCandidateStatus.REJECTED
                     and not self.config.store_rejected
                 ):
+                    self._clear_transient_asset_from_validation(validation)
                     decision_log.append(
                         self._candidate_decision_record(
                             kind="candidate_skip",
@@ -876,6 +922,196 @@ class ImageDiscoveryBuilder:
             search_result.title,
         )
 
+    def _apply_retrieval_consistency_check(
+        self,
+        *,
+        plan: VisualSearchPlan,
+        candidates: list[ImageSearchCandidate],
+    ) -> dict[str, Any]:
+        if not self.config.enable_retrieval_consistency_check:
+            return {"check": "retrieval_consistency", "decision": "disabled"}
+        accepted = [
+            candidate
+            for candidate in candidates
+            if candidate.validation.status == ImageCandidateStatus.ACCEPTED
+        ][: self.config.retrieval_consistency_max_images]
+        required_count = max(
+            self.config.retrieval_consistency_min_images,
+            (len(accepted) + 1) // 2,
+        )
+        metadata: dict[str, Any] = {
+            "check": "retrieval_consistency",
+            "candidate_count": len(accepted),
+            "required_consistent_count": required_count,
+        }
+        if len(accepted) < self.config.retrieval_consistency_min_images:
+            self._reject_candidates_for_consistency(
+                accepted,
+                reason="retrieval_consistency_insufficient_content_matched_images",
+                metadata=metadata,
+            )
+            metadata["decision"] = "reject"
+            return metadata
+
+        resolved_candidates: list[tuple[ImageSearchCandidate, ResolvedImageAsset]] = []
+        for candidate in accepted:
+            asset = self._transient_asset_for_candidate(candidate)
+            if asset is None:
+                asset, error = self._resolve_image_asset(candidate.search_result, persist_asset=False)
+                if asset is None:
+                    candidate.validation.status = ImageCandidateStatus.REJECTED
+                    candidate.validation.reason = f"retrieval_consistency_image_unavailable:{error or 'unknown'}"
+                    continue
+                candidate.validation.metadata = dict(candidate.validation.metadata or {})
+                candidate.validation.metadata["transient_image_key"] = asset.cache_key
+            resolved_candidates.append((candidate, asset))
+
+        if len(resolved_candidates) < self.config.retrieval_consistency_min_images:
+            self._reject_candidates_for_consistency(
+                accepted,
+                reason="retrieval_consistency_insufficient_resolved_images",
+                metadata=metadata,
+            )
+            metadata["decision"] = "reject"
+            return metadata
+
+        required_count = max(
+            self.config.retrieval_consistency_min_images,
+            (len(resolved_candidates) + 1) // 2,
+        )
+        metadata["candidate_count"] = len(resolved_candidates)
+        metadata["required_consistent_count"] = required_count
+        image_parts: list[dict[str, Any]] = [
+            {
+                "type": "text",
+                "text": (
+                    f"Search query:\n{plan.target.content or ''}\n\n"
+                    f"There are {len(resolved_candidates)} content-matched candidate images. "
+                    f"At least {required_count} must depict the same main visual content."
+                ),
+            }
+        ]
+        for index, (candidate, asset) in enumerate(resolved_candidates, start=1):
+            image_parts.append(
+                {
+                    "type": "text",
+                    "text": (
+                        f"Candidate image {index}:\n"
+                        f"title: {candidate.search_result.title or ''}\n"
+                        f"caption: {candidate.search_result.snippet or ''}"
+                    ),
+                }
+            )
+            image_parts.append({"type": "image_url", "image_url": {"url": asset.model_url}})
+
+        model_alias = (
+            os.environ.get("IMAGE_RETRIEVAL_CONSISTENCY_MODEL")
+            or self.image_check_model_alias
+            or os.environ.get("IMAGE_CHECK_MODEL")
+        )
+        if not model_alias:
+            self._reject_candidates_for_consistency(
+                accepted,
+                reason="missing_image_retrieval_consistency_model",
+                metadata=metadata,
+            )
+            metadata["decision"] = "reject"
+            return metadata
+
+        try:
+            response = self.model_client.generate(
+                ModelRequest(
+                    model=model_alias,
+                    messages=[
+                        ModelMessage(role="system", content=PROMPT_IMAGE_RETRIEVAL_CONSISTENCY),
+                        ModelMessage(role="user", content=image_parts),
+                    ],
+                    metadata={"trace_label": f"image_retrieval_consistency:{plan.plan_id}"},
+                )
+            )
+            decision, consistent_indexes, judge_reason = self._parse_retrieval_consistency_response(response.content)
+        except Exception as exc:
+            self._reject_candidates_for_consistency(
+                accepted,
+                reason=f"retrieval_consistency_model_error:{exc.__class__.__name__}:{exc}",
+                metadata=metadata,
+            )
+            metadata["decision"] = "reject"
+            return metadata
+
+        consistent_indexes = {
+            index
+            for index in consistent_indexes
+            if 1 <= index <= len(resolved_candidates)
+        }
+        metadata.update(
+            {
+                "model_alias": model_alias,
+                "decision": decision,
+                "consistent_indexes": sorted(consistent_indexes),
+                "judge_reason": judge_reason,
+                "raw_model_output": response.content,
+            }
+        )
+        if decision != "true" or len(consistent_indexes) < required_count:
+            self._reject_candidates_for_consistency(
+                accepted,
+                reason="retrieval_consistency_not_converged",
+                metadata=metadata,
+            )
+            metadata["decision"] = "reject"
+            return metadata
+
+        selected_ids = {
+            resolved_candidates[index - 1][0].candidate_id
+            for index in consistent_indexes
+        }
+        for candidate in accepted:
+            candidate.validation.metadata = dict(candidate.validation.metadata or {})
+            candidate.validation.metadata["retrieval_consistency"] = metadata
+            if candidate.candidate_id not in selected_ids:
+                candidate.validation.status = ImageCandidateStatus.REJECTED
+                candidate.validation.reason = "retrieval_consistency_outlier"
+        metadata["decision"] = "accept"
+        return metadata
+
+    @staticmethod
+    def _parse_retrieval_consistency_response(text: str) -> tuple[str, set[int], str | None]:
+        answer_match = re.search(r"<answer>(.*?)</answer>", text, flags=re.DOTALL | re.IGNORECASE)
+        images_match = re.search(r"<consistent_images>(.*?)</consistent_images>", text, flags=re.DOTALL | re.IGNORECASE)
+        reason_match = re.search(r"<reason>(.*?)</reason>", text, flags=re.DOTALL | re.IGNORECASE)
+        answer = answer_match.group(1).strip().lower() if answer_match else ""
+        image_text = images_match.group(1) if images_match else ""
+        indexes = {int(value) for value in re.findall(r"\d+", image_text)}
+        reason = re.sub(r"\s+", " ", reason_match.group(1)).strip() if reason_match else None
+        return answer, indexes, reason
+
+    @staticmethod
+    def _reject_candidates_for_consistency(
+        candidates: list[ImageSearchCandidate],
+        *,
+        reason: str,
+        metadata: dict[str, Any],
+    ) -> None:
+        for candidate in candidates:
+            candidate.validation.status = ImageCandidateStatus.REJECTED
+            candidate.validation.reason = reason
+            candidate.validation.metadata = dict(candidate.validation.metadata or {})
+            candidate.validation.metadata["retrieval_consistency"] = dict(metadata)
+
+    def _transient_asset_for_candidate(self, candidate: ImageSearchCandidate) -> ResolvedImageAsset | None:
+        key = (candidate.validation.metadata or {}).get("transient_image_key")
+        return self._transient_image_cache.get(key) if key else None
+
+    def _clear_transient_assets(self, candidates: list[ImageSearchCandidate]) -> None:
+        for candidate in candidates:
+            self._clear_transient_asset_from_validation(candidate.validation)
+
+    def _clear_transient_asset_from_validation(self, validation: ImageValidationResult) -> None:
+        key = (validation.metadata or {}).get("transient_image_key")
+        if key:
+            self._transient_image_cache.pop(key, None)
+
     @staticmethod
     def _select_primary_candidate(candidates: list[ImageSearchCandidate]) -> ImageSearchCandidate | None:
         accepted = [
@@ -907,6 +1143,15 @@ class ImageDiscoveryBuilder:
         create_source_edge: bool = True,
     ) -> None:
         resolved_asset = self._resolved_image_from_validation(candidate.validation)
+        if resolved_asset is None and self.config.precheck_image_urls:
+            resolved_asset, _ = self._resolve_image_asset(
+                candidate.search_result,
+                persist_asset=True,
+            )
+            if resolved_asset is not None:
+                candidate.validation.metadata = dict(candidate.validation.metadata or {})
+                candidate.validation.metadata["resolved_image_key"] = resolved_asset.cache_key
+                candidate.validation.metadata["resolved_image"] = resolved_asset.to_metadata()
         provisional_node = self._image_node_from_result(
             candidate.search_result,
             run_id=run_id,
@@ -1392,6 +1637,7 @@ class ImageDiscoveryBuilder:
         resolved_asset, rejection = self._precheck_candidate_for_processing(
             search_result,
             stage="image_check",
+            persist_asset=False,
         )
         if rejection is not None:
             return rejection
@@ -1404,7 +1650,7 @@ class ImageDiscoveryBuilder:
                 "debug_force_accept_images": True,
             }
             if resolved_asset is not None:
-                metadata["resolved_image_key"] = resolved_asset.cache_key
+                metadata["transient_image_key"] = resolved_asset.cache_key
                 metadata["resolved_image"] = resolved_asset.to_metadata()
             return ImageValidationResult(
                 status=ImageCandidateStatus.ACCEPTED,
@@ -1424,7 +1670,7 @@ class ImageDiscoveryBuilder:
                 )
                 if resolved_asset is not None:
                     result.metadata = dict(result.metadata or {})
-                    result.metadata["resolved_image_key"] = resolved_asset.cache_key
+                    result.metadata["transient_image_key"] = resolved_asset.cache_key
                     result.metadata["resolved_image"] = resolved_asset.to_metadata()
                 return result
             except Exception as exc:
@@ -1447,6 +1693,7 @@ class ImageDiscoveryBuilder:
         search_result: ImageSearchResult,
         *,
         stage: str,
+        persist_asset: bool = True,
     ) -> tuple[ResolvedImageAsset | None, ImageValidationResult | None]:
         if not search_result.image_url:
             return None, self._reject("missing_image_url")
@@ -1471,7 +1718,10 @@ class ImageDiscoveryBuilder:
 
         resolved_asset: ResolvedImageAsset | None = None
         if self.config.precheck_image_urls:
-            resolved_asset, precheck_error = self._resolve_image_asset(search_result)
+            resolved_asset, precheck_error = self._resolve_image_asset(
+                search_result,
+                persist_asset=persist_asset,
+            )
             if precheck_error is not None or resolved_asset is None:
                 self._log_invalid_image_url(search_result.image_url, precheck_error, stage=stage)
                 return None, self._reject(
@@ -1639,13 +1889,20 @@ class ImageDiscoveryBuilder:
     def _resolve_image_asset(
         self,
         search_result: ImageSearchResult,
+        *,
+        persist_asset: bool = True,
     ) -> tuple[ResolvedImageAsset | None, str | None]:
         image_url = search_result.image_url
         source_page_url = search_result.source_page_url
         cache_key = self._resolved_image_cache_key(image_url, source_page_url)
-        cached = self._resolved_image_cache.get(cache_key)
-        if cached is not None:
-            return cached, None
+        if persist_asset:
+            cached = self._resolved_image_cache.get(cache_key)
+            if cached is not None:
+                return cached, None
+        else:
+            cached = self._transient_image_cache.get(cache_key)
+            if cached is not None:
+                return cached, None
 
         attempted_errors: list[str] = []
         direct_asset, direct_error = self._download_and_prepare_image_asset(
@@ -1653,9 +1910,10 @@ class ImageDiscoveryBuilder:
             source_page_url=source_page_url,
             strategy="direct",
             cache_key=cache_key,
+            persist_asset=persist_asset,
         )
         if direct_asset is not None:
-            self._resolved_image_cache[cache_key] = direct_asset
+            (self._resolved_image_cache if persist_asset else self._transient_image_cache)[cache_key] = direct_asset
             return direct_asset, None
         if direct_error:
             attempted_errors.append(direct_error)
@@ -1667,9 +1925,10 @@ class ImageDiscoveryBuilder:
                     source_page_url=source_page_url,
                     strategy="source_page_recovery",
                     cache_key=cache_key,
+                    persist_asset=persist_asset,
                 )
                 if recovered_asset is not None:
-                    self._resolved_image_cache[cache_key] = recovered_asset
+                    (self._resolved_image_cache if persist_asset else self._transient_image_cache)[cache_key] = recovered_asset
                     self._log_recovered_image_url(
                         original_url=image_url,
                         recovered_url=recovered_url,
@@ -1688,6 +1947,7 @@ class ImageDiscoveryBuilder:
         source_page_url: str | None,
         strategy: str,
         cache_key: str,
+        persist_asset: bool = True,
     ) -> tuple[ResolvedImageAsset | None, str | None]:
         if not image_url:
             return None, "missing_image_url"
@@ -1729,8 +1989,15 @@ class ImageDiscoveryBuilder:
         if resized_height is not None:
             height = resized_height
 
-        cache_path = self._write_image_cache_file(cache_key, resized_payload, resized_content_type)
-        asset_uri = self._maybe_upload_cached_image(cache_path, cache_key) or cache_path
+        cache_path = None
+        asset_uri = image_url
+        if persist_asset:
+            cache_path = self._write_image_cache_file(cache_key, resized_payload, resized_content_type)
+            asset_uri = (
+                self._maybe_upload_cached_image(cache_path, cache_key)
+                if self.config.upload_cached_images
+                else None
+            ) or cache_path
         model_url = self._data_url(resized_content_type, resized_payload)
         return (
             ResolvedImageAsset(
@@ -3251,6 +3518,13 @@ reason: visible player in uniform
 visual_fact: Kobe Bryant is visible
 </check>"""
                 )
+            if "several image-search results converge" in system:
+                return ModelResponse(
+                    content="""<thinking>Both candidates show the same final-game scene.</thinking>
+<answer>TRUE</answer>
+<consistent_images>1, 2</consistent_images>
+<reason>Both images depict the same main visual content.</reason>"""
+                )
             if "selecting the best Wikipedia candidate" in system:
                 return ModelResponse(
                     content="""<selection>
@@ -3311,6 +3585,7 @@ entity: Los Angeles Lakers | jersey logo | visible team branding on the uniform
                 config=ImageDiscoveryConfig(
                     per_query_limit=1,
                     max_images_per_plan=1,
+                    enable_retrieval_consistency_check=False,
                     precheck_image_urls=False,
                 ),
                 model_client=MockModel(),
@@ -3326,6 +3601,46 @@ entity: Los Angeles Lakers | jersey logo | visible team branding on the uniform
             assert result.grounded_edges
             assert result.image_node.metadata.get("image_grounding", {}).get("context") is not None
             assert store.stats()["nodes"] == 3
+
+            first_candidate = result.candidates[0]
+            second_candidate = ImageSearchCandidate(
+                candidate_id="candidate_same_scene",
+                source_query=first_candidate.source_query,
+                source_snapshot=first_candidate.source_snapshot,
+                search_result=ImageSearchResult(
+                    title="Kobe Bryant final game second photo",
+                    image_url="https://example.com/kobe-final-game-second.jpg",
+                    source_page_url="https://example.com/kobe",
+                    snippet="Kobe Bryant in the same final game uniform",
+                ),
+                validation=ImageValidationResult(
+                    status=ImageCandidateStatus.ACCEPTED,
+                    confidence=0.8,
+                ),
+            )
+            transient_candidates = [first_candidate, second_candidate]
+            for index, candidate in enumerate(transient_candidates, start=1):
+                key = f"smoke_transient_{index}"
+                candidate.validation.metadata = {"transient_image_key": key}
+                builder._transient_image_cache[key] = ResolvedImageAsset(
+                    cache_key=key,
+                    original_url=candidate.search_result.image_url,
+                    resolved_url=candidate.search_result.image_url,
+                    source_page_url=candidate.search_result.source_page_url,
+                    model_url="data:image/jpeg;base64,AA==",
+                    asset_uri="",
+                    cache_path=None,
+                    content_type="image/jpeg",
+                )
+            builder.config.enable_retrieval_consistency_check = True
+            consistency = builder._apply_retrieval_consistency_check(
+                plan=plan,
+                candidates=transient_candidates,
+            )
+            assert consistency["decision"] == "accept"
+            assert len([item for item in transient_candidates if item.validation.status == ImageCandidateStatus.ACCEPTED]) == 2
+            builder._clear_transient_assets(transient_candidates)
+            assert not builder._transient_image_cache
     finally:
         if old_check is None:
             os.environ.pop("IMAGE_CHECK_MODEL", None)

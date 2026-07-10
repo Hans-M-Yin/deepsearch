@@ -359,7 +359,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--image-budget-chars",
         type=int,
         default=8000,
-        help="Approximate text-description chars needed for one additional visual plan. Pages below the internal minimum threshold produce no visual plans.",
+        help="Legacy visual-planner context budget setting. Pages below the internal minimum threshold produce no visual plans; eligible pages may produce up to five plans.",
     )
     parser.add_argument("--no-images", action="store_true", help="Disable visual planning and image discovery.")
     parser.add_argument(

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 from hashlib import sha256
@@ -41,15 +42,21 @@ For example:
 
 # Requirements
 
-1. The image must be **unique**.  
+1. The image must be **unique**.
 The image must be the only image that truly satisfies the passage. In simple terms, different people reading the same passage should retrieve the same image target.
 
 For passages that do not naturally correspond to a unique image, you may rewrite or refine the passage so that it points to only one unique image target.
 
-Some categories of images are considered inherently unique.  
+Some categories of images are considered inherently unique.
 Examples include paintings, buildings, album covers, or specific moments from historical events. Even if different photographers captured different photos, the underlying visual content is effectively the same, so this still satisfies uniqueness.
 
 However, the event itself must be **specific and unambiguous**.
+
+For a photograph of a specific event, checking only the event date or year is not enough. Before outputting the query, also check that it identifies the main people or subject, and one particular event scene, action, or moment. The query should make image search results converge on the same main visual content, instead of merely retrieving many images about the same topic.
+
+For example:
+- "Healthcare workers in protective clothing during the 2003 Hong Kong SARS outbreak" is not unique. Although the time and topic are specific, many hospitals, workers, dates, and scenes satisfy the description.
+- "12 Years a Slave cast and producers accepting the Best Picture Oscar at the 86th Academy Awards in 2014" is sufficiently unique. It identifies one award-ceremony moment, one film group, and one stage scene; different photographs are expected to have substantially the same main content.
 
 For example:
 - “Los Angeles Lakers championship parade” is ambiguous because it could refer to multiple years.
@@ -75,18 +82,18 @@ The query must not contain any explicit URL, domain name, filename, image identi
 
 3. The number of unique image materials corresponding to the subject is uncertain. If you believe no suitable image exists, you may output nothing.
 
-4. When suitable images exist, output 1 to 3 visual plans. The plans must be meaningfully different from one another: do not output multiple plans that point to the same underlying event, the same object, or near-duplicate visual targets described with slightly different wording.
+4. When suitable images exist, output 2 to 5 visual plans. For a niche or obscure entity, be conservative and usually output 2 strong plans rather than inventing weak ones. For a well-known entity with several distinct, well-documented visual materials, output 3 to 5 plans. The plans must be meaningfully different from one another: do not output multiple plans that point to the same underlying event, the same object, or near-duplicate visual targets described with slightly different wording.
 
 5. We will directly use your rewritten text for image search. Please strictly follow the format below:
 
-You can validate your query as follows: for photographs of a specific event, check whether the event's date or time is included; for photographs of a specific object or entity, check whether the object or entity is unique in the world.
+You can validate your query as follows: for photographs of a specific event, check whether the event's date or time is included, whether the main people or subject are identified, and whether one particular event scene, action, or moment is identified; for photographs of a specific object or entity, check whether the object or entity is unique in the world.
 
 ```text
 <query>Your rewritten text</query>
 <reason>Explain why this text satisfies the requirements, including how it fulfills the three conditions above.</reason>
 ```
 
-Repeat the format for multiple results. Output 1 to 3 results when suitable images exist; otherwise output nothing.
+Repeat the format for multiple results. Output 2 to 5 results when suitable images exist; otherwise output nothing.
 
 # Example
 
@@ -118,6 +125,44 @@ Content: ...(Emit here)...
 </reason>
 
 Now, strictly follow all the requirements and goals above to complete the following person.
+"""
+
+
+PROMPT_VISUAL_PLAN_UNIQUENESS_JUDGE = """You are judging whether an image-search query points to a sufficiently unique visual target for a multimodal knowledge graph.
+
+The query will be sent to an image search engine. Keep it only if several correct search results are likely to show the same main visual content, or the same canonical visual object. A real event name, a year, or a location alone does not make a query unique.
+
+For an event photograph, check whether the query identifies all of the following when needed:
+- one particular time, edition, or moment;
+- the particular people or main subject;
+- one particular event sub-scene or action.
+
+Reject a query when many visibly different photographs would still be equally correct, even if they concern the same historical topic or the same named event.
+For non-event objective subjects—such as buildings, artworks, covers and posters, or fine-grained biological categories—return TRUE as well when, despite possible differences in shooting angle or time, the image content remains essentially the same, and the images retrieved on the internet are generally highly similar.
+Note that you should judge whether the images returned by the search are actually likely to satisfy content consistency. For example, the San Francisco skyline or Beijing CBD, although they are also objective subjects, should return FALSE, because differences in viewpoint and time can lead to major changes in visual content.
+
+Examples:
+
+Query: healthcare workers in protective clothing during the 2003 Hong Kong SARS outbreak
+Answer: FALSE
+Reason: The year and outbreak are specific, but many hospitals, workers, dates, and scenes satisfy the query. Search results need not show the same main visual content.
+
+Query: 12 Years a Slave cast and producers accepting the Best Picture Oscar at the 86th Academy Awards in 2014
+Answer: TRUE
+Reason: It identifies one ceremony, one award result, one film group, and the acceptance moment on stage. Different photos should show approximately the same scene.
+
+Query: Los Angeles Lakers championship parade in 2008
+Answer: FALSE
+Reason: It identifies one parade year but not one sub-scene. Many different moments, vehicles, crowds, and players would be correct.
+
+Query: cover of Justin Bieber's album Changes
+Answer: TRUE
+Reason: It identifies one canonical album artwork. Different copies preserve the same main visual content.
+
+Output exactly:
+<thinking>Your reasoning process</thinking>
+<answer>TRUE/FALSE</answer>
+<reason>short reason</reason>
 """
 
 
@@ -264,7 +309,7 @@ class LLMVisualSearchPlanner:
         *,
         model_client: ModelWorkerClient | None = None,
         model_alias: str | None = None,
-        max_targets: int = 7,
+        max_targets: int = 5,
         max_queries_per_target: int = 4,
         min_query_terms: int = 3,
         target_chars_per_budget: int = 8000,
@@ -277,6 +322,7 @@ class LLMVisualSearchPlanner:
         self.min_query_terms = min_query_terms
         self.target_chars_per_budget = max(1, target_chars_per_budget)
         self.min_content_chars_for_images = max(0, min_content_chars_for_images)
+        self.last_plan_trace: dict[str, Any] = {}
 
     def plan(
         self,
@@ -291,6 +337,13 @@ class LLMVisualSearchPlanner:
             raise ValueError("VISUAL_PLANNER_MODEL or TEXT_PROCESS_MODEL is required for visual planning.")
         target_budget = self._compute_target_budget(page_text)
         if target_budget <= 0:
+            self.last_plan_trace = {
+                "raw_model_output": None,
+                "raw_candidates": [],
+                "judge_results": [],
+                "kept_candidates": [],
+                "reason": "insufficient_page_content",
+            }
             return []
 
         started_at = time.perf_counter()
@@ -307,7 +360,12 @@ class LLMVisualSearchPlanner:
         _trace_timing(
             f"[visual-plan] stage=llm_call node={node.get('title') or node.get('node_id')!r} elapsed_s={time.perf_counter() - started_at:.3f}"
         )
-        candidates = self._parse_targets(response.content)
+        raw_candidates = self._parse_targets(response.content)
+        candidates, judge_results = self._filter_unique_candidates(
+            raw_candidates,
+            node=node,
+            model_alias=os.environ.get("VISUAL_PLAN_JUDGE_MODEL") or os.environ.get("TEXT_PROCESS_MODEL") or model_alias,
+        )
         plans: list[VisualSearchPlan] = []
         for candidate in candidates:
             if len(plans) >= target_budget:
@@ -322,22 +380,95 @@ class LLMVisualSearchPlanner:
             )
             if plan is not None:
                 plans.append(plan)
+        self.last_plan_trace = {
+            "raw_model_output": response.content,
+            "raw_candidates": [dict(candidate) for candidate in raw_candidates],
+            "judge_results": [dict(candidate) for candidate in judge_results],
+            "kept_candidates": [dict(candidate) for candidate in candidates],
+            "plan_ids": [plan.plan_id for plan in plans],
+            "target_budget": target_budget,
+        }
         return plans
 
     def _compute_target_budget(self, page_text: str) -> int:
         content_chars = len(page_text or "")
         if content_chars < self.min_content_chars_for_images:
             return 0
-        budget = content_chars // self.target_chars_per_budget
-        budget = max(1, budget)
-        return min(self.max_targets, budget)
+        del content_chars
+        return self.max_targets
+
+    def _filter_unique_candidates(
+        self,
+        candidates: list[dict[str, Any]],
+        *,
+        node: dict[str, Any],
+        model_alias: str,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        if not candidates:
+            return [], []
+        kept: list[dict[str, Any]] = []
+        with ThreadPoolExecutor(max_workers=min(5, len(candidates))) as executor:
+            futures = {
+                executor.submit(self._judge_candidate_uniqueness, candidate, node=node, model_alias=model_alias): index
+                for index, candidate in enumerate(candidates)
+            }
+            judged: dict[int, dict[str, Any]] = {}
+            for future in as_completed(futures):
+                index = futures[future]
+                try:
+                    judged[index] = future.result()
+                except Exception as exc:
+                    judged[index] = {
+                        **candidates[index],
+                        "plan_judge_keep": False,
+                        "plan_judge_reason": f"judge_error:{exc.__class__.__name__}",
+                    }
+        for index, candidate in enumerate(candidates):
+            verdict = judged[index]
+            if verdict.get("plan_judge_keep"):
+                kept.append(verdict)
+        return kept, [judged[index] for index in range(len(candidates))]
+
+    def _judge_candidate_uniqueness(
+        self,
+        candidate: dict[str, Any],
+        *,
+        node: dict[str, Any],
+        model_alias: str,
+    ) -> dict[str, Any]:
+        query = str(candidate.get("query") or "").strip()
+        reason = str(candidate.get("reason") or "").strip()
+        response = self.model_client.generate(
+            ModelRequest(
+                model=model_alias,
+                messages=[
+                    ModelMessage(role="system", content=PROMPT_VISUAL_PLAN_UNIQUENESS_JUDGE),
+                    ModelMessage(
+                        role="user",
+                        content=(
+                            f"Entity: {node.get('title') or ''}\n"
+                            f"Query: {query}\n"
+                            f"Planner reason: {reason}"
+                        ),
+                    ),
+                ],
+                metadata={"trace_label": f"visual_plan_judge:{node.get('title') or node.get('node_id') or ''}"},
+            )
+        )
+        keep, judge_reason = self._parse_plan_judge_response(response.content)
+        return {
+            **candidate,
+            "plan_judge_keep": keep,
+            "plan_judge_reason": judge_reason,
+            "plan_judge_raw_output": response.content,
+        }
 
     @staticmethod
     def _prompt_input(node: dict[str, Any], page_text: str, target_budget: int) -> str:
         title = node.get("title") or ""
         attributes = node.get("attributes") or {}
         return (
-            "Complete the following person.\n\n"
+            "Complete the following Wikipedia entity.\n\n"
             f"Entity: {title}\n"
             f"Attributes: {attributes}\n\n"
             "Content:\n"
@@ -346,8 +477,8 @@ class LLMVisualSearchPlanner:
             "- Output only repeated <query>...</query><reason>...</reason> blocks.\n"
             "- Do not output markdown fences, bullets, JSON, headings, or any extra text.\n"
             "- Each <query> must be a single rewritten search query.\n"
-            "- Each <reason> must explain uniqueness and likely online existence.\n"
-            f"- Output at most {target_budget} results."
+            "- Each <reason> must explain time, people/main subject, and event/scene convergence.\n"
+            f"- Output between 2 and {target_budget} results only when suitable plans exist; otherwise output nothing."
         )
 
     @staticmethod
@@ -381,6 +512,14 @@ class LLMVisualSearchPlanner:
             candidates.append({"query": query, "reason": reason})
         return candidates
 
+    @staticmethod
+    def _parse_plan_judge_response(text: str) -> tuple[bool, str | None]:
+        answer_match = re.search(r"<answer>(.*?)</answer>", text, flags=re.DOTALL | re.IGNORECASE)
+        reason_match = re.search(r"<reason>(.*?)</reason>", text, flags=re.DOTALL | re.IGNORECASE)
+        answer = answer_match.group(1).strip().upper() if answer_match else ""
+        reason = re.sub(r"\s+", " ", reason_match.group(1)).strip() if reason_match else None
+        return answer == "TRUE", reason
+
     def _candidate_to_plan(
         self,
         candidate: dict[str, Any],
@@ -411,6 +550,8 @@ class LLMVisualSearchPlanner:
                 "downstream_use": downstream_use.value,
                 "query": query,
                 "reason": reason,
+                "plan_judge_reason": candidate.get("plan_judge_reason"),
+                "plan_judge_raw_output": candidate.get("plan_judge_raw_output"),
                 "expected_visual": query,
                 "source_evidence_ids": source_evidence_ids,
                 "run_id": run_id,
@@ -443,6 +584,7 @@ class LLMVisualSearchPlanner:
                 "downstream_use": downstream_use.value,
                 "query": query,
                 "reason": reason,
+                "plan_judge_reason": candidate.get("plan_judge_reason"),
                 "target_budget": target_budget,
             },
         )
@@ -487,6 +629,12 @@ def _smoke_test() -> None:
     class MockModel:
         def generate(self, request: ModelRequest) -> ModelResponse:
             assert request.model == "mock_planner"
+            if request.messages[0].content == PROMPT_VISUAL_PLAN_UNIQUENESS_JUDGE:
+                return ModelResponse(
+                    content="""<thinking>The event and participant are specific.</thinking>
+<answer>TRUE</answer>
+<reason>One identifiable final-game event.</reason>"""
+                )
             return ModelResponse(
                 content="""<query>Kobe Bryant final game in 2016 photo</query>
 <reason>The passage points to one specific event, Kobe Bryant's final NBA game in 2016. Photos of that game are widely available online, and different matching images still depict the same uniquely identified event.</reason>"""
@@ -513,7 +661,7 @@ def _smoke_test() -> None:
         "First paragraph.\n\nSecond paragraph.",
         1,
     )
-    assert "Complete the following person." in prompt_input
+    assert "Complete the following Wikipedia entity." in prompt_input
     assert "P1: First paragraph." in prompt_input
     assert "P2: Second paragraph." in prompt_input
     print("visual_planner smoke test passed")
