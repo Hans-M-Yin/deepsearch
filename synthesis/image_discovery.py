@@ -67,6 +67,41 @@ def _jsonify(value: Any) -> Any:
     return value
 
 
+def _short_debug_text(text: str | None, limit: int = 240) -> str | None:
+    if text is None:
+        return None
+    compact = re.sub(r"\s+", " ", str(text)).strip()
+    if len(compact) <= limit:
+        return compact
+    return compact[: max(0, limit - 3)].rstrip() + "..."
+
+
+def _image_source_kind(url: str | None) -> str:
+    if not url:
+        return "missing"
+    if str(url).startswith("data:"):
+        return "data_url"
+    return "remote_url"
+
+
+def _format_debug_image_source(url: str | None) -> str | None:
+    if not url:
+        return None
+    raw = str(url)
+    if raw.startswith("data:"):
+        header, _, payload = raw.partition(",")
+        return f"{header},<payload_len={len(payload)}>"
+    return _short_debug_text(raw, limit=240)
+
+
+def _log_image_debug(label: str, **payload: Any) -> None:
+    print(
+        f"[{label}] {json.dumps(_jsonify(payload), ensure_ascii=False, default=str)}",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
 class ImageCandidateStatus(str, Enum):
     ACCEPTED = "accepted"
     REJECTED = "rejected"
@@ -1380,6 +1415,7 @@ class ImageDiscoveryBuilder:
                 plan_id=plan.plan_id,
                 search_result=search_result,
                 model_image_url=model_image_url,
+                resolved_asset=resolved_asset,
             )
             response = self.model_client.generate(
                 ModelRequest(
@@ -1410,6 +1446,7 @@ class ImageDiscoveryBuilder:
                 plan_id=plan.plan_id,
                 search_result=search_result,
                 model_image_url=model_image_url,
+                resolved_asset=resolved_asset,
                 model_output=response.content,
             )
         except Exception as exc:
@@ -1898,10 +1935,28 @@ class ImageDiscoveryBuilder:
         if persist_asset:
             cached = self._resolved_image_cache.get(cache_key)
             if cached is not None:
+                _log_image_debug(
+                    "image-resolve-cache-hit",
+                    image_url=image_url,
+                    source_page_url=source_page_url,
+                    persist_asset=persist_asset,
+                    strategy=cached.strategy,
+                    resolved_url=cached.resolved_url,
+                    model_image_source_kind=_image_source_kind(cached.model_url),
+                )
                 return cached, None
         else:
             cached = self._transient_image_cache.get(cache_key)
             if cached is not None:
+                _log_image_debug(
+                    "image-resolve-cache-hit",
+                    image_url=image_url,
+                    source_page_url=source_page_url,
+                    persist_asset=persist_asset,
+                    strategy=cached.strategy,
+                    resolved_url=cached.resolved_url,
+                    model_image_source_kind=_image_source_kind(cached.model_url),
+                )
                 return cached, None
 
         attempted_errors: list[str] = []
@@ -1914,6 +1969,18 @@ class ImageDiscoveryBuilder:
         )
         if direct_asset is not None:
             (self._resolved_image_cache if persist_asset else self._transient_image_cache)[cache_key] = direct_asset
+            _log_image_debug(
+                "image-resolve-success",
+                image_url=image_url,
+                source_page_url=source_page_url,
+                persist_asset=persist_asset,
+                strategy=direct_asset.strategy,
+                resolved_url=direct_asset.resolved_url,
+                content_type=direct_asset.content_type,
+                width=direct_asset.width,
+                height=direct_asset.height,
+                model_image_source_kind=_image_source_kind(direct_asset.model_url),
+            )
             return direct_asset, None
         if direct_error:
             attempted_errors.append(direct_error)
@@ -1934,11 +2001,31 @@ class ImageDiscoveryBuilder:
                         recovered_url=recovered_url,
                         source_page_url=source_page_url,
                     )
+                    _log_image_debug(
+                        "image-resolve-success",
+                        image_url=image_url,
+                        source_page_url=source_page_url,
+                        persist_asset=persist_asset,
+                        strategy=recovered_asset.strategy,
+                        resolved_url=recovered_asset.resolved_url,
+                        content_type=recovered_asset.content_type,
+                        width=recovered_asset.width,
+                        height=recovered_asset.height,
+                        model_image_source_kind=_image_source_kind(recovered_asset.model_url),
+                    )
                     return recovered_asset, None
                 if recovered_error:
                     attempted_errors.append(recovered_error)
 
-        return None, " | ".join(attempted_errors) if attempted_errors else "unresolved_image_asset"
+        final_error = " | ".join(attempted_errors) if attempted_errors else "unresolved_image_asset"
+        _log_image_debug(
+            "image-resolve-failed",
+            image_url=image_url,
+            source_page_url=source_page_url,
+            persist_asset=persist_asset,
+            error=final_error,
+        )
+        return None, final_error
 
     def _download_and_prepare_image_asset(
         self,
@@ -1999,6 +2086,20 @@ class ImageDiscoveryBuilder:
                 else None
             ) or cache_path
         model_url = self._data_url(resized_content_type, resized_payload)
+        _log_image_debug(
+            "image-asset-ready",
+            strategy=strategy,
+            image_url=image_url,
+            source_page_url=source_page_url,
+            persist_asset=persist_asset,
+            content_type=resized_content_type,
+            width=width,
+            height=height,
+            cache_path=cache_path,
+            asset_uri=asset_uri,
+            model_image_source_kind=_image_source_kind(model_url),
+            model_image_source=_format_debug_image_source(model_url),
+        )
         return (
             ResolvedImageAsset(
                 cache_key=cache_key,
@@ -2325,7 +2426,12 @@ class ImageDiscoveryBuilder:
 
     @staticmethod
     def _log_invalid_image_url(image_url: str | None, reason: str, *, stage: str) -> None:
-        return
+        _log_image_debug(
+            "image-invalid-url",
+            stage=stage,
+            image_url=image_url,
+            reason=reason,
+        )
 
     @staticmethod
     def _log_image_download(
@@ -2337,7 +2443,16 @@ class ImageDiscoveryBuilder:
         attempt: int,
         max_bytes: int | None,
     ) -> None:
-        return
+        _log_image_debug(
+            "image-download-ok",
+            image_url=image_url,
+            byte_count=byte_count,
+            byte_count_human=ImageDiscoveryBuilder._format_byte_count(byte_count),
+            elapsed_s=round(elapsed_s, 3),
+            content_type=content_type,
+            attempt=attempt,
+            max_bytes=max_bytes,
+        )
 
     @staticmethod
     def _log_image_download_failure(
@@ -2347,7 +2462,13 @@ class ImageDiscoveryBuilder:
         elapsed_s: float,
         attempt: int,
     ) -> None:
-        return
+        _log_image_debug(
+            "image-download-failed",
+            image_url=image_url,
+            reason=reason,
+            elapsed_s=round(elapsed_s, 3),
+            attempt=attempt,
+        )
 
     @staticmethod
     def _format_byte_count(size: int) -> str:
@@ -2365,7 +2486,12 @@ class ImageDiscoveryBuilder:
         recovered_url: str,
         source_page_url: str | None,
     ) -> None:
-        return
+        _log_image_debug(
+            "image-url-recovered",
+            original_url=original_url,
+            recovered_url=recovered_url,
+            source_page_url=source_page_url,
+        )
 
     @staticmethod
     def _log_image_result_fate(
@@ -2378,7 +2504,19 @@ class ImageDiscoveryBuilder:
         reason: str,
         raw_model_output: str | None = None,
     ) -> None:
-        return
+        _log_image_debug(
+            "image-result-fate",
+            plan_id=plan_id,
+            query=query,
+            result_index=result_index,
+            title=search_result.title if search_result is not None else None,
+            image_url=search_result.image_url if search_result is not None else None,
+            source_page_url=search_result.source_page_url if search_result is not None else None,
+            thumbnail_url=search_result.thumbnail_url if search_result is not None else None,
+            fate=fate,
+            reason=reason,
+            raw_model_output_preview=_short_debug_text(raw_model_output, limit=240),
+        )
 
     def _image_check_with_mllm(
         self,
@@ -2399,6 +2537,7 @@ class ImageDiscoveryBuilder:
             plan_id=plan.plan_id,
             search_result=search_result,
             model_image_url=image_for_model,
+            resolved_asset=resolved_asset,
         )
         response = self.model_client.generate(
             ModelRequest(
@@ -2432,6 +2571,7 @@ class ImageDiscoveryBuilder:
             plan_id=plan.plan_id,
             search_result=search_result,
             model_image_url=image_for_model,
+            resolved_asset=resolved_asset,
             model_output=response.content,
         )
         return self._parse_image_check_response(
@@ -2450,9 +2590,27 @@ class ImageDiscoveryBuilder:
         plan_id: str,
         search_result: ImageSearchResult,
         model_image_url: str | None,
+        resolved_asset: ResolvedImageAsset | None = None,
         model_output: str | None = None,
     ) -> None:
-        return
+        _log_image_debug(
+            "image-llm-call",
+            stage=stage,
+            when=when,
+            model_alias=model_alias,
+            plan_id=plan_id,
+            image_attached=bool(model_image_url),
+            model_image_source_kind=_image_source_kind(model_image_url),
+            model_image_source=_format_debug_image_source(model_image_url),
+            search_result_image_url=search_result.image_url,
+            search_result_source_page_url=search_result.source_page_url,
+            search_result_thumbnail_url=search_result.thumbnail_url,
+            resolved_strategy=resolved_asset.strategy if resolved_asset is not None else None,
+            resolved_url=resolved_asset.resolved_url if resolved_asset is not None else None,
+            resolved_content_type=resolved_asset.content_type if resolved_asset is not None else None,
+            resolved_cache_path=resolved_asset.cache_path if resolved_asset is not None else None,
+            model_output_preview=_short_debug_text(model_output, limit=240),
+        )
 
     @staticmethod
     def _image_check_prompt_input(
