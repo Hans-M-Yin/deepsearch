@@ -117,6 +117,42 @@ class SearchResponse:
         return _jsonify(asdict(self))
 
 
+def _log_serper_results(response: SearchResponse) -> None:
+    """Print the parsed Serper response so search failures are visible in terminal traces."""
+
+    print(
+        "[serper-results]"
+        f" engine={response.engine}"
+        f" query={response.query!r}"
+        f" status_code={response.status_code}"
+        f" result_count={len(response.results)}",
+        file=sys.stderr,
+        flush=True,
+    )
+    for index, result in enumerate(response.results, start=1):
+        if isinstance(result, ImageSearchResult):
+            print(
+                "[serper-results]"
+                f" index={index}"
+                f" rank={result.rank}"
+                f" title={result.title!r}"
+                f" image_url={result.image_url!r}"
+                f" source_page_url={result.source_page_url!r}",
+                file=sys.stderr,
+                flush=True,
+            )
+        else:
+            print(
+                "[serper-results]"
+                f" index={index}"
+                f" rank={result.rank}"
+                f" title={result.title!r}"
+                f" url={result.url!r}",
+                file=sys.stderr,
+                flush=True,
+            )
+
+
 class SearchClient(Protocol):
     """Minimal search interface used by graph builders."""
 
@@ -515,24 +551,28 @@ class SerperAdapterSearchClient:
     def search_text(self, query: str, *, limit: int = 10, **kwargs: Any) -> SearchResponse:
         body = self._serper_body(_augment_text_query(query), limit, kwargs)
         raw = self._post_json("/search", body)
-        return SearchResponse(
+        response = SearchResponse(
             query=query,
             engine="serper_adapter:search",
             results=OpenSerpSearchClient._parse_text_results(raw),
             raw_response=raw,
             status_code=200,
         )
+        _log_serper_results(response)
+        return response
 
     def search_image(self, query: str, *, limit: int = 10, **kwargs: Any) -> SearchResponse:
         body = self._serper_body(query, limit, kwargs)
         raw = self._post_json("/images", body)
-        return SearchResponse(
+        response = SearchResponse(
             query=query,
             engine="serper_adapter:images",
             results=OpenSerpSearchClient._parse_image_results(raw),
             raw_response=raw,
             status_code=200,
         )
+        _log_serper_results(response)
+        return response
 
     @staticmethod
     def _serper_body(query: str, limit: int, params: dict[str, Any]) -> dict[str, Any]:
@@ -608,7 +648,7 @@ class SerperSearchClient:
 
     def search_text(self, query: str, *, limit: int = 10, **kwargs: Any) -> SearchResponse:
         raw, status_code, metadata = self._post_json(self.search_url, self._serper_body(_augment_text_query(query), limit, kwargs))
-        return SearchResponse(
+        response = SearchResponse(
             query=query,
             engine="serper:search",
             results=self._parse_text_results(raw),
@@ -616,10 +656,12 @@ class SerperSearchClient:
             status_code=status_code,
             metadata=metadata,
         )
+        _log_serper_results(response)
+        return response
 
     def search_image(self, query: str, *, limit: int = 10, **kwargs: Any) -> SearchResponse:
         raw, status_code, metadata = self._post_json(self.images_url, self._serper_body(query, limit, kwargs))
-        return SearchResponse(
+        response = SearchResponse(
             query=query,
             engine="serper:images",
             results=self._parse_image_results(raw),
@@ -627,6 +669,8 @@ class SerperSearchClient:
             status_code=status_code,
             metadata=metadata,
         )
+        _log_serper_results(response)
+        return response
 
     def _post_json(self, url: str, body: dict[str, Any]) -> tuple[dict[str, Any], int, dict[str, Any]]:
         api_key = self.api_key
