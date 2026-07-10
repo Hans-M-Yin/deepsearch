@@ -105,11 +105,16 @@ def _print_candidate_list(title: str, candidates: list[dict[str, Any]]) -> None:
     for index, candidate in enumerate(candidates, start=1):
         search_result = candidate.get("search_result") or {}
         validation = candidate.get("validation") or {}
+        validation_metadata = validation.get("metadata") or {}
+        resolved_image = validation_metadata.get("resolved_image") or {}
         print(f"{index}. title: {search_result.get('title') or ''}")
         print(f"   image_url: {search_result.get('image_url') or ''}")
+        print(f"   source_page_url: {search_result.get('source_page_url') or ''}")
         print(f"   status: {validation.get('status') or ''}")
         print(f"   confidence: {validation.get('confidence')}")
         print(f"   reason: {validation.get('reason') or ''}")
+        print(f"   resolved_strategy: {resolved_image.get('strategy') or ''}")
+        print(f"   resolved_url: {resolved_image.get('resolved_url') or ''}")
 
 
 def _enum_value(value: Any) -> Any:
