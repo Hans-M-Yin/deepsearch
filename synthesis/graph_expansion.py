@@ -1097,6 +1097,7 @@ class GraphExpansionStrategy:
                 "source_page_url": candidate.source_page_url,
                 "file_page_url": candidate.file_page_url,
                 "image_url": candidate.image_url,
+                "thumbnail_url": candidate.thumbnail_url,
                 "caption": caption,
                 "rank": candidate.rank,
             },
@@ -1111,6 +1112,7 @@ class GraphExpansionStrategy:
                 "source_page_url": candidate.source_page_url,
                 "file_page_url": candidate.file_page_url,
                 "image_url": candidate.image_url,
+                "thumbnail_url": candidate.thumbnail_url,
                 "rank": candidate.rank,
             },
         )
@@ -1123,6 +1125,7 @@ class GraphExpansionStrategy:
             metadata={
                 "plan_source": "wikipedia_inline_image",
                 "image_url": candidate.image_url,
+                "thumbnail_url": candidate.thumbnail_url,
                 "source_page_url": candidate.source_page_url,
                 "file_page_url": candidate.file_page_url,
                 "caption": caption,
@@ -1152,11 +1155,13 @@ class GraphExpansionStrategy:
             title=title,
             image_url=image_url,
             source_page_url=source_page_url,
+            thumbnail_url=metadata.get("thumbnail_url"),
             snippet=caption,
             source="wikipedia_inline",
             rank=metadata.get("rank"),
             raw={
                 "file_page_url": file_page_url,
+                "thumbnail_url": metadata.get("thumbnail_url"),
                 "raw_caption": metadata.get("raw_caption"),
                 "alt_text": metadata.get("alt_text"),
                 "plan_source": "wikipedia_inline_image",

@@ -60,6 +60,7 @@ def _build_plan(*, text_result: Any, candidate: Any, run_id: str) -> VisualSearc
             "source_page_url": candidate.source_page_url,
             "file_page_url": candidate.file_page_url,
             "image_url": candidate.image_url,
+            "thumbnail_url": candidate.thumbnail_url,
             "caption": caption,
             "rank": candidate.rank,
         },
@@ -74,6 +75,7 @@ def _build_plan(*, text_result: Any, candidate: Any, run_id: str) -> VisualSearc
             "source_page_url": candidate.source_page_url,
             "file_page_url": candidate.file_page_url,
             "image_url": candidate.image_url,
+            "thumbnail_url": candidate.thumbnail_url,
             "rank": candidate.rank,
         },
     )
@@ -86,6 +88,7 @@ def _build_plan(*, text_result: Any, candidate: Any, run_id: str) -> VisualSearc
         metadata={
             "plan_source": "wikipedia_inline_image",
             "image_url": candidate.image_url,
+            "thumbnail_url": candidate.thumbnail_url,
             "source_page_url": candidate.source_page_url,
             "file_page_url": candidate.file_page_url,
             "caption": caption,
@@ -102,11 +105,13 @@ def _build_search_result(candidate: Any) -> ImageSearchResult:
         title=title,
         image_url=candidate.image_url,
         source_page_url=candidate.source_page_url,
+        thumbnail_url=candidate.thumbnail_url,
         snippet=candidate.caption,
         source="wikipedia_inline",
         rank=candidate.rank,
         raw={
             "file_page_url": candidate.file_page_url,
+            "thumbnail_url": candidate.thumbnail_url,
             "raw_caption": candidate.raw_caption,
             "alt_text": candidate.alt_text,
             "plan_source": "wikipedia_inline_image",
@@ -184,6 +189,7 @@ def main(argv: list[str] | None = None) -> int:
                 "drop_candidate": validation.drop_candidate,
                 "reason": validation.reason,
                 "image_url": candidate.image_url,
+                "thumbnail_url": candidate.thumbnail_url,
                 "file_page_url": candidate.file_page_url,
                 "caption": candidate.caption,
                 "raw_caption": candidate.raw_caption,
@@ -210,6 +216,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"keep: {'yes' if item['keep'] else 'no'}")
         print(f"reason: {item.get('reason') or '-'}")
         print(f"image_url: {item.get('image_url') or ''}")
+        print(f"thumbnail_url: {item.get('thumbnail_url') or ''}")
         print(f"file_page_url: {item.get('file_page_url') or ''}")
         print(f"caption: {_short(item.get('caption'), 400)}")
         print(f"alt_text: {_short(item.get('alt_text'), 240)}")

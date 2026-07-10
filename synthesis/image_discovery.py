@@ -235,11 +235,11 @@ reason: short reason
 
 PROMPT_WIKI_INLINE_IMAGE_QUESTION = """
 I’m determining whether a user recognizes a particular image or its main content, and I need you to help me come up with a question to ask the user.
-You will be given the image, a brief description of the image, and the Wikipedia page the image comes from. The question you propose should focus on the semantic content of the image rather than purely visual details. In other words, it should require world knowledge to answer, such as identifying people, scenes, objects, and so on.
+You will be given the image, a brief description of the image, and the Wikipedia page the image comes from. The question you propose should focus on the semantic content of the image rather than purely visual details. In other words, it should require world knowledge to answer, such as identifying people, objects, and so on.
 
 Requirements:
 1. The question must point to a clearly defined target and be unambiguous.
-2. Since you may also be unable to directly identify the people, objects, or scene in the image, you should use the provided image description and the subject of the associated Wikipedia page to make a reliable inference about the people and objects shown.
+2. Since you may also be unable to directly identify the people, objects or other entities that have unique names in the image, you should use the provided image description and the subject of the associated Wikipedia page to make a reliable inference about the people and objects shown.
 3. Output format: please follow the format below exactly:
 <thinking>Your reasoning process</thinking>
 <question>The question you propose</question>
@@ -250,8 +250,8 @@ Example 1:
 Wikipedia: Donald Trump
 description: Taking the presidential oath of office, administered by Chief Justice John Roberts, on January 20, 2017
 <thinking>Based on the image, the man in the foreground wearing a red tie can be identified as Trump. Standing next to him is his wife Melania, and his youngest son Barron, wearing a dark blue tie, is also beside them. The man with a balding hairstyle, seen from behind and administering the oath, can be inferred from the description and world knowledge to be John Roberts. Now I can ask a question to determine whether the user recognizes the main figures and the event shown in the image.</thinking>
-<question>What event is taking place in this photo, who is the man in the foreground wearing the red tie, and who is the balding man seen from behind?</question>
-<answer>Donald Trump’s presidential inauguration oath ceremony; Donald Trump; John Roberts</answer>
+<question>Who is the man in the foreground wearing the red tie, and who is the balding man seen from behind?</question>
+<answer>Donald Trump; John Roberts</answer>
 
 Example 2:
 (a gameplay screenshot)

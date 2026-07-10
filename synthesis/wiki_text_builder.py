@@ -339,6 +339,7 @@ class WikiInlineImageCandidate:
 
     image_url: str
     source_page_url: str
+    thumbnail_url: str | None = None
     file_page_url: str | None = None
     caption: str | None = None
     raw_caption: str | None = None
@@ -970,6 +971,8 @@ class WikiTextBuilder:
             parsed = cls._parse_nested_image_block(block, source_url=source_url)
             if parsed is None:
                 continue
+            thumbnail_url = parsed["image_url"]
+            image_url = cls._wikimedia_original_image_url(thumbnail_url) or thumbnail_url
             caption_block = cls._next_nonempty_block(blocks, start=index + 1)
             caption_text = cls._clean_markdown_text(caption_block) if caption_block else None
             if not caption_text:
@@ -977,8 +980,9 @@ class WikiTextBuilder:
             rank += 1
             images.append(
                 WikiInlineImageCandidate(
-                    image_url=parsed["image_url"],
+                    image_url=image_url,
                     source_page_url=source_url,
+                    thumbnail_url=thumbnail_url if image_url != thumbnail_url else None,
                     file_page_url=parsed.get("file_page_url") or None,
                     caption=caption_text or None,
                     raw_caption=caption_block,
@@ -1660,6 +1664,26 @@ class WikiTextBuilder:
             "file_page_url": file_page_url or "",
             "alt_text": alt_text,
         }
+
+    @staticmethod
+    def _wikimedia_original_image_url(thumbnail_url: str) -> str | None:
+        parsed = urlparse(str(thumbnail_url or "").strip())
+        if parsed.hostname != "upload.wikimedia.org":
+            return None
+        path_parts = parsed.path.split("/")
+        try:
+            thumb_index = path_parts.index("thumb")
+        except ValueError:
+            return None
+        if thumb_index + 2 >= len(path_parts):
+            return None
+
+        original_parts = path_parts[:thumb_index] + path_parts[thumb_index + 1 : -1]
+        original_path = "/".join(original_parts)
+        original_name = unquote(original_parts[-1]).lower()
+        if not original_name.endswith((".jpg", ".jpeg", ".png", ".webp", ".gif")):
+            return None
+        return parsed._replace(path=original_path, params="", query="", fragment="").geturl()
 
     @classmethod
     def _clean_markdown_text(cls, text: str | None) -> str:
