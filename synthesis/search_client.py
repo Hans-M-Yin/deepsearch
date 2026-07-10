@@ -117,6 +117,31 @@ class SearchResponse:
         return _jsonify(asdict(self))
 
 
+def _log_serper_request(*, url: str, body: dict[str, Any]) -> None:
+    """Log an outbound Serper request before network I/O begins."""
+
+    print(
+        "[serper-request]"
+        f" url={url!r}"
+        f" body={json.dumps(body, ensure_ascii=False)}",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
+def _log_serper_raw_response(*, url: str, status_code: int, raw: dict[str, Any]) -> None:
+    """Log Serper's unmodified parsed JSON response before result parsing."""
+
+    print(
+        "[serper-raw-response]"
+        f" url={url!r}"
+        f" status_code={status_code}"
+        f" raw={json.dumps(raw, ensure_ascii=False, default=str)}",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
 def _log_serper_results(response: SearchResponse) -> None:
     """Print the parsed Serper response so search failures are visible in terminal traces."""
 
@@ -600,9 +625,11 @@ class SerperAdapterSearchClient:
         return body
 
     def _post_json(self, path: str, body: dict[str, Any]) -> dict[str, Any]:
+        url = f"{self.base_url}{path}"
+        _log_serper_request(url=url, body=body)
         payload = json.dumps(body).encode("utf-8")
         request = Request(
-            f"{self.base_url}{path}",
+            url,
             data=payload,
             headers={
                 "Accept": "application/json",
@@ -613,7 +640,10 @@ class SerperAdapterSearchClient:
         )
         with urlopen(request, timeout=self.timeout_s) as response:
             response_payload = response.read().decode("utf-8")
-        return json.loads(response_payload)
+            status_code = response.getcode()
+        raw = json.loads(response_payload)
+        _log_serper_raw_response(url=url, status_code=status_code, raw=raw)
+        return raw
 
 
 class SerperSearchClient:
@@ -683,6 +713,7 @@ class SerperSearchClient:
                 f"at {_FIXED_SERPER_KEYS_FILE}."
             )
 
+        _log_serper_request(url=url, body=body)
         payload = json.dumps(body).encode("utf-8")
         request = Request(
             url,
@@ -712,6 +743,7 @@ class SerperSearchClient:
                 message += f" Response body: {error_payload}"
             raise RuntimeError(message) from exc
         raw = json.loads(response_payload)
+        _log_serper_raw_response(url=url, status_code=status_code, raw=raw)
         self._log_raw_response(url=url, body=body, status_code=status_code, raw=raw)
         metadata = {
             "serper_key_pool": pool_metadata if pool_metadata else None,
