@@ -117,6 +117,19 @@ class SearchResponse:
         return _jsonify(asdict(self))
 
 
+def _log_serper_key(*, url: str, api_key: str, metadata: dict[str, Any] | None = None) -> None:
+    """Log the exact Serper API key selected for an outbound request."""
+
+    print(
+        "[serper-key]"
+        f" url={url!r}"
+        f" api_key={api_key!r}"
+        f" metadata={json.dumps(metadata or {}, ensure_ascii=False, default=str)}",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
 def _log_serper_request(*, url: str, body: dict[str, Any]) -> None:
     """Log an outbound Serper request before network I/O begins."""
 
@@ -626,6 +639,7 @@ class SerperAdapterSearchClient:
 
     def _post_json(self, path: str, body: dict[str, Any]) -> dict[str, Any]:
         url = f"{self.base_url}{path}"
+        _log_serper_key(url=url, api_key=self.api_key, metadata={"client": self.__class__.__name__})
         _log_serper_request(url=url, body=body)
         payload = json.dumps(body).encode("utf-8")
         request = Request(
@@ -713,6 +727,7 @@ class SerperSearchClient:
                 f"at {_FIXED_SERPER_KEYS_FILE}."
             )
 
+        _log_serper_key(url=url, api_key=api_key, metadata=pool_metadata)
         _log_serper_request(url=url, body=body)
         payload = json.dumps(body).encode("utf-8")
         request = Request(
