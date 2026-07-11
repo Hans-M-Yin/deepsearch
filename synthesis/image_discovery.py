@@ -264,6 +264,36 @@ entity: candidate name | block|keep | short reason
 """
 
 
+PROMPT_TEXT_TO_IMAGE_RELATION_REWRITE = """You are rewriting an image-search query into a source-aware graph relation.
+
+Goal:
+- The original search query already identifies one unique image or visual scene.
+- Rewrite it into a short relation phrase that connects the source text node to that image node more naturally.
+
+Requirements:
+1. Make only minimal edits to the original search query.
+2. Preserve every uniqueness-bearing detail, including the main entity, event, action, date, place, and distinctive scene details.
+3. Make the phrase read naturally as a relation from the source node to the image.
+4. Prefer replacing repeated mentions of the source title with a pronoun or possessive when this is natural and unambiguous.
+5. Do not broaden the query, drop key details, or add unsupported facts.
+6. Do not output a full sentence. Output a short phrase only.
+
+Examples:
+Source title: Kobe Bryant
+Original search query: Kobe Bryant giving his farewell "Mamba Out" speech at center court after his final NBA game on April 13, 2016
+Relation: his farewell "Mamba Out" speech at center court after his final NBA game on April 13, 2016
+
+Source title: Lionel Messi
+Original search query: Lionel Messi sleeping while hugging the World Cup trophy after the 2022 FIFA World Cup final
+Relation: his photo of himself sleeping while hugging the World Cup trophy after the 2022 FIFA World Cup final
+
+Return valid JSON with exactly this field:
+{
+  "relation": "..."
+}
+"""
+
+
 PROMPT_IMAGE_ENTITY_RESOLUTION = """You are selecting the best Wikipedia candidate for linking one image-grounded entity into the multimodal graph.
 
 Given one grounded entity from an image and a candidate list, decide whether one candidate can be confidently selected.
@@ -1234,6 +1264,12 @@ class ImageDiscoveryBuilder:
         ]
         source_node_title = self._source_node_title(plan.source_node_id) or plan.target.content
         primary_caption = candidate.grounded_caption or provisional_node.caption or candidate.search_result.snippet
+        primary_query = (
+            candidate.source_query.query
+            or plan.target.content
+            or candidate.search_result.title
+            or ""
+        )
         primary_image_uri = (
             resolved_asset.asset_uri
             if resolved_asset is not None
@@ -1245,19 +1281,26 @@ class ImageDiscoveryBuilder:
             image_variants=variants,
             source_page_url=candidate.search_result.source_page_url,
             caption=primary_caption,
-            title=candidate.search_result.title,
+            title=primary_query or candidate.search_result.title,
             width=resolved_asset.width if resolved_asset is not None and resolved_asset.width is not None else candidate.search_result.width,
             height=resolved_asset.height if resolved_asset is not None and resolved_asset.height is not None else candidate.search_result.height,
             content_type=resolved_asset.content_type if resolved_asset is not None else self._content_type(candidate.search_result),
             run_id=run_id,
             metadata={
-                "search_query": candidate.source_query.query,
+                "search_query": primary_query,
                 "candidate_count": len(result.candidates),
                 "visual_target": plan.target.content,
                 "resolved_image": resolved_asset.to_metadata() if resolved_asset is not None else None,
             },
         )
         self._apply_grounding_to_image_node(image_node, grounding)
+
+        edge_relation, relation_rewrite_metadata = self._rewrite_text_to_image_relation(
+            source_node_title=source_node_title,
+            search_query=primary_query,
+            image_node=image_node,
+            resolved_asset=resolved_asset,
+        )
 
         original_asset = self._image_asset(
             candidate.search_result,
@@ -1320,6 +1363,8 @@ class ImageDiscoveryBuilder:
                 search_result=candidate.search_result,
                 run_id=run_id,
                 used_fallback=candidate.used_fallback,
+                relation=edge_relation,
+                relation_metadata=relation_rewrite_metadata,
             )
         grounded_edges, queued_tasks = self._link_or_queue_grounded_entities(
             image_node=image_node,
@@ -3804,6 +3849,87 @@ class ImageDiscoveryBuilder:
         normalized = re.sub(r"\s+", " ", re.sub(r"[^0-9a-zA-Z]+", " ", (entity_type or "").lower())).strip()
         return normalized or None
 
+    @staticmethod
+    def _normalize_relation_rewrite_key(text: str | None) -> str:
+        return re.sub(r"\s+", " ", str(text or "")).strip().lower()
+
+    def _rewrite_text_to_image_relation(
+        self,
+        *,
+        source_node_title: str | None,
+        search_query: str | None,
+        image_node: ImageNode,
+        resolved_asset: ResolvedImageAsset | None,
+    ) -> tuple[str, dict[str, Any]]:
+        raw_query = str(search_query or "").strip()
+        if not raw_query:
+            return "retrieved_image_for_visual_target", {
+                "relation_rewrite_applied": False,
+                "relation_rewrite_reason": "missing_search_query",
+            }
+
+        model_alias = (
+            os.environ.get("IMAGE_RELATION_REWRITE_MODEL")
+            or os.environ.get("IMAGE_GROUND_MODEL")
+            or self.image_check_model_alias
+            or os.environ.get("IMAGE_CHECK_MODEL")
+        )
+        if not model_alias:
+            return raw_query, {
+                "relation_rewrite_applied": False,
+                "relation_rewrite_reason": "missing_model_alias",
+            }
+
+        user_parts: list[dict[str, Any]] = [
+            {
+                "type": "text",
+                "text": (
+                    f"Source text node title:\n{source_node_title or ''}\n\n"
+                    f"Original search query:\n{raw_query}\n\n"
+                    f"Image node title:\n{image_node.title or ''}\n\n"
+                    f"Grounded image caption:\n{image_node.caption or ''}"
+                ),
+            }
+        ]
+        if resolved_asset is not None and resolved_asset.model_url:
+            user_parts.append({"type": "image_url", "image_url": {"url": resolved_asset.model_url}})
+
+        try:
+            response = self.model_client.generate(
+                ModelRequest(
+                    model=model_alias,
+                    response_format={"type": "json_object"},
+                    messages=[
+                        ModelMessage(role="system", content=PROMPT_TEXT_TO_IMAGE_RELATION_REWRITE),
+                        ModelMessage(role="user", content=user_parts),
+                    ],
+                    metadata={
+                        "trace_label": f"text_to_image_relation_rewrite:{source_node_title or ''}:{raw_query[:80]}"
+                    },
+                )
+            )
+            parsed = json.loads(response.content)
+        except Exception as exc:
+            return raw_query, {
+                "relation_rewrite_applied": False,
+                "relation_rewrite_reason": f"model_error:{exc.__class__.__name__}",
+            }
+
+        relation = str(parsed.get("relation") or "").strip()
+        if not relation:
+            return raw_query, {
+                "relation_rewrite_applied": False,
+                "relation_rewrite_reason": "empty_relation",
+                "relation_rewrite_model": model_alias,
+            }
+
+        applied = self._normalize_relation_rewrite_key(relation) != self._normalize_relation_rewrite_key(raw_query)
+        return relation, {
+            "relation_rewrite_applied": applied,
+            "relation_rewrite_reason": "model_output",
+            "relation_rewrite_model": model_alias,
+        }
+
     def _edge_from_plan_to_image(
         self,
         *,
@@ -3815,14 +3941,24 @@ class ImageDiscoveryBuilder:
         search_result: ImageSearchResult,
         run_id: str | None,
         used_fallback: bool,
+        relation: str | None = None,
+        relation_metadata: dict[str, Any] | None = None,
     ) -> Edge | None:
         if not plan.source_node_id:
             return None
+        edge_relation = relation or query.query or "retrieved_image_for_visual_target"
+        metadata = {
+            "query_id": query.query_id,
+            "query": query.query,
+            "used_fallback": used_fallback,
+        }
+        if relation_metadata:
+            metadata.update({key: value for key, value in relation_metadata.items() if value is not None})
         return Edge.create(
             plan.source_node_id,
             image_node.node_id,
             edge_type=EdgeType.SEARCH_RETRIEVED,
-            relation=query.query or "retrieved_image_for_visual_target",
+            relation=edge_relation,
             src_node_type=NodeType.TEXT.value,
             dst_node_type=NodeType.IMAGE.value,
             evidence_refs=[
@@ -3837,11 +3973,7 @@ class ImageDiscoveryBuilder:
                 builder=self.builder_name,
             ),
             extractor=self.builder_name,
-            metadata={
-                "query_id": query.query_id,
-                "query": query.query,
-                "used_fallback": used_fallback,
-            },
+            metadata=metadata,
             evidence_key=f"{query.query_id}:{image_node.node_id}",
         )
 
@@ -3969,6 +4101,8 @@ candidate_index: 0
 reason: exact local Wikipedia match
 </selection>"""
                 )
+            if "rewriting an image-search query into a source-aware graph relation" in system:
+                return ModelResponse(content=json.dumps({"relation": "his final game uniform photo"}))
             return ModelResponse(
                 content="""<ground>
 caption: Kobe Bryant in his final game
@@ -4032,8 +4166,12 @@ entity: Los Angeles Lakers | jersey logo | visible team branding on the uniform
             image = result.primary_image()
             assert image is not None
             assert result.image_node is not None
+            assert result.image_node.title == "Kobe Bryant final game uniform photo"
             assert result.image_node.caption == "Kobe Bryant in his final game"
             assert result.edge is not None
+            assert result.edge.relation == "his final game uniform photo"
+            assert result.edge.metadata.get("query") == "Kobe Bryant final game uniform photo"
+            assert result.edge.metadata.get("relation_rewrite_applied") is True
             assert result.grounded_edges
             assert result.image_node.metadata.get("image_grounding", {}).get("context") is not None
             assert store.stats()["nodes"] == 3

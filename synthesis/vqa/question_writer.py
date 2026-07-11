@@ -54,11 +54,11 @@ Important semantics by hop type:
   treat this as a normal entity-to-entity relation
 - text -> image:
   treat the target as a key photo / visual scene, not as an image file
-  the edge relation is the retrieval query for finding that image
-  preserve the query's distinctive details
-  do not generalize it into a vague scene description
-  you may lightly rewrite it into natural language, but you must keep the key
-  entity, event, action, and distinguishing scene details
+  the edge relation is the source-aware relation connecting the source node to that image
+  the destination image node's title / search_query is the original retrieval query for finding that image
+  preserve the relation's distinctive details and keep it aligned with the retrieval query
+  do not generalize either one into a vague scene description
+  keep the key entity, event, action, and distinguishing scene details intact
 - image -> text:
   treat the source as a visual clue inside the image, and treat the target as
   the entity identified by that clue
@@ -709,8 +709,16 @@ class QuestionWriter:
         target = target_label
         relation = str(parsed.get("relation") or hop.relation or hop.edge_type or "").strip()
         retrieval_query = str(parsed.get("retrieval_query") or "").strip()
-        if hop.src_modality == "text" and hop.dst_modality == "image" and not retrieval_query:
-            retrieval_query = str(hop.relation or "").strip()
+        if hop.src_modality == "text" and hop.dst_modality == "image":
+            raw_retrieval_query = self._hop_image_retrieval_query(hop)
+            if (
+                not retrieval_query
+                or (
+                    raw_retrieval_query
+                    and self._normalized_compact_text(retrieval_query) == self._normalized_compact_text(relation)
+                )
+            ):
+                retrieval_query = raw_retrieval_query or retrieval_query
         if not statement or not source or not target:
             return self._fallback_compress_hop(hop, source_label=source_label, target_label=target_label)
         return {
@@ -1516,10 +1524,28 @@ class QuestionWriter:
             return text
         return text.rstrip(".!") + "?"
 
+    @staticmethod
+    def _normalized_compact_text(text: Any) -> str:
+        return re.sub(r"\s+", " ", str(text or "")).strip().lower()
+
+    @classmethod
+    def _image_search_query(cls, content: dict[str, Any]) -> str:
+        title = str(content.get("title") or "").strip()
+        search_query = str(content.get("search_query") or "").strip()
+        if title and search_query and cls._normalized_compact_text(title) == cls._normalized_compact_text(search_query):
+            return title
+        return search_query or title
+
+    @classmethod
+    def _hop_image_retrieval_query(cls, hop: HopContext) -> str:
+        if hop.dst_modality != "image":
+            return ""
+        return cls._image_search_query(hop.dst_content)
+
     @classmethod
     def _hop_anchor_label(cls, content: dict[str, Any], *, fallback: str) -> str:
         if content.get("node_type") == "image":
-            search_query = cls._shorten_text(content.get("search_query"), limit=180)
+            search_query = cls._shorten_text(cls._image_search_query(content), limit=180)
             if search_query:
                 return f"the image that {search_query}"
             caption = cls._shorten_text(content.get("caption"), limit=180)
@@ -1780,8 +1806,10 @@ class QuestionWriter:
         if hop.src_modality == "text" and hop.dst_modality == "text":
             statement = f"{source_label} {relation} {target_label}".strip()
         elif hop.src_modality == "text" and hop.dst_modality == "image":
-            retrieval_query = str(hop.relation or "").strip()
-            if retrieval_query:
+            retrieval_query = QuestionWriter._hop_image_retrieval_query(hop)
+            if relation:
+                statement = f"{source_label} is associated with a key photo of {relation}."
+            elif retrieval_query:
                 statement = (
                     f"{source_label} is associated with a key photo or visual scene described by the query: "
                     f"{retrieval_query}."
