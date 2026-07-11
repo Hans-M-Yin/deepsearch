@@ -3573,14 +3573,13 @@ class ImageDiscoveryBuilder:
             for item in local_candidates
             if item.get("url")
         }
-        debug = {
-            "model_alias": model_alias,
-            "prompt_user_text": user_text,
-            "raw_model_output": response.content,
-            "decision": decision,
-            "wiki_candidates": [candidate.to_dict() for candidate in wiki_candidates],
-            "local_candidates": local_candidates,
-        }
+        debug = self._build_entity_resolution_debug_payload(
+            model_alias=model_alias,
+            decision=decision,
+            wiki_candidates=wiki_candidates,
+            local_candidates=local_candidates,
+            local_candidate_by_url=local_candidate_by_url,
+        )
         if decision["decision"] != "select":
             return None
         index = decision["candidate_index"]
@@ -3600,6 +3599,56 @@ class ImageDiscoveryBuilder:
             "matched_node": None,
             "resolved_target": chosen.to_dict(),
             "debug": debug,
+        }
+
+    @staticmethod
+    def _compact_entity_resolution_candidate(candidate: Any) -> dict[str, Any]:
+        raw = candidate.to_dict() if hasattr(candidate, "to_dict") else dict(candidate or {})
+        return {
+            "title": raw.get("title") or "",
+            "url": raw.get("url") or "",
+            "canonical_id": raw.get("canonical_id") or "",
+            "qid": raw.get("qid") or "",
+            "score": raw.get("score"),
+            "source": raw.get("source") or "",
+        }
+
+    @staticmethod
+    def _compact_local_resolution_match(item: dict[str, Any] | None) -> dict[str, Any] | None:
+        if not item:
+            return None
+        node = item.get("node") or {}
+        return {
+            "node_id": node.get("node_id") or "",
+            "title": node.get("title") or "",
+            "url": item.get("url") or "",
+        }
+
+    def _build_entity_resolution_debug_payload(
+        self,
+        *,
+        model_alias: str,
+        decision: dict[str, Any],
+        wiki_candidates: list[Any],
+        local_candidates: list[dict[str, Any]],
+        local_candidate_by_url: dict[str, dict[str, Any]],
+    ) -> dict[str, Any]:
+        selected_candidate = None
+        selected_local_node = None
+        index = decision.get("candidate_index")
+        if isinstance(index, int) and 0 <= index < len(wiki_candidates):
+            chosen = wiki_candidates[index]
+            selected_candidate = self._compact_entity_resolution_candidate(chosen)
+            selected_local_node = self._compact_local_resolution_match(
+                local_candidate_by_url.get(getattr(chosen, "url", None))
+            )
+        return {
+            "model_alias": model_alias,
+            "decision": decision,
+            "candidate_count": len(wiki_candidates),
+            "local_candidate_count": len(local_candidates),
+            "selected_candidate": selected_candidate,
+            "selected_local_node": selected_local_node,
         }
 
     @staticmethod

@@ -214,6 +214,79 @@ def _print_image_result(plan_index: int, plan: Any, result: Any) -> None:
     print(json.dumps(node_metadata.get("query_overlap_grounded_entities") or [], ensure_ascii=False, indent=2))
 
 
+def _candidate_entity_names(candidate: Any, result: Any) -> list[str]:
+    names = [
+        (entity.get("name") or "").strip()
+        for entity in (getattr(candidate, "grounded_entities", None) or [])
+        if (entity.get("name") or "").strip()
+    ]
+    if names:
+        return names
+    if getattr(candidate, "is_primary", False) and getattr(result, "image_node", None) is not None:
+        node_metadata = getattr(result.image_node, "metadata", {}) or {}
+        return [
+            (entity.get("name") or "").strip()
+            for entity in (node_metadata.get("grounded_entities") or [])
+            if (entity.get("name") or "").strip()
+        ]
+    return []
+
+
+def _resolved_candidate_url(candidate: Any) -> str:
+    validation = getattr(candidate, "validation", None)
+    metadata = getattr(validation, "metadata", {}) or {}
+    resolved_image = metadata.get("resolved_image") or {}
+    search_result = getattr(candidate, "search_result", None)
+    return (
+        resolved_image.get("resolved_url")
+        or getattr(search_result, "image_url", None)
+        or getattr(search_result, "source_page_url", None)
+        or ""
+    )
+
+
+def _download_success_count(result: Any) -> int:
+    metadata = getattr(result, "metadata", {}) or {}
+    decisions = list(metadata.get("candidate_decisions") or [])
+    return sum(1 for item in decisions if item.get("kind") == "candidate_kept")
+
+
+def _print_compact_summary(
+    *,
+    planner_trace: dict[str, Any],
+    kept_plan_count: int,
+    image_runs: list[tuple[int, Any, Any]],
+    image_failures: list[tuple[int, str]],
+) -> None:
+    print("\n=== Compact Summary ===")
+    raw_candidates = list(planner_trace.get("raw_candidates") or [])
+    print(f"planner_raw_count: {len(raw_candidates)}")
+    print(f"planner_kept_count: {kept_plan_count}")
+    if not image_runs and not image_failures:
+        return
+
+    for plan_index, plan, result in image_runs:
+        accepted = list(result.accepted_images())
+        print(f"plan_{plan_index}: {_short(plan.target.content or '', 140)}")
+        print(f"  download_success_count: {_download_success_count(result)}")
+        print(f"  consistency_kept_count: {len(accepted)}")
+        if not accepted:
+            print("  kept_images: []")
+            continue
+        for kept_index, candidate in enumerate(accepted, start=1):
+            query_text = getattr(getattr(candidate, 'source_query', None), 'query', '') or ''
+            image_url = _resolved_candidate_url(candidate)
+            entity_names = _candidate_entity_names(candidate, result)
+            print(
+                f"  {kept_index}. query={_short(query_text, 120)} | "
+                f"image_url={_short(image_url, 180)} | "
+                f"grounded_entities={entity_names}"
+            )
+
+    for plan_index, error in image_failures:
+        print(f"plan_{plan_index}_failed: {_short(error, 240)}")
+
+
 def _build_image_search_client(name: str) -> Any:
     from synthesis.search_client import (
         CommonsImageSearchClient,
@@ -334,6 +407,8 @@ def main(argv: list[str] | None = None) -> int:
         _print_plan_summary(records)
 
         image_results: list[Any] = []
+        image_runs: list[tuple[int, Any, Any]] = []
+        image_failures: list[tuple[int, str]] = []
         if not args.plans_only:
             image_builder = ImageDiscoveryBuilder(
                 store=store,
@@ -357,8 +432,10 @@ def main(argv: list[str] | None = None) -> int:
                 except Exception as exc:
                     print(f"\n=== Image Pipeline: Plan {index} Failed ===")
                     print(f"{exc.__class__.__name__}: {exc}")
+                    image_failures.append((index, f"{exc.__class__.__name__}: {exc}"))
                     continue
                 image_results.append(image_result)
+                image_runs.append((index, plan, image_result))
                 _print_image_result(index, plan, image_result)
 
         if args.pretty:
@@ -373,6 +450,13 @@ def main(argv: list[str] | None = None) -> int:
             }
             print("\n=== json ===")
             print(json.dumps(payload, ensure_ascii=False, indent=2))
+
+        _print_compact_summary(
+            planner_trace=visual_planner.last_plan_trace,
+            kept_plan_count=len(records),
+            image_runs=image_runs,
+            image_failures=image_failures,
+        )
     return 0
 
 
