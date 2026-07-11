@@ -155,6 +155,25 @@ Output exactly:
 """
 
 
+PROMPT_IMAGE_RECOVERY_SELECTION = """You are selecting the single best recovered image from one source page for a search query.
+
+These recovered images come from the same webpage and may include duplicates, different preview sizes of the same image, unrelated media from the page, thumbnails, UI graphics, or low-information images.
+
+Selection priorities:
+1. Choose the image whose visible content best matches the search query.
+2. If multiple images depict the same target equally well, prefer the higher-quality image with the larger visible resolution.
+3. Prefer a real scene/image relevant to the query over generic page assets, logos, icons, avatars, or decorative graphics.
+4. Always choose exactly one candidate.
+
+Output exactly:
+<selection>
+decision: select
+candidate_index: integer
+reason: short reason
+</selection>
+"""
+
+
 PROMPT_IMAGE_GROUND = """You are analyzing an accepted image for multimodal graph construction.
 
 Task:
@@ -993,7 +1012,11 @@ class ImageDiscoveryBuilder:
         for candidate in accepted:
             asset = self._transient_asset_for_candidate(candidate)
             if asset is None:
-                asset, error = self._resolve_image_asset(candidate.search_result, persist_asset=False)
+                asset, error = self._resolve_image_asset(
+                    candidate.search_result,
+                    persist_asset=False,
+                    recovery_query=candidate.source_query.query,
+                )
                 if asset is None:
                     candidate.validation.status = ImageCandidateStatus.REJECTED
                     candidate.validation.reason = f"retrieval_consistency_image_unavailable:{error or 'unknown'}"
@@ -1183,6 +1206,7 @@ class ImageDiscoveryBuilder:
             resolved_asset, _ = self._resolve_image_asset(
                 candidate.search_result,
                 persist_asset=True,
+                recovery_query=candidate.source_query.query,
             )
             if resolved_asset is not None:
                 candidate.validation.metadata = dict(candidate.validation.metadata or {})
@@ -1378,7 +1402,10 @@ class ImageDiscoveryBuilder:
         resolved_asset = self._resolved_image_from_validation(validation)
         precheck_error: str | None = None
         if self.config.precheck_image_urls and resolved_asset is None:
-            resolved_asset, precheck_error = self._resolve_image_asset(search_result)
+            resolved_asset, precheck_error = self._resolve_image_asset(
+                search_result,
+                recovery_query=image_node.caption or search_result.title or search_result.snippet,
+            )
         if self.config.precheck_image_urls and resolved_asset is None:
             precheck_error = precheck_error or "missing_resolved_image_asset"
             self._log_invalid_image_url(search_result.image_url, precheck_error, stage="image_ground")
@@ -1676,6 +1703,7 @@ class ImageDiscoveryBuilder:
             search_result,
             stage="image_check",
             persist_asset=False,
+            recovery_query=query.query,
         )
         if rejection is not None:
             return rejection
@@ -1732,6 +1760,7 @@ class ImageDiscoveryBuilder:
         *,
         stage: str,
         persist_asset: bool = True,
+        recovery_query: str | None = None,
     ) -> tuple[ResolvedImageAsset | None, ImageValidationResult | None]:
         if not search_result.image_url:
             return None, self._reject("missing_image_url")
@@ -1759,6 +1788,7 @@ class ImageDiscoveryBuilder:
             resolved_asset, precheck_error = self._resolve_image_asset(
                 search_result,
                 persist_asset=persist_asset,
+                recovery_query=recovery_query,
             )
             if precheck_error is not None or resolved_asset is None:
                 self._log_invalid_image_url(search_result.image_url, precheck_error, stage=stage)
@@ -1779,6 +1809,7 @@ class ImageDiscoveryBuilder:
         resolved_asset, rejection = self._precheck_candidate_for_processing(
             search_result,
             stage="wiki_inline_image_check",
+            recovery_query=plan.target.content or search_result.title or search_result.snippet,
         )
         if rejection is not None:
             return rejection
@@ -1929,10 +1960,12 @@ class ImageDiscoveryBuilder:
         search_result: ImageSearchResult,
         *,
         persist_asset: bool = True,
+        recovery_query: str | None = None,
     ) -> tuple[ResolvedImageAsset | None, str | None]:
         image_url = search_result.image_url
         source_page_url = search_result.source_page_url
-        cache_key = self._resolved_image_cache_key(image_url, source_page_url)
+        selection_hint = self._recovery_selection_hint(search_result, recovery_query)
+        cache_key = self._resolved_image_cache_key(image_url, source_page_url, selection_hint)
         if persist_asset:
             cached = self._resolved_image_cache.get(cache_key)
             if cached is not None:
@@ -1941,6 +1974,7 @@ class ImageDiscoveryBuilder:
                     image_url=image_url,
                     source_page_url=source_page_url,
                     persist_asset=persist_asset,
+                    selection_hint=_short_debug_text(selection_hint),
                     strategy=cached.strategy,
                     resolved_url=cached.resolved_url,
                     model_image_source_kind=_image_source_kind(cached.model_url),
@@ -1954,6 +1988,7 @@ class ImageDiscoveryBuilder:
                     image_url=image_url,
                     source_page_url=source_page_url,
                     persist_asset=persist_asset,
+                    selection_hint=_short_debug_text(selection_hint),
                     strategy=cached.strategy,
                     resolved_url=cached.resolved_url,
                     model_image_source_kind=_image_source_kind(cached.model_url),
@@ -1975,6 +2010,7 @@ class ImageDiscoveryBuilder:
                 image_url=image_url,
                 source_page_url=source_page_url,
                 persist_asset=persist_asset,
+                selection_hint=_short_debug_text(selection_hint),
                 strategy=direct_asset.strategy,
                 resolved_url=direct_asset.resolved_url,
                 content_type=direct_asset.content_type,
@@ -1987,36 +2023,78 @@ class ImageDiscoveryBuilder:
             attempted_errors.append(direct_error)
 
         if self.config.try_source_page_recovery and source_page_url:
+            recovered_assets: list[ResolvedImageAsset] = []
             for recovered_url in self._recover_candidate_image_urls(search_result):
                 recovered_asset, recovered_error = self._download_and_prepare_image_asset(
                     recovered_url,
                     source_page_url=source_page_url,
                     strategy="source_page_recovery",
                     cache_key=cache_key,
-                    persist_asset=persist_asset,
+                    persist_asset=False,
                 )
                 if recovered_asset is not None:
-                    (self._resolved_image_cache if persist_asset else self._transient_image_cache)[cache_key] = recovered_asset
                     self._log_recovered_image_url(
                         original_url=image_url,
                         recovered_url=recovered_url,
                         source_page_url=source_page_url,
                     )
-                    _log_image_debug(
-                        "image-resolve-success",
-                        image_url=image_url,
-                        source_page_url=source_page_url,
-                        persist_asset=persist_asset,
-                        strategy=recovered_asset.strategy,
-                        resolved_url=recovered_asset.resolved_url,
-                        content_type=recovered_asset.content_type,
-                        width=recovered_asset.width,
-                        height=recovered_asset.height,
-                        model_image_source_kind=_image_source_kind(recovered_asset.model_url),
-                    )
-                    return recovered_asset, None
+                    recovered_assets.append(recovered_asset)
+                    continue
                 if recovered_error:
                     attempted_errors.append(recovered_error)
+
+            if recovered_assets:
+                selected_asset, selection_metadata = self._select_best_recovered_asset(
+                    search_result=search_result,
+                    recovery_query=selection_hint,
+                    recovered_assets=recovered_assets,
+                )
+                final_asset = selected_asset
+                if persist_asset:
+                    persisted_asset, persisted_error = self._download_and_prepare_image_asset(
+                        selected_asset.resolved_url,
+                        source_page_url=source_page_url,
+                        strategy=selected_asset.strategy,
+                        cache_key=cache_key,
+                        persist_asset=True,
+                    )
+                    if persisted_asset is not None:
+                        final_asset = persisted_asset
+                    elif persisted_error:
+                        attempted_errors.append(f"persist_selected_asset_failed:{persisted_error}")
+                (self._resolved_image_cache if persist_asset else self._transient_image_cache)[cache_key] = final_asset
+                _log_image_debug(
+                    "image-recovery-selection",
+                    image_url=image_url,
+                    source_page_url=source_page_url,
+                    persist_asset=persist_asset,
+                    selection_hint=_short_debug_text(selection_hint),
+                    candidate_count=len(recovered_assets),
+                    selection=selection_metadata,
+                    candidates=[
+                        {
+                            "resolved_url": asset.resolved_url,
+                            "width": asset.width,
+                            "height": asset.height,
+                            "content_type": asset.content_type,
+                        }
+                        for asset in recovered_assets
+                    ],
+                )
+                _log_image_debug(
+                    "image-resolve-success",
+                    image_url=image_url,
+                    source_page_url=source_page_url,
+                    persist_asset=persist_asset,
+                    selection_hint=_short_debug_text(selection_hint),
+                    strategy=final_asset.strategy,
+                    resolved_url=final_asset.resolved_url,
+                    content_type=final_asset.content_type,
+                    width=final_asset.width,
+                    height=final_asset.height,
+                    model_image_source_kind=_image_source_kind(final_asset.model_url),
+                )
+                return final_asset, None
 
         final_error = " | ".join(attempted_errors) if attempted_errors else "unresolved_image_asset"
         _log_image_debug(
@@ -2024,9 +2102,150 @@ class ImageDiscoveryBuilder:
             image_url=image_url,
             source_page_url=source_page_url,
             persist_asset=persist_asset,
+            selection_hint=_short_debug_text(selection_hint),
             error=final_error,
         )
         return None, final_error
+
+    @staticmethod
+    def _recovery_selection_hint(
+        search_result: ImageSearchResult,
+        recovery_query: str | None,
+    ) -> str:
+        return (
+            (recovery_query or "").strip()
+            or (search_result.title or "").strip()
+            or (search_result.snippet or "").strip()
+            or (search_result.source_page_url or "").strip()
+            or (search_result.image_url or "").strip()
+        )
+
+    def _select_best_recovered_asset(
+        self,
+        *,
+        search_result: ImageSearchResult,
+        recovery_query: str,
+        recovered_assets: list[ResolvedImageAsset],
+    ) -> tuple[ResolvedImageAsset, dict[str, Any]]:
+        if len(recovered_assets) == 1:
+            return recovered_assets[0], {
+                "mode": "single_candidate",
+                "selected_index": 0,
+                "reason": "only_recovered_candidate",
+            }
+
+        model_alias = self.image_check_model_alias or os.environ.get("IMAGE_CHECK_MODEL")
+        if not model_alias:
+            return recovered_assets[0], {
+                "mode": "fallback_first_candidate",
+                "selected_index": 0,
+                "reason": "missing_image_check_model",
+            }
+
+        try:
+            response = self.model_client.generate(
+                ModelRequest(
+                    model=model_alias,
+                    messages=[
+                        ModelMessage(role="system", content=PROMPT_IMAGE_RECOVERY_SELECTION),
+                        ModelMessage(
+                            role="user",
+                            content=self._build_recovered_image_selection_input(
+                                search_result=search_result,
+                                recovery_query=recovery_query,
+                                recovered_assets=recovered_assets,
+                            ),
+                        ),
+                    ],
+                    metadata={
+                        "trace_label": (
+                            f"image_recovery_selection:{search_result.title or ''}:{recovery_query[:80]}"
+                        )
+                    },
+                )
+            )
+            decision = self._parse_recovered_image_selection_response(response.content)
+            index = decision.get("candidate_index")
+            if isinstance(index, int) and 0 <= index < len(recovered_assets):
+                return recovered_assets[index], {
+                    "mode": "llm_selected",
+                    "selected_index": index,
+                    "reason": decision.get("reason") or "",
+                    "raw_model_output": response.content,
+                    "model_alias": model_alias,
+                }
+            return recovered_assets[0], {
+                "mode": "fallback_first_candidate",
+                "selected_index": 0,
+                "reason": "invalid_llm_selection_index",
+                "raw_model_output": response.content,
+                "model_alias": model_alias,
+            }
+        except Exception as exc:
+            return recovered_assets[0], {
+                "mode": "fallback_first_candidate",
+                "selected_index": 0,
+                "reason": f"image_recovery_selection_model_error:{exc.__class__.__name__}:{exc}",
+                "model_alias": model_alias,
+            }
+
+    @staticmethod
+    def _build_recovered_image_selection_input(
+        *,
+        search_result: ImageSearchResult,
+        recovery_query: str,
+        recovered_assets: list[ResolvedImageAsset],
+    ) -> list[dict[str, Any]]:
+        content: list[dict[str, Any]] = [
+            {
+                "type": "text",
+                "text": (
+                    f"Search query:\n{recovery_query}\n\n"
+                    f"Original search-result title: {search_result.title or ''}\n"
+                    f"Original search-result caption: {search_result.snippet or ''}\n"
+                    f"Source page URL: {search_result.source_page_url or ''}\n\n"
+                    "Choose the single best recovered image by candidate_index."
+                ),
+            }
+        ]
+        for index, asset in enumerate(recovered_assets):
+            content.append(
+                {
+                    "type": "text",
+                    "text": (
+                        f"Candidate [{index}]\n"
+                        f"resolved_url: {asset.resolved_url or ''}\n"
+                        f"content_type: {asset.content_type or ''}\n"
+                        f"size: {asset.width}x{asset.height}"
+                    ),
+                }
+            )
+            content.append({"type": "image_url", "image_url": {"url": asset.model_url}})
+        return content
+
+    @staticmethod
+    def _parse_recovered_image_selection_response(text: str) -> dict[str, Any]:
+        match = re.search(r"<selection>(.*?)</selection>", text, flags=re.DOTALL | re.IGNORECASE)
+        block = match.group(1) if match else text
+        fields: dict[str, str] = {}
+        for raw_line in block.splitlines():
+            line = raw_line.strip()
+            if not line or ":" not in line:
+                continue
+            key, value = line.split(":", 1)
+            fields[key.strip().lower()] = value.strip()
+        raw_index = (fields.get("candidate_index") or "").strip().lower()
+        candidate_index: int | None = None
+        if raw_index:
+            try:
+                candidate_index = int(raw_index)
+            except ValueError:
+                candidate_index = None
+        return {
+            "decision": (fields.get("decision") or "").strip().lower(),
+            "candidate_index": candidate_index,
+            "reason": fields.get("reason") or "",
+        }
 
     def _download_and_prepare_image_asset(
         self,
@@ -2249,8 +2468,12 @@ class ImageDiscoveryBuilder:
         return self._resolved_image_cache.get(key)
 
     @staticmethod
-    def _resolved_image_cache_key(image_url: str | None, source_page_url: str | None) -> str:
-        payload = f"{image_url or ''}||{source_page_url or ''}"
+    def _resolved_image_cache_key(
+        image_url: str | None,
+        source_page_url: str | None,
+        selection_hint: str | None = None,
+    ) -> str:
+        payload = f"{image_url or ''}||{source_page_url or ''}||{selection_hint or ''}"
         return sha256(payload.encode("utf-8")).hexdigest()[:24]
 
     def _write_image_cache_file(self, cache_key: str, payload: bytes, content_type: str) -> str:
@@ -3684,6 +3907,14 @@ visual_fact: Kobe Bryant is visible
 <consistent_images>1, 2</consistent_images>
 <reason>Both images depict the same main visual content.</reason>"""
                 )
+            if "selecting the single best recovered image" in system:
+                return ModelResponse(
+                    content="""<selection>
+decision: select
+candidate_index: 1
+reason: candidate 1 is the closest content match and has the higher usable resolution
+</selection>"""
+                )
             if "selecting the best Wikipedia candidate" in system:
                 return ModelResponse(
                     content="""<selection>
@@ -3800,6 +4031,79 @@ entity: Los Angeles Lakers | jersey logo | visible team branding on the uniform
             assert len([item for item in transient_candidates if item.validation.status == ImageCandidateStatus.ACCEPTED]) == 2
             builder._clear_transient_assets(transient_candidates)
             assert not builder._transient_image_cache
+
+            recovered_urls = [
+                "https://example.com/recovered-small.jpg",
+                "https://example.com/recovered-large.jpg",
+            ]
+            recovery_search_result = ImageSearchResult(
+                title="Recovered source page image",
+                image_url="https://example.com/recovery-original.jpg",
+                source_page_url="https://example.com/source-page",
+                snippet="Kobe Bryant standing on the scorer's table",
+            )
+
+            def fake_recover_candidate_image_urls(search_result: ImageSearchResult) -> list[str]:
+                assert search_result.source_page_url == recovery_search_result.source_page_url
+                return list(recovered_urls)
+
+            def fake_download_and_prepare_image_asset(
+                image_url: str | None,
+                *,
+                source_page_url: str | None,
+                strategy: str,
+                cache_key: str,
+                persist_asset: bool = True,
+            ) -> tuple[ResolvedImageAsset | None, str | None]:
+                del cache_key
+                if image_url == recovery_search_result.image_url:
+                    return None, "direct_unavailable"
+                if image_url == recovered_urls[0]:
+                    return (
+                        ResolvedImageAsset(
+                            cache_key="recovered_small",
+                            original_url=image_url,
+                            resolved_url=image_url,
+                            source_page_url=source_page_url,
+                            model_url="data:image/jpeg;base64,AA==",
+                            asset_uri=image_url,
+                            cache_path=None,
+                            content_type="image/jpeg",
+                            width=240,
+                            height=300,
+                            strategy=strategy,
+                        ),
+                        None,
+                    )
+                if image_url == recovered_urls[1]:
+                    return (
+                        ResolvedImageAsset(
+                            cache_key="recovered_large",
+                            original_url=image_url,
+                            resolved_url=image_url,
+                            source_page_url=source_page_url,
+                            model_url="data:image/jpeg;base64,AQ==",
+                            asset_uri=image_url,
+                            cache_path=None,
+                            content_type="image/jpeg",
+                            width=600,
+                            height=750,
+                            strategy=strategy,
+                        ),
+                        None,
+                    )
+                return None, f"unexpected_url:{image_url}"
+
+            builder._recover_candidate_image_urls = fake_recover_candidate_image_urls  # type: ignore[method-assign]
+            builder._download_and_prepare_image_asset = fake_download_and_prepare_image_asset  # type: ignore[method-assign]
+            selected_asset, selected_error = builder._resolve_image_asset(
+                recovery_search_result,
+                persist_asset=False,
+                recovery_query="Kobe Bryant standing on the scorer's table",
+            )
+            assert selected_error is None
+            assert selected_asset is not None
+            assert selected_asset.resolved_url == recovered_urls[1]
     finally:
         if old_check is None:
             os.environ.pop("IMAGE_CHECK_MODEL", None)
