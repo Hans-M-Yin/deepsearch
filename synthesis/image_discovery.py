@@ -96,11 +96,8 @@ def _format_debug_image_source(url: str | None) -> str | None:
 
 
 def _log_image_debug(label: str, **payload: Any) -> None:
-    print(
-        f"[{label}] {json.dumps(_jsonify(payload), ensure_ascii=False, default=str)}",
-        file=sys.stderr,
-        flush=True,
-    )
+    del label, payload
+    return
 
 
 class ImageCandidateStatus(str, Enum):

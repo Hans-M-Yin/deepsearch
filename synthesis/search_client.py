@@ -119,27 +119,14 @@ class SearchResponse:
 
 def _log_serper_key(*, url: str, api_key: str, metadata: dict[str, Any] | None = None) -> None:
     """Log the exact Serper API key selected for an outbound request."""
-
-    print(
-        "[serper-key]"
-        f" url={url!r}"
-        f" api_key={api_key!r}"
-        f" metadata={json.dumps(metadata or {}, ensure_ascii=False, default=str)}",
-        file=sys.stderr,
-        flush=True,
-    )
+    del url, api_key, metadata
+    return
 
 
 def _log_serper_request(*, url: str, body: dict[str, Any]) -> None:
     """Log an outbound Serper request before network I/O begins."""
-
-    print(
-        "[serper-request]"
-        f" url={url!r}"
-        f" body={json.dumps(body, ensure_ascii=False)}",
-        file=sys.stderr,
-        flush=True,
-    )
+    del url, body
+    return
 
 
 def _log_serper_raw_response(*, url: str, status_code: int, raw: dict[str, Any]) -> None:
@@ -157,38 +144,8 @@ def _log_serper_raw_response(*, url: str, status_code: int, raw: dict[str, Any])
 
 def _log_serper_results(response: SearchResponse) -> None:
     """Print the parsed Serper response so search failures are visible in terminal traces."""
-
-    print(
-        "[serper-results]"
-        f" engine={response.engine}"
-        f" query={response.query!r}"
-        f" status_code={response.status_code}"
-        f" result_count={len(response.results)}",
-        file=sys.stderr,
-        flush=True,
-    )
-    for index, result in enumerate(response.results, start=1):
-        if isinstance(result, ImageSearchResult):
-            print(
-                "[serper-results]"
-                f" index={index}"
-                f" rank={result.rank}"
-                f" title={result.title!r}"
-                f" image_url={result.image_url!r}"
-                f" source_page_url={result.source_page_url!r}",
-                file=sys.stderr,
-                flush=True,
-            )
-        else:
-            print(
-                "[serper-results]"
-                f" index={index}"
-                f" rank={result.rank}"
-                f" title={result.title!r}"
-                f" url={result.url!r}",
-                file=sys.stderr,
-                flush=True,
-            )
+    del response
+    return
 
 
 class SearchClient(Protocol):
