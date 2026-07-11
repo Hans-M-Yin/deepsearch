@@ -188,38 +188,62 @@ Important grounding rules:
    - Prefer "Kobe Bryant" over "Kobe", "Los Angeles Lakers" over "Lakers", and "Eiffel Tower" over "the tower".
    
 Output guidance:
-1. `relation_to_image` is a visual locator, not an abstract semantic relation.
-   It should help a user immediately point to the entity inside the image.
-2. Describe the entity using visible position, local context, or distinctive appearance.
+1. `relation_to_image` should be a scene-centric or object-centric locator, not an image-centric description.
+   Treat the image only as a carrier of evidence, not as the reference frame.
+2. It should help a user identify the entity through scene semantics, object semantics, or stable local structure.
+   Prefer locators based on:
+   - role or identity in the scene
+   - action or interaction
+   - distinctive clothing, pose, held object, or visible mark
+   - relation to another visible person or object
+   - stable position within a visible group, row, lineup, or formation
+3. If positional language is needed, anchor it to another visible entity or to a stable group structure, not to the image frame.
    Good examples:
-   - second row, third person from the left
-   - rightmost person on the album cover
-   - gold trophy held in the man's arms
-   - landmark behind the main character
+   - woman standing beside Cristiano Ronaldo
+   - player immediately to the left of the trophy holder
+   - front-row center person in the group
+   - child sitting on the man's shoulders
    - logo on the front of the jersey
-   - account name at the top of the screenshot
-3. Prefer short, concrete, image-grounded locators:
-   - relative position in a group
-   - relative location in the frame
-   - nearby object or nearby person
-   - distinctive clothing, pose, or visible mark
-4. Avoid abstract or non-localizable relations such as:
+4. Avoid frame-anchored locators such as:
+   - left side of the image
+   - right side of the image
+   - top-right corner
+   - upper part of the picture
+   - foreground
+   - background
+   - center of the image
+5. Avoid salience-anchored or media-anchored locators such as:
+   - main character
+   - main subject
+   - central figure
+   - person in the photo
+   - shown in the image
+   - depicted here
+   These rely too much on the image as an image, rather than on the depicted scene or object structure.
+6. For image artifacts such as posters, album covers, screenshots, documents, or maps, still prefer semantic or structural parts over frame coordinates.
+   Good examples:
+   - face at the far right of the four-person lineup
+   - logo on the front of the jersey
+   - text in the app header bar
+   - emblem on the shield held by the knight
+7. Avoid abstract or non-localizable relations such as:
    - depicted in image
    - shown in image
    - associated with image
    - represented in image
    These are too generic and do not help locate the entity.
-5. If the image contains multiple people or objects, `relation_to_image` must disambiguate the target.
-6. `evidence` should be one short sentence explaining the visible cue that supports the grounding.
-7. If two surface forms refer to the same entity, output only the canonical one and mention the alias/handle inside `evidence`.
+8. If the image contains multiple people or objects, `relation_to_image` must disambiguate the target.
+9. If no stable scene-centric or object-centric locator is available, omit the entity rather than using a vague image-centric relation.
+10. `evidence` should be one short sentence explaining the visible cue that supports the grounding.
+11. If two surface forms refer to the same entity, output only the canonical one and mention the alias/handle inside `evidence`.
 
 Examples:
 - For a 2025 G20 summit group photo:
-  `entity: Emmanuel Macron | second row, third person from the left | visible as the suited male figure in that position`
+  `entity: Emmanuel Macron | front-row center person in the group | visible as the suited male figure standing in the middle of the front row`
 - For the Queen II album cover:
-  `entity: Roger Taylor | rightmost person on the album cover | visible as the face at the far right of the four-person composition`
+  `entity: Roger Taylor | face at the far right of the four-person lineup | visible as the rightmost face in the four-person arrangement`
 - For a John Wick 4 poster:
-  `entity: Eiffel Tower | landmark behind the main character | visible rising in the background behind John Wick`
+  `entity: Eiffel Tower | landmark behind the man in the black suit | visible rising behind the standing man in the black suit`
 
 Output exactly one block:
 <ground>
