@@ -4334,7 +4334,7 @@ caption: Kobe Bryant courtside photo
             image = result.primary_image()
             assert image is not None
             assert result.image_node is not None
-            assert result.image_node.title == "Kobe Bryant final game uniform photo"
+            assert result.image_node.title == "Image: Kobe Bryant final game uniform photo"
             assert result.image_node.caption == "Kobe Bryant in his final game"
             assert result.edge is not None
             assert result.edge.relation == "his final game uniform photo"

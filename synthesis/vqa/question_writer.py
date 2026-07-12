@@ -78,10 +78,9 @@ Return valid JSON with exactly these fields:
 PROMPT_COMPRESS_HOP_TEXT_TO_TEXT = """You are compressing one text-to-text hop from a reasoning trajectory.
 
 You are given:
-- hop_type: the modality pair for this hop
-- source: the current source text node title
+- source: the current source text node name
 - relation: the edge relation string
-- target: the current target text node title
+- target: the current target text node name
 
 Write one short declarative statement that captures the essential meaning of
 this hop for downstream question composition.
@@ -109,9 +108,8 @@ Anchor rules:
 Example 1:
 Input:
 {
-  "hop_type": "text->text",
   "source": "David E. Finley, Jr.",
-  "relation": "earned his professional degree from",
+  "relation": "the school where he earned his professional degree",
   "target": "Harvard Law School"
 }
 Output:
@@ -126,9 +124,8 @@ Output:
 Example 2:
 Input:
 {
-  "hop_type": "text->text",
   "source": "Bird in Space",
-  "relation": "the museum that houses its 1925 marble and 1927 bronze versions is",
+  "relation": "the museum that houses its 1925 marble and 1927 bronze versions",
   "target": "National Gallery of Art"
 }
 Output:
@@ -151,37 +148,39 @@ Return valid JSON with exactly these fields:
 """
 
 
-PROMPT_COMPRESS_HOP_TEXT_TO_IMAGE = """You are compressing one text-to-image hop from a reasoning trajectory.
+PROMPT_COMPRESS_HOP_TEXT_TO_IMAGE = """You are writing one natural-language declarative sentence for a structured text-to-image hop.
 
-You are given:
-- hop_type: the modality pair for this hop
-- source: the current source text node title
-- relation: the edge relation string
-- target: the current target image node title
+You will be given:
+- source: the name of the current source text node
+- relation: the edge relation string from the source to the image
+- target: the name of the current target image
 
-Write one short declarative statement that captures the essential meaning of
-this hop for downstream question composition.
+Task:
+Write one complete declarative sentence in English that converts the structured
+information above into a natural-language statement.
 
-For this hop type, the target should be treated as a key photo or visual scene,
-not merely as an image file. The point of the statement is to preserve the
-transition from the source entity to that target image.
+The sentence must preserve the transition from the source text node to the
+target image. It should be a relation sentence, not a standalone caption of the
+target image.
 
-This means:
-- the source must remain explicit in the statement
-- the statement should sound like a source-to-image relation, not like a standalone image caption
-- first anchor the image to the source, then describe the image target implied by the relation and target title
-- the target string is the retrieval clue for finding that image
-- preserve distinctive event, date, action, and scene details when they matter
-- keep the statement aligned with the relation and target rather than drifting into a vague scene description
-
-The statement should:
-- preserve the relation needed for downstream reasoning
-- make the transition from the source to the target image clear
-- be concise
-- avoid unnecessary details
-- avoid asking a question
+Requirements:
+- include the source explicitly
+- include the target explicitly as the image target
+- preserve the relation and all uniqueness-bearing details, especially event, time, place, action, and scene details
+- make the sentence natural, coherent, and unambiguous
 - stay faithful to THIS hop only
-- not introduce entities that are not the current source node or current target node
+- do not introduce any information not provided
+- do not introduce literal type prefixes such as "Image:" unless they are already present in the input
+- do not replace the target with a free-floating scene description detached from the source
+- avoid vague scaffolds like "For X, the relevant image is ..." or "About X, there is ..."
+- when possible, phrase the sentence as a direct transition from the source to the target image
+
+Field guidance:
+- `statement` should be the natural-language sentence
+- `source` should stay aligned with the given source
+- `target` should stay aligned with the given target
+- `relation` should stay close to the given relation string; only smooth grammar lightly if needed
+- `retrieval_query` should be a concise image lookup clue, usually the target itself or a slightly cleaner version
 
 Anchor rules:
 - source must refer to the current source node only
@@ -192,35 +191,33 @@ Anchor rules:
 Example 1:
 Input:
 {
-  "hop_type": "text->image",
   "source": "Port Jackson",
   "relation": "Japanese midget submarine recovered from Sydney Harbour after the 31 May 1942 raid",
   "target": "photo of the recovered Japanese midget submarine"
 }
 Output:
 {
-  "statement": "Port Jackson is associated with a photo of the Japanese midget submarine recovered from Sydney Harbour after the 31 May 1942 raid.",
+  "statement": "Port Jackson is related to a photo that shows the Japanese midget submarine recovered from Sydney Harbour after the 31 May 1942 raid.",
   "source": "Port Jackson",
-  "target": "the photo of the recovered Japanese midget submarine",
-  "relation": "is associated with a photo of the Japanese midget submarine recovered from Sydney Harbour after the 31 May 1942 raid",
+  "target": "photo of the recovered Japanese midget submarine",
+  "relation": "Japanese midget submarine recovered from Sydney Harbour after the 31 May 1942 raid",
   "retrieval_query": "photo of the recovered Japanese midget submarine"
 }
 
 Example 2:
 Input:
 {
-  "hop_type": "text->image",
   "source": "Constantin Brancusi",
   "relation": "photo of him in his Paris studio taken by Edward Steichen in 1920",
-  "target": "Steichen photo of Brancusi in his studio"
+  "target": "Steichen photo of Brancusi in his Paris studio"
 }
 Output:
 {
-  "statement": "Constantin Brancusi is associated with a Steichen photo of him in his Paris studio taken in 1920.",
+  "statement": "Constantin Brancusi is related to a photo that shows him in his Paris studio, taken by Edward Steichen in 1920.",
   "source": "Constantin Brancusi",
-  "target": "the Steichen photo of Brancusi in his studio",
-  "relation": "is associated with a Steichen photo of him in his Paris studio taken in 1920",
-  "retrieval_query": "Steichen photo of Brancusi in his studio"
+  "target": "Steichen photo of Brancusi in his Paris studio",
+  "relation": "photo of him in his Paris studio taken by Edward Steichen in 1920",
+  "retrieval_query": "Steichen photo of Brancusi in his Paris studio"
 }
 
 Return valid JSON with exactly these fields:
@@ -234,31 +231,39 @@ Return valid JSON with exactly these fields:
 """
 
 
-PROMPT_COMPRESS_HOP_IMAGE_TO_TEXT = """You are compressing one image-to-text hop from a reasoning trajectory.
+PROMPT_COMPRESS_HOP_IMAGE_TO_TEXT = """You are writing one natural-language declarative sentence for a structured image-to-text hop.
 
-You are given:
-- hop_type: the modality pair for this hop
-- source: the current source image node title
-- relation: the edge relation string
-- target: the current target text node title
+You will be given:
+- source: the name of the current image node; this is a brief description of the image, but the image itself is not provided
+- relation: a description of how the target appears in the image
+- target: the name of the current target text node
 
-Write one short declarative statement that captures the essential meaning of
-this hop for downstream question composition.
+Task:
+Write one short declarative sentence in English that converts the structured
+information above into a natural-language statement.
 
-For this hop type, the source should be treated as a visual clue inside the
-image, and the target should be treated as the entity identified by that clue.
-The statement should preserve the transition from the image clue to the target,
+The sentence must preserve the transition from the image to the target text
+node. It should make clear that the target is identified from the image,
 rather than turning into a generic fact about the target alone.
 
-The statement should:
-- preserve the relation needed for downstream reasoning
-- keep the image clue as the anchor of the sentence
-- make it clear that the target is identified from the image
-- be concise
-- avoid unnecessary details
-- avoid asking a question
+Requirements:
+- include both source and target explicitly
+- preserve the descriptive image name, the target name, and the relation
+- do not omit key identifying details from the relation
+- keep the image as the anchor of the sentence
+- make the sentence concise, natural, coherent, and unambiguous
 - stay faithful to THIS hop only
-- not introduce entities that are not the current source node or current target node
+- do not introduce any information not provided
+- do not introduce literal type prefixes such as "Image:" unless they are already present in the input
+- do not add new absolute directional descriptions such as top, bottom, left, right, upper-left, or lower-right
+- if the provided relation already contains a directional detail, preserve it rather than inventing a different spatial claim
+
+Field guidance:
+- `statement` should be the natural-language sentence
+- `source` should stay aligned with the given source
+- `target` should stay aligned with the given target
+- `relation` should stay close to the given relation string; only smooth grammar lightly if needed
+- `retrieval_query` must be an empty string for this hop type
 
 Anchor rules:
 - source must refer to the current source node only
@@ -269,7 +274,6 @@ Anchor rules:
 Example 1:
 Input:
 {
-  "hop_type": "image->text",
   "source": "photo of a player taking the decisive penalty in a World Cup final",
   "relation": "the player taking the penalty in the image is",
   "target": "Gonzalo Montiel"
@@ -277,7 +281,7 @@ Input:
 Output:
 {
   "statement": "In the photo of a player taking the decisive penalty in a World Cup final, the player taking the penalty in the image is Gonzalo Montiel.",
-  "source": "the photo of a player taking the decisive penalty in a World Cup final",
+  "source": "photo of a player taking the decisive penalty in a World Cup final",
   "target": "Gonzalo Montiel",
   "relation": "the player taking the penalty in the image is",
   "retrieval_query": ""
@@ -286,17 +290,16 @@ Output:
 Example 2:
 Input:
 {
-  "hop_type": "image->text",
-  "source": "celebration photo with a green banner on the left",
-  "relation": "the logo on the green banner on the left belongs to",
-  "target": "German Football Association"
+  "source": "first page of the original handwritten United States Constitution on parchment with the words We the People",
+  "relation": "the chamber of Congress named at the end of Article I, Section 1 is",
+  "target": "United States House of Representatives"
 }
 Output:
 {
-  "statement": "In the celebration photo with a green banner on the left, the logo on the green banner on the left belongs to the German Football Association.",
-  "source": "the celebration photo with a green banner on the left",
-  "target": "German Football Association",
-  "relation": "the logo on the green banner on the left belongs to",
+  "statement": "In the first page of the original handwritten United States Constitution on parchment with the words We the People, the chamber of Congress named at the end of Article I, Section 1 is the United States House of Representatives.",
+  "source": "first page of the original handwritten United States Constitution on parchment with the words We the People",
+  "target": "United States House of Representatives",
+  "relation": "the chamber of Congress named at the end of Article I, Section 1 is",
   "retrieval_query": ""
 }
 
@@ -898,7 +901,7 @@ class QuestionWriter:
 
     def compress_hop(self, *, hop: HopContext) -> dict[str, Any]:
         source_label = self._hop_anchor_label(hop.src_content, fallback=hop.src_node_id)
-        target_label = self._hop_anchor_label(hop.dst_content, fallback=hop.dst_node_id)
+        target_label = self._compress_hop_prompt_label(hop.dst_content, fallback=hop.dst_node_id)
         model_client = self.compress_hop_model_client or self.model_client
         model = self.compress_hop_model or self.model
         if model_client is None:
@@ -961,12 +964,14 @@ class QuestionWriter:
 
     @classmethod
     def _compress_hop_prompt_payload(cls, *, hop: HopContext) -> dict[str, Any]:
-        return {
-            "hop_type": f"{hop.src_modality}->{hop.dst_modality}",
+        payload = {
             "source": cls._compress_hop_prompt_label(hop.src_content, fallback=hop.src_node_id),
             "relation": str(hop.relation or hop.edge_type or "").strip(),
             "target": cls._compress_hop_prompt_label(hop.dst_content, fallback=hop.dst_node_id),
         }
+        if (hop.src_modality, hop.dst_modality) not in {("text", "text"), ("text", "image"), ("image", "text")}:
+            payload["hop_type"] = f"{hop.src_modality}->{hop.dst_modality}"
+        return payload
 
     def select_target_ask(self, *, context: WriterContext) -> dict[str, Any]:
         if self.model_client is None:
@@ -1763,9 +1768,19 @@ class QuestionWriter:
     def _normalized_compact_text(text: Any) -> str:
         return re.sub(r"\s+", " ", str(text or "")).strip().lower()
 
+    @staticmethod
+    def _strip_image_title_prefix(text: Any) -> str:
+        normalized = str(text or "").strip()
+        if not normalized:
+            return ""
+        prefix, sep, remainder = normalized.partition(":")
+        if sep and prefix.strip().lower() == "image":
+            return remainder.strip()
+        return normalized
+
     @classmethod
     def _image_search_query(cls, content: dict[str, Any]) -> str:
-        title = str(content.get("title") or "").strip()
+        title = cls._strip_image_title_prefix(content.get("title"))
         search_query = str(content.get("search_query") or "").strip()
         if title and search_query and cls._normalized_compact_text(title) == cls._normalized_compact_text(search_query):
             return title
@@ -1778,8 +1793,51 @@ class QuestionWriter:
         return cls._image_search_query(hop.dst_content)
 
     @staticmethod
-    def _compress_hop_prompt_label(content: dict[str, Any], *, fallback: str) -> str:
-        title = str(content.get("title") or "").strip()
+    def _looks_like_image_phrase(text: str) -> bool:
+        normalized = str(text or "").strip().lower()
+        if not normalized:
+            return False
+        return normalized.startswith(
+            (
+                "photo ",
+                "photo of",
+                "portrait ",
+                "portrait of",
+                "painting ",
+                "painting of",
+                "poster ",
+                "poster of",
+                "cover ",
+                "cover of",
+                "map ",
+                "map of",
+                "screenshot ",
+                "screenshot of",
+                "image ",
+                "image of",
+            )
+        )
+
+    @classmethod
+    def _image_target_phrase(cls, target_label: str) -> str:
+        normalized = str(target_label or "").strip()
+        if not normalized:
+            return ""
+        lowered = normalized.lower()
+        if lowered.startswith(("a ", "an ", "the ", "this ", "that ")):
+            return normalized
+        return f"a {normalized}"
+
+    @classmethod
+    def _compress_hop_prompt_label(cls, content: dict[str, Any], *, fallback: str) -> str:
+        if content.get("node_type") == "image":
+            search_query = cls._shorten_text(cls._image_search_query(content), limit=180)
+            if search_query:
+                return search_query
+            caption = cls._shorten_text(content.get("caption"), limit=180)
+            if caption:
+                return caption
+        title = cls._strip_image_title_prefix(content.get("title"))
         if title:
             return title
         return str(content.get("caption") or fallback)
@@ -2044,20 +2102,24 @@ class QuestionWriter:
         relation = hop.relation or hop.edge_type or "is connected to"
         retrieval_query = ""
         source_label = source_label or QuestionWriter._hop_anchor_label(hop.src_content, fallback=hop.src_node_id)
-        target_label = target_label or QuestionWriter._hop_anchor_label(hop.dst_content, fallback=hop.dst_node_id)
+        target_label = target_label or QuestionWriter._compress_hop_prompt_label(hop.dst_content, fallback=hop.dst_node_id)
         if hop.src_modality == "text" and hop.dst_modality == "text":
             statement = f"{source_label} {relation} {target_label}".strip()
         elif hop.src_modality == "text" and hop.dst_modality == "image":
             retrieval_query = QuestionWriter._hop_image_retrieval_query(hop)
-            if relation:
-                statement = f"{source_label} is associated with a key photo of {relation}."
+            if relation and not QuestionWriter._looks_like_image_phrase(relation):
+                statement = f"{source_label} is related to a photo that shows {relation}."
+            elif target_label:
+                statement = f"{source_label} is related to {QuestionWriter._image_target_phrase(target_label)}."
             elif retrieval_query:
                 statement = (
-                    f"{source_label} is associated with a key photo or visual scene described by the query: "
+                    f"{source_label} is related to a photo that can be located using the clue: "
                     f"{retrieval_query}."
                 )
+            elif relation:
+                statement = f"{source_label} is related to {relation}."
             else:
-                statement = f"{source_label} is associated with a key photo or visual scene: {target_label}."
+                statement = f"{source_label} is related to an unspecified photo target."
         elif hop.src_modality == "image" and hop.dst_modality == "text":
             statement = f"{QuestionWriter._image_clue_label(hop)} refers to {target_label}."
         else:

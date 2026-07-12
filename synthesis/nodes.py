@@ -33,6 +33,18 @@ def _jsonify(value: Any) -> Any:
     return value
 
 
+def _normalize_image_title(title: str | None) -> str | None:
+    text = str(title or "").strip()
+    if not text:
+        return None
+    prefix, sep, remainder = text.partition(":")
+    if sep and prefix.strip().lower() == "image":
+        text = remainder.strip()
+    if not text:
+        return None
+    return f"Image: {text}"
+
+
 class NodeType(str, Enum):
     TEXT = "text"
     IMAGE = "image"
@@ -228,7 +240,7 @@ class ImageNode(Node):
     ) -> "ImageNode":
         return cls(
             node_id=cls.make_id("image", image_url),
-            title=title,
+            title=_normalize_image_title(title),
             summary=caption,
             image_url=image_url,
             source_page_url=source_page_url,
@@ -262,7 +274,7 @@ class ImageNode(Node):
         rejected_ids = [variant.variant_id for variant in image_variants if variant.validation_status == NodeStatus.REJECTED.value or variant.validation_status == "rejected"]
         return cls(
             node_id=cls.make_id("image_bundle", primary_image_id, primary_image_url),
-            title=title,
+            title=_normalize_image_title(title),
             summary=caption,
             image_url=primary_image_url,
             source_page_url=source_page_url,
@@ -337,6 +349,11 @@ def _smoke_test() -> None:
         "https://example.com/image.jpg",
         source_page_url="https://example.com/page",
         caption="Example image",
+        title="Example search query",
+    )
+    prefixed = ImageNode.from_url(
+        "https://example.com/prefixed.jpg",
+        title="Image: Already prefixed",
     )
     region = RegionNode.from_bbox(
         image.node_id,
@@ -347,6 +364,8 @@ def _smoke_test() -> None:
     assert text.to_dict()["node_type"] == "text"
     assert text.canonical_id == "wikidata:Q123"
     assert image.to_dict()["node_type"] == "image"
+    assert image.title == "Image: Example search query"
+    assert prefixed.title == "Image: Already prefixed"
     assert region.parent_image_id == image.node_id
     assert TextNode.make_id("wiki_entity", "Q123") == text.node_id
     print("nodes smoke test passed")
