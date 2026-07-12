@@ -781,20 +781,36 @@ class ImageDiscoveryBuilder:
                         plan=plan,
                         candidate=candidate,
                         run_id=run_id,
-                        persist=persist,
+                        persist=False,
                         create_source_edge=False,
                     )
-                    if result.image_node is not None and result.image_node.source is not None:
-                        result.image_node.source.source_type = "wikipedia_inline_image"
-                    if result.image_node is not None:
-                        result.image_node.metadata = dict(result.image_node.metadata or {})
-                        result.image_node.metadata.update(
-                            {
-                                "image_origin": "wikipedia_inline",
-                                "source_text_node_id": plan.source_node_id,
-                                "source_evidence_ids": list(plan.source_evidence_ids),
-                            }
+                    provisional_grounded_edge_count = len(result.grounded_edges)
+                    provisional_queued_task_count = len(result.queued_tasks)
+                    keep_in_graph = self._wiki_inline_result_has_expandable_targets(result)
+                    result.metadata.update(
+                        {
+                            "wiki_inline_keep_in_graph": keep_in_graph,
+                            "wiki_inline_grounded_edge_count": provisional_grounded_edge_count,
+                            "wiki_inline_queued_task_count": provisional_queued_task_count,
+                        }
+                    )
+                    if keep_in_graph and persist:
+                        self._materialize_primary_candidate(
+                            result=result,
+                            plan=plan,
+                            candidate=candidate,
+                            run_id=run_id,
+                            persist=True,
+                            create_source_edge=False,
                         )
+                    if keep_in_graph:
+                        self._annotate_wiki_inline_materialized_result(
+                            result=result,
+                            plan=plan,
+                        )
+                    else:
+                        result.metadata["wiki_inline_skip_reason"] = "no_expandable_grounded_entities"
+                        self._discard_materialized_result(result)
             result.metadata.update(
                 {
                     "query_count": len(plan.queries),
@@ -826,6 +842,37 @@ class ImageDiscoveryBuilder:
                 self._clear_transient_assets(result.candidates)
             elif validation is not None:
                 self._clear_transient_asset_from_validation(validation)
+
+    @staticmethod
+    def _wiki_inline_result_has_expandable_targets(result: ImageDiscoveryResult) -> bool:
+        return bool(result.grounded_edges or result.queued_tasks)
+
+    @staticmethod
+    def _annotate_wiki_inline_materialized_result(
+        *,
+        result: ImageDiscoveryResult,
+        plan: VisualSearchPlan,
+    ) -> None:
+        if result.image_node is not None and result.image_node.source is not None:
+            result.image_node.source.source_type = "wikipedia_inline_image"
+        if result.image_node is not None:
+            result.image_node.metadata = dict(result.image_node.metadata or {})
+            result.image_node.metadata.update(
+                {
+                    "image_origin": "wikipedia_inline",
+                    "source_text_node_id": plan.source_node_id,
+                    "source_evidence_ids": list(plan.source_evidence_ids),
+                }
+            )
+
+    @staticmethod
+    def _discard_materialized_result(result: ImageDiscoveryResult) -> None:
+        result.image_node = None
+        result.edge = None
+        result.image_evidence = None
+        result.search_evidence = None
+        result.grounded_edges = []
+        result.queued_tasks = []
 
     def _discover_with_client(
         self,
@@ -4213,6 +4260,25 @@ entity: Los Angeles Lakers | jersey logo | visible team branding on the uniform
 </ground>"""
             )
 
+    class MockNoEntityGroundModel(MockModel):
+        def generate(self, request: ModelRequest) -> ModelResponse:
+            system = request.messages[0].content
+            if "Wikipedia inline image is visually relevant" in system:
+                return super().generate(request)
+            if "checking whether a candidate image" in system:
+                return super().generate(request)
+            if "selecting the single best recovered image" in system:
+                return super().generate(request)
+            if "selecting the best Wikipedia candidate" in system:
+                return super().generate(request)
+            if "rewriting an image-search query into a source-aware graph relation" in system:
+                return super().generate(request)
+            return ModelResponse(
+                content="""<ground>
+caption: Kobe Bryant courtside photo
+</ground>"""
+            )
+
     old_check = os.environ.get("IMAGE_CHECK_MODEL")
     old_ground = os.environ.get("IMAGE_GROUND_MODEL")
     os.environ["IMAGE_CHECK_MODEL"] = "mock_image"
@@ -4493,6 +4559,68 @@ entity: Los Angeles Lakers | jersey logo | visible team branding on the uniform
             assert inline_builder._resolved_image_cache
             assert not inline_builder._transient_image_cache
             assert store.stats()["nodes"] == 4
+
+            drop_inline_builder = ImageDiscoveryBuilder(
+                store=store,
+                search_client=MockImageSearchClient(),
+                config=ImageDiscoveryConfig(
+                    per_query_limit=1,
+                    max_images_per_plan=1,
+                    enable_retrieval_consistency_check=False,
+                    precheck_image_urls=True,
+                    upload_cached_images=False,
+                    try_source_page_recovery=False,
+                ),
+                model_client=MockNoEntityGroundModel(),
+                wiki_resolver=MockWikiResolver(),
+            )
+            drop_persist_calls: list[bool] = []
+
+            def fake_drop_inline_download_and_prepare_image_asset(
+                image_url: str | None,
+                *,
+                source_page_url: str | None,
+                strategy: str,
+                cache_key: str,
+                persist_asset: bool = True,
+            ) -> tuple[ResolvedImageAsset | None, str | None]:
+                drop_persist_calls.append(persist_asset)
+                if not image_url:
+                    return None, "missing_image_url"
+                asset_uri = f"/tmp/{cache_key}.jpg" if persist_asset else image_url
+                cache_path = f"/tmp/{cache_key}.jpg" if persist_asset else None
+                return (
+                    ResolvedImageAsset(
+                        cache_key=cache_key,
+                        original_url=image_url,
+                        resolved_url=image_url,
+                        source_page_url=source_page_url,
+                        model_url="data:image/jpeg;base64,AA==",
+                        asset_uri=asset_uri,
+                        cache_path=cache_path,
+                        content_type="image/jpeg",
+                        width=640,
+                        height=480,
+                        strategy=strategy,
+                    ),
+                    None,
+                )
+
+            drop_inline_builder._download_and_prepare_image_asset = fake_drop_inline_download_and_prepare_image_asset  # type: ignore[method-assign]
+            before_drop_node_count = store.stats()["nodes"]
+            dropped_inline = drop_inline_builder.discover_for_wiki_inline_image(
+                wiki_inline_plan,
+                search_result=wiki_inline_search_result,
+                run_id="run_smoke",
+                persist=True,
+            )
+            assert dropped_inline.image_node is None
+            assert dropped_inline.metadata.get("wiki_inline_keep_in_graph") is False
+            assert dropped_inline.metadata.get("wiki_inline_skip_reason") == "no_expandable_grounded_entities"
+            assert drop_persist_calls and set(drop_persist_calls) == {False}
+            assert not drop_inline_builder._resolved_image_cache
+            assert not drop_inline_builder._transient_image_cache
+            assert store.stats()["nodes"] == before_drop_node_count
     finally:
         if old_check is None:
             os.environ.pop("IMAGE_CHECK_MODEL", None)
