@@ -752,72 +752,80 @@ class ImageDiscoveryBuilder:
     ) -> ImageDiscoveryResult:
         total_started = time.perf_counter()
         result = ImageDiscoveryResult(plan_id=plan.plan_id)
-        validation = self._wiki_inline_image_check(
-            plan=plan,
-            search_result=search_result,
-            run_id=run_id,
-        )
-        snapshot = self._snapshot_from_wiki_inline_result(search_result, plan=plan, run_id=run_id)
-        result.snapshots.append(snapshot)
-        if persist:
-            self._persist_snapshot(snapshot)
-
-        if not validation.drop_candidate:
-            candidate = ImageSearchCandidate(
-                candidate_id=self._candidate_record_id(search_result),
-                source_query=(plan.queries or [SearchQuerySpec.create("", plan.target.evidence_id)])[0],
-                source_snapshot=snapshot,
+        validation: ImageValidationResult | None = None
+        try:
+            validation = self._wiki_inline_image_check(
+                plan=plan,
                 search_result=search_result,
-                validation=validation,
-                used_fallback=False,
+                run_id=run_id,
+                persist_asset=False,
             )
-            result.candidates = [candidate]
-            if validation.status == ImageCandidateStatus.ACCEPTED:
-                self._materialize_primary_candidate(
-                    result=result,
-                    plan=plan,
-                    candidate=candidate,
-                    run_id=run_id,
-                    persist=persist,
-                    create_source_edge=False,
+            snapshot = self._snapshot_from_wiki_inline_result(search_result, plan=plan, run_id=run_id)
+            result.snapshots.append(snapshot)
+            if persist:
+                self._persist_snapshot(snapshot)
+
+            if not validation.drop_candidate:
+                candidate = ImageSearchCandidate(
+                    candidate_id=self._candidate_record_id(search_result),
+                    source_query=(plan.queries or [SearchQuerySpec.create("", plan.target.evidence_id)])[0],
+                    source_snapshot=snapshot,
+                    search_result=search_result,
+                    validation=validation,
+                    used_fallback=False,
                 )
-                if result.image_node is not None and result.image_node.source is not None:
-                    result.image_node.source.source_type = "wikipedia_inline_image"
-                if result.image_node is not None:
-                    result.image_node.metadata = dict(result.image_node.metadata or {})
-                    result.image_node.metadata.update(
-                        {
-                            "image_origin": "wikipedia_inline",
-                            "source_text_node_id": plan.source_node_id,
-                            "source_evidence_ids": list(plan.source_evidence_ids),
-                        }
+                result.candidates = [candidate]
+                if validation.status == ImageCandidateStatus.ACCEPTED:
+                    self._materialize_primary_candidate(
+                        result=result,
+                        plan=plan,
+                        candidate=candidate,
+                        run_id=run_id,
+                        persist=persist,
+                        create_source_edge=False,
                     )
-        result.metadata.update(
-            {
-                "query_count": len(plan.queries),
-                "image_count": len(result.candidates),
-                "usable_image_count": len(result.usable_images()),
-                "accepted_image_count": len(result.accepted_images()),
-                "queued_task_count": len(result.queued_tasks),
-                "candidate_decisions": [
-                    {
-                        "kind": "wiki_inline_image",
-                        "query": (plan.queries[0].query if plan.queries else ""),
-                        "title": search_result.title,
-                        "url": search_result.image_url,
-                        "status": validation.status.value,
-                        "reason": validation.reason,
-                        "check": (validation.metadata or {}).get("check"),
-                    }
-                ],
-            }
-        )
-        if persist and self.store is not None:
-            self.store.maybe_flush()
-        _trace_timing(
-            f"[image-discovery] phase=done_wiki_inline plan_id={plan.plan_id} elapsed_s={time.perf_counter() - total_started:.3f} accepted={len(result.accepted_images())} kept={'yes' if result.image_node is not None else 'no'}"
-        )
-        return result
+                    if result.image_node is not None and result.image_node.source is not None:
+                        result.image_node.source.source_type = "wikipedia_inline_image"
+                    if result.image_node is not None:
+                        result.image_node.metadata = dict(result.image_node.metadata or {})
+                        result.image_node.metadata.update(
+                            {
+                                "image_origin": "wikipedia_inline",
+                                "source_text_node_id": plan.source_node_id,
+                                "source_evidence_ids": list(plan.source_evidence_ids),
+                            }
+                        )
+            result.metadata.update(
+                {
+                    "query_count": len(plan.queries),
+                    "image_count": len(result.candidates),
+                    "usable_image_count": len(result.usable_images()),
+                    "accepted_image_count": len(result.accepted_images()),
+                    "queued_task_count": len(result.queued_tasks),
+                    "candidate_decisions": [
+                        {
+                            "kind": "wiki_inline_image",
+                            "query": (plan.queries[0].query if plan.queries else ""),
+                            "title": search_result.title,
+                            "url": search_result.image_url,
+                            "status": validation.status.value,
+                            "reason": validation.reason,
+                            "check": (validation.metadata or {}).get("check"),
+                        }
+                    ],
+                }
+            )
+            if persist and self.store is not None:
+                self.store.maybe_flush()
+            _trace_timing(
+                f"[image-discovery] phase=done_wiki_inline plan_id={plan.plan_id} elapsed_s={time.perf_counter() - total_started:.3f} accepted={len(result.accepted_images())} kept={'yes' if result.image_node is not None else 'no'}"
+            )
+            return result
+        finally:
+            if result.candidates:
+                self._clear_transient_assets(result.candidates)
+            elif validation is not None:
+                self._clear_transient_asset_from_validation(validation)
 
     def _discover_with_client(
         self,
@@ -1250,6 +1258,26 @@ class ImageDiscoveryBuilder:
         if key:
             self._transient_image_cache.pop(key, None)
 
+    def _bind_resolved_asset_to_validation(
+        self,
+        validation: ImageValidationResult,
+        resolved_asset: ResolvedImageAsset,
+        *,
+        persist_asset: bool,
+    ) -> None:
+        metadata = dict(validation.metadata or {})
+        old_transient_key = metadata.get("transient_image_key")
+        if persist_asset:
+            if old_transient_key:
+                self._transient_image_cache.pop(old_transient_key, None)
+            metadata.pop("transient_image_key", None)
+            metadata["resolved_image_key"] = resolved_asset.cache_key
+        else:
+            metadata.pop("resolved_image_key", None)
+            metadata["transient_image_key"] = resolved_asset.cache_key
+        metadata["resolved_image"] = resolved_asset.to_metadata()
+        validation.metadata = metadata
+
     @staticmethod
     def _select_primary_candidate(candidates: list[ImageSearchCandidate]) -> ImageSearchCandidate | None:
         accepted = [
@@ -1280,17 +1308,22 @@ class ImageDiscoveryBuilder:
         persist: bool,
         create_source_edge: bool = True,
     ) -> None:
-        resolved_asset = self._resolved_image_from_validation(candidate.validation)
+        resolved_asset = self._resolved_image_from_validation(
+            candidate.validation,
+            include_transient=not persist,
+        )
         if resolved_asset is None and self.config.precheck_image_urls:
             resolved_asset, _ = self._resolve_image_asset(
                 candidate.search_result,
-                persist_asset=True,
+                persist_asset=persist,
                 recovery_query=candidate.source_query.query,
             )
             if resolved_asset is not None:
-                candidate.validation.metadata = dict(candidate.validation.metadata or {})
-                candidate.validation.metadata["resolved_image_key"] = resolved_asset.cache_key
-                candidate.validation.metadata["resolved_image"] = resolved_asset.to_metadata()
+                self._bind_resolved_asset_to_validation(
+                    candidate.validation,
+                    resolved_asset,
+                    persist_asset=persist,
+                )
         provisional_node = self._image_node_from_result(
             candidate.search_result,
             run_id=run_id,
@@ -1302,6 +1335,7 @@ class ImageDiscoveryBuilder:
             image_node=provisional_node,
             validation=candidate.validation,
             run_id=run_id,
+            persist_asset=persist,
         )
         candidate.grounded_entities = list(grounding.get("grounded_entities", []))
         candidate.grounded_caption = grounding.get("caption")
@@ -1479,6 +1513,7 @@ class ImageDiscoveryBuilder:
         image_node: ImageNode,
         validation: ImageValidationResult,
         run_id: str | None,
+        persist_asset: bool = True,
     ) -> dict[str, Any]:
         """Analyze an accepted image and ground unique visible entities."""
 
@@ -1493,13 +1528,23 @@ class ImageDiscoveryBuilder:
             self._apply_grounding_to_image_node(image_node, grounding)
             return grounding
 
-        resolved_asset = self._resolved_image_from_validation(validation)
+        resolved_asset = self._resolved_image_from_validation(
+            validation,
+            include_transient=not persist_asset,
+        )
         precheck_error: str | None = None
         if self.config.precheck_image_urls and resolved_asset is None:
             resolved_asset, precheck_error = self._resolve_image_asset(
                 search_result,
+                persist_asset=persist_asset,
                 recovery_query=image_node.caption or search_result.title or search_result.snippet,
             )
+            if resolved_asset is not None:
+                self._bind_resolved_asset_to_validation(
+                    validation,
+                    resolved_asset,
+                    persist_asset=persist_asset,
+                )
         if self.config.precheck_image_urls and resolved_asset is None:
             precheck_error = precheck_error or "missing_resolved_image_asset"
             self._log_invalid_image_url(search_result.image_url, precheck_error, stage="image_ground")
@@ -1809,15 +1854,19 @@ class ImageDiscoveryBuilder:
                 "check": "force_accept_images",
                 "debug_force_accept_images": True,
             }
-            if resolved_asset is not None:
-                metadata["transient_image_key"] = resolved_asset.cache_key
-                metadata["resolved_image"] = resolved_asset.to_metadata()
-            return ImageValidationResult(
+            result = ImageValidationResult(
                 status=ImageCandidateStatus.ACCEPTED,
                 confidence=1.0,
                 reason="force_accept_images",
                 metadata=metadata,
             )
+            if resolved_asset is not None:
+                self._bind_resolved_asset_to_validation(
+                    result,
+                    resolved_asset,
+                    persist_asset=False,
+                )
+            return result
 
         if model_alias:
             try:
@@ -1829,9 +1878,11 @@ class ImageDiscoveryBuilder:
                     resolved_asset=resolved_asset,
                 )
                 if resolved_asset is not None:
-                    result.metadata = dict(result.metadata or {})
-                    result.metadata["transient_image_key"] = resolved_asset.cache_key
-                    result.metadata["resolved_image"] = resolved_asset.to_metadata()
+                    self._bind_resolved_asset_to_validation(
+                        result,
+                        resolved_asset,
+                        persist_asset=False,
+                    )
                 return result
             except Exception as exc:
                 error = f"{exc.__class__.__name__}: {exc}"
@@ -1920,10 +1971,12 @@ class ImageDiscoveryBuilder:
         plan: VisualSearchPlan,
         search_result: ImageSearchResult,
         run_id: str | None,
+        persist_asset: bool = False,
     ) -> ImageValidationResult:
         resolved_asset, rejection = self._precheck_candidate_for_processing(
             search_result,
             stage="wiki_inline_image_check",
+            persist_asset=persist_asset,
             recovery_query=plan.target.content or search_result.title or search_result.snippet,
         )
         if rejection is not None:
@@ -2012,8 +2065,11 @@ class ImageDiscoveryBuilder:
             }
         )
         if resolved_asset is not None:
-            result.metadata["resolved_image_key"] = resolved_asset.cache_key
-            result.metadata["resolved_image"] = resolved_asset.to_metadata()
+            self._bind_resolved_asset_to_validation(
+                result,
+                resolved_asset,
+                persist_asset=persist_asset,
+            )
         if result.status == ImageCandidateStatus.REJECTED:
             result.drop_candidate = True
         return result
@@ -2524,11 +2580,21 @@ class ImageDiscoveryBuilder:
     def _resolved_image_from_validation(
         self,
         validation: ImageValidationResult,
+        *,
+        include_transient: bool = False,
     ) -> ResolvedImageAsset | None:
-        key = (validation.metadata or {}).get("resolved_image_key")
-        if not key:
+        metadata = validation.metadata or {}
+        key = metadata.get("resolved_image_key")
+        if key:
+            asset = self._resolved_image_cache.get(key)
+            if asset is not None:
+                return asset
+        if not include_transient:
             return None
-        return self._resolved_image_cache.get(key)
+        transient_key = metadata.get("transient_image_key")
+        if not transient_key:
+            return None
+        return self._transient_image_cache.get(transient_key)
 
     @staticmethod
     def _resolved_image_cache_key(
@@ -4094,6 +4160,17 @@ def _smoke_test() -> None:
     class MockModel:
         def generate(self, request: ModelRequest) -> ModelResponse:
             system = request.messages[0].content
+            if "Wikipedia inline image is visually relevant" in system:
+                return ModelResponse(
+                    content=(
+                        "<check>\n"
+                        "decision: accept\n"
+                        "confidence: 0.9\n"
+                        "reason: clearly related to the page subject\n"
+                        "visual_fact: Kobe Bryant is visible\n"
+                        "</check>"
+                    )
+                )
             if "checking whether a candidate image" in system:
                 return ModelResponse(
                     content="""<check>
@@ -4313,6 +4390,109 @@ entity: Los Angeles Lakers | jersey logo | visible team branding on the uniform
             assert selected_error is None
             assert selected_asset is not None
             assert selected_asset.resolved_url == recovered_urls[1]
+
+            wiki_inline_target = Evidence.create(
+                EvidenceType.VISUAL_TARGET,
+                content="Kobe Bryant courtside photo",
+                node_ids=[text_node.node_id],
+                metadata={"expected_visual": "Kobe Bryant courtside photo"},
+            )
+            wiki_inline_query = SearchQuerySpec.create(
+                "Kobe Bryant courtside photo",
+                wiki_inline_target.evidence_id,
+                expected_visual="Kobe Bryant courtside photo",
+            )
+            wiki_inline_plan = VisualSearchPlan.create(
+                wiki_inline_target,
+                queries=[wiki_inline_query],
+                source_node_id=text_node.node_id,
+                source_evidence_ids=["evidence_text"],
+                planner="wikipedia_inline_image_planner",
+                metadata={"plan_source": "wikipedia_inline_image"},
+            )
+            wiki_inline_search_result = ImageSearchResult(
+                title="Kobe Bryant courtside photo",
+                image_url="https://example.com/wiki-inline-kobe.jpg",
+                source_page_url="https://en.wikipedia.org/wiki/Kobe_Bryant",
+                snippet="Kobe Bryant courtside",
+                source="wikipedia_inline",
+            )
+            inline_builder = ImageDiscoveryBuilder(
+                store=store,
+                search_client=MockImageSearchClient(),
+                config=ImageDiscoveryConfig(
+                    per_query_limit=1,
+                    max_images_per_plan=1,
+                    enable_retrieval_consistency_check=False,
+                    precheck_image_urls=True,
+                    upload_cached_images=False,
+                    try_source_page_recovery=False,
+                ),
+                model_client=MockModel(),
+                wiki_resolver=MockWikiResolver(),
+            )
+            persist_calls: list[bool] = []
+
+            def fake_inline_download_and_prepare_image_asset(
+                image_url: str | None,
+                *,
+                source_page_url: str | None,
+                strategy: str,
+                cache_key: str,
+                persist_asset: bool = True,
+            ) -> tuple[ResolvedImageAsset | None, str | None]:
+                persist_calls.append(persist_asset)
+                if not image_url:
+                    return None, "missing_image_url"
+                asset_uri = f"/tmp/{cache_key}.jpg" if persist_asset else image_url
+                cache_path = f"/tmp/{cache_key}.jpg" if persist_asset else None
+                return (
+                    ResolvedImageAsset(
+                        cache_key=cache_key,
+                        original_url=image_url,
+                        resolved_url=image_url,
+                        source_page_url=source_page_url,
+                        model_url="data:image/jpeg;base64,AA==",
+                        asset_uri=asset_uri,
+                        cache_path=cache_path,
+                        content_type="image/jpeg",
+                        width=640,
+                        height=480,
+                        strategy=strategy,
+                    ),
+                    None,
+                )
+
+            inline_builder._download_and_prepare_image_asset = fake_inline_download_and_prepare_image_asset  # type: ignore[method-assign]
+
+            provisional_inline = inline_builder.discover_for_wiki_inline_image(
+                wiki_inline_plan,
+                search_result=wiki_inline_search_result,
+                run_id="run_smoke",
+                persist=False,
+            )
+            assert provisional_inline.image_node is not None
+            assert persist_calls and set(persist_calls) == {False}
+            assert not inline_builder._resolved_image_cache
+            assert not inline_builder._transient_image_cache
+            assert store.stats()["nodes"] == 3
+
+            previous_call_count = len(persist_calls)
+            kept_inline = inline_builder.discover_for_wiki_inline_image(
+                wiki_inline_plan,
+                search_result=wiki_inline_search_result,
+                run_id="run_smoke",
+                persist=True,
+            )
+            assert kept_inline.image_node is not None
+            assert kept_inline.image_node.source is not None
+            assert kept_inline.image_node.source.source_type == "wikipedia_inline_image"
+            kept_call_slice = persist_calls[previous_call_count:]
+            assert False in kept_call_slice
+            assert True in kept_call_slice
+            assert inline_builder._resolved_image_cache
+            assert not inline_builder._transient_image_cache
+            assert store.stats()["nodes"] == 4
     finally:
         if old_check is None:
             os.environ.pop("IMAGE_CHECK_MODEL", None)
