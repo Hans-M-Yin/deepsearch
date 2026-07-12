@@ -233,6 +233,7 @@ Output guidance:
    - represented in image
    These are too generic and do not help locate the entity.
 8. If the image contains multiple people or objects, `relation_to_image` must disambiguate the target.
+   The locator must be concrete and specifically localizable; avoid vague descriptions such as `sponsor logo in the background`.
 9. If no stable scene-centric or object-centric locator is available, omit the entity rather than using a vague image-centric relation.
 10. `evidence` should be one short sentence explaining the visible cue that supports the grounding.
 11. If two surface forms refer to the same entity, output only the canonical one and mention the alias/handle inside `evidence`.
