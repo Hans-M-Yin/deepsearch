@@ -424,6 +424,32 @@ Output format:
 """
 
 
+PROMPT_WIKI_INLINE_IMAGE_TITLE_CHECK = """You are checking whether a Wikipedia inline image is visually relevant to the subject of a Wikipedia page.
+
+You will receive:
+- the Wikipedia page title
+- the image itself
+
+Important rules:
+1. Judge from the visible image content first.
+2. Do not rely on caption text, alt text, surrounding prose, or other metadata that is not visually shown.
+3. Accept if the image is directly about the page subject, OR if it provides clear and informative visual context that is still meaningfully related to the page subject.
+4. Keep informative contextual images when a reasonable reader would say the image is about this title or helps illustrate this title, even if the subject itself is not the only thing visible.
+5. Reject only when the image has little or no visual information, is a tiny/icon-like/decorative asset, is effectively empty, or has no clear visual relation to the page title.
+6. For a person page, keep images that show the person, the person's recognizable representation, or a clearly related scene/object strongly associated with that person.
+7. For an organization, place, product, vehicle, artwork, event, or topic page, keep images that directly depict the title or provide clearly relevant visual context for it.
+
+Output exactly one block:
+<check>
+decision: accept|reject
+confidence: 0.0-1.0
+reason: short reason
+visual_fact: visible fact 1
+visual_fact: visible fact 2
+</check>
+"""
+
+
 @dataclass(slots=True)
 class ImageDiscoveryConfig:
     """Cheap gates and retrieval limits for image discovery."""
@@ -1863,6 +1889,28 @@ class ImageDiscoveryBuilder:
                     f"image_url_precheck_failed:{precheck_error}",
                     drop_candidate=True,
                 )
+            if (
+                self.config.min_width is not None
+                and resolved_asset.width is not None
+                and resolved_asset.width < self.config.min_width
+            ):
+                if not persist_asset:
+                    self._transient_image_cache.pop(resolved_asset.cache_key, None)
+                return None, self._reject(
+                    f"resolved_width_below_min:{resolved_asset.width}",
+                    drop_candidate=True,
+                )
+            if (
+                self.config.min_height is not None
+                and resolved_asset.height is not None
+                and resolved_asset.height < self.config.min_height
+            ):
+                if not persist_asset:
+                    self._transient_image_cache.pop(resolved_asset.cache_key, None)
+                return None, self._reject(
+                    f"resolved_height_below_min:{resolved_asset.height}",
+                    drop_candidate=True,
+                )
         return resolved_asset, None
 
     def _wiki_inline_image_check(
@@ -1872,7 +1920,6 @@ class ImageDiscoveryBuilder:
         search_result: ImageSearchResult,
         run_id: str | None,
     ) -> ImageValidationResult:
-        del run_id
         resolved_asset, rejection = self._precheck_candidate_for_processing(
             search_result,
             stage="wiki_inline_image_check",
@@ -1881,106 +1928,55 @@ class ImageDiscoveryBuilder:
         if rejection is not None:
             return rejection
 
-        caption = str(search_result.snippet or "").strip()
-        if not caption:
-            return self._reject("missing_wiki_inline_caption", drop_candidate=True)
+        wiki_title = (self._source_node_title(plan.source_node_id) or "").strip()
+        if not wiki_title:
+            return self._reject("missing_wiki_inline_title", drop_candidate=True)
 
-        question_model = (
-            os.environ.get("TEXT_PROCESS_MODEL")
-            or os.environ.get("IMAGE_CHECK_MODEL")
-            or os.environ.get("IMAGE_GROUND_MODEL")
-        )
-        answer_model = (
-            os.environ.get("WIKI_INLINE_IMAGE_QA_MODEL")
-            or os.environ.get("IMAGE_GROUND_MODEL")
+        model_alias = (
+            os.environ.get("WIKI_INLINE_IMAGE_CHECK_MODEL")
+            or self.image_check_model_alias
             or os.environ.get("IMAGE_CHECK_MODEL")
             or os.environ.get("TEXT_PROCESS_MODEL")
+            or os.environ.get("IMAGE_GROUND_MODEL")
         )
-        judge_model = (
-            os.environ.get("WIKI_INLINE_IMAGE_QA_JUDGE_MODEL")
-            or os.environ.get("WIKI_INLINE_IMAGE_QA_MODEL")
-            or answer_model
-        )
-        if not question_model or not answer_model or not judge_model:
-            return self._reject("missing_wiki_inline_image_models", drop_candidate=True)
+        if not model_alias:
+            return self._reject("missing_wiki_inline_image_model", drop_candidate=True)
 
         try:
-            wiki_title = self._source_node_title(plan.source_node_id) or ""
             image_for_model = resolved_asset.model_url if resolved_asset is not None else search_result.image_url
-            question_response = self.model_client.generate(
+            self._log_image_model_call(
+                stage="wiki_inline_image_check",
+                when="before",
+                model_alias=model_alias,
+                plan_id=plan.plan_id,
+                search_result=search_result,
+                model_image_url=image_for_model,
+                resolved_asset=resolved_asset,
+            )
+            response = self.model_client.generate(
                 ModelRequest(
-                    model=question_model,
+                    model=model_alias,
                     messages=[
-                        ModelMessage(role="system", content=PROMPT_WIKI_INLINE_IMAGE_QUESTION),
+                        ModelMessage(role="system", content=PROMPT_WIKI_INLINE_IMAGE_TITLE_CHECK),
                         ModelMessage(
                             role="user",
                             content=[
                                 {
                                     "type": "text",
-                                    "text": self._wiki_inline_question_prompt_input(
-                                        caption=caption,
-                                        wikipedia_title=wiki_title,
-                                    ),
+                                    "text": self._wiki_inline_title_check_prompt_input(wikipedia_title=wiki_title),
                                 },
                                 {"type": "image_url", "image_url": {"url": image_for_model}},
                             ],
                         ),
                     ],
-                    metadata={"trace_label": f"wiki_inline_question:{plan.plan_id}"},
-                )
-            )
-            question_payload = self._parse_wiki_inline_question(question_response.content)
-            question = question_payload["question"]
-            expected_answer = question_payload.get("answer", "")
-            answer_response = self.model_client.generate(
-                ModelRequest(
-                    model=answer_model,
-                    messages=[
-                        ModelMessage(role="system", content=PROMPT_WIKI_INLINE_IMAGE_ANSWER),
-                        ModelMessage(
-                            role="user",
-                            content=[
-                                {"type": "text", "text": question},
-                                {"type": "image_url", "image_url": {"url": image_for_model}},
-                            ],
-                        ),
-                    ],
-                    metadata={"trace_label": f"wiki_inline_answer:{plan.plan_id}"},
-                )
-            )
-            answer = self._parse_wiki_inline_answer(answer_response.content)
-            judge_response = self.model_client.generate(
-                ModelRequest(
-                    model=judge_model,
-                    messages=[
-                        ModelMessage(role="system", content=PROMPT_WIKI_INLINE_IMAGE_JUDGE),
-                        ModelMessage(
-                            role="user",
-                            content=[
-                                {
-                                    "type": "text",
-                                    "text": (
-                                        f"Caption:\n{caption}\n\n"
-                                        f"Wikipedia:\n{wiki_title}\n\n"
-                                        f"Question:\n{question}\n\n"
-                                        f"Expected answer:\n{expected_answer}\n\n"
-                                        f"Answer:\n{answer}"
-                                    ),
-                                },
-                                {"type": "image_url", "image_url": {"url": image_for_model}},
-                            ],
-                        ),
-                    ],
-                    metadata={"trace_label": f"wiki_inline_judge:{plan.plan_id}"},
+                    metadata={"trace_label": f"wiki_inline_title_check:{plan.plan_id}"},
                 )
             )
         except Exception as exc:
             print(
                 "[wiki-inline-image] model request failed "
                 f"plan_id={plan.plan_id} "
-                f"question_model={question_model!r} "
-                f"answer_model={answer_model!r} "
-                f"judge_model={judge_model!r}",
+                f"model_alias={model_alias!r}",
                 file=sys.stderr,
                 flush=True,
             )
@@ -1989,38 +1985,37 @@ class ImageDiscoveryBuilder:
                 f"wiki_inline_image_model_error:{exc.__class__.__name__}:{exc}",
                 drop_candidate=True,
             )
-
-        decision, judge_reason = self._parse_wiki_inline_judge(judge_response.content)
-        metadata = {
-            "check": "wiki_inline_identifiability",
-            "question_model": question_model,
-            "answer_model": answer_model,
-            "judge_model": judge_model,
-            "question": question,
-            "expected_answer": expected_answer,
-            "answer": answer,
-            "judge_reason": judge_reason,
-            "question_raw_output": question_response.content,
-            "answer_raw_output": answer_response.content,
-            "judge_raw_output": judge_response.content,
-        }
-        if resolved_asset is not None:
-            metadata["resolved_image_key"] = resolved_asset.cache_key
-            metadata["resolved_image"] = resolved_asset.to_metadata()
-        if decision == "true":
-            return ImageValidationResult(
-                status=ImageCandidateStatus.REJECTED,
-                confidence=1.0,
-                reason="wiki_inline_judge_true_drop",
-                drop_candidate=True,
-                metadata=metadata,
-            )
-        return ImageValidationResult(
-            status=ImageCandidateStatus.ACCEPTED,
-            confidence=1.0,
-            reason="wiki_inline_judge_false_keep",
-            metadata=metadata,
+        self._log_image_model_call(
+            stage="wiki_inline_image_check",
+            when="after",
+            model_alias=model_alias,
+            plan_id=plan.plan_id,
+            search_result=search_result,
+            model_image_url=image_for_model,
+            resolved_asset=resolved_asset,
+            model_output=response.content,
         )
+
+        result = self._parse_image_check_response(
+            response.content,
+            run_id=run_id,
+            model_alias=model_alias,
+            usage=response.usage,
+        )
+        result.metadata = dict(result.metadata or {})
+        result.metadata.update(
+            {
+                "check": "wiki_inline_title_relevance",
+                "wikipedia_title": wiki_title,
+                "search_result_title": search_result.title,
+            }
+        )
+        if resolved_asset is not None:
+            result.metadata["resolved_image_key"] = resolved_asset.cache_key
+            result.metadata["resolved_image"] = resolved_asset.to_metadata()
+        if result.status == ImageCandidateStatus.REJECTED:
+            result.drop_candidate = True
+        return result
 
     def _resolve_image_asset(
         self,
@@ -2927,6 +2922,10 @@ class ImageDiscoveryBuilder:
             f"Wikipedia: {wikipedia_title or ''}\n"
             f"description: {caption or ''}"
         )
+
+    @staticmethod
+    def _wiki_inline_title_check_prompt_input(*, wikipedia_title: str) -> str:
+        return f"Wikipedia page title: {wikipedia_title or ''}"
 
     @staticmethod
     def _parse_image_check_response(

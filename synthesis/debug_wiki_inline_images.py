@@ -194,13 +194,11 @@ def main(argv: list[str] | None = None) -> int:
                 "caption": candidate.caption,
                 "raw_caption": candidate.raw_caption,
                 "alt_text": candidate.alt_text,
-                "question": metadata.get("question"),
-                "expected_answer": metadata.get("expected_answer"),
-                "model_answer": metadata.get("answer"),
-                "judge_reason": metadata.get("judge_reason"),
-                "question_raw_output": metadata.get("question_raw_output"),
-                "answer_raw_output": metadata.get("answer_raw_output"),
-                "judge_raw_output": metadata.get("judge_raw_output"),
+                "check": metadata.get("check"),
+                "model_alias": metadata.get("model_alias"),
+                "wikipedia_title": metadata.get("wikipedia_title"),
+                "visual_facts": metadata.get("visual_facts") or [],
+                "raw_model_output": metadata.get("raw_model_output"),
                 "resolved_image": metadata.get("resolved_image"),
             }
         )
@@ -220,13 +218,13 @@ def main(argv: list[str] | None = None) -> int:
         print(f"file_page_url: {item.get('file_page_url') or ''}")
         print(f"caption: {_short(item.get('caption'), 400)}")
         print(f"alt_text: {_short(item.get('alt_text'), 240)}")
-        print(f"question: {_short(item.get('question'), 400)}")
-        print(f"expected_answer: {_short(item.get('expected_answer'), 240)}")
-        print(f"model_answer: {_short(item.get('model_answer'), 240)}")
-        print(f"judge_reason: {_short(item.get('judge_reason'), 400)}")
-        print(f"question_raw_output: {_short(item.get('question_raw_output'), 400)}")
-        print(f"answer_raw_output: {_short(item.get('answer_raw_output'), 240)}")
-        print(f"judge_raw_output: {_short(item.get('judge_raw_output'), 400)}")
+        print(f"check: {item.get('check') or '-'}")
+        print(f"model_alias: {item.get('model_alias') or '-'}")
+        print(f"wikipedia_title: {_short(item.get('wikipedia_title'), 240)}")
+        visual_facts = item.get('visual_facts') or []
+        if visual_facts:
+            print(f"visual_facts: {' | '.join(_short(fact, 120) for fact in visual_facts[:3])}")
+        print(f"raw_model_output: {_short(item.get('raw_model_output'), 400)}")
 
     if args.pretty:
         payload = {
