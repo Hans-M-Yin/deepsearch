@@ -39,29 +39,15 @@ from .schemas import PathCandidate, QuestionDraft
 _VQA_FIXED_REQUEST_ID = "3200636808"
 
 
-PROMPT_COMPRESS_HOP = """You are compressing one hop from a multimodal reasoning trajectory.
+PROMPT_COMPRESS_HOP_GENERIC = """You are compressing one hop from a multimodal reasoning trajectory.
 
 You are given:
 - a source node
 - the edge relation connecting to the next node
-- a destination node
+- a target node
 
 Write one short declarative statement that captures the essential meaning of
 this hop for downstream question composition.
-
-Important semantics by hop type:
-- text -> text:
-  treat this as a normal entity-to-entity relation
-- text -> image:
-  treat the target as a key photo / visual scene, not as an image file
-  the edge relation is the source-aware relation connecting the source node to that image
-  the destination image node's title / search_query is the original retrieval query for finding that image
-  preserve the relation's distinctive details and keep it aligned with the retrieval query
-  do not generalize either one into a vague scene description
-  keep the key entity, event, action, and distinguishing scene details intact
-- image -> text:
-  treat the source as a visual clue inside the image, and treat the target as
-  the entity identified by that clue
 
 The statement should:
 - preserve the relation needed for downstream reasoning
@@ -69,11 +55,11 @@ The statement should:
 - avoid unnecessary details
 - avoid asking a question
 - stay faithful to THIS hop only
-- not introduce entities that are not the current source node or current destination node
+- not introduce entities that are not the current source node or current target node
 
 Anchor rules:
 - source must refer to the current source node only
-- target must refer to the current destination node only
+- target must refer to the current target node only
 - do not replace source or target with entities from earlier or later hops
 - do not turn this into a cross-hop summary
 
@@ -83,7 +69,254 @@ Return valid JSON with exactly these fields:
   "source": "...",
   "target": "...",
   "relation": "...",
-  "retrieval_query": "..."  // required for text -> image, otherwise empty string
+  "retrieval_query": "..."
+}
+"""
+
+
+PROMPT_COMPRESS_HOP_TEXT_TO_TEXT = """You are compressing one text-to-text hop from a reasoning trajectory.
+
+You are given:
+- a source text node
+- the edge relation connecting it to a target text node
+- a target text node
+
+Write one short declarative statement that captures the essential meaning of
+this hop for downstream question composition.
+
+Treat this as a directed entity-to-entity relation. The statement should make
+the transition from the source to the target clear, rather than replacing
+either one with a broad summary.
+
+The statement should:
+- preserve the relation needed for downstream reasoning
+- keep the direction from source to target clear
+- preserve dates, roles, numbers, and other constraints when they matter
+- be concise
+- avoid unnecessary details
+- avoid asking a question
+- stay faithful to THIS hop only
+- not introduce entities that are not the current source node or current target node
+
+Anchor rules:
+- source must refer to the current source node only
+- target must refer to the current target node only
+- do not replace source or target with entities from earlier or later hops
+- do not turn this into a cross-hop summary
+
+Example 1:
+Input:
+{
+  "hop_type": "text->text",
+  "source_node": {"title": "David E. Finley, Jr."},
+  "edge": {"edge_type": "wiki_attribute", "relation": "earned his professional degree from"},
+  "target_node": {"title": "Harvard Law School"}
+}
+Output:
+{
+  "statement": "David E. Finley, Jr. earned his professional degree from Harvard Law School.",
+  "source": "David E. Finley, Jr.",
+  "target": "Harvard Law School",
+  "relation": "earned his professional degree from",
+  "retrieval_query": ""
+}
+
+Example 2:
+Input:
+{
+  "hop_type": "text->text",
+  "source_node": {"title": "Bird in Space"},
+  "edge": {"edge_type": "wiki_link", "relation": "the museum that houses its 1925 marble and 1927 bronze versions is"},
+  "target_node": {"title": "National Gallery of Art"}
+}
+Output:
+{
+  "statement": "The museum that houses the 1925 marble and 1927 bronze versions of Bird in Space is the National Gallery of Art.",
+  "source": "Bird in Space",
+  "target": "National Gallery of Art",
+  "relation": "the museum that houses its 1925 marble and 1927 bronze versions is",
+  "retrieval_query": ""
+}
+
+Return valid JSON with exactly these fields:
+{
+  "statement": "...",
+  "source": "...",
+  "target": "...",
+  "relation": "...",
+  "retrieval_query": ""
+}
+"""
+
+
+PROMPT_COMPRESS_HOP_TEXT_TO_IMAGE = """You are compressing one text-to-image hop from a reasoning trajectory.
+
+You are given:
+- a source text node
+- the edge relation connecting it to a target image node
+- a target image node
+
+Write one short declarative statement that captures the essential meaning of
+this hop for downstream question composition.
+
+For this hop type, the target should be treated as a key photo or visual scene,
+not merely as an image file. The point of the statement is to preserve the
+transition from the source entity to that target image.
+
+This means:
+- the source must remain explicit in the statement
+- the statement should sound like a source-to-image relation, not like a standalone image caption
+- first anchor the image to the source, then describe what the target image shows
+- the target image node's title or search_query is the retrieval clue for finding that image
+- preserve distinctive event, date, action, and scene details when they matter
+- keep the statement aligned with the retrieval clue rather than drifting into a vague scene description
+
+The statement should:
+- preserve the relation needed for downstream reasoning
+- make the transition from the source to the target image clear
+- be concise
+- avoid unnecessary details
+- avoid asking a question
+- stay faithful to THIS hop only
+- not introduce entities that are not the current source node or current target node
+
+Anchor rules:
+- source must refer to the current source node only
+- target must refer to the current target node only
+- do not replace source or target with entities from earlier or later hops
+- do not turn this into a cross-hop summary
+
+Example 1:
+Input:
+{
+  "hop_type": "text->image",
+  "source_node": {"title": "Port Jackson"},
+  "edge": {"edge_type": "search_retrieved", "relation": "Japanese midget submarine recovered from Sydney Harbour after the 31 May 1942 raid"},
+  "target_node": {
+    "title": "photo of the recovered Japanese midget submarine",
+    "caption": "A black-and-white historical photograph showing the recovery of a Japanese midget submarine from Sydney Harbour after the 31 May 1942 raid.",
+    "search_query": "Japanese midget submarine recovered from Sydney Harbour after the 31 May 1942 raid"
+  }
+}
+Output:
+{
+  "statement": "About Port Jackson, there is a black-and-white historical photograph showing the recovery of a Japanese midget submarine from the harbour after the 31 May 1942 raid.",
+  "source": "Port Jackson",
+  "target": "the black-and-white historical photograph of the recovered Japanese midget submarine",
+  "relation": "is associated with a historical photograph showing the recovery of a Japanese midget submarine after the 31 May 1942 raid",
+  "retrieval_query": "Japanese midget submarine recovered from Sydney Harbour after the 31 May 1942 raid"
+}
+
+Example 2:
+Input:
+{
+  "hop_type": "text->image",
+  "source_node": {"title": "Constantin Brancusi"},
+  "edge": {"edge_type": "search_retrieved", "relation": "photo of him in his Paris studio taken by Edward Steichen in 1920"},
+  "target_node": {
+    "title": "Steichen photo of Brancusi in his studio",
+    "caption": "A famous 1920 photograph by Edward Steichen showing Constantin Brancusi in his Paris studio.",
+    "search_query": "Edward Steichen 1920 photo of Constantin Brancusi in Paris studio"
+  }
+}
+Output:
+{
+  "statement": "About Constantin Brancusi, there is a famous 1920 photograph by Edward Steichen showing him in his Paris studio.",
+  "source": "Constantin Brancusi",
+  "target": "the 1920 Edward Steichen photograph of Brancusi in his Paris studio",
+  "relation": "is associated with a famous 1920 photograph by Edward Steichen showing him in his Paris studio",
+  "retrieval_query": "Edward Steichen 1920 photo of Constantin Brancusi in Paris studio"
+}
+
+Return valid JSON with exactly these fields:
+{
+  "statement": "...",
+  "source": "...",
+  "target": "...",
+  "relation": "...",
+  "retrieval_query": "..."
+}
+"""
+
+
+PROMPT_COMPRESS_HOP_IMAGE_TO_TEXT = """You are compressing one image-to-text hop from a reasoning trajectory.
+
+You are given:
+- a source image node
+- the edge relation connecting it to a target text node
+- a target text node
+
+Write one short declarative statement that captures the essential meaning of
+this hop for downstream question composition.
+
+For this hop type, the source should be treated as a visual clue inside the
+image, and the target should be treated as the entity identified by that clue.
+The statement should preserve the transition from the image clue to the target,
+rather than turning into a generic fact about the target alone.
+
+The statement should:
+- preserve the relation needed for downstream reasoning
+- keep the image clue as the anchor of the sentence
+- make it clear that the target is identified from the image
+- be concise
+- avoid unnecessary details
+- avoid asking a question
+- stay faithful to THIS hop only
+- not introduce entities that are not the current source node or current target node
+
+Anchor rules:
+- source must refer to the current source node only
+- target must refer to the current target node only
+- do not replace source or target with entities from earlier or later hops
+- do not turn this into a cross-hop summary
+
+Example 1:
+Input:
+{
+  "hop_type": "image->text",
+  "source_node": {
+    "caption": "A photo of a player taking the decisive penalty in a World Cup final.",
+    "visual_facts": ["the player taking the penalty"]
+  },
+  "edge": {"edge_type": "image_depicts", "relation": "the player taking the penalty in the image is"},
+  "target_node": {"title": "Gonzalo Montiel"}
+}
+Output:
+{
+  "statement": "The player taking the penalty in the image is Gonzalo Montiel.",
+  "source": "the player taking the penalty in the image",
+  "target": "Gonzalo Montiel",
+  "relation": "the player taking the penalty in the image is",
+  "retrieval_query": ""
+}
+
+Example 2:
+Input:
+{
+  "hop_type": "image->text",
+  "source_node": {
+    "caption": "A celebration scene with a green banner on the left.",
+    "visual_facts": ["the logo on the green banner on the left"]
+  },
+  "edge": {"edge_type": "image_depicts", "relation": "the logo on the green banner on the left belongs to"},
+  "target_node": {"title": "German Football Association"}
+}
+Output:
+{
+  "statement": "The logo on the green banner on the left of the image belongs to the German Football Association.",
+  "source": "the logo on the green banner on the left of the image",
+  "target": "German Football Association",
+  "relation": "the logo on the green banner on the left belongs to",
+  "retrieval_query": ""
+}
+
+Return valid JSON with exactly these fields:
+{
+  "statement": "...",
+  "source": "...",
+  "target": "...",
+  "relation": "...",
+  "retrieval_query": ""
 }
 """
 
@@ -687,11 +920,11 @@ class QuestionWriter:
                 "edge_type": hop.edge_type,
                 "relation": hop.relation,
             },
-            "destination_node": hop.dst_content,
+            "target_node": hop.dst_content,
         }
         try:
             parsed = self._generate_json(
-                system=PROMPT_COMPRESS_HOP,
+                system=self._compress_hop_prompt(hop=hop),
                 user_payload=prompt,
                 trace_label=f"compress_hop_{hop.hop_index}",
                 model_client=model_client,
@@ -732,6 +965,17 @@ class QuestionWriter:
             "src_node_id": hop.src_node_id,
             "dst_node_id": hop.dst_node_id,
         }
+
+    @staticmethod
+    def _compress_hop_prompt(*, hop: HopContext) -> str:
+        hop_type = (hop.src_modality, hop.dst_modality)
+        if hop_type == ("text", "text"):
+            return PROMPT_COMPRESS_HOP_TEXT_TO_TEXT
+        if hop_type == ("text", "image"):
+            return PROMPT_COMPRESS_HOP_TEXT_TO_IMAGE
+        if hop_type == ("image", "text"):
+            return PROMPT_COMPRESS_HOP_IMAGE_TO_TEXT
+        return PROMPT_COMPRESS_HOP_GENERIC
 
     def select_target_ask(self, *, context: WriterContext) -> dict[str, Any]:
         if self.model_client is None:

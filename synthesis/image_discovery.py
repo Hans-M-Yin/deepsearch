@@ -188,7 +188,7 @@ Important grounding rules:
    - Prefer "Kobe Bryant" over "Kobe", "Los Angeles Lakers" over "Lakers", and "Eiffel Tower" over "the tower".
    
 Output guidance:
-1. `relation_to_image` should be a scene-centric or object-centric locator, not an image-centric description.
+1. The second field is a scene-centric or object-centric locator, not an image-centric description.
    Treat the image only as a carrier of evidence, not as the reference frame.
 2. It should help a user identify the entity through scene semantics, object semantics, or stable local structure.
    Prefer locators based on:
@@ -232,11 +232,12 @@ Output guidance:
    - associated with image
    - represented in image
    These are too generic and do not help locate the entity.
-8. If the image contains multiple people or objects, `relation_to_image` must disambiguate the target.
+8. If the image contains multiple people or objects, the locator must disambiguate the target.
    The locator must be concrete and specifically localizable; avoid vague descriptions such as `sponsor logo in the background`.
 9. If no stable scene-centric or object-centric locator is available, omit the entity rather than using a vague image-centric relation.
 10. `evidence` should be one short sentence explaining the visible cue that supports the grounding.
 11. If two surface forms refer to the same entity, output only the canonical one and mention the alias/handle inside `evidence`.
+NOTICE:If there are more than 5 entities, keep only the 5 clearest, most salient, and most certain entities, and ignore the rest.
 
 Examples:
 - For a 2025 G20 summit group photo:
@@ -249,8 +250,8 @@ Examples:
 Output exactly one block:
 <ground>
 caption: one concise image caption
-entity: name | relation_to_image | evidence
-entity: name | relation_to_image | evidence
+entity: name | locator | evidence
+entity: name | locator | evidence
 </ground>
 """
 
@@ -330,7 +331,7 @@ If the candidate list is ambiguous, too broad, partially related, or insufficien
 You may receive:
 - the grounded entity name
 - the grounded entity type
-- the relation_to_image and visual evidence
+- the locator phrase and visual evidence
 - the image caption
 - the source text node title
 - the source query text
