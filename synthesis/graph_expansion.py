@@ -7,6 +7,7 @@ from dataclasses import asdict, dataclass, field
 from enum import Enum
 import os
 from pathlib import Path
+import random
 import sys
 from threading import RLock
 import time
@@ -218,6 +219,8 @@ class GraphExpansionConfig:
     attribute_errors_fatal: bool = False
     enable_image_expansion: bool = True
     persist: bool = True
+    max_wiki_inline_images_per_page: int = 2
+    wiki_inline_random_seed: str = "wiki_inline_page_cap_v1"
 
 
 class GraphExpansionStrategy:
@@ -1011,25 +1014,14 @@ class GraphExpansionStrategy:
         plans = list(visual_plans) + list(wiki_plans)
         self._log_image_plan_start(text_result, plans)
         image_results: list[ImageDiscoveryResult] = []
-        for index, plan in enumerate(plans, start=1):
+        for index, plan in enumerate(visual_plans, start=1):
             self._log_image_plan_execute_start(text_result, plan_index=index, plan=plan)
             try:
-                if self._is_wiki_inline_image_plan(plan):
-                    search_result = self._wiki_inline_image_search_result(plan)
-                    if search_result is None:
-                        continue
-                    image_result = self.image_builder.discover_for_wiki_inline_image(
-                        plan,
-                        search_result=search_result,
-                        run_id=run_id,
-                        persist=self.config.persist,
-                    )
-                else:
-                    image_result = self.image_builder.discover_for_plan(
-                        plan,
-                        run_id=run_id,
-                        persist=self.config.persist,
-                    )
+                image_result = self.image_builder.discover_for_plan(
+                    plan,
+                    run_id=run_id,
+                    persist=self.config.persist,
+                )
             except Exception as exc:
                 self._log_image_plan_execute_failure(
                     text_result,
@@ -1044,6 +1036,14 @@ class GraphExpansionStrategy:
                 plan_index=index,
                 result=image_result,
             )
+        image_results.extend(
+            self._execute_wiki_inline_plans(
+                text_result,
+                wiki_plans,
+                run_id=run_id,
+                start_index=len(visual_plans) + 1,
+            )
+        )
         self._log_image_plan_results(text_result, plans, image_results)
         queued_tasks: list[ExpansionTask] = []
         for image_result in image_results:
@@ -1052,6 +1052,159 @@ class GraphExpansionStrategy:
                 if task is not None:
                     queued_tasks.append(task)
         return plans, image_results, queued_tasks
+
+    def _execute_wiki_inline_plans(
+        self,
+        text_result: WikiTextBuildResult,
+        wiki_plans: list[VisualSearchPlan],
+        *,
+        run_id: str | None,
+        start_index: int,
+    ) -> list[ImageDiscoveryResult]:
+        if not wiki_plans:
+            return []
+
+        page_cap = int(self.config.max_wiki_inline_images_per_page)
+        needs_two_stage = page_cap > 0 and len(wiki_plans) > page_cap
+        provisional_results: list[tuple[int, VisualSearchPlan, Any, ImageDiscoveryResult]] = []
+
+        for offset, plan in enumerate(wiki_plans, start=start_index):
+            self._log_image_plan_execute_start(text_result, plan_index=offset, plan=plan)
+            search_result = self._wiki_inline_image_search_result(plan)
+            if search_result is None:
+                continue
+            try:
+                image_result = self.image_builder.discover_for_wiki_inline_image(
+                    plan,
+                    search_result=search_result,
+                    run_id=run_id,
+                    persist=self.config.persist and not needs_two_stage,
+                )
+            except Exception as exc:
+                self._log_image_plan_execute_failure(
+                    text_result,
+                    plan_index=offset,
+                    plan=plan,
+                    error=exc,
+                )
+                raise
+            provisional_results.append((offset, plan, search_result, image_result))
+
+        if not needs_two_stage:
+            final_results = [result for _, _, _, result in provisional_results]
+            for plan_index, _, _, result in provisional_results:
+                self._log_image_plan_execute_done(
+                    text_result,
+                    plan_index=plan_index,
+                    result=result,
+                )
+            return final_results
+
+        accepted_positions = [
+            position
+            for position, (_, _, _, result) in enumerate(provisional_results)
+            if result.image_node is not None
+        ]
+        kept_positions = self._sample_kept_wiki_inline_positions(
+            text_result,
+            accepted_positions=accepted_positions,
+            page_cap=page_cap,
+        )
+        seed_text = self._wiki_inline_page_seed(text_result)
+        final_results: list[ImageDiscoveryResult] = []
+
+        for position, (plan_index, plan, search_result, result) in enumerate(provisional_results):
+            final_result = result
+            if position in kept_positions:
+                if self.config.persist:
+                    final_result = self.image_builder.discover_for_wiki_inline_image(
+                        plan,
+                        search_result=search_result,
+                        run_id=run_id,
+                        persist=True,
+                    )
+                self._annotate_wiki_inline_result(
+                    final_result,
+                    random_cap_applied=True,
+                    selected_for_page_cap=True,
+                    page_cap=page_cap,
+                    accepted_count=len(accepted_positions),
+                    selected_count=len(kept_positions),
+                    seed_text=seed_text,
+                    reason="selected_after_random_page_cap",
+                )
+            else:
+                was_accepted = final_result.image_node is not None
+                self._annotate_wiki_inline_result(
+                    final_result,
+                    random_cap_applied=True,
+                    selected_for_page_cap=False,
+                    page_cap=page_cap,
+                    accepted_count=len(accepted_positions),
+                    selected_count=len(kept_positions),
+                    seed_text=seed_text,
+                    reason=(
+                        "dropped_after_random_page_cap"
+                        if was_accepted
+                        else "not_accepted_before_random_page_cap"
+                    ),
+                )
+                if was_accepted:
+                    final_result.image_node = None
+                    final_result.edge = None
+                    final_result.image_evidence = None
+                    final_result.search_evidence = None
+                    final_result.grounded_edges = []
+                    final_result.queued_tasks = []
+            final_results.append(final_result)
+            self._log_image_plan_execute_done(
+                text_result,
+                plan_index=plan_index,
+                result=final_result,
+            )
+
+        return final_results
+
+    def _wiki_inline_page_seed(self, text_result: WikiTextBuildResult) -> str:
+        return f"{self.config.wiki_inline_random_seed}:{text_result.node.node_id}"
+
+    def _sample_kept_wiki_inline_positions(
+        self,
+        text_result: WikiTextBuildResult,
+        *,
+        accepted_positions: list[int],
+        page_cap: int,
+    ) -> set[int]:
+        if page_cap <= 0 or len(accepted_positions) <= page_cap:
+            return set(accepted_positions)
+        rng = random.Random(self._wiki_inline_page_seed(text_result))
+        sampled = rng.sample(accepted_positions, k=page_cap)
+        return set(sampled)
+
+    @staticmethod
+    def _annotate_wiki_inline_result(
+        result: ImageDiscoveryResult,
+        *,
+        random_cap_applied: bool,
+        selected_for_page_cap: bool,
+        page_cap: int,
+        accepted_count: int,
+        selected_count: int,
+        seed_text: str,
+        reason: str,
+    ) -> None:
+        result.metadata = dict(result.metadata or {})
+        result.metadata.update(
+            {
+                "wiki_inline_random_cap_applied": random_cap_applied,
+                "wiki_inline_random_cap_selected": selected_for_page_cap,
+                "wiki_inline_random_cap_limit": page_cap,
+                "wiki_inline_random_cap_accepted_count": accepted_count,
+                "wiki_inline_random_cap_selected_count": selected_count,
+                "wiki_inline_random_cap_seed": seed_text,
+                "wiki_inline_random_cap_reason": reason,
+            }
+        )
 
     def _build_wiki_inline_image_plans(
         self,
@@ -1261,7 +1414,7 @@ def _smoke_test() -> None:
     from .edges import Edge, EdgeType
     from .evidence import EvidenceType, SearchEngine, SearchSnapshot
     from .image_discovery import ImageDiscoveryResult
-    from .nodes import NodeSource, TextNode
+    from .nodes import ImageNode, NodeSource, TextNode
     from .visual_planner import SearchQuerySpec, VisualSearchPlan
 
     class MockWikiBuilder:
@@ -1428,6 +1581,43 @@ def _smoke_test() -> None:
             del run_id, persist
             return ImageDiscoveryResult(plan_id=plan.plan_id)
 
+    class MockInlineImageBuilder(MockImageBuilder):
+        def __init__(self) -> None:
+            self.inline_calls: list[tuple[str, bool]] = []
+
+        def discover_for_wiki_inline_image(
+            self,
+            plan: VisualSearchPlan,
+            *,
+            search_result,
+            run_id: str | None = None,
+            persist: bool = True,
+        ) -> ImageDiscoveryResult:
+            del run_id
+            self.inline_calls.append((plan.plan_id, persist))
+            result = ImageDiscoveryResult(plan_id=plan.plan_id)
+            result.image_node = ImageNode.from_url(
+                search_result.image_url or "https://example.com/inline.jpg",
+                source_page_url=search_result.source_page_url,
+                title=search_result.title,
+                caption=search_result.snippet,
+                metadata={"mock_inline": True},
+            )
+            result.metadata = {"mock_inline": True}
+            return result
+
+    class MockNoVisualPlanner:
+        def plan(
+            self,
+            *,
+            node: dict[str, Any],
+            page_text: str,
+            source_evidence_ids: list[str] | None = None,
+            run_id: str | None = None,
+        ) -> list[VisualSearchPlan]:
+            del node, page_text, source_evidence_ids, run_id
+            return []
+
     with tempfile.TemporaryDirectory() as tmpdir:
         store = JsonlGraphStore(tmpdir)
         wiki_builder = MockWikiBuilder(store)
@@ -1481,6 +1671,74 @@ def _smoke_test() -> None:
         assert image_result is not None
         assert image_result.task.task_type == ExpansionTaskType.IMAGE_EXPAND
         assert wiki_builder.read_calls == 1
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = JsonlGraphStore(tmpdir)
+        wiki_builder = MockWikiBuilder(store)
+        inline_builder = MockInlineImageBuilder()
+        strategy = GraphExpansionStrategy(
+            store=store,
+            wiki_builder=wiki_builder,
+            visual_planner=MockNoVisualPlanner(),
+            image_builder=inline_builder,
+            config=GraphExpansionConfig(
+                max_depth=0,
+                max_new_text_neighbors=0,
+                enable_image_expansion=True,
+                max_wiki_inline_images_per_page=2,
+                wiki_inline_random_seed="smoke_seed",
+            ),
+        )
+        text_result = wiki_builder.build_from_url(
+            "https://en.wikipedia.org/wiki/Seed",
+            run_id="run_smoke",
+            persist=True,
+        )
+
+        def make_inline_plan(image_url: str, rank: int) -> VisualSearchPlan:
+            target = Evidence.create(
+                EvidenceType.VISUAL_TARGET,
+                content=f"caption for {rank}",
+                node_ids=[text_result.node.node_id],
+                url=image_url,
+            )
+            return VisualSearchPlan.create(
+                target,
+                queries=[SearchQuerySpec.create(f"caption for {rank}", target.evidence_id)],
+                source_node_id=text_result.node.node_id,
+                source_evidence_ids=[text_result.text_evidence.evidence_id],
+                planner="wikipedia_inline_image_planner",
+                metadata={
+                    "plan_source": "wikipedia_inline_image",
+                    "image_url": image_url,
+                    "source_page_url": "https://en.wikipedia.org/wiki/Seed",
+                    "caption": f"caption for {rank}",
+                    "rank": rank,
+                },
+            )
+
+        inline_results = strategy._execute_wiki_inline_plans(
+            text_result,
+            [
+                make_inline_plan("https://example.com/1.jpg", 1),
+                make_inline_plan("https://example.com/2.jpg", 2),
+                make_inline_plan("https://example.com/3.jpg", 3),
+            ],
+            run_id="run_smoke",
+            start_index=1,
+        )
+        assert len(inline_results) == 3
+        assert len([item for item in inline_builder.inline_calls if item[1] is False]) == 3
+        assert len([item for item in inline_builder.inline_calls if item[1] is True]) == 2
+        selected = [
+            item for item in inline_results if (item.metadata or {}).get("wiki_inline_random_cap_selected")
+        ]
+        dropped = [
+            item for item in inline_results if (item.metadata or {}).get("wiki_inline_random_cap_reason") == "dropped_after_random_page_cap"
+        ]
+        assert len(selected) == 2
+        assert len(dropped) == 1
+        assert dropped[0].image_node is None
     print("graph_expansion smoke test passed")
 
 

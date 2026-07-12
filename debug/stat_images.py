@@ -128,6 +128,7 @@ def summarize_node(node: dict[str, Any], in_deg: int, out_deg: int) -> dict[str,
         "in_degree": in_deg,
         "out_degree": out_deg,
         "source_type": source.get("source_type") if isinstance(source, dict) else None,
+        "image_origin": metadata.get("image_origin"),
         "source_url": source_url_of(node),
         "image_url": node.get("image_url"),
         "source_page_url": node.get("source_page_url"),
@@ -145,6 +146,19 @@ def summarize_node(node: dict[str, Any], in_deg: int, out_deg: int) -> dict[str,
         "query_overlap_grounded_entities": list(metadata.get("query_overlap_grounded_entities") or []),
         "created_at": node.get("created_at"),
     }
+
+
+def classify_image_type(record: dict[str, Any]) -> str:
+    source_type = str(record.get("source_type") or "").strip()
+    image_origin = str(record.get("image_origin") or "").strip().lower()
+
+    if source_type == "wikipedia_inline_image" or image_origin == "wikipedia_inline":
+        return "wiki_inline"
+    if source_type in {"image_search_bundle", "image_search"}:
+        return "visual_plan"
+    if source_type:
+        return f"other:{source_type}"
+    return "other:unknown"
 
 
 def build_graph_indexes(
@@ -705,9 +719,16 @@ def main() -> int:
     queued_image_entity_tasks = collect_queued_image_entity_tasks(runner_state)
     image_entity_failures = collect_image_entity_failures(runner_state)
 
+    all_image_type_counter: Counter[str] = Counter()
+    for node in nodes:
+        if node.get("node_type") != "image":
+            continue
+        all_image_type_counter[classify_image_type(summarize_node(node, 0, 0))] += 1
+
     isolated_all: list[dict[str, Any]] = []
     isolated_type_counter: Counter[str] = Counter()
     isolated_status_counter: Counter[str] = Counter()
+    isolated_image_type_counter: Counter[str] = Counter()
 
     for node in nodes:
         node_id = node.get("node_id")
@@ -721,6 +742,8 @@ def main() -> int:
         isolated_all.append(item)
         isolated_type_counter[str(node.get("node_type"))] += 1
         isolated_status_counter[str(node.get("status"))] += 1
+        if item.get("node_type") == "image":
+            isolated_image_type_counter[classify_image_type(item)] += 1
 
     isolated_all.sort(
         key=lambda item: (
@@ -770,6 +793,8 @@ def main() -> int:
         "unknown_edge_dst_refs": unknown_dst,
         "isolated_by_type": dict(isolated_type_counter),
         "isolated_by_status": dict(isolated_status_counter),
+        "all_image_types": dict(all_image_type_counter),
+        "isolated_image_types": dict(isolated_image_type_counter),
         "processed_entity_selection_status": dict(entity_status_counter),
     }
 
@@ -808,6 +833,8 @@ def main() -> int:
     print_summary(isolated_status_counter, "\nfully_isolated_by_status:")
     print_summary(entity_status_counter, "\nprocessed_entity_selection_status:")
     print_nodes(processed_records)
+    print_summary(all_image_type_counter, "\nall_image_type_counts:")
+    print_summary(isolated_image_type_counter, "\nfully_isolated_image_type_counts:")
     return 0
 
 
