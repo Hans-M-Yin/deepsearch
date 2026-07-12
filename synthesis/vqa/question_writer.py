@@ -42,9 +42,10 @@ _VQA_FIXED_REQUEST_ID = "3200636808"
 PROMPT_COMPRESS_HOP_GENERIC = """You are compressing one hop from a multimodal reasoning trajectory.
 
 You are given:
-- a source node
-- the edge relation connecting to the next node
-- a target node
+- hop_type: the modality pair for this hop
+- source: the current source node title
+- relation: the edge relation string
+- target: the current target node title
 
 Write one short declarative statement that captures the essential meaning of
 this hop for downstream question composition.
@@ -77,9 +78,10 @@ Return valid JSON with exactly these fields:
 PROMPT_COMPRESS_HOP_TEXT_TO_TEXT = """You are compressing one text-to-text hop from a reasoning trajectory.
 
 You are given:
-- a source text node
-- the edge relation connecting it to a target text node
-- a target text node
+- hop_type: the modality pair for this hop
+- source: the current source text node title
+- relation: the edge relation string
+- target: the current target text node title
 
 Write one short declarative statement that captures the essential meaning of
 this hop for downstream question composition.
@@ -108,9 +110,9 @@ Example 1:
 Input:
 {
   "hop_type": "text->text",
-  "source_node": {"title": "David E. Finley, Jr."},
-  "edge": {"edge_type": "wiki_attribute", "relation": "earned his professional degree from"},
-  "target_node": {"title": "Harvard Law School"}
+  "source": "David E. Finley, Jr.",
+  "relation": "earned his professional degree from",
+  "target": "Harvard Law School"
 }
 Output:
 {
@@ -125,9 +127,9 @@ Example 2:
 Input:
 {
   "hop_type": "text->text",
-  "source_node": {"title": "Bird in Space"},
-  "edge": {"edge_type": "wiki_link", "relation": "the museum that houses its 1925 marble and 1927 bronze versions is"},
-  "target_node": {"title": "National Gallery of Art"}
+  "source": "Bird in Space",
+  "relation": "the museum that houses its 1925 marble and 1927 bronze versions is",
+  "target": "National Gallery of Art"
 }
 Output:
 {
@@ -152,9 +154,10 @@ Return valid JSON with exactly these fields:
 PROMPT_COMPRESS_HOP_TEXT_TO_IMAGE = """You are compressing one text-to-image hop from a reasoning trajectory.
 
 You are given:
-- a source text node
-- the edge relation connecting it to a target image node
-- a target image node
+- hop_type: the modality pair for this hop
+- source: the current source text node title
+- relation: the edge relation string
+- target: the current target image node title
 
 Write one short declarative statement that captures the essential meaning of
 this hop for downstream question composition.
@@ -166,10 +169,10 @@ transition from the source entity to that target image.
 This means:
 - the source must remain explicit in the statement
 - the statement should sound like a source-to-image relation, not like a standalone image caption
-- first anchor the image to the source, then describe what the target image shows
-- the target image node's title or search_query is the retrieval clue for finding that image
+- first anchor the image to the source, then describe the image target implied by the relation and target title
+- the target string is the retrieval clue for finding that image
 - preserve distinctive event, date, action, and scene details when they matter
-- keep the statement aligned with the retrieval clue rather than drifting into a vague scene description
+- keep the statement aligned with the relation and target rather than drifting into a vague scene description
 
 The statement should:
 - preserve the relation needed for downstream reasoning
@@ -190,42 +193,34 @@ Example 1:
 Input:
 {
   "hop_type": "text->image",
-  "source_node": {"title": "Port Jackson"},
-  "edge": {"edge_type": "search_retrieved", "relation": "Japanese midget submarine recovered from Sydney Harbour after the 31 May 1942 raid"},
-  "target_node": {
-    "title": "photo of the recovered Japanese midget submarine",
-    "caption": "A black-and-white historical photograph showing the recovery of a Japanese midget submarine from Sydney Harbour after the 31 May 1942 raid.",
-    "search_query": "Japanese midget submarine recovered from Sydney Harbour after the 31 May 1942 raid"
-  }
+  "source": "Port Jackson",
+  "relation": "Japanese midget submarine recovered from Sydney Harbour after the 31 May 1942 raid",
+  "target": "photo of the recovered Japanese midget submarine"
 }
 Output:
 {
-  "statement": "About Port Jackson, there is a black-and-white historical photograph showing the recovery of a Japanese midget submarine from the harbour after the 31 May 1942 raid.",
+  "statement": "Port Jackson is associated with a photo of the Japanese midget submarine recovered from Sydney Harbour after the 31 May 1942 raid.",
   "source": "Port Jackson",
-  "target": "the black-and-white historical photograph of the recovered Japanese midget submarine",
-  "relation": "is associated with a historical photograph showing the recovery of a Japanese midget submarine after the 31 May 1942 raid",
-  "retrieval_query": "Japanese midget submarine recovered from Sydney Harbour after the 31 May 1942 raid"
+  "target": "the photo of the recovered Japanese midget submarine",
+  "relation": "is associated with a photo of the Japanese midget submarine recovered from Sydney Harbour after the 31 May 1942 raid",
+  "retrieval_query": "photo of the recovered Japanese midget submarine"
 }
 
 Example 2:
 Input:
 {
   "hop_type": "text->image",
-  "source_node": {"title": "Constantin Brancusi"},
-  "edge": {"edge_type": "search_retrieved", "relation": "photo of him in his Paris studio taken by Edward Steichen in 1920"},
-  "target_node": {
-    "title": "Steichen photo of Brancusi in his studio",
-    "caption": "A famous 1920 photograph by Edward Steichen showing Constantin Brancusi in his Paris studio.",
-    "search_query": "Edward Steichen 1920 photo of Constantin Brancusi in Paris studio"
-  }
+  "source": "Constantin Brancusi",
+  "relation": "photo of him in his Paris studio taken by Edward Steichen in 1920",
+  "target": "Steichen photo of Brancusi in his studio"
 }
 Output:
 {
-  "statement": "About Constantin Brancusi, there is a famous 1920 photograph by Edward Steichen showing him in his Paris studio.",
+  "statement": "Constantin Brancusi is associated with a Steichen photo of him in his Paris studio taken in 1920.",
   "source": "Constantin Brancusi",
-  "target": "the 1920 Edward Steichen photograph of Brancusi in his Paris studio",
-  "relation": "is associated with a famous 1920 photograph by Edward Steichen showing him in his Paris studio",
-  "retrieval_query": "Edward Steichen 1920 photo of Constantin Brancusi in Paris studio"
+  "target": "the Steichen photo of Brancusi in his studio",
+  "relation": "is associated with a Steichen photo of him in his Paris studio taken in 1920",
+  "retrieval_query": "Steichen photo of Brancusi in his studio"
 }
 
 Return valid JSON with exactly these fields:
@@ -242,9 +237,10 @@ Return valid JSON with exactly these fields:
 PROMPT_COMPRESS_HOP_IMAGE_TO_TEXT = """You are compressing one image-to-text hop from a reasoning trajectory.
 
 You are given:
-- a source image node
-- the edge relation connecting it to a target text node
-- a target text node
+- hop_type: the modality pair for this hop
+- source: the current source image node title
+- relation: the edge relation string
+- target: the current target text node title
 
 Write one short declarative statement that captures the essential meaning of
 this hop for downstream question composition.
@@ -274,17 +270,14 @@ Example 1:
 Input:
 {
   "hop_type": "image->text",
-  "source_node": {
-    "caption": "A photo of a player taking the decisive penalty in a World Cup final.",
-    "visual_facts": ["the player taking the penalty"]
-  },
-  "edge": {"edge_type": "image_depicts", "relation": "the player taking the penalty in the image is"},
-  "target_node": {"title": "Gonzalo Montiel"}
+  "source": "photo of a player taking the decisive penalty in a World Cup final",
+  "relation": "the player taking the penalty in the image is",
+  "target": "Gonzalo Montiel"
 }
 Output:
 {
-  "statement": "The player taking the penalty in the image is Gonzalo Montiel.",
-  "source": "the player taking the penalty in the image",
+  "statement": "In the photo of a player taking the decisive penalty in a World Cup final, the player taking the penalty in the image is Gonzalo Montiel.",
+  "source": "the photo of a player taking the decisive penalty in a World Cup final",
   "target": "Gonzalo Montiel",
   "relation": "the player taking the penalty in the image is",
   "retrieval_query": ""
@@ -294,17 +287,14 @@ Example 2:
 Input:
 {
   "hop_type": "image->text",
-  "source_node": {
-    "caption": "A celebration scene with a green banner on the left.",
-    "visual_facts": ["the logo on the green banner on the left"]
-  },
-  "edge": {"edge_type": "image_depicts", "relation": "the logo on the green banner on the left belongs to"},
-  "target_node": {"title": "German Football Association"}
+  "source": "celebration photo with a green banner on the left",
+  "relation": "the logo on the green banner on the left belongs to",
+  "target": "German Football Association"
 }
 Output:
 {
-  "statement": "The logo on the green banner on the left of the image belongs to the German Football Association.",
-  "source": "the logo on the green banner on the left of the image",
+  "statement": "In the celebration photo with a green banner on the left, the logo on the green banner on the left belongs to the German Football Association.",
+  "source": "the celebration photo with a green banner on the left",
   "target": "German Football Association",
   "relation": "the logo on the green banner on the left belongs to",
   "retrieval_query": ""
@@ -913,15 +903,7 @@ class QuestionWriter:
         model = self.compress_hop_model or self.model
         if model_client is None:
             return self._fallback_compress_hop(hop, source_label=source_label, target_label=target_label)
-        prompt = {
-            "hop_type": f"{hop.src_modality}->{hop.dst_modality}",
-            "source_node": hop.src_content,
-            "edge": {
-                "edge_type": hop.edge_type,
-                "relation": hop.relation,
-            },
-            "target_node": hop.dst_content,
-        }
+        prompt = self._compress_hop_prompt_payload(hop=hop)
         try:
             parsed = self._generate_json(
                 system=self._compress_hop_prompt(hop=hop),
@@ -976,6 +958,15 @@ class QuestionWriter:
         if hop_type == ("image", "text"):
             return PROMPT_COMPRESS_HOP_IMAGE_TO_TEXT
         return PROMPT_COMPRESS_HOP_GENERIC
+
+    @classmethod
+    def _compress_hop_prompt_payload(cls, *, hop: HopContext) -> dict[str, Any]:
+        return {
+            "hop_type": f"{hop.src_modality}->{hop.dst_modality}",
+            "source": cls._compress_hop_prompt_label(hop.src_content, fallback=hop.src_node_id),
+            "relation": str(hop.relation or hop.edge_type or "").strip(),
+            "target": cls._compress_hop_prompt_label(hop.dst_content, fallback=hop.dst_node_id),
+        }
 
     def select_target_ask(self, *, context: WriterContext) -> dict[str, Any]:
         if self.model_client is None:
@@ -1785,6 +1776,13 @@ class QuestionWriter:
         if hop.dst_modality != "image":
             return ""
         return cls._image_search_query(hop.dst_content)
+
+    @staticmethod
+    def _compress_hop_prompt_label(content: dict[str, Any], *, fallback: str) -> str:
+        title = str(content.get("title") or "").strip()
+        if title:
+            return title
+        return str(content.get("caption") or fallback)
 
     @classmethod
     def _hop_anchor_label(cls, content: dict[str, Any], *, fallback: str) -> str:

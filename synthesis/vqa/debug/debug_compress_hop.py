@@ -269,14 +269,9 @@ def main(argv: list[str] | None = None) -> int:
         "runtime_mode": "llm" if args.model_alias else "fallback",
         "model_alias": args.model_alias,
         "prompt_name": _prompt_name_for_hop_type(args.hop_type),
-        "input": {
-            "source_node": source_node,
-            "edge": {
-                "edge_type": "debug_edge",
-                "relation": args.relation,
-            },
-            "target_node": target_node,
-        },
+        "input": writer._compress_hop_prompt_payload(hop=hop),
+        "source_node": source_node,
+        "target_node": target_node,
         "result": result,
     }
     if args.show_prompt:
