@@ -326,6 +326,34 @@ def spread_components(components, positions):
     return positions
 
 
+def normalize_positions(components, positions):
+    if not positions:
+        return positions
+
+    min_x = min(x for x, _ in positions.values())
+    max_x = max(x for x, _ in positions.values())
+    min_y = min(y for _, y in positions.values())
+    max_y = max(y for _, y in positions.values())
+
+    graph_w = max(1.0, max_x - min_x)
+    graph_h = max(1.0, max_y - min_y)
+    avail_w = INNER_W - 60
+    avail_h = INNER_H - 60
+
+    scale = min(avail_w / graph_w, avail_h / graph_h, 1.0)
+    offset_x = MARGIN + (INNER_W - graph_w * scale) / 2
+    offset_y = MARGIN + (INNER_H - graph_h * scale) / 2
+
+    for node_id, (x, y) in list(positions.items()):
+        nx = offset_x + (x - min_x) * scale
+        ny = offset_y + (y - min_y) * scale
+        positions[node_id] = [
+            min(MARGIN + INNER_W - 18, max(MARGIN + 18, nx)),
+            min(MARGIN + INNER_H - 18, max(MARGIN + 18, ny)),
+        ]
+    return positions
+
+
 def compute_label_nodes(nodes, degree):
     scored = []
     for node in nodes:
@@ -367,6 +395,10 @@ def render_svg(run_dir, nodes, valid_edges, positions, degree):
     svg.append(f'<svg xmlns="http://www.w3.org/2000/svg" width="{WIDTH}" height="{HEIGHT}" viewBox="0 0 {WIDTH} {HEIGHT}">')
     svg.append('<rect width="100%" height="100%" fill="#f8fafc"/>')
     svg.append(f'<text x="{MARGIN}" y="44" font-family="Arial, sans-serif" font-size="28" font-weight="bold" fill="#0f172a">Knowledge Graph Overview</text>')
+    min_x = min(x for x, _ in positions.values()) if positions else 0
+    max_x = max(x for x, _ in positions.values()) if positions else 0
+    min_y = min(y for _, y in positions.values()) if positions else 0
+    max_y = max(y for _, y in positions.values()) if positions else 0
     svg.append(f'<text x="{MARGIN}" y="72" font-family="Arial, sans-serif" font-size="15" fill="#475569">run={esc(run_dir)} · nodes={len(nodes)} · edges={len(valid_edges)} · layout=component-aware force layout</text>')
     svg.append(f'<rect x="{MARGIN}" y="{MARGIN}" width="{INNER_W}" height="{INNER_H}" rx="18" ry="18" fill="#ffffff" stroke="#dbe4ee"/>')
     legend_x = MARGIN + INNER_W + PANEL_GAP
@@ -483,6 +515,8 @@ def render_svg(run_dir, nodes, valid_edges, positions, degree):
     stats = [
         f"labeled nodes: {len(label_nodes)}",
         f"labeled edges: {len(edge_label_ids)}",
+        f"x-range: {min_x:.0f}..{max_x:.0f}",
+        f"y-range: {min_y:.0f}..{max_y:.0f}",
         "layout: component-aware + force-directed",
         "goal: avoid single-ring clustering",
         "titles: only high-signal nodes shown",
@@ -516,6 +550,7 @@ def main():
     positions = initialize_positions(components, centers, node_by_id, degree)
     positions = force_layout(components, positions, node_by_id, valid_edges, degree)
     positions = spread_components(components, positions)
+    positions = normalize_positions(components, positions)
 
     svg = render_svg(run_dir, nodes, valid_edges, positions, degree)
     out = run_dir / args.output
