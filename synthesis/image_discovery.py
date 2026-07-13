@@ -204,13 +204,13 @@ Output guidance:
    - front-row center person in the group
    - child sitting on the man's shoulders
    - logo on the front of the jersey
-4. Avoid frame-anchored locators such as:
+4. DO NOT use any frame-anchored locators such as:
    - left side of the image
    - right side of the image
-   - top-right corner
+   - top-right corner if the image
    - upper part of the picture
-   - foreground
-   - background
+   - foreground of the image
+   - background of the image
    - center of the image
 5. Avoid salience-anchored or media-anchored locators such as:
    - main character
