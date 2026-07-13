@@ -108,6 +108,16 @@ def image_variant_sources(node: dict[str, Any]) -> list[str]:
     return sorted(sources)
 
 
+def status_distribution(items: list[dict[str, Any]]) -> dict[str, int]:
+    counter: Counter[str] = Counter()
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        status = str(item.get("status") or "unknown").strip() or "unknown"
+        counter[status] += 1
+    return {str(key): counter[key] for key in sorted(counter)}
+
+
 def classify_image_type(node: dict[str, Any]) -> str:
     source = node.get("source") or {}
     metadata = node.get("metadata") or {}
@@ -150,6 +160,84 @@ def average_degree_stats(records: list[dict[str, Any]]) -> dict[str, Any]:
         "avg_out_degree": (total_out / count) if count else 0.0,
         "degree_distribution": degree_distribution(records),
     }
+
+
+def image_grounding_stats(records: list[dict[str, Any]]) -> dict[str, Any]:
+    count = len(records)
+    grounded_distribution: Counter[int] = Counter()
+    no_text_reason_counter: Counter[str] = Counter()
+    total_grounded = 0
+    total_linked_text = 0
+    total_without_text = 0
+    total_query_overlap = 0
+    images_with_grounded = 0
+    images_with_linked_text = 0
+    images_with_grounded_but_no_text = 0
+
+    for record in records:
+        grounded_count = int(record.get("grounded_entity_count") or 0)
+        linked_text_count = int(record.get("linked_text_edge_count") or 0)
+        without_text_count = int(record.get("grounded_without_text_edge_count") or 0)
+        query_overlap_count = int(record.get("query_overlap_grounded_entity_count") or 0)
+
+        grounded_distribution[grounded_count] += 1
+        total_grounded += grounded_count
+        total_linked_text += linked_text_count
+        total_without_text += without_text_count
+        total_query_overlap += query_overlap_count
+        if grounded_count > 0:
+            images_with_grounded += 1
+        if linked_text_count > 0:
+            images_with_linked_text += 1
+        if grounded_count > 0 and without_text_count > 0:
+            images_with_grounded_but_no_text += 1
+        no_text_reason_counter.update(record.get("grounded_no_text_reason_counts") or {})
+
+    return {
+        "total_grounded_entities": total_grounded,
+        "avg_grounded_entities_per_image": (total_grounded / count) if count else 0.0,
+        "images_with_grounded_entities": images_with_grounded,
+        "images_with_linked_text_entities": images_with_linked_text,
+        "linked_text_edge_count": total_linked_text,
+        "grounded_without_text_edge_count": total_without_text,
+        "images_with_grounded_but_no_text": images_with_grounded_but_no_text,
+        "query_overlap_flagged_entity_count": total_query_overlap,
+        "grounded_entity_distribution": {str(key): grounded_distribution[key] for key in sorted(grounded_distribution)},
+        "no_text_reason_counts": {str(key): no_text_reason_counter[key] for key in sorted(no_text_reason_counter)},
+    }
+
+
+def merge_group_stats(
+    records: list[dict[str, Any]],
+    *,
+    include_image_grounding: bool,
+) -> dict[str, Any]:
+    stats = average_degree_stats(records)
+    if include_image_grounding:
+        stats["grounding_stats"] = image_grounding_stats(records)
+    return stats
+
+
+def image_text_edge_counts(
+    *,
+    nodes_by_id: dict[str, dict[str, Any]],
+    edges: list[dict[str, Any]],
+) -> Counter[str]:
+    counter: Counter[str] = Counter()
+    for edge in edges:
+        src = edge.get("src_node_id")
+        dst = edge.get("dst_node_id")
+        if src not in nodes_by_id or dst not in nodes_by_id:
+            continue
+        if nodes_by_id[src].get("node_type") != "image":
+            continue
+        if nodes_by_id[dst].get("node_type") != "text":
+            continue
+        edge_type = str(edge.get("edge_type") or "").strip()
+        if edge_type and edge_type != "image_depicts":
+            continue
+        counter[str(src)] += 1
+    return counter
 
 
 def build_graph_state(
@@ -215,6 +303,7 @@ def summarize_node(
     *,
     in_degree: int,
     out_degree: int,
+    linked_text_edge_count: int,
     summary_chars: int,
 ) -> dict[str, Any]:
     metadata = node.get("metadata") or {}
@@ -239,6 +328,14 @@ def summarize_node(
     }
     if node.get("node_type") == "image":
         variant_sources = image_variant_sources(node)
+        unresolved_status_counts = status_distribution(unresolved_grounded_entities)
+        grounded_without_text_edge_count = max(0, len(grounded_entities) - int(linked_text_edge_count))
+        grounded_no_text_reason_counts: Counter[str] = Counter(unresolved_status_counts)
+        explained_without_text = sum(int(value) for value in unresolved_status_counts.values())
+        if grounded_without_text_edge_count > explained_without_text:
+            grounded_no_text_reason_counts["unknown_or_pending_no_text"] += (
+                grounded_without_text_edge_count - explained_without_text
+            )
         summary.update(
             {
                 "image_type": classify_image_type(node),
@@ -252,6 +349,13 @@ def summarize_node(
                 "grounded_entity_count": len(grounded_entities),
                 "unresolved_grounded_entity_count": len(unresolved_grounded_entities),
                 "query_overlap_grounded_entity_count": len(query_overlap_grounded_entities),
+                "linked_text_edge_count": int(linked_text_edge_count),
+                "grounded_without_text_edge_count": grounded_without_text_edge_count,
+                "unresolved_status_counts": unresolved_status_counts,
+                "grounded_no_text_reason_counts": {
+                    str(key): grounded_no_text_reason_counts[key]
+                    for key in sorted(grounded_no_text_reason_counts)
+                },
                 "grounded_entity_names": [item.get("name") for item in grounded_entities[:5] if isinstance(item, dict)],
                 "unresolved_entity_names": [item.get("name") for item in unresolved_grounded_entities[:5] if isinstance(item, dict)],
                 "query_overlap_entity_names": [item.get("name") for item in query_overlap_grounded_entities[:5] if isinstance(item, dict)],
@@ -457,6 +561,7 @@ def build_report(
         edges_with_missing_dst,
         edges_between_known_nodes,
     ) = build_graph_state(nodes=nodes, edges=edges)
+    linked_text_edges = image_text_edge_counts(nodes_by_id=nodes_by_id, edges=edges)
 
     summaries: list[dict[str, Any]] = []
     for node_id in sorted(nodes_by_id):
@@ -466,6 +571,7 @@ def build_report(
                 node,
                 in_degree=in_degree.get(node_id, 0),
                 out_degree=out_degree.get(node_id, 0),
+                linked_text_edge_count=linked_text_edges.get(node_id, 0),
                 summary_chars=summary_chars,
             )
         )
@@ -505,11 +611,11 @@ def build_report(
         "edges_with_missing_src": edges_with_missing_src,
         "edges_with_missing_dst": edges_with_missing_dst,
         "group_stats": {
-            "text": average_degree_stats(text_nodes),
-            "image": average_degree_stats(image_nodes),
-            "image_wiki_inline": average_degree_stats(image_wiki_inline),
-            "image_visual_plan": average_degree_stats(image_visual_plan),
-            "image_other": average_degree_stats(image_other),
+            "text": merge_group_stats(text_nodes, include_image_grounding=False),
+            "image": merge_group_stats(image_nodes, include_image_grounding=True),
+            "image_wiki_inline": merge_group_stats(image_wiki_inline, include_image_grounding=True),
+            "image_visual_plan": merge_group_stats(image_visual_plan, include_image_grounding=True),
+            "image_other": merge_group_stats(image_other, include_image_grounding=True),
         },
         "connectivity": {
             "type": "weakly_connected_components",
@@ -525,12 +631,13 @@ def build_report(
 
 
 def print_distribution(label: str, distribution: dict[str, int]) -> None:
+    indent = " " * (len(label) - len(label.lstrip(" ")) + 2)
     print(label)
     if not distribution:
-        print("  <empty>")
+        print(f"{indent}<empty>")
         return
     text = ", ".join(f"{degree}:{count}" for degree, count in distribution.items())
-    print(f"  {text}")
+    print(f"{indent}{text}")
 
 
 def print_group_stats(label: str, stats: dict[str, Any]) -> None:
@@ -540,6 +647,37 @@ def print_group_stats(label: str, stats: dict[str, Any]) -> None:
     print(f"  avg_in_degree={stats.get('avg_in_degree', 0.0):.3f}")
     print(f"  avg_out_degree={stats.get('avg_out_degree', 0.0):.3f}")
     print_distribution("  degree_distribution:", stats.get("degree_distribution") or {})
+    grounding = stats.get("grounding_stats") or {}
+    if grounding:
+        print("  grounded_entity_stats:")
+        print(f"    total_grounded_entities={grounding.get('total_grounded_entities', 0)}")
+        print(
+            "    avg_grounded_entities_per_image="
+            f"{grounding.get('avg_grounded_entities_per_image', 0.0):.3f}"
+        )
+        print(f"    images_with_grounded_entities={grounding.get('images_with_grounded_entities', 0)}")
+        print(f"    images_with_linked_text_entities={grounding.get('images_with_linked_text_entities', 0)}")
+        print(f"    linked_text_edge_count={grounding.get('linked_text_edge_count', 0)}")
+        print(
+            "    grounded_without_text_edge_count="
+            f"{grounding.get('grounded_without_text_edge_count', 0)}"
+        )
+        print(
+            "    images_with_grounded_but_no_text="
+            f"{grounding.get('images_with_grounded_but_no_text', 0)}"
+        )
+        print(
+            "    query_overlap_flagged_entity_count="
+            f"{grounding.get('query_overlap_flagged_entity_count', 0)}"
+        )
+        print_distribution(
+            "    grounded_entity_distribution:",
+            grounding.get("grounded_entity_distribution") or {},
+        )
+        print_distribution(
+            "    no_text_reason_counts:",
+            grounding.get("no_text_reason_counts") or {},
+        )
 
 
 def print_isolated_samples(samples: list[dict[str, Any]]) -> None:
@@ -560,13 +698,20 @@ def print_isolated_samples(samples: list[dict[str, Any]]) -> None:
         if record.get("node_type") == "image":
             print(
                 f"      image_type={record.get('image_type')} grounding_check={record.get('grounding_check')} "
-                f"grounded={record.get('grounded_entity_count')} unresolved={record.get('unresolved_grounded_entity_count')} "
+                f"grounded={record.get('grounded_entity_count')} linked_text={record.get('linked_text_edge_count')} "
+                f"grounded_without_text={record.get('grounded_without_text_edge_count')} "
+                f"unresolved={record.get('unresolved_grounded_entity_count')} "
                 f"query_overlap={record.get('query_overlap_grounded_entity_count')}"
             )
             if record.get("image_origin") or record.get("variant_sources"):
                 print(
                     f"      image_origin={record.get('image_origin')!r} "
                     f"variant_sources={record.get('variant_sources') or []}"
+                )
+            if record.get("grounded_no_text_reason_counts"):
+                print(
+                    "      grounded_no_text_reason_counts="
+                    f"{record.get('grounded_no_text_reason_counts')}"
                 )
             if record.get("search_query"):
                 print(f"      search_query={record.get('search_query')!r}")
