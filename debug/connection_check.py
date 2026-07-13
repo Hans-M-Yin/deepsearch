@@ -94,12 +94,29 @@ def source_url_of(node: dict[str, Any]) -> str | None:
     return None
 
 
+def image_variant_sources(node: dict[str, Any]) -> list[str]:
+    variants = node.get("image_variants") or []
+    if not isinstance(variants, list):
+        return []
+    sources: set[str] = set()
+    for variant in variants:
+        if not isinstance(variant, dict):
+            continue
+        source = str(variant.get("source") or "").strip()
+        if source:
+            sources.add(source)
+    return sorted(sources)
+
+
 def classify_image_type(node: dict[str, Any]) -> str:
     source = node.get("source") or {}
     metadata = node.get("metadata") or {}
     source_type = str(source.get("source_type") if isinstance(source, dict) else "" or "").strip()
     image_origin = str(metadata.get("image_origin") or "").strip().lower()
+    variant_sources = image_variant_sources(node)
     if source_type == "wikipedia_inline_image" or image_origin == "wikipedia_inline":
+        return "wiki_inline"
+    if "wikipedia_inline" in variant_sources:
         return "wiki_inline"
     if source_type in {"image_search_bundle", "image_search"}:
         return "visual_plan"
@@ -221,9 +238,12 @@ def summarize_node(
         "updated_at": node.get("updated_at"),
     }
     if node.get("node_type") == "image":
+        variant_sources = image_variant_sources(node)
         summary.update(
             {
                 "image_type": classify_image_type(node),
+                "image_origin": metadata.get("image_origin"),
+                "variant_sources": variant_sources,
                 "image_url": node.get("image_url"),
                 "source_page_url": node.get("source_page_url"),
                 "search_query": metadata.get("search_query"),
@@ -543,6 +563,11 @@ def print_isolated_samples(samples: list[dict[str, Any]]) -> None:
                 f"grounded={record.get('grounded_entity_count')} unresolved={record.get('unresolved_grounded_entity_count')} "
                 f"query_overlap={record.get('query_overlap_grounded_entity_count')}"
             )
+            if record.get("image_origin") or record.get("variant_sources"):
+                print(
+                    f"      image_origin={record.get('image_origin')!r} "
+                    f"variant_sources={record.get('variant_sources') or []}"
+                )
             if record.get("search_query"):
                 print(f"      search_query={record.get('search_query')!r}")
             if record.get("visual_target"):
