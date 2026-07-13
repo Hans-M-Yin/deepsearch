@@ -1,9 +1,9 @@
-mkdir -p runs/0712_multi_seed_visual_test5
+mkdir -p runs/0712_multi_seed_visual_test6
 echo "Start Generate."
 source synthesis/.env
 python synthesis/run_min_graph.py \
   --seed-urls-file synthesis/seeds.txt \
-  --store-dir runs/0712_multi_seed_visual_test5 \
+  --store-dir runs/0712_multi_seed_visual_test6 \
   --reader-base-url http://localhost:8004 \
   --skip-attributes \
   --max-neighbors 4 \
