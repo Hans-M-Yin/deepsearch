@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import random
 import sys
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -60,7 +61,10 @@ def parse_args() -> argparse.Namespace:
         "--limit",
         type=int,
         required=True,
-        help="Maximum number of image nodes to print. <=0 means all image nodes.",
+        help=(
+            "Maximum number of wiki_inline nodes and visual_plan nodes to print "
+            "per origin. <=0 means all image nodes."
+        ),
     )
     parser.add_argument(
         "--summary-chars",
@@ -581,7 +585,23 @@ def build_report(*, graph_dir: Path, limit: int, summary_chars: int) -> dict[str
         ),
         reverse=True,
     )
-    selected_nodes = image_nodes if limit <= 0 else image_nodes[:limit]
+    wiki_inline_nodes = [node for node in image_nodes if _image_origin(node) == "wiki_inline"]
+    visual_plan_nodes = [node for node in image_nodes if _image_origin(node) == "visual_plan"]
+
+    if limit <= 0:
+        selected_nodes = list(image_nodes)
+    else:
+        selected_nodes = random.sample(wiki_inline_nodes, k=min(limit, len(wiki_inline_nodes)))
+        selected_nodes.extend(
+            random.sample(visual_plan_nodes, k=min(limit, len(visual_plan_nodes)))
+        )
+        selected_nodes.sort(
+            key=lambda node: (
+                str(node.get("created_at") or ""),
+                str(node.get("node_id") or ""),
+            ),
+            reverse=True,
+        )
 
     runner_state, runner_state_error = _load_runner_state(graph_dir)
     runner_state_index = _collect_runner_state_index(runner_state)
@@ -601,7 +621,14 @@ def build_report(*, graph_dir: Path, limit: int, summary_chars: int) -> dict[str
         "graph_dir": str(graph_dir),
         "limit": limit,
         "total_image_nodes": len(image_nodes),
+        "total_image_nodes_by_origin": {
+            "wiki_inline": len(wiki_inline_nodes),
+            "visual_plan": len(visual_plan_nodes),
+        },
         "returned_image_nodes": len(images),
+        "returned_image_nodes_by_origin": dict(
+            sorted(Counter(str(item.get("origin") or "unknown") for item in images).items())
+        ),
         "runner_state_present": runner_state is not None,
         "runner_state_error": runner_state_error,
         "images": images,
@@ -669,7 +696,11 @@ def print_report(report: dict[str, Any]) -> None:
     print("Image Node Summary")
     print(f"  graph_dir={report.get('graph_dir')}")
     print(f"  total_image_nodes={report.get('total_image_nodes')}")
+    if report.get("total_image_nodes_by_origin"):
+        print(f"  total_image_nodes_by_origin={report.get('total_image_nodes_by_origin')}")
     print(f"  returned_image_nodes={report.get('returned_image_nodes')}")
+    if report.get("returned_image_nodes_by_origin"):
+        print(f"  returned_image_nodes_by_origin={report.get('returned_image_nodes_by_origin')}")
     print(f"  limit={report.get('limit')}")
     print(f"  runner_state_present={report.get('runner_state_present')}")
     if report.get("runner_state_error"):
