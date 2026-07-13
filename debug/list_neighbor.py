@@ -126,19 +126,35 @@ def _node_title(node: dict[str, Any], *, summary_chars: int) -> str:
     return "<untitled>"
 
 
+def _image_variant_sources(node: dict[str, Any]) -> list[str]:
+    variants = node.get("image_variants") or []
+    if not isinstance(variants, list):
+        return []
+    sources: set[str] = set()
+    for variant in variants:
+        if not isinstance(variant, dict):
+            continue
+        source = str(variant.get("source") or "").strip()
+        if source:
+            sources.add(source)
+    return sorted(sources)
+
+
 def _image_origin(node: dict[str, Any]) -> str:
     metadata = node.get("metadata") or {}
     source = node.get("source") or {}
     source_type = source.get("source_type") if isinstance(source, dict) else None
-    if (
-        source_type == "wikipedia_inline_image"
-        or metadata.get("image_origin") == "wikipedia_inline"
-        or metadata.get("wiki_inline_keep_in_graph") is not None
-    ):
+    image_origin = str(metadata.get("image_origin") or "").strip().lower()
+    variant_sources = _image_variant_sources(node)
+    if source_type == "wikipedia_inline_image" or image_origin == "wikipedia_inline":
         return "wiki_inline"
-    if metadata.get("search_query") or metadata.get("visual_target") or source_type == "image_search_bundle":
+    if "wikipedia_inline" in variant_sources:
+        return "wiki_inline"
+    if source_type in {"image_search_bundle", "image_search"}:
         return "visual_plan"
-    return "unknown"
+    if source_type:
+        return f"other:{source_type}"
+    return "other:unknown"
 
 
 def _load_runner_state(graph_dir: Path) -> tuple[dict[str, Any] | None, str | None]:
@@ -522,6 +538,7 @@ def _image_report(
 ) -> dict[str, Any]:
     source = image_node.get("source") or {}
     metadata = image_node.get("metadata") or {}
+    variant_sources = _image_variant_sources(image_node)
     out_edges = list(store.edges_from(str(image_node.get("node_id") or "")))
     grounded_entities = _build_grounded_entity_reports(
         image_node=image_node,
@@ -540,6 +557,8 @@ def _image_report(
         "created_at": image_node.get("created_at"),
         "source_type": source.get("source_type") if isinstance(source, dict) else None,
         "origin": _image_origin(image_node),
+        "image_origin": metadata.get("image_origin"),
+        "variant_sources": variant_sources,
         "image_url": image_node.get("image_url") or _source_url(image_node),
         "source_page_url": image_node.get("source_page_url"),
         "summary": _short(image_node.get("summary") or image_node.get("caption"), summary_chars),
@@ -666,6 +685,11 @@ def print_report(report: dict[str, Any]) -> None:
         print(f"  title={image.get('title')!r}")
         print(f"  status={image.get('status')}")
         print(f"  origin={image.get('origin')} source_type={image.get('source_type')}")
+        if image.get("image_origin") or image.get("variant_sources"):
+            print(
+                f"  image_origin={image.get('image_origin')!r} "
+                f"variant_sources={image.get('variant_sources') or []}"
+            )
         print(f"  image_url={image.get('image_url')}")
         if image.get("source_page_url"):
             print(f"  source_page_url={image.get('source_page_url')}")
