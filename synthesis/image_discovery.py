@@ -237,6 +237,7 @@ Output guidance:
 9. If no stable scene-centric or object-centric locator is available, omit the entity rather than using a vague image-centric relation.
 10. `evidence` should be one short sentence explaining the visible cue that supports the grounding.
 11. If two surface forms refer to the same entity, output only the canonical one and mention the alias/handle inside `evidence`.
+12. Do not ground watermarks, publisher logos, channel bugs, UI overlays, copyright marks...
 NOTICE:If there are more than 5 entities, keep only the 5 clearest, most salient, and most certain entities, and ignore the rest.
 
 Examples:
