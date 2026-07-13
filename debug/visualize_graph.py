@@ -214,41 +214,36 @@ def assign_component_centers(components):
     return centers
 
 
-def initialize_positions(components, centers, node_by_id, degree):
+def initialize_positions(components, centers, node_by_id, degree, undirected):
     rng = random.Random(SEED)
     positions = {}
-    type_order = {"text": 0, "region": 1, "image": 2, "default": 3}
 
     for comp_idx, comp in enumerate(components):
         center_x, center_y = centers[comp_idx]
-        buckets = defaultdict(list)
-        for node_id in comp:
-            buckets[node_type(node_by_id[node_id])].append(node_id)
-
-        ordered_types = sorted(buckets.keys(), key=lambda t: type_order.get(t, 99))
-        band_count = max(1, len(ordered_types))
-        base_radius = 150 + 95 * math.sqrt(len(comp))
-
-        for band_idx, t in enumerate(ordered_types):
-            bucket = buckets[t]
-            rng.shuffle(bucket)
-            radius = base_radius + band_idx * 120
-            spread = 2 * math.pi / max(1, len(bucket))
-            phase = rng.random() * math.pi * 2
-            for i, node_id in enumerate(bucket):
-                jitter_r = rng.uniform(-35, 35)
-                jitter_a = rng.uniform(-0.35, 0.35)
-                angle = phase + i * spread + jitter_a
-                x = center_x + (radius + jitter_r) * math.cos(angle)
-                y = center_y + (radius + jitter_r) * math.sin(angle)
-                x += rng.uniform(-28, 28)
-                y += rng.uniform(-28, 28)
-                positions[node_id] = [x, y]
-
-        # Put only the single largest hub in the middle.  Centering several
-        # hubs on top of one another caused immediate, persistent collisions.
         hub = max(comp, key=lambda nid: degree[nid])
         positions[hub] = [center_x, center_y]
+        levels = defaultdict(list)
+        distance = {hub: 0}
+        queue = deque([hub])
+        while queue:
+            current = queue.popleft()
+            for neighbor in sorted(undirected.get(current, ()), key=lambda nid: (-degree[nid], nid)):
+                if neighbor not in distance:
+                    distance[neighbor] = distance[current] + 1
+                    levels[distance[neighbor]].append(neighbor)
+                    queue.append(neighbor)
+
+        # Nodes are initialized in graph-distance rings rather than modality
+        # rings: an image reached from a text node starts beside that text node.
+        phase = rng.random() * math.pi * 2
+        for depth, level in sorted(levels.items()):
+            radius = 285 + (depth - 1) * 250
+            for index, node_id in enumerate(level):
+                angle = phase + 2 * math.pi * index / len(level) + rng.uniform(-0.10, 0.10)
+                positions[node_id] = [
+                    center_x + radius * math.cos(angle) + rng.uniform(-14, 14),
+                    center_y + radius * math.sin(angle) + rng.uniform(-14, 14),
+                ]
     return positions
 
 
@@ -427,9 +422,21 @@ def has_card_collisions(positions, node_by_id, padding=8.0):
     return False
 
 
-def grid_fallback_positions(node_by_id, degree):
-    """Guaranteed non-overlapping fallback for exceptionally dense graphs."""
-    ordered_ids = sorted(node_by_id, key=lambda nid: (-degree[nid], node_type(node_by_id[nid]), nid))
+def grid_fallback_positions(node_by_id, degree, undirected):
+    """Non-overlapping fallback that keeps BFS-neighbors next to each other."""
+    ordered_ids = []
+    seen = set()
+    while len(seen) < len(node_by_id):
+        root = max((nid for nid in node_by_id if nid not in seen), key=lambda nid: (degree[nid], nid))
+        queue = deque([root])
+        seen.add(root)
+        while queue:
+            current = queue.popleft()
+            ordered_ids.append(current)
+            for neighbor in sorted(undirected.get(current, ()), key=lambda nid: (-degree[nid], nid)):
+                if neighbor not in seen:
+                    seen.add(neighbor)
+                    queue.append(neighbor)
     cell_w, cell_h = 280.0, 250.0
     columns = max(1, int((INNER_W - 50) // cell_w))
     positions = {}
@@ -649,7 +656,7 @@ def main():
     node_by_id, valid_edges, undirected, _outgoing, _incoming, degree = build_graph(nodes, edges)
     components = connected_components(list(node_by_id.keys()), undirected)
     centers = assign_component_centers(components)
-    positions = initialize_positions(components, centers, node_by_id, degree)
+    positions = initialize_positions(components, centers, node_by_id, degree, undirected)
     positions = force_layout(components, positions, node_by_id, valid_edges, degree)
     positions = spread_components(components, positions)
     positions = resolve_card_collisions(positions, node_by_id)
@@ -658,7 +665,7 @@ def main():
     if has_card_collisions(positions, node_by_id):
         # A deterministic grid is preferable to an illegible force layout when
         # a dense run cannot be separated within the page bounds.
-        positions = grid_fallback_positions(node_by_id, degree)
+        positions = grid_fallback_positions(node_by_id, degree, undirected)
 
     svg = render_svg(run_dir, nodes, valid_edges, positions, degree)
     out = run_dir / args.output
