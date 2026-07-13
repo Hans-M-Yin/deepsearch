@@ -307,7 +307,7 @@ Requirements:
 Examples:
 Source title: Kobe Bryant
 Original search query: Kobe Bryant giving his farewell "Mamba Out" speech at center court after his final NBA game on April 13, 2016
-Relation: his farewell "Mamba Out" speech at center court after his final NBA game on April 13, 2016
+Relation: his photo of himself giving his farewell "Mamba Out" speech at center court after his final NBA game on April 13, 2016
 
 Source title: Lionel Messi
 Original search query: Lionel Messi sleeping while hugging the World Cup trophy after the 2022 FIFA World Cup final
