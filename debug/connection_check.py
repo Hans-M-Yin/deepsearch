@@ -118,6 +118,16 @@ def status_distribution(items: list[dict[str, Any]]) -> dict[str, int]:
     return {str(key): counter[key] for key in sorted(counter)}
 
 
+def entity_key(entity: dict[str, Any]) -> tuple[str, str, str]:
+    if not isinstance(entity, dict):
+        return ("", "", "")
+    return (
+        " ".join(str(entity.get("name") or "").split()).lower(),
+        " ".join(str(entity.get("relation_to_image") or "").split()).lower(),
+        " ".join(str(entity.get("evidence") or "").split()).lower(),
+    )
+
+
 def classify_image_type(node: dict[str, Any]) -> str:
     source = node.get("source") or {}
     metadata = node.get("metadata") or {}
@@ -218,6 +228,94 @@ def merge_group_stats(
     return stats
 
 
+def load_runner_state(graph_dir: Path) -> dict[str, Any]:
+    state_path = graph_dir / "graph_runner_state.json"
+    if not state_path.exists():
+        return {
+            "found": False,
+            "path": str(state_path),
+            "load_error": None,
+            "status": None,
+            "queue_size": 0,
+            "image_entity_task_count": 0,
+            "image_entity_pending_link_count": 0,
+            "query_overlap_pending_link_count": 0,
+            "queue": [],
+        }
+    try:
+        payload = json.loads(state_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return {
+            "found": True,
+            "path": str(state_path),
+            "load_error": f"{exc.__class__.__name__}: {exc}",
+            "status": None,
+            "queue_size": 0,
+            "image_entity_task_count": 0,
+            "image_entity_pending_link_count": 0,
+            "query_overlap_pending_link_count": 0,
+            "queue": [],
+        }
+
+    queue = list(payload.get("queue") or [])
+    image_entity_task_count = 0
+    image_entity_pending_link_count = 0
+    query_overlap_pending_link_count = 0
+    for task in queue:
+        if not isinstance(task, dict):
+            continue
+        if str(task.get("task_type") or "") != "text_expand":
+            continue
+        metadata = task.get("metadata") or {}
+        if not isinstance(metadata, dict) or metadata.get("task_origin") != "image_entity":
+            continue
+        image_entity_task_count += 1
+        for pending in metadata.get("pending_parent_links") or []:
+            if not isinstance(pending, dict):
+                continue
+            if str(pending.get("link_type") or "wiki_link") != "image_entity":
+                continue
+            image_entity_pending_link_count += 1
+            if bool(pending.get("query_overlap_entity")):
+                query_overlap_pending_link_count += 1
+    return {
+        "found": True,
+        "path": str(state_path),
+        "load_error": None,
+        "status": payload.get("status"),
+        "queue_size": len(queue),
+        "image_entity_task_count": image_entity_task_count,
+        "image_entity_pending_link_count": image_entity_pending_link_count,
+        "query_overlap_pending_link_count": query_overlap_pending_link_count,
+        "queue": queue,
+    }
+
+
+def queued_image_entity_links(
+    *,
+    queue_records: list[dict[str, Any]],
+    nodes_by_id: dict[str, dict[str, Any]],
+) -> dict[str, list[dict[str, Any]]]:
+    links_by_image: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for task in queue_records:
+        if not isinstance(task, dict):
+            continue
+        if str(task.get("task_type") or "") != "text_expand":
+            continue
+        metadata = task.get("metadata") or {}
+        if not isinstance(metadata, dict) or metadata.get("task_origin") != "image_entity":
+            continue
+        for pending in metadata.get("pending_parent_links") or []:
+            if not isinstance(pending, dict):
+                continue
+            if str(pending.get("link_type") or "wiki_link") != "image_entity":
+                continue
+            parent_node_id = pending.get("parent_node_id")
+            if parent_node_id in nodes_by_id:
+                links_by_image[str(parent_node_id)].append(pending)
+    return links_by_image
+
+
 def image_text_edge_counts(
     *,
     nodes_by_id: dict[str, dict[str, Any]],
@@ -238,6 +336,84 @@ def image_text_edge_counts(
             continue
         counter[str(src)] += 1
     return counter
+
+
+def linked_grounded_entities_by_image(
+    *,
+    nodes_by_id: dict[str, dict[str, Any]],
+    edges: list[dict[str, Any]],
+) -> dict[str, list[dict[str, Any]]]:
+    grounded_by_image: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for edge in edges:
+        src = edge.get("src_node_id")
+        dst = edge.get("dst_node_id")
+        if src not in nodes_by_id or dst not in nodes_by_id:
+            continue
+        if nodes_by_id[src].get("node_type") != "image":
+            continue
+        if nodes_by_id[dst].get("node_type") != "text":
+            continue
+        edge_type = str(edge.get("edge_type") or "").strip()
+        if edge_type and edge_type != "image_depicts":
+            continue
+        for evidence_ref in edge.get("evidence_refs") or []:
+            if not isinstance(evidence_ref, dict):
+                continue
+            metadata = evidence_ref.get("metadata") or {}
+            grounded = metadata.get("grounded_entity") if isinstance(metadata, dict) else None
+            if isinstance(grounded, dict):
+                grounded_by_image[str(src)].append(grounded)
+    return grounded_by_image
+
+
+def derive_grounded_no_text_reason_counts(
+    *,
+    grounded_entities: list[dict[str, Any]],
+    unresolved_grounded_entities: list[dict[str, Any]],
+    query_overlap_grounded_entities: list[dict[str, Any]],
+    linked_grounded_entities: list[dict[str, Any]],
+    queued_pending_links: list[dict[str, Any]],
+) -> dict[str, int]:
+    linked_keys: Counter[tuple[str, str, str]] = Counter(
+        entity_key(item) for item in linked_grounded_entities if any(entity_key(item))
+    )
+    unresolved_statuses_by_key: dict[tuple[str, str, str], deque[str]] = defaultdict(deque)
+    for item in unresolved_grounded_entities:
+        key = entity_key(item)
+        if not any(key):
+            continue
+        status = str(item.get("status") or "unknown").strip() or "unknown"
+        unresolved_statuses_by_key[key].append(status)
+    queued_keys: Counter[tuple[str, str, str]] = Counter()
+    for pending in queued_pending_links:
+        if not isinstance(pending, dict):
+            continue
+        key = entity_key(pending.get("entity") or {})
+        if any(key):
+            queued_keys[key] += 1
+    query_overlap_keys: Counter[tuple[str, str, str]] = Counter(
+        entity_key(item) for item in query_overlap_grounded_entities if any(entity_key(item))
+    )
+
+    reason_counts: Counter[str] = Counter()
+    for entity in grounded_entities:
+        key = entity_key(entity)
+        if linked_keys[key] > 0:
+            linked_keys[key] -= 1
+            continue
+        if unresolved_statuses_by_key[key]:
+            reason_counts[unresolved_statuses_by_key[key].popleft()] += 1
+            continue
+        if queued_keys[key] > 0:
+            queued_keys[key] -= 1
+            reason_counts["still_queued_image_entity"] += 1
+            continue
+        if query_overlap_keys[key] > 0:
+            query_overlap_keys[key] -= 1
+            reason_counts["query_overlap_without_text"] += 1
+            continue
+        reason_counts["other_unexplained"] += 1
+    return {str(key): reason_counts[key] for key in sorted(reason_counts)}
 
 
 def build_graph_state(
@@ -304,6 +480,8 @@ def summarize_node(
     in_degree: int,
     out_degree: int,
     linked_text_edge_count: int,
+    linked_grounded_entities: list[dict[str, Any]],
+    queued_pending_links: list[dict[str, Any]],
     summary_chars: int,
 ) -> dict[str, Any]:
     metadata = node.get("metadata") or {}
@@ -330,12 +508,13 @@ def summarize_node(
         variant_sources = image_variant_sources(node)
         unresolved_status_counts = status_distribution(unresolved_grounded_entities)
         grounded_without_text_edge_count = max(0, len(grounded_entities) - int(linked_text_edge_count))
-        grounded_no_text_reason_counts: Counter[str] = Counter(unresolved_status_counts)
-        explained_without_text = sum(int(value) for value in unresolved_status_counts.values())
-        if grounded_without_text_edge_count > explained_without_text:
-            grounded_no_text_reason_counts["unknown_or_pending_no_text"] += (
-                grounded_without_text_edge_count - explained_without_text
-            )
+        grounded_no_text_reason_counts = derive_grounded_no_text_reason_counts(
+            grounded_entities=grounded_entities,
+            unresolved_grounded_entities=unresolved_grounded_entities,
+            query_overlap_grounded_entities=query_overlap_grounded_entities,
+            linked_grounded_entities=linked_grounded_entities,
+            queued_pending_links=queued_pending_links,
+        )
         summary.update(
             {
                 "image_type": classify_image_type(node),
@@ -351,11 +530,9 @@ def summarize_node(
                 "query_overlap_grounded_entity_count": len(query_overlap_grounded_entities),
                 "linked_text_edge_count": int(linked_text_edge_count),
                 "grounded_without_text_edge_count": grounded_without_text_edge_count,
+                "queued_image_entity_count": len(queued_pending_links),
                 "unresolved_status_counts": unresolved_status_counts,
-                "grounded_no_text_reason_counts": {
-                    str(key): grounded_no_text_reason_counts[key]
-                    for key in sorted(grounded_no_text_reason_counts)
-                },
+                "grounded_no_text_reason_counts": grounded_no_text_reason_counts,
                 "grounded_entity_names": [item.get("name") for item in grounded_entities[:5] if isinstance(item, dict)],
                 "unresolved_entity_names": [item.get("name") for item in unresolved_grounded_entities[:5] if isinstance(item, dict)],
                 "query_overlap_entity_names": [item.get("name") for item in query_overlap_grounded_entities[:5] if isinstance(item, dict)],
@@ -382,8 +559,15 @@ def infer_image_isolation_reason(summary: dict[str, Any]) -> str:
     grounded_count = int(summary.get("grounded_entity_count") or 0)
     unresolved_count = int(summary.get("unresolved_grounded_entity_count") or 0)
     query_overlap_count = int(summary.get("query_overlap_grounded_entity_count") or 0)
+    no_text_reasons = summary.get("grounded_no_text_reason_counts") or {}
+    queued_count = int(no_text_reasons.get("still_queued_image_entity") or 0)
+    query_overlap_without_text = int(no_text_reasons.get("query_overlap_without_text") or 0)
     if query_overlap_count > 0 and grounded_count == 0 and unresolved_count == 0:
         return "all grounded entities were filtered by query overlap, so no image->text edge was kept"
+    if queued_count > 0:
+        return "grounded entities resolved to image-entity text tasks that are still queued, so no persisted image->text edge exists yet"
+    if query_overlap_without_text > 0:
+        return "some grounded entities were marked as query-overlap and still did not produce a persisted image->text edge"
     if unresolved_count > 0 and grounded_count == 0:
         return "grounded entities were found but remained unresolved, so no outgoing image->text edge was persisted"
     if grounded_count == 0 and grounding_check in {
@@ -541,6 +725,7 @@ def build_report(
     store = JsonlGraphStore(graph_dir)
     nodes = store.list_nodes()
     edges = store.list_edges()
+    runner_state = load_runner_state(graph_dir)
     if active_only:
         nodes = [node for node in nodes if is_active(node)]
         active_node_ids = {node["node_id"] for node in nodes if isinstance(node.get("node_id"), str)}
@@ -562,6 +747,11 @@ def build_report(
         edges_between_known_nodes,
     ) = build_graph_state(nodes=nodes, edges=edges)
     linked_text_edges = image_text_edge_counts(nodes_by_id=nodes_by_id, edges=edges)
+    linked_grounded_by_image = linked_grounded_entities_by_image(nodes_by_id=nodes_by_id, edges=edges)
+    queued_links_by_image = queued_image_entity_links(
+        queue_records=runner_state.get("queue") or [],
+        nodes_by_id=nodes_by_id,
+    )
 
     summaries: list[dict[str, Any]] = []
     for node_id in sorted(nodes_by_id):
@@ -572,6 +762,8 @@ def build_report(
                 in_degree=in_degree.get(node_id, 0),
                 out_degree=out_degree.get(node_id, 0),
                 linked_text_edge_count=linked_text_edges.get(node_id, 0),
+                linked_grounded_entities=linked_grounded_by_image.get(node_id, []),
+                queued_pending_links=queued_links_by_image.get(node_id, []),
                 summary_chars=summary_chars,
             )
         )
@@ -610,6 +802,11 @@ def build_report(
         "edges_between_known_nodes": edges_between_known_nodes,
         "edges_with_missing_src": edges_with_missing_src,
         "edges_with_missing_dst": edges_with_missing_dst,
+        "runner_state": {
+            key: value
+            for key, value in runner_state.items()
+            if key != "queue"
+        },
         "group_stats": {
             "text": merge_group_stats(text_nodes, include_image_grounding=False),
             "image": merge_group_stats(image_nodes, include_image_grounding=True),
@@ -699,6 +896,7 @@ def print_isolated_samples(samples: list[dict[str, Any]]) -> None:
             print(
                 f"      image_type={record.get('image_type')} grounding_check={record.get('grounding_check')} "
                 f"grounded={record.get('grounded_entity_count')} linked_text={record.get('linked_text_edge_count')} "
+                f"queued={record.get('queued_image_entity_count')} "
                 f"grounded_without_text={record.get('grounded_without_text_edge_count')} "
                 f"unresolved={record.get('unresolved_grounded_entity_count')} "
                 f"query_overlap={record.get('query_overlap_grounded_entity_count')}"
@@ -741,6 +939,21 @@ def print_report(report: dict[str, Any]) -> None:
     print(f"  edges_between_known_nodes={report.get('edges_between_known_nodes')}")
     print(f"  edges_with_missing_src={report.get('edges_with_missing_src')}")
     print(f"  edges_with_missing_dst={report.get('edges_with_missing_dst')}")
+    runner_state = report.get("runner_state") or {}
+    print(
+        f"  runner_state_found={runner_state.get('found')} "
+        f"status={runner_state.get('status')} queue_size={runner_state.get('queue_size')}"
+    )
+    if runner_state.get("path"):
+        print(f"  runner_state_path={runner_state.get('path')}")
+    if runner_state.get("load_error"):
+        print(f"  runner_state_load_error={runner_state.get('load_error')}")
+    print(
+        "  runner_image_entity_queue="
+        f"tasks={runner_state.get('image_entity_task_count')} "
+        f"pending_links={runner_state.get('image_entity_pending_link_count')} "
+        f"query_overlap_pending_links={runner_state.get('query_overlap_pending_link_count')}"
+    )
 
     print("\nDegree Stats")
     group_stats = report.get("group_stats") or {}

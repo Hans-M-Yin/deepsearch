@@ -1,13 +1,13 @@
-"""List one graph node's neighbors and show how each connection is formed.
+"""List image nodes and summarize grounded-entity status.
 
 Examples:
   python debug/list_neighbor.py \
-    --graph-dir synthesis/runs/mock_graph_review_20260712_env/query_overlap \
-    --node-id text_a8fca8f8fd340934
+    --graph-dir runs/0712_multi_seed_visual_test4 \
+    --limit 10
 
   python debug/list_neighbor.py \
-    --graph-dir runs/0712_multi_seed_visual_test4 \
-    --node-id image_1234567890abcdef \
+    --graph-dir synthesis/runs/mock_graph_review_20260712_env/query_overlap \
+    --limit 5 \
     --json
 """
 
@@ -16,7 +16,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
 
@@ -28,9 +28,28 @@ if str(ROOT) not in sys.path:
 from synthesis.store import JsonlGraphStore
 
 
+IMAGE_NODE_TYPE = "image"
+IMAGE_DEPICTS_EDGE_TYPE = "image_depicts"
+DEFAULT_STATE_FILE_NAME = "graph_runner_state.json"
+
+STATUS_PRIORITY = {
+    "linked": 100,
+    "parent_link_failed": 90,
+    "queued_pending": 80,
+    "task_failed": 70,
+    "task_skipped": 60,
+    "task_completed": 50,
+    "unresolved": 40,
+    "filtered_by_query_entity_overlap": 35,
+    "filtered_out": 30,
+    "query_overlap_entity": 20,
+    "grounded_only": 10,
+}
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Print one graph node's incoming/outgoing edges and its neighboring nodes."
+        description="Summarize image nodes, their origin, and grounded-entity status."
     )
     parser.add_argument(
         "--graph-dir",
@@ -38,15 +57,16 @@ def parse_args() -> argparse.Namespace:
         help="Directory containing nodes.jsonl and edges.jsonl.",
     )
     parser.add_argument(
-        "--node-id",
+        "--limit",
+        type=int,
         required=True,
-        help="Node id to inspect.",
+        help="Maximum number of image nodes to print. <=0 means all image nodes.",
     )
     parser.add_argument(
         "--summary-chars",
         type=int,
-        default=140,
-        help="Max characters used when printing title/summary snippets.",
+        default=180,
+        help="Max characters used when printing long title/evidence snippets.",
     )
     parser.add_argument(
         "--json",
@@ -61,6 +81,28 @@ def _short(value: Any, limit: int) -> str:
     if limit <= 0 or len(text) <= limit:
         return text
     return text[: max(0, limit - 3)] + "..."
+
+
+def _normalize_text(value: Any) -> str:
+    return " ".join(str(value or "").strip().lower().split())
+
+
+def _entity_key(entity: dict[str, Any]) -> tuple[str, str, str, str] | None:
+    name = _normalize_text(entity.get("name"))
+    entity_type = _normalize_text(entity.get("type"))
+    relation = _normalize_text(entity.get("relation_to_image") or entity.get("relation"))
+    evidence = _normalize_text(entity.get("evidence"))
+    if not any((name, entity_type, relation, evidence)):
+        return None
+    return (name, entity_type, relation, evidence)
+
+
+def _entity_sort_label(entity: dict[str, Any]) -> tuple[str, str, str]:
+    return (
+        _normalize_text(entity.get("name")),
+        _normalize_text(entity.get("type")),
+        _normalize_text(entity.get("relation_to_image") or entity.get("relation")),
+    )
 
 
 def _source_url(node: dict[str, Any]) -> str | None:
@@ -84,247 +126,557 @@ def _node_title(node: dict[str, Any], *, summary_chars: int) -> str:
     return "<untitled>"
 
 
-def _node_brief(node: dict[str, Any] | None, *, node_id: str | None, summary_chars: int) -> dict[str, Any]:
-    if node is None:
-        return {
-            "node_id": node_id,
-            "node_type": None,
-            "title": None,
-            "status": None,
-            "source_url": None,
-            "missing": True,
-        }
-    return {
-        "node_id": node.get("node_id") or node_id,
-        "node_type": node.get("node_type"),
-        "title": _node_title(node, summary_chars=summary_chars),
-        "status": node.get("status"),
-        "source_url": _source_url(node),
-        "missing": False,
-    }
-
-
-def _edge_sort_key(edge: dict[str, Any]) -> tuple[str, str, str, str]:
-    return (
-        str(edge.get("edge_type") or ""),
-        str(edge.get("relation") or ""),
-        str(edge.get("dst_node_id") or ""),
-        str(edge.get("src_node_id") or ""),
-    )
-
-
-def _edge_record(
-    *,
-    focus_node: dict[str, Any],
-    edge: dict[str, Any],
-    neighbor: dict[str, Any] | None,
-    direction: str,
-    summary_chars: int,
-) -> dict[str, Any]:
-    if direction == "out":
-        src = focus_node
-        dst = neighbor
-        neighbor_id = edge.get("dst_node_id")
-    else:
-        src = neighbor
-        dst = focus_node
-        neighbor_id = edge.get("src_node_id")
-
-    src_label = _node_title(src or {}, summary_chars=summary_chars) if src is not None else str(edge.get("src_node_id"))
-    dst_label = _node_title(dst or {}, summary_chars=summary_chars) if dst is not None else str(edge.get("dst_node_id"))
-    edge_type = str(edge.get("edge_type") or "")
-    relation = str(edge.get("relation") or "")
-    relation_suffix = f":{relation}" if relation else ""
-    description = f"{src_label} -[{edge_type}{relation_suffix}]-> {dst_label}"
-
-    return {
-        "edge_id": edge.get("edge_id"),
-        "direction": direction,
-        "edge_type": edge.get("edge_type"),
-        "relation": edge.get("relation"),
-        "status": edge.get("status"),
-        "confidence": edge.get("confidence"),
-        "src_node_id": edge.get("src_node_id"),
-        "dst_node_id": edge.get("dst_node_id"),
-        "neighbor_node_id": neighbor_id,
-        "neighbor": _node_brief(neighbor, node_id=neighbor_id, summary_chars=summary_chars),
-        "description": description,
-    }
-
-
-def _node_report(node: dict[str, Any], *, summary_chars: int) -> dict[str, Any]:
+def _image_origin(node: dict[str, Any]) -> str:
+    metadata = node.get("metadata") or {}
     source = node.get("source") or {}
-    return {
-        "node_id": node.get("node_id"),
-        "node_type": node.get("node_type"),
-        "title": _node_title(node, summary_chars=summary_chars),
-        "status": node.get("status"),
-        "subtype": node.get("subtype"),
-        "canonical_id": node.get("canonical_id"),
-        "source_type": source.get("source_type") if isinstance(source, dict) else None,
-        "source_url": _source_url(node),
-        "summary": _short(node.get("summary") or node.get("caption"), summary_chars),
-    }
+    source_type = source.get("source_type") if isinstance(source, dict) else None
+    if (
+        source_type == "wikipedia_inline_image"
+        or metadata.get("image_origin") == "wikipedia_inline"
+        or metadata.get("wiki_inline_keep_in_graph") is not None
+    ):
+        return "wiki_inline"
+    if metadata.get("search_query") or metadata.get("visual_target") or source_type == "image_search_bundle":
+        return "visual_plan"
+    return "unknown"
 
 
-def build_report(*, graph_dir: Path, node_id: str, summary_chars: int) -> dict[str, Any]:
-    store = JsonlGraphStore(graph_dir)
-    focus_node = store.get_node(node_id)
-    if focus_node is None:
-        raise KeyError(f"Node not found: {node_id}")
+def _load_runner_state(graph_dir: Path) -> tuple[dict[str, Any] | None, str | None]:
+    state_path = graph_dir / DEFAULT_STATE_FILE_NAME
+    if not state_path.exists():
+        return None, None
+    try:
+        return json.loads(state_path.read_text(encoding="utf-8")), None
+    except Exception as exc:
+        return None, f"{exc.__class__.__name__}: {exc}"
 
-    nodes_by_id = {record["node_id"]: record for record in store.list_nodes()}
-    out_edges_raw = sorted(store.edges_from(node_id), key=_edge_sort_key)
-    in_edges_raw = sorted(store.edges_to(node_id), key=_edge_sort_key)
 
-    out_edges = [
-        _edge_record(
-            focus_node=focus_node,
-            edge=edge,
-            neighbor=nodes_by_id.get(edge.get("dst_node_id")),
-            direction="out",
-            summary_chars=summary_chars,
-        )
-        for edge in out_edges_raw
-    ]
-    in_edges = [
-        _edge_record(
-            focus_node=focus_node,
-            edge=edge,
-            neighbor=nodes_by_id.get(edge.get("src_node_id")),
-            direction="in",
-            summary_chars=summary_chars,
-        )
-        for edge in in_edges_raw
-    ]
+def _task_entity_records(task_record: dict[str, Any]) -> list[dict[str, Any]]:
+    metadata = task_record.get("metadata") or {}
+    if metadata.get("task_origin") != "image_entity":
+        return []
 
-    neighbors_by_id: dict[str, dict[str, Any]] = defaultdict(
-        lambda: {"neighbor": None, "connections": []}
-    )
-    for item in out_edges + in_edges:
-        neighbor_id = item.get("neighbor_node_id")
-        if not neighbor_id:
+    parent_node_id = task_record.get("parent_node_id")
+    pending_links = metadata.get("pending_parent_links") or []
+    records: list[dict[str, Any]] = []
+
+    for pending in pending_links:
+        if not isinstance(pending, dict):
             continue
-        bucket = neighbors_by_id[neighbor_id]
-        bucket["neighbor"] = item["neighbor"]
-        bucket["connections"].append(
+        if (pending.get("link_type") or "wiki_link") != "image_entity":
+            continue
+        entity = pending.get("entity")
+        if not isinstance(entity, dict):
+            entity = {
+                "name": metadata.get("entity_name"),
+                "type": metadata.get("entity_type"),
+            }
+        key = _entity_key(entity)
+        if key is None:
+            continue
+        records.append(
             {
-                "direction": item["direction"],
-                "edge_id": item["edge_id"],
-                "edge_type": item["edge_type"],
-                "relation": item["relation"],
-                "status": item["status"],
-                "description": item["description"],
+                "image_node_id": pending.get("parent_node_id") or parent_node_id,
+                "entity": dict(entity),
+                "entity_key": key,
+                "resolved_target": pending.get("resolved_target"),
             }
         )
 
-    neighbors = []
-    for neighbor_id, payload in neighbors_by_id.items():
-        connections = sorted(
-            payload["connections"],
+    if records:
+        return records
+
+    entity = {
+        "name": metadata.get("entity_name"),
+        "type": metadata.get("entity_type"),
+    }
+    key = _entity_key(entity)
+    if key is None or not parent_node_id:
+        return []
+    return [
+        {
+            "image_node_id": parent_node_id,
+            "entity": entity,
+            "entity_key": key,
+            "resolved_target": None,
+        }
+    ]
+
+
+def _matching_failure(failures: list[dict[str, Any]], entity: dict[str, Any]) -> dict[str, Any] | None:
+    entity_name = _normalize_text(entity.get("name"))
+    entity_type = _normalize_text(entity.get("type"))
+    for failure in failures:
+        failure_name = _normalize_text(failure.get("entity_name"))
+        failure_type = _normalize_text(failure.get("entity_type"))
+        if entity_name and failure_name and entity_name == failure_name:
+            return failure
+        if entity_name and failure_name:
+            continue
+        if entity_type and failure_type and entity_type == failure_type:
+            return failure
+    return None
+
+
+def _runner_status_from_section(section: str, record: dict[str, Any], entity: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    if section == "queue":
+        return "queued_pending", {}
+    if section == "failed_tasks":
+        return "task_failed", {"error": record.get("error")}
+    if section == "skipped_tasks":
+        return "task_skipped", {"attribute_error": record.get("attribute_error")}
+    if section == "completed_tasks":
+        failures = [item for item in (record.get("parent_link_failures") or []) if isinstance(item, dict)]
+        failure = _matching_failure(failures, entity)
+        if failure is not None:
+            return "parent_link_failed", {"failure": failure}
+        return "task_completed", {"materialized_edge_count": record.get("materialized_edge_count")}
+    return "grounded_only", {}
+
+
+def _collect_runner_state_index(state: dict[str, Any] | None) -> dict[tuple[str, tuple[str, str, str, str]], list[dict[str, Any]]]:
+    if not isinstance(state, dict):
+        return {}
+
+    indexed: dict[tuple[str, tuple[str, str, str, str]], list[dict[str, Any]]] = defaultdict(list)
+    sections = (
+        ("queue", state.get("queue") or []),
+        ("failed_tasks", state.get("failed_tasks") or []),
+        ("skipped_tasks", state.get("skipped_tasks") or []),
+        ("completed_tasks", state.get("completed_tasks") or []),
+    )
+
+    for section_name, items in sections:
+        for raw in items:
+            task_record = raw if section_name == "queue" else raw.get("task") or {}
+            for task_item in _task_entity_records(task_record):
+                image_node_id = task_item.get("image_node_id")
+                entity_key = task_item.get("entity_key")
+                entity = task_item.get("entity")
+                if not image_node_id or entity_key is None or not isinstance(entity, dict):
+                    continue
+                status, extra = _runner_status_from_section(section_name, raw if isinstance(raw, dict) else {}, entity)
+                indexed[(str(image_node_id), entity_key)].append(
+                    {
+                        "status": status,
+                        "entity": dict(entity),
+                        "resolved_target": task_item.get("resolved_target"),
+                        "section": section_name,
+                        **extra,
+                    }
+                )
+    return indexed
+
+
+def _collect_linked_entities(
+    *,
+    edges: list[dict[str, Any]],
+    nodes_by_id: dict[str, dict[str, Any]],
+    summary_chars: int,
+) -> dict[tuple[str, str, str, str], list[dict[str, Any]]]:
+    linked: dict[tuple[str, str, str, str], list[dict[str, Any]]] = defaultdict(list)
+    for edge in edges:
+        if edge.get("edge_type") != IMAGE_DEPICTS_EDGE_TYPE:
+            continue
+        target_node = nodes_by_id.get(edge.get("dst_node_id"))
+        edge_metadata = edge.get("metadata") or {}
+        evidence_refs = edge.get("evidence_refs") or []
+        matched = False
+
+        for evidence_ref in evidence_refs:
+            if not isinstance(evidence_ref, dict):
+                continue
+            ref_metadata = evidence_ref.get("metadata") or {}
+            entity = ref_metadata.get("grounded_entity")
+            if not isinstance(entity, dict):
+                continue
+            key = _entity_key(entity)
+            if key is None:
+                continue
+            linked[key].append(
+                {
+                    "edge_id": edge.get("edge_id"),
+                    "relation": edge.get("relation"),
+                    "dst_node_id": edge.get("dst_node_id"),
+                    "dst_title": _node_title(target_node or {}, summary_chars=summary_chars) if target_node else None,
+                    "query_overlap_entity": bool(
+                        ref_metadata.get("query_overlap_entity")
+                        or edge_metadata.get("query_overlap_entity")
+                    ),
+                    "resolved_target": ref_metadata.get("resolved_target"),
+                }
+            )
+            matched = True
+
+        if matched:
+            continue
+
+        fallback_entity = {
+            "name": edge_metadata.get("entity_name"),
+            "type": edge_metadata.get("entity_type"),
+            "relation_to_image": edge.get("relation"),
+        }
+        key = _entity_key(fallback_entity)
+        if key is None:
+            continue
+        linked[key].append(
+            {
+                "edge_id": edge.get("edge_id"),
+                "relation": edge.get("relation"),
+                "dst_node_id": edge.get("dst_node_id"),
+                "dst_title": _node_title(target_node or {}, summary_chars=summary_chars) if target_node else None,
+                "query_overlap_entity": bool(edge_metadata.get("query_overlap_entity")),
+                "resolved_target": None,
+            }
+        )
+    return linked
+
+
+def _ensure_entity_report(
+    reports: dict[tuple[str, str, str, str], dict[str, Any]],
+    entity: dict[str, Any],
+    *,
+    summary_chars: int,
+) -> dict[str, Any] | None:
+    key = _entity_key(entity)
+    if key is None:
+        return None
+    report = reports.get(key)
+    if report is None:
+        report = {
+            "entity_key": list(key),
+            "name": entity.get("name"),
+            "type": entity.get("type"),
+            "relation_to_image": _short(entity.get("relation_to_image") or entity.get("relation"), summary_chars),
+            "evidence": _short(entity.get("evidence"), summary_chars),
+            "status": "grounded_only",
+            "query_overlap_entity": False,
+            "metadata_statuses": [],
+            "linked_targets": [],
+            "runner_state": [],
+            "present_in_grounded_entities": False,
+            "present_in_unresolved_grounded_entities": False,
+            "present_in_query_overlap_grounded_entities": False,
+        }
+        reports[key] = report
+        return report
+
+    if not report.get("name") and entity.get("name"):
+        report["name"] = entity.get("name")
+    if not report.get("type") and entity.get("type"):
+        report["type"] = entity.get("type")
+    if not report.get("relation_to_image") and (entity.get("relation_to_image") or entity.get("relation")):
+        report["relation_to_image"] = _short(entity.get("relation_to_image") or entity.get("relation"), summary_chars)
+    if not report.get("evidence") and entity.get("evidence"):
+        report["evidence"] = _short(entity.get("evidence"), summary_chars)
+    return report
+
+
+def _choose_entity_status(report: dict[str, Any]) -> str:
+    if report.get("linked_targets"):
+        return "linked"
+
+    runner_statuses = {str(item.get("status") or "") for item in (report.get("runner_state") or [])}
+    for candidate in ("parent_link_failed", "queued_pending", "task_failed", "task_skipped", "task_completed"):
+        if candidate in runner_statuses:
+            return candidate
+
+    metadata_statuses = {str(item or "") for item in (report.get("metadata_statuses") or [])}
+    for candidate in ("unresolved", "filtered_by_query_entity_overlap", "filtered_out", "query_overlap_entity"):
+        if candidate in metadata_statuses:
+            return candidate
+    return "grounded_only"
+
+
+def _status_rank(status: str) -> int:
+    return STATUS_PRIORITY.get(status, 0)
+
+
+def _build_grounded_entity_reports(
+    *,
+    image_node: dict[str, Any],
+    out_edges: list[dict[str, Any]],
+    nodes_by_id: dict[str, dict[str, Any]],
+    runner_state_index: dict[tuple[str, tuple[str, str, str, str]], list[dict[str, Any]]],
+    summary_chars: int,
+) -> list[dict[str, Any]]:
+    metadata = image_node.get("metadata") or {}
+    raw_grounded = [item for item in (metadata.get("grounded_entities") or []) if isinstance(item, dict)]
+    unresolved = [item for item in (metadata.get("unresolved_grounded_entities") or []) if isinstance(item, dict)]
+    query_overlap = [item for item in (metadata.get("query_overlap_grounded_entities") or []) if isinstance(item, dict)]
+
+    linked_by_key = _collect_linked_entities(
+        edges=out_edges,
+        nodes_by_id=nodes_by_id,
+        summary_chars=summary_chars,
+    )
+
+    reports: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+
+    for entity in raw_grounded:
+        report = _ensure_entity_report(reports, entity, summary_chars=summary_chars)
+        if report is not None:
+            report["present_in_grounded_entities"] = True
+
+    for entity in unresolved:
+        report = _ensure_entity_report(reports, entity, summary_chars=summary_chars)
+        if report is not None:
+            report["present_in_unresolved_grounded_entities"] = True
+            status = str(entity.get("status") or "unresolved")
+            report["metadata_statuses"].append(status)
+            if status in {"query_overlap_entity", "filtered_by_query_entity_overlap"}:
+                report["query_overlap_entity"] = True
+
+    for entity in query_overlap:
+        report = _ensure_entity_report(reports, entity, summary_chars=summary_chars)
+        if report is not None:
+            report["present_in_query_overlap_grounded_entities"] = True
+            report["query_overlap_entity"] = True
+            report["metadata_statuses"].append(str(entity.get("status") or "query_overlap_entity"))
+
+    for entity_key, linked_targets in linked_by_key.items():
+        report = reports.get(entity_key)
+        if report is None:
+            fallback_entity = {
+                "name": entity_key[0],
+                "type": entity_key[1],
+                "relation_to_image": entity_key[2],
+                "evidence": entity_key[3],
+            }
+            report = _ensure_entity_report(reports, fallback_entity, summary_chars=summary_chars)
+        if report is None:
+            continue
+        report["linked_targets"].extend(linked_targets)
+        if any(item.get("query_overlap_entity") for item in linked_targets):
+            report["query_overlap_entity"] = True
+
+    image_node_id = str(image_node.get("node_id") or "")
+    for entity_key, report in list(reports.items()):
+        runner_items = runner_state_index.get((image_node_id, entity_key), [])
+        if runner_items:
+            report["runner_state"].extend(runner_items)
+            if any(item.get("status") == "queued_pending" for item in runner_items):
+                report["query_overlap_entity"] = report.get("query_overlap_entity", False)
+
+    # Include entities that only show up in runner state or linked edges.
+    known_keys = set(reports)
+    for key, linked_targets in linked_by_key.items():
+        if key in known_keys:
+            continue
+        fallback_entity = {
+            "name": key[0],
+            "type": key[1],
+            "relation_to_image": key[2],
+            "evidence": key[3],
+        }
+        report = _ensure_entity_report(reports, fallback_entity, summary_chars=summary_chars)
+        if report is not None:
+            report["linked_targets"].extend(linked_targets)
+    for (parent_node_id, key), runner_items in runner_state_index.items():
+        if parent_node_id != image_node_id:
+            continue
+        if key in reports:
+            continue
+        entity = runner_items[0].get("entity") if runner_items else {}
+        report = _ensure_entity_report(reports, entity if isinstance(entity, dict) else {}, summary_chars=summary_chars)
+        if report is not None:
+            report["runner_state"].extend(runner_items)
+
+    grounded_entities = list(reports.values())
+    for report in grounded_entities:
+        report["metadata_statuses"] = sorted(set(str(item) for item in report.get("metadata_statuses") or [] if item))
+        report["status"] = _choose_entity_status(report)
+        report["linked_targets"] = sorted(
+            report.get("linked_targets") or [],
             key=lambda item: (
-                str(item.get("direction") or ""),
-                str(item.get("edge_type") or ""),
-                str(item.get("relation") or ""),
+                str(item.get("dst_title") or ""),
+                str(item.get("dst_node_id") or ""),
                 str(item.get("edge_id") or ""),
             ),
         )
-        neighbors.append(
-            {
-                "neighbor": payload["neighbor"]
-                or _node_brief(None, node_id=neighbor_id, summary_chars=summary_chars),
-                "connection_count": len(connections),
-                "connections": connections,
-            }
+        report["runner_state"] = sorted(
+            report.get("runner_state") or [],
+            key=lambda item: (
+                -_status_rank(str(item.get("status") or "")),
+                str(item.get("section") or ""),
+                str(((item.get("resolved_target") or {}).get("title") or "")),
+            ),
         )
-    neighbors.sort(
+
+    grounded_entities.sort(
         key=lambda item: (
-            str((item.get("neighbor") or {}).get("title") or ""),
-            str((item.get("neighbor") or {}).get("node_id") or ""),
+            -_status_rank(str(item.get("status") or "")),
+            *_entity_sort_label(item),
         )
     )
+    return grounded_entities
+
+
+def _image_report(
+    *,
+    image_node: dict[str, Any],
+    store: JsonlGraphStore,
+    nodes_by_id: dict[str, dict[str, Any]],
+    runner_state_index: dict[tuple[str, tuple[str, str, str, str]], list[dict[str, Any]]],
+    summary_chars: int,
+) -> dict[str, Any]:
+    source = image_node.get("source") or {}
+    metadata = image_node.get("metadata") or {}
+    out_edges = list(store.edges_from(str(image_node.get("node_id") or "")))
+    grounded_entities = _build_grounded_entity_reports(
+        image_node=image_node,
+        out_edges=out_edges,
+        nodes_by_id=nodes_by_id,
+        runner_state_index=runner_state_index,
+        summary_chars=summary_chars,
+    )
+    status_counts = Counter(str(item.get("status") or "unknown") for item in grounded_entities)
 
     return {
-        "graph_dir": str(graph_dir),
-        "node": _node_report(focus_node, summary_chars=summary_chars),
-        "degree": len(in_edges) + len(out_edges),
-        "in_degree": len(in_edges),
-        "out_degree": len(out_edges),
-        "incident_edge_count": len(in_edges) + len(out_edges),
-        "neighbor_count": len(neighbors),
-        "unique_neighbor_count": len(neighbors),
-        "in_edges": in_edges,
-        "out_edges": out_edges,
-        "neighbors": neighbors,
+        "node_id": image_node.get("node_id"),
+        "node_type": image_node.get("node_type"),
+        "title": _node_title(image_node, summary_chars=summary_chars),
+        "status": image_node.get("status"),
+        "created_at": image_node.get("created_at"),
+        "source_type": source.get("source_type") if isinstance(source, dict) else None,
+        "origin": _image_origin(image_node),
+        "image_url": image_node.get("image_url") or _source_url(image_node),
+        "source_page_url": image_node.get("source_page_url"),
+        "summary": _short(image_node.get("summary") or image_node.get("caption"), summary_chars),
+        "search_query": _short(metadata.get("search_query"), summary_chars),
+        "visual_target": _short(metadata.get("visual_target"), summary_chars),
+        "grounded_entity_count": len(grounded_entities),
+        "grounded_entity_status_counts": dict(sorted(status_counts.items())),
+        "grounded_entities": grounded_entities,
     }
 
 
-def _print_edge_section(title: str, edges: list[dict[str, Any]]) -> None:
-    print(f"\n{title} ({len(edges)})")
-    if not edges:
-        print("  <none>")
-        return
-    for index, edge in enumerate(edges, start=1):
-        neighbor = edge.get("neighbor") or {}
-        neighbor_title = neighbor.get("title") or "<untitled>"
-        neighbor_type = neighbor.get("node_type") or "?"
-        print(
-            f"  {index:>2}. edge_id={edge.get('edge_id')} direction={edge.get('direction')} "
-            f"type={edge.get('edge_type')} relation={edge.get('relation')!r}"
+def build_report(*, graph_dir: Path, limit: int, summary_chars: int) -> dict[str, Any]:
+    store = JsonlGraphStore(graph_dir)
+    nodes_by_id = {record["node_id"]: record for record in store.list_nodes()}
+    image_nodes = [node for node in nodes_by_id.values() if node.get("node_type") == IMAGE_NODE_TYPE]
+    image_nodes.sort(
+        key=lambda node: (
+            str(node.get("created_at") or ""),
+            str(node.get("node_id") or ""),
+        ),
+        reverse=True,
+    )
+    selected_nodes = image_nodes if limit <= 0 else image_nodes[:limit]
+
+    runner_state, runner_state_error = _load_runner_state(graph_dir)
+    runner_state_index = _collect_runner_state_index(runner_state)
+
+    images = [
+        _image_report(
+            image_node=node,
+            store=store,
+            nodes_by_id=nodes_by_id,
+            runner_state_index=runner_state_index,
+            summary_chars=summary_chars,
         )
-        print(
-            f"      neighbor={neighbor.get('node_id')} [{neighbor_type}] {neighbor_title}"
-        )
-        print(f"      path={edge.get('description')}")
+        for node in selected_nodes
+    ]
+
+    return {
+        "graph_dir": str(graph_dir),
+        "limit": limit,
+        "total_image_nodes": len(image_nodes),
+        "returned_image_nodes": len(images),
+        "runner_state_present": runner_state is not None,
+        "runner_state_error": runner_state_error,
+        "images": images,
+    }
 
 
-def _print_neighbor_section(neighbors: list[dict[str, Any]]) -> None:
-    print(f"\nUnique Neighbors ({len(neighbors)})")
-    if not neighbors:
-        print("  <none>")
+def _print_grounded_entities(grounded_entities: list[dict[str, Any]]) -> None:
+    print(f"  grounded_entity_count={len(grounded_entities)}")
+    if not grounded_entities:
+        print("  grounded_entities=<none>")
         return
-    for index, item in enumerate(neighbors, start=1):
-        neighbor = item.get("neighbor") or {}
+
+    print("  grounded_entities:")
+    for index, entity in enumerate(grounded_entities, start=1):
+        name = entity.get("name") or "<unnamed>"
+        entity_type = entity.get("type") or "?"
+        status = entity.get("status") or "unknown"
         print(
-            f"  {index:>2}. {neighbor.get('node_id')} [{neighbor.get('node_type') or '?'}] "
-            f"{neighbor.get('title') or '<untitled>'}"
+            f"    {index:>2}. status={status} query_overlap={bool(entity.get('query_overlap_entity'))} "
+            f"name={name!r} type={entity_type!r}"
         )
-        print(f"      connection_count={item.get('connection_count', 0)}")
-        for conn_index, conn in enumerate(item.get("connections") or [], start=1):
-            print(
-                f"      {conn_index:>2}. direction={conn.get('direction')} edge_id={conn.get('edge_id')} "
-                f"type={conn.get('edge_type')} relation={conn.get('relation')!r}"
-            )
-            print(f"          path={conn.get('description')}")
+        if entity.get("relation_to_image"):
+            print(f"        relation_to_image={entity.get('relation_to_image')!r}")
+        if entity.get("evidence"):
+            print(f"        evidence={entity.get('evidence')!r}")
+        metadata_statuses = entity.get("metadata_statuses") or []
+        if metadata_statuses:
+            print(f"        metadata_statuses={metadata_statuses}")
+        linked_targets = entity.get("linked_targets") or []
+        if linked_targets:
+            for target in linked_targets:
+                print(
+                    "        linked_to="
+                    f"{target.get('dst_node_id')} title={target.get('dst_title')!r} "
+                    f"edge_id={target.get('edge_id')} relation={target.get('relation')!r}"
+                )
+                resolved_target = target.get("resolved_target") or {}
+                if isinstance(resolved_target, dict) and resolved_target.get("url"):
+                    print(
+                        "          resolved_target="
+                        f"{resolved_target.get('title')!r} url={resolved_target.get('url')}"
+                    )
+        runner_state = entity.get("runner_state") or []
+        if runner_state:
+            for item in runner_state:
+                print(
+                    f"        runner_state status={item.get('status')} section={item.get('section')}"
+                )
+                resolved_target = item.get("resolved_target") or {}
+                if isinstance(resolved_target, dict) and resolved_target.get("url"):
+                    print(
+                        "          resolved_target="
+                        f"{resolved_target.get('title')!r} url={resolved_target.get('url')}"
+                    )
+                if item.get("error"):
+                    print(f"          error={item.get('error')!r}")
+                if item.get("attribute_error"):
+                    print(f"          attribute_error={item.get('attribute_error')!r}")
+                failure = item.get("failure")
+                if isinstance(failure, dict):
+                    print(f"          failure_reason={failure.get('reason')!r}")
 
 
 def print_report(report: dict[str, Any]) -> None:
-    node = report["node"]
-    print("Node")
-    print(f"  node_id={node.get('node_id')}")
-    print(f"  node_type={node.get('node_type')}")
-    print(f"  title={node.get('title')!r}")
-    print(f"  status={node.get('status')}")
-    if node.get("subtype"):
-        print(f"  subtype={node.get('subtype')}")
-    if node.get("canonical_id"):
-        print(f"  canonical_id={node.get('canonical_id')}")
-    if node.get("source_type"):
-        print(f"  source_type={node.get('source_type')}")
-    if node.get("source_url"):
-        print(f"  source_url={node.get('source_url')}")
-    if node.get("summary"):
-        print(f"  summary={node.get('summary')!r}")
-    print(f"  degree={report.get('degree')}")
-    print(f"  in_degree={report.get('in_degree')}")
-    print(f"  out_degree={report.get('out_degree')}")
-    print(f"  incident_edge_count={report.get('incident_edge_count')}")
-    print(f"  neighbor_count={report.get('neighbor_count')}")
-    print(f"  unique_neighbor_count={report.get('unique_neighbor_count')}")
+    print("Image Node Summary")
+    print(f"  graph_dir={report.get('graph_dir')}")
+    print(f"  total_image_nodes={report.get('total_image_nodes')}")
+    print(f"  returned_image_nodes={report.get('returned_image_nodes')}")
+    print(f"  limit={report.get('limit')}")
+    print(f"  runner_state_present={report.get('runner_state_present')}")
+    if report.get("runner_state_error"):
+        print(f"  runner_state_error={report.get('runner_state_error')!r}")
 
-    _print_edge_section("Outgoing Edges", report.get("out_edges") or [])
-    _print_edge_section("Incoming Edges", report.get("in_edges") or [])
-    _print_neighbor_section(report.get("neighbors") or [])
+    images = report.get("images") or []
+    if not images:
+        print("\n<no image nodes>")
+        return
+
+    for index, image in enumerate(images, start=1):
+        print(f"\n[{index}] {image.get('node_id')}")
+        print(f"  title={image.get('title')!r}")
+        print(f"  status={image.get('status')}")
+        print(f"  origin={image.get('origin')} source_type={image.get('source_type')}")
+        print(f"  image_url={image.get('image_url')}")
+        if image.get("source_page_url"):
+            print(f"  source_page_url={image.get('source_page_url')}")
+        if image.get("search_query"):
+            print(f"  search_query={image.get('search_query')!r}")
+        if image.get("visual_target"):
+            print(f"  visual_target={image.get('visual_target')!r}")
+        if image.get("summary"):
+            print(f"  summary={image.get('summary')!r}")
+        print(f"  grounded_entity_status_counts={image.get('grounded_entity_status_counts')}")
+        _print_grounded_entities(image.get("grounded_entities") or [])
 
 
 def main() -> int:
@@ -333,16 +685,12 @@ def main() -> int:
     if not graph_dir.exists():
         print(f"Graph directory does not exist: {graph_dir}", file=sys.stderr)
         return 1
-    try:
-        report = build_report(
-            graph_dir=graph_dir,
-            node_id=args.node_id,
-            summary_chars=max(20, int(args.summary_chars)),
-        )
-    except KeyError as exc:
-        print(str(exc), file=sys.stderr)
-        return 1
 
+    report = build_report(
+        graph_dir=graph_dir,
+        limit=int(args.limit),
+        summary_chars=max(40, int(args.summary_chars)),
+    )
     if args.json:
         print(json.dumps(report, ensure_ascii=False, indent=2))
     else:
