@@ -150,8 +150,9 @@ def _render_direction(
         )
     if len(lines) > len(visible):
         extra_y = y + (len(rendered) + 1) * LINE_HEIGHT
+        more_edges_text = f"... {len(lines) - len(visible)} more edges"
         svg.append(
-            f'<text x="{x}" y="{extra_y}" font-family="Arial, sans-serif" font-size="12.5" font-style="italic" fill="#64748B">{esc(f'... {len(lines) - len(visible)} more edges')}</text>'
+            f'<text x="{x}" y="{extra_y}" font-family="Arial, sans-serif" font-size="12.5" font-style="italic" fill="#64748B">{esc(more_edges_text)}</text>'
         )
     del width
 
