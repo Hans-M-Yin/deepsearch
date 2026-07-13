@@ -2033,13 +2033,7 @@ class ImageDiscoveryBuilder:
         if not wiki_title:
             return self._reject("missing_wiki_inline_title", drop_candidate=True)
 
-        model_alias = (
-            os.environ.get("WIKI_INLINE_IMAGE_CHECK_MODEL")
-            or self.image_check_model_alias
-            or os.environ.get("IMAGE_CHECK_MODEL")
-            or os.environ.get("TEXT_PROCESS_MODEL")
-            or os.environ.get("IMAGE_GROUND_MODEL")
-        )
+        model_alias = self._wiki_inline_model_alias()
         if not model_alias:
             return self._reject("missing_wiki_inline_image_model", drop_candidate=True)
 
@@ -2119,7 +2113,13 @@ class ImageDiscoveryBuilder:
             )
         if result.status == ImageCandidateStatus.REJECTED:
             result.drop_candidate = True
-        return result
+            return result
+        return self._wiki_inline_self_qa_check(
+            plan=plan,
+            search_result=search_result,
+            validation=result,
+            run_id=run_id,
+        )
 
     def _resolve_image_asset(
         self,
@@ -3042,6 +3042,32 @@ class ImageDiscoveryBuilder:
         return f"Wikipedia page title: {wikipedia_title or ''}"
 
     @staticmethod
+    def _wiki_inline_judge_prompt_input(
+        *,
+        question: str,
+        reference_answer: str,
+        model_answer: str,
+    ) -> str:
+        return (
+            f"Question: {question or ''}\n"
+            f"Reference answer: {reference_answer or ''}\n"
+            f"User answer: {model_answer or ''}"
+        )
+
+    def _wiki_inline_model_alias(self, *, preferred_env: str | None = None) -> str | None:
+        if preferred_env:
+            alias = os.environ.get(preferred_env)
+            if alias:
+                return alias
+        return (
+            os.environ.get("WIKI_INLINE_IMAGE_CHECK_MODEL")
+            or self.image_check_model_alias
+            or os.environ.get("IMAGE_CHECK_MODEL")
+            or os.environ.get("TEXT_PROCESS_MODEL")
+            or os.environ.get("IMAGE_GROUND_MODEL")
+        )
+
+    @staticmethod
     def _parse_image_check_response(
         text: str,
         *,
@@ -3161,6 +3187,203 @@ class ImageDiscoveryBuilder:
         except (TypeError, ValueError):
             return None
         return max(0.0, min(1.0, confidence))
+
+    def _wiki_inline_self_qa_check(
+        self,
+        *,
+        plan: VisualSearchPlan,
+        search_result: ImageSearchResult,
+        validation: ImageValidationResult,
+        run_id: str | None,
+    ) -> ImageValidationResult:
+        if validation.status != ImageCandidateStatus.ACCEPTED:
+            return validation
+
+        wiki_title = (self._source_node_title(plan.source_node_id) or "").strip()
+        if not wiki_title:
+            return self._reject("missing_wiki_inline_title", drop_candidate=True)
+
+        model_alias = self._wiki_inline_model_alias(preferred_env="WIKI_INLINE_IMAGE_JUDGE_MODEL")
+        if not model_alias:
+            return self._reject("missing_wiki_inline_judge_model", drop_candidate=True)
+
+        resolved_asset = self._resolved_image_from_validation(validation, include_transient=True)
+        image_for_model = resolved_asset.model_url if resolved_asset is not None else search_result.image_url
+        caption = (search_result.snippet or plan.target.content or "").strip()
+        prompt_input = self._wiki_inline_question_prompt_input(
+            caption=caption,
+            wikipedia_title=wiki_title,
+        )
+
+        try:
+            self._log_image_model_call(
+                stage="wiki_inline_question",
+                when="before",
+                model_alias=model_alias,
+                plan_id=plan.plan_id,
+                search_result=search_result,
+                model_image_url=image_for_model,
+                resolved_asset=resolved_asset,
+            )
+            question_response = self.model_client.generate(
+                ModelRequest(
+                    model=model_alias,
+                    messages=[
+                        ModelMessage(role="system", content=PROMPT_WIKI_INLINE_IMAGE_QUESTION),
+                        ModelMessage(
+                            role="user",
+                            content=[
+                                {"type": "text", "text": prompt_input},
+                                {"type": "image_url", "image_url": {"url": image_for_model}},
+                            ],
+                        ),
+                    ],
+                    metadata={"trace_label": f"wiki_inline_question:{plan.plan_id}"},
+                )
+            )
+            self._log_image_model_call(
+                stage="wiki_inline_question",
+                when="after",
+                model_alias=model_alias,
+                plan_id=plan.plan_id,
+                search_result=search_result,
+                model_image_url=image_for_model,
+                resolved_asset=resolved_asset,
+                model_output=question_response.content,
+            )
+            question_payload = self._parse_wiki_inline_question(question_response.content)
+            generated_question = question_payload["question"]
+            reference_answer = question_payload.get("answer", "").strip()
+            if not reference_answer:
+                raise ValueError("Missing reference answer in wiki-inline question output.")
+
+            self._log_image_model_call(
+                stage="wiki_inline_answer",
+                when="before",
+                model_alias=model_alias,
+                plan_id=plan.plan_id,
+                search_result=search_result,
+                model_image_url=image_for_model,
+                resolved_asset=resolved_asset,
+            )
+            answer_response = self.model_client.generate(
+                ModelRequest(
+                    model=model_alias,
+                    messages=[
+                        ModelMessage(role="system", content=PROMPT_WIKI_INLINE_IMAGE_ANSWER),
+                        ModelMessage(
+                            role="user",
+                            content=[
+                                {"type": "text", "text": generated_question},
+                                {"type": "image_url", "image_url": {"url": image_for_model}},
+                            ],
+                        ),
+                    ],
+                    metadata={"trace_label": f"wiki_inline_answer:{plan.plan_id}"},
+                )
+            )
+            self._log_image_model_call(
+                stage="wiki_inline_answer",
+                when="after",
+                model_alias=model_alias,
+                plan_id=plan.plan_id,
+                search_result=search_result,
+                model_image_url=image_for_model,
+                resolved_asset=resolved_asset,
+                model_output=answer_response.content,
+            )
+            model_answer = self._parse_wiki_inline_answer(answer_response.content)
+
+            judge_input = self._wiki_inline_judge_prompt_input(
+                question=generated_question,
+                reference_answer=reference_answer,
+                model_answer=model_answer,
+            )
+            self._log_image_model_call(
+                stage="wiki_inline_judge",
+                when="before",
+                model_alias=model_alias,
+                plan_id=plan.plan_id,
+                search_result=search_result,
+                model_image_url=None,
+                resolved_asset=resolved_asset,
+            )
+            judge_response = self.model_client.generate(
+                ModelRequest(
+                    model=model_alias,
+                    messages=[
+                        ModelMessage(role="system", content=PROMPT_WIKI_INLINE_IMAGE_JUDGE),
+                        ModelMessage(role="user", content=judge_input),
+                    ],
+                    metadata={"trace_label": f"wiki_inline_judge:{plan.plan_id}"},
+                )
+            )
+            self._log_image_model_call(
+                stage="wiki_inline_judge",
+                when="after",
+                model_alias=model_alias,
+                plan_id=plan.plan_id,
+                search_result=search_result,
+                model_image_url=None,
+                resolved_asset=resolved_asset,
+                model_output=judge_response.content,
+            )
+            judge_decision, judge_reason = self._parse_wiki_inline_judge(judge_response.content)
+        except Exception as exc:
+            print(
+                "[wiki-inline-image] self-qa request failed "
+                f"plan_id={plan.plan_id} "
+                f"model_alias={model_alias!r}",
+                file=sys.stderr,
+                flush=True,
+            )
+            traceback.print_exc(file=sys.stderr)
+            return self._reject(
+                f"wiki_inline_self_qa_model_error:{exc.__class__.__name__}:{exc}",
+                drop_candidate=True,
+            )
+
+        merged_metadata = dict(validation.metadata or {})
+        merged_metadata["wiki_inline_self_qa"] = {
+            "question": generated_question,
+            "reference_answer": reference_answer,
+            "model_answer": model_answer,
+            "judge_decision": judge_decision,
+            "judge_reason": judge_reason,
+            "model_alias": model_alias,
+            "question_usage": question_response.usage,
+            "answer_usage": answer_response.usage,
+            "judge_usage": judge_response.usage,
+            "question_raw_model_output": question_response.content,
+            "answer_raw_model_output": answer_response.content,
+            "judge_raw_model_output": judge_response.content,
+            "caption": caption,
+            "wikipedia_title": wiki_title,
+            "filter_reason": (
+                "model_answered_generated_question"
+                if judge_decision == "true"
+                else "model_failed_generated_question"
+            ),
+        }
+        if judge_decision == "true":
+            merged_metadata["check"] = "wiki_inline_self_qa"
+            merged_metadata["model_alias"] = model_alias
+            merged_metadata["raw_model_output"] = judge_response.content
+            return ImageValidationResult(
+                status=ImageCandidateStatus.REJECTED,
+                confidence=validation.confidence,
+                reason="model_answered_generated_question",
+                drop_candidate=True,
+                metadata=merged_metadata,
+            )
+
+        return ImageValidationResult(
+            status=validation.status,
+            confidence=validation.confidence,
+            reason=validation.reason,
+            drop_candidate=validation.drop_candidate,
+            metadata=merged_metadata,
+        )
 
     @staticmethod
     def _reject(reason: str, *, drop_candidate: bool = False) -> ImageValidationResult:
@@ -4218,6 +4441,20 @@ def _smoke_test() -> None:
                         "</check>"
                     )
                 )
+            if "I’m determining whether a user recognizes a particular image" in system:
+                return ModelResponse(
+                    content=(
+                        "<thinking>The page and caption suggest Kobe Bryant is the subject.</thinking>\n"
+                        "<question>Who is shown courtside in this image?</question>\n"
+                        "<answer>Kobe Bryant</answer>"
+                    )
+                )
+            if "You are answering a question about an image content." in system:
+                return ModelResponse(content="UNKNOWN")
+            if "You are judging whether an answer correctly identifies the key information" in system:
+                return ModelResponse(
+                    content="<thinking>The answer does not identify the subject.</thinking>\n<answer>FALSE</answer>"
+                )
             if "checking whether a candidate image" in system:
                 return ModelResponse(
                     content="""<check>
@@ -4260,10 +4497,27 @@ entity: Los Angeles Lakers | jersey logo | visible team branding on the uniform
 </ground>"""
             )
 
+    class MockAnswerableInlineModel(MockModel):
+        def generate(self, request: ModelRequest) -> ModelResponse:
+            system = request.messages[0].content
+            if "You are answering a question about an image content." in system:
+                return ModelResponse(content="Kobe Bryant")
+            if "You are judging whether an answer correctly identifies the key information" in system:
+                return ModelResponse(
+                    content="<thinking>The answer matches the reference answer.</thinking>\n<answer>TRUE</answer>"
+                )
+            return super().generate(request)
+
     class MockNoEntityGroundModel(MockModel):
         def generate(self, request: ModelRequest) -> ModelResponse:
             system = request.messages[0].content
             if "Wikipedia inline image is visually relevant" in system:
+                return super().generate(request)
+            if "I’m determining whether a user recognizes a particular image" in system:
+                return super().generate(request)
+            if "You are answering a question about an image content." in system:
+                return super().generate(request)
+            if "You are judging whether an answer correctly identifies the key information" in system:
                 return super().generate(request)
             if "checking whether a candidate image" in system:
                 return super().generate(request)
@@ -4559,6 +4813,68 @@ caption: Kobe Bryant courtside photo
             assert inline_builder._resolved_image_cache
             assert not inline_builder._transient_image_cache
             assert store.stats()["nodes"] == 4
+
+            answerable_inline_builder = ImageDiscoveryBuilder(
+                store=store,
+                search_client=MockImageSearchClient(),
+                config=ImageDiscoveryConfig(
+                    per_query_limit=1,
+                    max_images_per_plan=1,
+                    enable_retrieval_consistency_check=False,
+                    precheck_image_urls=True,
+                    upload_cached_images=False,
+                    try_source_page_recovery=False,
+                ),
+                model_client=MockAnswerableInlineModel(),
+                wiki_resolver=MockWikiResolver(),
+            )
+            answerable_persist_calls: list[bool] = []
+
+            def fake_answerable_inline_download_and_prepare_image_asset(
+                image_url: str | None,
+                *,
+                source_page_url: str | None,
+                strategy: str,
+                cache_key: str,
+                persist_asset: bool = True,
+            ) -> tuple[ResolvedImageAsset | None, str | None]:
+                answerable_persist_calls.append(persist_asset)
+                if not image_url:
+                    return None, "missing_image_url"
+                asset_uri = f"/tmp/{cache_key}.jpg" if persist_asset else image_url
+                cache_path = f"/tmp/{cache_key}.jpg" if persist_asset else None
+                return (
+                    ResolvedImageAsset(
+                        cache_key=cache_key,
+                        original_url=image_url,
+                        resolved_url=image_url,
+                        source_page_url=source_page_url,
+                        model_url="data:image/jpeg;base64,AA==",
+                        asset_uri=asset_uri,
+                        cache_path=cache_path,
+                        content_type="image/jpeg",
+                        width=640,
+                        height=480,
+                        strategy=strategy,
+                    ),
+                    None,
+                )
+
+            answerable_inline_builder._download_and_prepare_image_asset = fake_answerable_inline_download_and_prepare_image_asset  # type: ignore[method-assign]
+            before_answerable_node_count = store.stats()["nodes"]
+            answerable_inline = answerable_inline_builder.discover_for_wiki_inline_image(
+                wiki_inline_plan,
+                search_result=wiki_inline_search_result,
+                run_id="run_smoke",
+                persist=True,
+            )
+            assert answerable_inline.image_node is None
+            assert answerable_inline.metadata.get("query_count") == 1
+            assert answerable_inline.metadata.get("candidate_decisions", [])[0].get("reason") == "model_answered_generated_question"
+            assert answerable_persist_calls and set(answerable_persist_calls) == {False}
+            assert not answerable_inline_builder._resolved_image_cache
+            assert not answerable_inline_builder._transient_image_cache
+            assert store.stats()["nodes"] == before_answerable_node_count
 
             drop_inline_builder = ImageDiscoveryBuilder(
                 store=store,

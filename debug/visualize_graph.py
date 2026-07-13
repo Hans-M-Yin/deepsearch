@@ -17,7 +17,7 @@ ROW_H = 340
 SOURCE_W = 330
 ARROW_W = 140
 IMAGE_W = 300
-IMAGE_H = 210
+IMAGE_H = 185
 DETAIL_W = 1220
 CARD_PAD = 18
 
@@ -194,6 +194,7 @@ def render_source_card(svg, x, y, source_node):
 def render_image_card(svg, x, y, record):
     node = record["node"]
     origin = record["origin"]
+    relation = edge_relation(record["source_edge"]) if record["source_edge"] else "—"
     svg.append(f'<rect x="{x}" y="{y}" width="{IMAGE_W}" height="{ROW_H}" rx="18" fill="#ffffff" stroke="#f0abfc" stroke-width="1.5"/>')
     svg.append(f'<rect x="{x}" y="{y}" width="{IMAGE_W}" height="36" rx="18" fill="#fce7f3"/>')
     svg.append(f'<rect x="{x}" y="{y + 18}" width="{IMAGE_W}" height="18" fill="#fce7f3"/>')
@@ -206,7 +207,9 @@ def render_image_card(svg, x, y, record):
         svg.append(f'<image href="{esc(href)}" x="{image_x + 1}" y="{image_y + 1}" width="{image_w - 2}" height="{image_h - 2}" preserveAspectRatio="xMidYMid slice"/>')
     else:
         text(svg, image_x + image_w / 2, image_y + image_h / 2, "No image URL", size=14, fill="#9a6700", anchor="middle")
-    render_lines(svg, x + CARD_PAD, y + 292, node_title(node), width=32, max_lines=2, size=13, fill="#334155", weight="bold")
+    render_lines(svg, x + CARD_PAD, y + 260, node_title(node), width=32, max_lines=2, size=13, fill="#334155", weight="bold")
+    text(svg, x + CARD_PAD, y + 300, "source relation", size=11, fill="#9d174d", weight="bold")
+    render_lines(svg, x + CARD_PAD, y + 318, relation, width=34, max_lines=2, size=11, fill="#4c0519", line_gap=14)
 
 
 def render_details(svg, x, y, record):
@@ -264,8 +267,6 @@ def render_svg(run_dir, records, total_images):
         y = HEADER_H + MARGIN_Y + index * (ROW_H + ROW_GAP)
         render_source_card(svg, source_x, y, record["source_node"])
         svg.append(f'<path d="M {arrow_x + 18} {y + ROW_H / 2} L {image_x - 18} {y + ROW_H / 2}" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>')
-        relation = edge_relation(record["source_edge"]) if record["source_edge"] else "wiki_inline: no source edge"
-        text(svg, arrow_x + ARROW_W / 2, y + ROW_H / 2 - 14, short(relation, 22), size=11, fill="#64748b", anchor="middle")
         render_image_card(svg, image_x, y, record)
         render_details(svg, details_x, y, record)
 

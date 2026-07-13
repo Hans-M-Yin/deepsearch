@@ -181,6 +181,7 @@ def main(argv: list[str] | None = None) -> int:
             and not validation.drop_candidate
         )
         metadata = validation.metadata or {}
+        self_qa = metadata.get("wiki_inline_self_qa") or {}
         results.append(
             {
                 "index": index,
@@ -200,6 +201,15 @@ def main(argv: list[str] | None = None) -> int:
                 "visual_facts": metadata.get("visual_facts") or [],
                 "raw_model_output": metadata.get("raw_model_output"),
                 "resolved_image": metadata.get("resolved_image"),
+                "self_qa_question": self_qa.get("question"),
+                "self_qa_reference_answer": self_qa.get("reference_answer"),
+                "self_qa_model_answer": self_qa.get("model_answer"),
+                "self_qa_judge_decision": self_qa.get("judge_decision"),
+                "self_qa_judge_reason": self_qa.get("judge_reason"),
+                "self_qa_filter_reason": self_qa.get("filter_reason"),
+                "self_qa_question_raw_model_output": self_qa.get("question_raw_model_output"),
+                "self_qa_answer_raw_model_output": self_qa.get("answer_raw_model_output"),
+                "self_qa_judge_raw_model_output": self_qa.get("judge_raw_model_output"),
             }
         )
 
@@ -225,6 +235,12 @@ def main(argv: list[str] | None = None) -> int:
         if visual_facts:
             print(f"visual_facts: {' | '.join(_short(fact, 120) for fact in visual_facts[:3])}")
         print(f"raw_model_output: {_short(item.get('raw_model_output'), 400)}")
+        print(f"self_qa_question: {_short(item.get('self_qa_question'), 240)}")
+        print(f"self_qa_reference_answer: {_short(item.get('self_qa_reference_answer'), 240)}")
+        print(f"self_qa_model_answer: {_short(item.get('self_qa_model_answer'), 240)}")
+        print(f"self_qa_judge_decision: {item.get('self_qa_judge_decision') or '-'}")
+        print(f"self_qa_judge_reason: {_short(item.get('self_qa_judge_reason'), 240)}")
+        print(f"self_qa_filter_reason: {item.get('self_qa_filter_reason') or '-'}")
 
     if args.pretty:
         payload = {
