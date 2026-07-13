@@ -8,7 +8,7 @@ python synthesis/run_min_graph.py \
   --skip-attributes \
   --max-neighbors 4 \
   --max-steps 12345678 \
-  --max-nodes 512 \
+  --max-nodes 128 \
   --max-depth 128 \
   --parallel-workers 64 \
   --batch-size 64 \

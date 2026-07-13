@@ -18,9 +18,6 @@ https://en.wikipedia.org/wiki/Katherine_Johnson
 https://en.wikipedia.org/wiki/Abebe_Bikila
 
 # Artifact
-https://en.wikipedia.org/wiki/Antikythera_mechanism
 https://en.wikipedia.org/wiki/Arpanet
-https://en.wikipedia.org/wiki/Iron_lung
 https://en.wikipedia.org/wiki/Shinkansen_0_series
 https://en.wikipedia.org/wiki/Arecibo_Observatory
-https://en.wikipedia.org/wiki/Eames_Lounge_Chair
