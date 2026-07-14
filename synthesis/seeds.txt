@@ -9,7 +9,6 @@ https://en.wikipedia.org/wiki/Alan_Turing
 https://en.wikipedia.org/wiki/Hubble_Space_Telescope
 https://en.wikipedia.org/wiki/Boeing_747
 https://en.wikipedia.org/wiki/The_Great_Wave_off_Kanagawa
-https://en.wikipedia.org/wiki/CRISPR
 
 # Tail / niche
 
@@ -17,7 +16,20 @@ https://en.wikipedia.org/wiki/CRISPR
 https://en.wikipedia.org/wiki/Katherine_Johnson
 https://en.wikipedia.org/wiki/Abebe_Bikila
 
-# Artifact
-https://en.wikipedia.org/wiki/Arpanet
-https://en.wikipedia.org/wiki/Shinkansen_0_series
-https://en.wikipedia.org/wiki/Arecibo_Observatory
+# Video game
+https://en.wikipedia.org/wiki/LSD:_Dream_Emulator
+
+# Singer
+https://en.wikipedia.org/wiki/Linda_Perhacs
+
+# Actor
+https://en.wikipedia.org/wiki/Ruan_Lingyu
+
+# Politician
+https://en.wikipedia.org/wiki/Vigd%C3%ADs_Finnbogad%C3%B3ttir
+
+# Writer
+https://en.wikipedia.org/wiki/Bessie_Head
+
+# Historical figure
+https://en.wikipedia.org/wiki/Sundiata_Keita
