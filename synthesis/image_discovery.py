@@ -426,6 +426,82 @@ Output format:
 """
 
 
+PROMPT_WIKI_INLINE_ENTITY_UNIQUENESS_FILTER = """
+You are filtering grounded entities from a Wikipedia inline image for graph retention.
+
+Goal:
+Keep the image only if it contains at least one unique canonical entity that can anchor a useful graph node.
+Drop the image if all grounded entities are only generic classes, types, roles, phenomena, species, materials, scene categories, or other non-unique concepts.
+
+Definitions:
+- A unique canonical entity has one stable referent in a knowledge graph.
+  Examples: Aeron chair, Herman Miller, HMS Beagle, Eiffel Tower, Apollo 11, Queen II.
+- A non-unique category is a class or type rather than one stable referent.
+  Examples: cumulonimbus cloud, overshooting top, thunderstorm, cathedral, basketball player, dog, steam locomotive.
+- Technical or fine-grained terms are still non-unique if they denote a category, phenomenon, or visual pattern rather than one canonical entity.
+
+Task:
+You will receive:
+- the Wikipedia page title
+- a short image description
+- grounded candidate entities from the image, each with locator/evidence text
+
+For each candidate entity, decide whether to keep or block it.
+
+Keep an entity only if:
+- it denotes a unique canonical entity rather than a generic category; and
+- the caption / grounding evidence makes that identification plausible.
+
+Block an entity if:
+- it is only a generic class, type, role, phenomenon, species, material, scene category, or part;
+- it is a technical term but still denotes a category rather than one canonical entity;
+- uniqueness is unclear or doubtful.
+
+Important rules:
+1. Do not keep an entity only because it matches the Wikipedia page title. The page itself may describe a generic concept.
+2. Human-created named works, products, organizations, vehicles, buildings, artworks, and named historical entities can still be unique even if many copies or instances exist.
+3. Natural kinds, cloud types, biological taxa, weather formations, astronomical classes, and generic object categories should usually be blocked unless they clearly denote one named canonical entity.
+4. Be conservative. If you are unsure whether the term denotes one stable canonical entity, block it.
+5. The final image decision is KEEP only if at least one entity is kept.
+
+Examples:
+
+Wikipedia: Cumulonimbus cloud
+description: An anvil-topped thundercloud with a protruding dome above the top.
+Grounded candidate entities:
+- Cumulonimbus cloud | locator: main storm cloud filling the frame | evidence: the image shows the classic anvil-topped thundercloud form
+- Overshooting top | locator: dome above the cloud top | evidence: a protruding dome rises above the anvil top
+
+<filter>
+overall_decision: drop
+reason: all grounded entities are generic atmospheric categories rather than unique canonical entities
+entity: Cumulonimbus cloud | block | weather cloud type, not a unique canonical entity
+entity: Overshooting top | block | cloud feature category, not a unique canonical entity
+</filter>
+
+Wikipedia: Aeron chair
+description: Office chair designed by Don Chadwick and Bill Stumpf.
+Grounded candidate entities:
+- Aeron chair | locator: office chair in the foreground | evidence: the distinctive mesh-backed chair matches the named product model
+- Herman Miller | locator: brand mark on the chair base | evidence: the visible branding supports the named company
+
+<filter>
+overall_decision: keep
+reason: at least one grounded entity is a unique canonical entity
+entity: Aeron chair | keep | named product model with one stable canonical referent
+entity: Herman Miller | keep | named company uniquely identified by the grounded evidence
+</filter>
+
+Output exactly one block:
+<filter>
+overall_decision: keep|drop
+reason: short reason
+entity: candidate name | keep|block | short reason
+entity: candidate name | keep|block | short reason
+</filter>
+"""
+
+
 PROMPT_WIKI_INLINE_IMAGE_TITLE_CHECK = """You are checking whether a Wikipedia inline image is visually relevant to the subject of a Wikipedia page.
 
 You will receive:
@@ -486,6 +562,10 @@ class ImageDiscoveryConfig:
     image_grounding_reader_base_url: str = "http://127.0.0.1:8004"
     image_grounding_reader_timeout_s: float = 40.0
     image_grounding_max_context_chars: int = 6000
+    enable_wiki_inline_entity_uniqueness_filter: bool = True
+    enable_visual_plan_post_grounding_filter: bool = True
+    visual_plan_min_expandable_entities: int = 2
+    visual_plan_self_qa_entity_count: int = 2
     expandable_entity_types: set[str] = field(
         default_factory=lambda: {
             "person",
@@ -810,7 +890,15 @@ class ImageDiscoveryBuilder:
                             plan=plan,
                         )
                     else:
-                        result.metadata["wiki_inline_skip_reason"] = "no_expandable_grounded_entities"
+                        uniqueness_summary = result.metadata.get("wiki_inline_entity_uniqueness_filter") or {}
+                        if (
+                            isinstance(uniqueness_summary, dict)
+                            and uniqueness_summary.get("applied")
+                            and int(uniqueness_summary.get("kept_entity_count") or 0) == 0
+                        ):
+                            result.metadata["wiki_inline_skip_reason"] = "no_unique_canonical_grounded_entities"
+                        else:
+                            result.metadata["wiki_inline_skip_reason"] = "no_expandable_grounded_entities"
                         self._discard_materialized_result(result)
             result.metadata.update(
                 {
@@ -849,6 +937,11 @@ class ImageDiscoveryBuilder:
         return bool(result.grounded_edges or result.queued_tasks)
 
     @staticmethod
+    def _is_wiki_inline_plan(plan: VisualSearchPlan) -> bool:
+        metadata = plan.metadata or {}
+        return plan.planner == "wikipedia_inline_image_planner" or metadata.get("plan_source") == "wikipedia_inline_image"
+
+    @staticmethod
     def _annotate_wiki_inline_materialized_result(
         *,
         result: ImageDiscoveryResult,
@@ -874,6 +967,81 @@ class ImageDiscoveryBuilder:
         result.search_evidence = None
         result.grounded_edges = []
         result.queued_tasks = []
+
+    def _apply_visual_plan_post_grounding_filter(
+        self,
+        *,
+        plan: VisualSearchPlan,
+        candidate: ImageSearchCandidate,
+        search_result: ImageSearchResult,
+        image_node: ImageNode,
+        grounded_edges: list[Edge],
+        queued_tasks: list[dict[str, Any]],
+        run_id: str | None,
+    ) -> tuple[bool, dict[str, Any]]:
+        if self._is_wiki_inline_plan(plan) or not self.config.enable_visual_plan_post_grounding_filter:
+            return True, {}
+
+        grounded_edge_count = len(grounded_edges)
+        queued_task_count = len(queued_tasks)
+        expandable_entity_count = grounded_edge_count + queued_task_count
+        filter_summary: dict[str, Any] = {
+            "expandable_entity_count": expandable_entity_count,
+            "grounded_edge_count": grounded_edge_count,
+            "queued_task_count": queued_task_count,
+            "min_expandable_entities": int(self.config.visual_plan_min_expandable_entities),
+            "self_qa_entity_count": int(self.config.visual_plan_self_qa_entity_count),
+            "self_qa_applied": False,
+            "kept_in_graph": True,
+            "filter_reason": None,
+        }
+
+        if expandable_entity_count < int(self.config.visual_plan_min_expandable_entities):
+            filter_summary["kept_in_graph"] = False
+            filter_summary["filter_reason"] = "expandable_entity_count_below_threshold"
+            candidate.validation = ImageValidationResult(
+                status=ImageCandidateStatus.REJECTED,
+                confidence=candidate.validation.confidence,
+                reason="expandable_entity_count_below_threshold",
+                drop_candidate=True,
+                metadata={
+                    **dict(candidate.validation.metadata or {}),
+                    "visual_plan_post_grounding_filter": filter_summary,
+                },
+            )
+            candidate.is_primary = False
+            return False, filter_summary
+
+        if expandable_entity_count == int(self.config.visual_plan_self_qa_entity_count):
+            filter_summary["self_qa_applied"] = True
+            candidate.validation = self._visual_plan_self_qa_check(
+                plan=plan,
+                search_result=search_result,
+                image_node=image_node,
+                validation=candidate.validation,
+                run_id=run_id,
+            )
+            merged_metadata = dict(candidate.validation.metadata or {})
+            merged_metadata["visual_plan_post_grounding_filter"] = filter_summary
+            candidate.validation = ImageValidationResult(
+                status=candidate.validation.status,
+                confidence=candidate.validation.confidence,
+                reason=candidate.validation.reason,
+                drop_candidate=candidate.validation.drop_candidate,
+                metadata=merged_metadata,
+            )
+            if candidate.validation.status != ImageCandidateStatus.ACCEPTED or candidate.validation.drop_candidate:
+                filter_summary["kept_in_graph"] = False
+                filter_summary["filter_reason"] = candidate.validation.reason or "visual_plan_self_qa_rejected"
+                candidate.is_primary = False
+                candidate.validation.metadata["visual_plan_post_grounding_filter"] = filter_summary
+                return False, filter_summary
+
+        if candidate.validation.metadata:
+            candidate.validation.metadata["visual_plan_post_grounding_filter"] = filter_summary
+        else:
+            candidate.validation.metadata = {"visual_plan_post_grounding_filter": filter_summary}
+        return True, filter_summary
 
     def _discover_with_client(
         self,
@@ -1429,6 +1597,25 @@ class ImageDiscoveryBuilder:
         )
         self._apply_grounding_to_image_node(image_node, grounding)
 
+        wiki_inline_uniqueness_filter: dict[str, Any] = {}
+        filtered_grounded_entities, wiki_inline_uniqueness_filter = self._filter_wiki_inline_grounded_entities(
+            plan=plan,
+            search_result=candidate.search_result,
+            image_node=image_node,
+            grounded_entities=candidate.grounded_entities,
+            run_id=run_id,
+        )
+        if wiki_inline_uniqueness_filter:
+            candidate.validation.metadata = dict(candidate.validation.metadata or {})
+            candidate.validation.metadata["wiki_inline_entity_uniqueness_filter"] = dict(wiki_inline_uniqueness_filter)
+            result.metadata = dict(result.metadata or {})
+            result.metadata["wiki_inline_entity_uniqueness_filter"] = dict(wiki_inline_uniqueness_filter)
+            image_node.metadata = dict(image_node.metadata or {})
+            image_node.metadata["wiki_inline_entity_uniqueness_filter"] = dict(wiki_inline_uniqueness_filter)
+        candidate.grounded_entities = list(filtered_grounded_entities)
+        image_node.metadata = dict(image_node.metadata or {})
+        image_node.metadata["grounded_entities"] = list(candidate.grounded_entities)
+
         edge_relation, relation_rewrite_metadata = self._rewrite_text_to_image_relation(
             source_node_title=source_node_title,
             search_query=primary_query,
@@ -1508,6 +1695,26 @@ class ImageDiscoveryBuilder:
             source_node_title=source_node_title,
             source_query_text=candidate.source_query.query,
         )
+
+        keep_materialized_result, post_grounding_filter = self._apply_visual_plan_post_grounding_filter(
+            plan=plan,
+            candidate=candidate,
+            search_result=candidate.search_result,
+            image_node=image_node,
+            grounded_edges=grounded_edges,
+            queued_tasks=queued_tasks,
+            run_id=run_id,
+        )
+        if post_grounding_filter:
+            result.metadata = dict(result.metadata or {})
+            result.metadata["visual_plan_post_grounding_filter"] = dict(post_grounding_filter)
+        if not keep_materialized_result:
+            return
+
+        search_evidence.metadata = dict(search_evidence.metadata or {})
+        search_evidence.metadata["validation"] = candidate.validation.to_dict()
+        image_evidence.metadata = dict(image_evidence.metadata or {})
+        image_evidence.metadata["validation"] = candidate.validation.to_dict()
 
         if persist:
             self._persist_records(
@@ -3189,36 +3396,42 @@ class ImageDiscoveryBuilder:
             return None
         return max(0.0, min(1.0, confidence))
 
-    def _wiki_inline_self_qa_check(
+    def _run_image_self_qa_check(
         self,
         *,
         plan: VisualSearchPlan,
         search_result: ImageSearchResult,
         validation: ImageValidationResult,
         run_id: str | None,
+        subject_title: str,
+        caption: str,
+        metadata_key: str,
+        preferred_env: str | None,
+        missing_model_reason: str,
+        error_reason_prefix: str,
+        trace_prefix: str,
     ) -> ImageValidationResult:
         if validation.status != ImageCandidateStatus.ACCEPTED:
             return validation
 
-        wiki_title = (self._source_node_title(plan.source_node_id) or "").strip()
-        if not wiki_title:
-            return self._reject("missing_wiki_inline_title", drop_candidate=True)
-
-        model_alias = self._wiki_inline_model_alias(preferred_env="WIKI_INLINE_IMAGE_JUDGE_MODEL")
+        model_alias = self._wiki_inline_model_alias(preferred_env=preferred_env)
         if not model_alias:
-            return self._reject("missing_wiki_inline_judge_model", drop_candidate=True)
+            return self._reject(missing_model_reason, drop_candidate=True)
 
         resolved_asset = self._resolved_image_from_validation(validation, include_transient=True)
         image_for_model = resolved_asset.model_url if resolved_asset is not None else search_result.image_url
-        caption = (search_result.snippet or plan.target.content or "").strip()
         prompt_input = self._wiki_inline_question_prompt_input(
             caption=caption,
-            wikipedia_title=wiki_title,
+            wikipedia_title=subject_title,
         )
+
+        question_stage = f"{trace_prefix}_question"
+        answer_stage = f"{trace_prefix}_answer"
+        judge_stage = f"{trace_prefix}_judge"
 
         try:
             self._log_image_model_call(
-                stage="wiki_inline_question",
+                stage=question_stage,
                 when="before",
                 model_alias=model_alias,
                 plan_id=plan.plan_id,
@@ -3239,11 +3452,11 @@ class ImageDiscoveryBuilder:
                             ],
                         ),
                     ],
-                    metadata={"trace_label": f"wiki_inline_question:{plan.plan_id}"},
+                    metadata={"trace_label": f"{question_stage}:{plan.plan_id}"},
                 )
             )
             self._log_image_model_call(
-                stage="wiki_inline_question",
+                stage=question_stage,
                 when="after",
                 model_alias=model_alias,
                 plan_id=plan.plan_id,
@@ -3256,10 +3469,10 @@ class ImageDiscoveryBuilder:
             generated_question = question_payload["question"]
             reference_answer = question_payload.get("answer", "").strip()
             if not reference_answer:
-                raise ValueError("Missing reference answer in wiki-inline question output.")
+                raise ValueError("Missing self-QA reference answer output.")
 
             self._log_image_model_call(
-                stage="wiki_inline_answer",
+                stage=answer_stage,
                 when="before",
                 model_alias=model_alias,
                 plan_id=plan.plan_id,
@@ -3280,11 +3493,11 @@ class ImageDiscoveryBuilder:
                             ],
                         ),
                     ],
-                    metadata={"trace_label": f"wiki_inline_answer:{plan.plan_id}"},
+                    metadata={"trace_label": f"{answer_stage}:{plan.plan_id}"},
                 )
             )
             self._log_image_model_call(
-                stage="wiki_inline_answer",
+                stage=answer_stage,
                 when="after",
                 model_alias=model_alias,
                 plan_id=plan.plan_id,
@@ -3301,7 +3514,7 @@ class ImageDiscoveryBuilder:
                 model_answer=model_answer,
             )
             self._log_image_model_call(
-                stage="wiki_inline_judge",
+                stage=judge_stage,
                 when="before",
                 model_alias=model_alias,
                 plan_id=plan.plan_id,
@@ -3316,11 +3529,11 @@ class ImageDiscoveryBuilder:
                         ModelMessage(role="system", content=PROMPT_WIKI_INLINE_IMAGE_JUDGE),
                         ModelMessage(role="user", content=judge_input),
                     ],
-                    metadata={"trace_label": f"wiki_inline_judge:{plan.plan_id}"},
+                    metadata={"trace_label": f"{judge_stage}:{plan.plan_id}"},
                 )
             )
             self._log_image_model_call(
-                stage="wiki_inline_judge",
+                stage=judge_stage,
                 when="after",
                 model_alias=model_alias,
                 plan_id=plan.plan_id,
@@ -3332,7 +3545,7 @@ class ImageDiscoveryBuilder:
             judge_decision, judge_reason = self._parse_wiki_inline_judge(judge_response.content)
         except Exception as exc:
             print(
-                "[wiki-inline-image] self-qa request failed "
+                f"[{trace_prefix}] self-qa request failed "
                 f"plan_id={plan.plan_id} "
                 f"model_alias={model_alias!r}",
                 file=sys.stderr,
@@ -3340,12 +3553,12 @@ class ImageDiscoveryBuilder:
             )
             traceback.print_exc(file=sys.stderr)
             return self._reject(
-                f"wiki_inline_self_qa_model_error:{exc.__class__.__name__}:{exc}",
+                f"{error_reason_prefix}:{exc.__class__.__name__}:{exc}",
                 drop_candidate=True,
             )
 
         merged_metadata = dict(validation.metadata or {})
-        merged_metadata["wiki_inline_self_qa"] = {
+        merged_metadata[metadata_key] = {
             "question": generated_question,
             "reference_answer": reference_answer,
             "model_answer": model_answer,
@@ -3359,7 +3572,7 @@ class ImageDiscoveryBuilder:
             "answer_raw_model_output": answer_response.content,
             "judge_raw_model_output": judge_response.content,
             "caption": caption,
-            "wikipedia_title": wiki_title,
+            "wikipedia_title": subject_title,
             "filter_reason": (
                 "model_answered_generated_question"
                 if judge_decision == "true"
@@ -3367,7 +3580,7 @@ class ImageDiscoveryBuilder:
             ),
         }
         if judge_decision == "true":
-            merged_metadata["check"] = "wiki_inline_self_qa"
+            merged_metadata["check"] = metadata_key
             merged_metadata["model_alias"] = model_alias
             merged_metadata["raw_model_output"] = judge_response.content
             return ImageValidationResult(
@@ -3385,6 +3598,244 @@ class ImageDiscoveryBuilder:
             drop_candidate=validation.drop_candidate,
             metadata=merged_metadata,
         )
+
+    def _wiki_inline_self_qa_check(
+        self,
+        *,
+        plan: VisualSearchPlan,
+        search_result: ImageSearchResult,
+        validation: ImageValidationResult,
+        run_id: str | None,
+    ) -> ImageValidationResult:
+        if validation.status != ImageCandidateStatus.ACCEPTED:
+            return validation
+        wiki_title = (self._source_node_title(plan.source_node_id) or "").strip()
+        if not wiki_title:
+            return self._reject("missing_wiki_inline_title", drop_candidate=True)
+        caption = (search_result.snippet or plan.target.content or "").strip()
+        return self._run_image_self_qa_check(
+            plan=plan,
+            search_result=search_result,
+            validation=validation,
+            run_id=run_id,
+            subject_title=wiki_title,
+            caption=caption,
+            metadata_key="wiki_inline_self_qa",
+            preferred_env="WIKI_INLINE_IMAGE_JUDGE_MODEL",
+            missing_model_reason="missing_wiki_inline_judge_model",
+            error_reason_prefix="wiki_inline_self_qa_model_error",
+            trace_prefix="wiki_inline",
+        )
+
+    def _visual_plan_self_qa_check(
+        self,
+        *,
+        plan: VisualSearchPlan,
+        search_result: ImageSearchResult,
+        image_node: ImageNode,
+        validation: ImageValidationResult,
+        run_id: str | None,
+    ) -> ImageValidationResult:
+        if validation.status != ImageCandidateStatus.ACCEPTED:
+            return validation
+        source_title = (self._source_node_title(plan.source_node_id) or plan.target.content or "").strip()
+        if not source_title:
+            return self._reject("missing_visual_plan_title", drop_candidate=True)
+        caption = (image_node.caption or search_result.snippet or plan.target.content or "").strip()
+        return self._run_image_self_qa_check(
+            plan=plan,
+            search_result=search_result,
+            validation=validation,
+            run_id=run_id,
+            subject_title=source_title,
+            caption=caption,
+            metadata_key="visual_plan_self_qa",
+            preferred_env="VISUAL_PLAN_IMAGE_JUDGE_MODEL",
+            missing_model_reason="missing_visual_plan_judge_model",
+            error_reason_prefix="visual_plan_self_qa_model_error",
+            trace_prefix="visual_plan",
+        )
+
+
+    @staticmethod
+    def _wiki_inline_entity_uniqueness_prompt_input(
+        *,
+        wikipedia_title: str,
+        caption: str,
+        grounded_entities: list[dict[str, Any]],
+    ) -> str:
+        lines = [
+            f"Wikipedia: {wikipedia_title or ''}",
+            f"description: {caption or ''}",
+            "Grounded candidate entities:",
+        ]
+        for entity in grounded_entities:
+            lines.append(
+                "- "
+                f"{entity.get('name') or ''} | "
+                f"locator: {entity.get('relation_to_image') or ''} | "
+                f"evidence: {entity.get('evidence') or ''}"
+            )
+        return "\n".join(lines)
+
+    def _parse_wiki_inline_entity_uniqueness_filter(self, text: str) -> dict[str, Any]:
+        match = re.search(r"<filter>(.*?)</filter>", text, flags=re.DOTALL | re.IGNORECASE)
+        block = match.group(1) if match else text
+        parsed: dict[str, Any] = {
+            "overall_decision": None,
+            "reason": None,
+            "entities": {},
+            "raw_model_output": text,
+        }
+        for raw_line in block.splitlines():
+            line = raw_line.strip()
+            if not line or ":" not in line:
+                continue
+            key, value = line.split(":", 1)
+            key = key.strip().lower()
+            value = value.strip()
+            if not value:
+                continue
+            if key == "overall_decision":
+                decision = value.lower()
+                if decision in {"keep", "drop"}:
+                    parsed["overall_decision"] = decision
+            elif key == "reason":
+                parsed["reason"] = value
+            elif key == "entity":
+                parts = [part.strip() for part in value.split("|")]
+                if len(parts) < 2 or not parts[0]:
+                    continue
+                decision = parts[1].lower()
+                if decision not in {"keep", "block"}:
+                    continue
+                normalized = self._normalize_entity_label(parts[0])
+                if not normalized:
+                    continue
+                parsed["entities"][normalized] = {
+                    "name": parts[0],
+                    "decision": decision,
+                    "reason": parts[2] if len(parts) > 2 else "",
+                }
+        return parsed
+
+    def _filter_wiki_inline_grounded_entities(
+        self,
+        *,
+        plan: VisualSearchPlan,
+        search_result: ImageSearchResult,
+        image_node: ImageNode,
+        grounded_entities: list[dict[str, Any]],
+        run_id: str | None,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        entities = list(grounded_entities or [])
+        if not self._is_wiki_inline_plan(plan) or not self.config.enable_wiki_inline_entity_uniqueness_filter:
+            return entities, {}
+
+        base_summary: dict[str, Any] = {
+            "applied": False,
+            "input_entity_count": len(entities),
+            "kept_entity_count": len(entities),
+            "blocked_entity_count": 0,
+            "wikipedia_title": (self._source_node_title(plan.source_node_id) or "").strip(),
+            "caption": (image_node.caption or search_result.snippet or plan.target.content or "").strip(),
+        }
+        if not entities:
+            base_summary["skip_reason"] = "no_grounded_entities"
+            return entities, base_summary
+
+        wiki_title = base_summary["wikipedia_title"]
+        if not wiki_title:
+            base_summary["skip_reason"] = "missing_wiki_inline_title"
+            return entities, base_summary
+
+        model_alias = self._wiki_inline_model_alias(preferred_env="WIKI_INLINE_IMAGE_ENTITY_FILTER_MODEL")
+        if not model_alias:
+            base_summary["skip_reason"] = "missing_wiki_inline_entity_filter_model"
+            return entities, base_summary
+
+        prompt_input = self._wiki_inline_entity_uniqueness_prompt_input(
+            wikipedia_title=wiki_title,
+            caption=base_summary["caption"],
+            grounded_entities=entities,
+        )
+        try:
+            response = self.model_client.generate(
+                ModelRequest(
+                    model=model_alias,
+                    messages=[
+                        ModelMessage(role="system", content=PROMPT_WIKI_INLINE_ENTITY_UNIQUENESS_FILTER),
+                        ModelMessage(role="user", content=prompt_input),
+                    ],
+                    metadata={
+                        "trace_label": f"wiki_inline_entity_uniqueness:{plan.plan_id}:{wiki_title[:80]}",
+                        "run_id": run_id,
+                    },
+                )
+            )
+            parsed = self._parse_wiki_inline_entity_uniqueness_filter(response.content)
+        except Exception as exc:
+            print(
+                "[wiki-inline-entity-uniqueness] model request failed "
+                f"plan_id={plan.plan_id} "
+                f"model_alias={model_alias!r}",
+                file=sys.stderr,
+                flush=True,
+            )
+            traceback.print_exc(file=sys.stderr)
+            base_summary["skip_reason"] = f"model_error:{exc.__class__.__name__}:{exc}"
+            return entities, base_summary
+
+        decisions = parsed.get("entities") or {}
+        kept_entities: list[dict[str, Any]] = []
+        kept_entity_summaries: list[dict[str, Any]] = []
+        blocked_entity_summaries: list[dict[str, Any]] = []
+        for entity in entities:
+            label = (entity.get("name") or "").strip()
+            normalized = self._normalize_entity_label(label)
+            decision_record = decisions.get(normalized) if normalized else None
+            decision = (decision_record or {}).get("decision")
+            reason = ((decision_record or {}).get("reason") or "").strip()
+            if decision == "keep":
+                kept_entities.append(entity)
+                kept_entity_summaries.append(
+                    {
+                        "name": label,
+                        "reason": reason or "kept_by_model",
+                    }
+                )
+                continue
+            blocked_entity_summaries.append(
+                {
+                    **entity,
+                    "status": "blocked_by_uniqueness_filter" if decision == "block" else "missing_model_decision",
+                    "filter_reason": (
+                        reason
+                        or "no keep/block decision returned for entity"
+                    ),
+                }
+            )
+
+        summary = {
+            "applied": True,
+            "model_alias": model_alias,
+            "wikipedia_title": wiki_title,
+            "caption": base_summary["caption"],
+            "input_entity_count": len(entities),
+            "kept_entity_count": len(kept_entities),
+            "blocked_entity_count": len(blocked_entity_summaries),
+            "overall_decision": parsed.get("overall_decision") or ("keep" if kept_entities else "drop"),
+            "reason": parsed.get("reason") or (
+                "at least one grounded entity is a unique canonical entity"
+                if kept_entities
+                else "all grounded entities were blocked as non-unique or insufficiently grounded"
+            ),
+            "kept_entities": kept_entity_summaries,
+            "blocked_entities": blocked_entity_summaries,
+            "usage": response.usage,
+            "raw_model_output": response.content,
+        }
+        return kept_entities, summary
 
     @staticmethod
     def _reject(reason: str, *, drop_candidate: bool = False) -> ImageValidationResult:
@@ -4405,17 +4856,33 @@ def _smoke_test() -> None:
             limit: int = 5,
         ) -> list[Any]:
             del entity_type, source_title, context, limit
-            if label.strip().lower() != "los angeles lakers":
+            normalized = label.strip().lower()
+            records = {
+                "los angeles lakers": {
+                    "title": "Los Angeles Lakers",
+                    "url": "https://en.wikipedia.org/wiki/Los_Angeles_Lakers",
+                    "canonical_id": "wikidata:Q121783",
+                    "snippet": "American professional basketball team based in Los Angeles.",
+                },
+                "national basketball association": {
+                    "title": "National Basketball Association",
+                    "url": "https://en.wikipedia.org/wiki/National_Basketball_Association",
+                    "canonical_id": "wikidata:Q155223",
+                    "snippet": "Professional basketball league in North America.",
+                },
+            }
+            record = records.get(normalized)
+            if record is None:
                 return []
             return [
                 type(
                     "MockCandidate",
                     (),
                     {
-                        "title": "Los Angeles Lakers",
-                        "url": "https://en.wikipedia.org/wiki/Los_Angeles_Lakers",
-                        "canonical_id": "wikidata:Q121783",
-                        "snippet": "American professional basketball team based in Los Angeles.",
+                        "title": record["title"],
+                        "url": record["url"],
+                        "canonical_id": record["canonical_id"],
+                        "snippet": record["snippet"],
                         "score": 5.0,
                         "to_dict": lambda self: {
                             "title": self.title,
@@ -4456,6 +4923,15 @@ def _smoke_test() -> None:
                 return ModelResponse(
                     content="<thinking>The answer does not identify the subject.</thinking>\n<answer>FALSE</answer>"
                 )
+            if "filtering grounded entities from a Wikipedia inline image" in system:
+                return ModelResponse(
+                    content="""<filter>
+overall_decision: keep
+reason: the image grounds named basketball entities with stable canonical referents
+entity: Los Angeles Lakers | keep | named NBA team with a stable canonical identity
+entity: National Basketball Association | keep | named sports league with a stable canonical identity
+</filter>"""
+                )
             if "checking whether a candidate image" in system:
                 return ModelResponse(
                     content="""<check>
@@ -4495,6 +4971,7 @@ reason: exact local Wikipedia match
 caption: Kobe Bryant in his final game
 visual_fact: basketball uniform
 entity: Los Angeles Lakers | jersey logo | visible team branding on the uniform
+entity: National Basketball Association | league branding | NBA league branding is visible in the arena context
 </ground>"""
             )
 
@@ -4508,6 +4985,33 @@ entity: Los Angeles Lakers | jersey logo | visible team branding on the uniform
                     content="<thinking>The answer matches the reference answer.</thinking>\n<answer>TRUE</answer>"
                 )
             return super().generate(request)
+
+    class MockSingleEntityGroundModel(MockModel):
+        def generate(self, request: ModelRequest) -> ModelResponse:
+            system = request.messages[0].content
+            if "Wikipedia inline image is visually relevant" in system:
+                return super().generate(request)
+            if "I’m determining whether a user recognizes a particular image" in system:
+                return super().generate(request)
+            if "You are answering a question about an image content." in system:
+                return super().generate(request)
+            if "You are judging whether an answer correctly identifies the key information" in system:
+                return super().generate(request)
+            if "checking whether a candidate image" in system:
+                return super().generate(request)
+            if "selecting the single best recovered image" in system:
+                return super().generate(request)
+            if "selecting the best Wikipedia candidate" in system:
+                return super().generate(request)
+            if "rewriting an image-search query into a source-aware graph relation" in system:
+                return super().generate(request)
+            return ModelResponse(
+                content="""<ground>
+caption: Kobe Bryant in his final game
+visual_fact: basketball uniform
+entity: Los Angeles Lakers | jersey logo | visible team branding on the uniform
+</ground>"""
+            )
 
     class MockNoEntityGroundModel(MockModel):
         def generate(self, request: ModelRequest) -> ModelResponse:
@@ -4534,6 +5038,42 @@ caption: Kobe Bryant courtside photo
 </ground>"""
             )
 
+    class MockGenericCategoryInlineModel(MockModel):
+        def generate(self, request: ModelRequest) -> ModelResponse:
+            system = request.messages[0].content
+            if "filtering grounded entities from a Wikipedia inline image" in system:
+                return ModelResponse(
+                    content="""<filter>
+overall_decision: drop
+reason: all grounded entities are generic atmospheric categories rather than unique canonical entities
+entity: Cumulonimbus cloud | block | weather cloud type, not a unique canonical entity
+entity: Overshooting top | block | cloud feature category, not a unique canonical entity
+</filter>"""
+                )
+            if "Wikipedia inline image is visually relevant" in system:
+                return super().generate(request)
+            if "I’m determining whether a user recognizes a particular image" in system:
+                return super().generate(request)
+            if "You are answering a question about an image content." in system:
+                return super().generate(request)
+            if "You are judging whether an answer correctly identifies the key information" in system:
+                return super().generate(request)
+            if "checking whether a candidate image" in system:
+                return super().generate(request)
+            if "selecting the single best recovered image" in system:
+                return super().generate(request)
+            if "selecting the best Wikipedia candidate" in system:
+                return super().generate(request)
+            if "rewriting an image-search query into a source-aware graph relation" in system:
+                return super().generate(request)
+            return ModelResponse(
+                content="""<ground>
+caption: An anvil-topped thundercloud with a protruding dome above the top
+entity: Cumulonimbus cloud | main storm cloud filling the frame | the image shows the classic anvil-topped thundercloud form
+entity: Overshooting top | dome above the cloud top | a protruding dome rises above the anvil top
+</ground>"""
+            )
+
     old_check = os.environ.get("IMAGE_CHECK_MODEL")
     old_ground = os.environ.get("IMAGE_GROUND_MODEL")
     os.environ["IMAGE_CHECK_MODEL"] = "mock_image"
@@ -4555,6 +5095,13 @@ caption: Kobe Bryant courtside photo
             )
             store.upsert_node(text_node)
             store.upsert_node(lakers_node)
+
+            def make_seed_store(name: str) -> JsonlGraphStore:
+                child_store = JsonlGraphStore(Path(tmpdir) / name)
+                child_store.upsert_node(text_node)
+                child_store.upsert_node(lakers_node)
+                return child_store
+
             target = Evidence.create(
                 EvidenceType.VISUAL_TARGET,
                 content="Kobe Bryant final game uniform",
@@ -4596,8 +5143,56 @@ caption: Kobe Bryant courtside photo
             assert result.edge.metadata.get("query") == "Kobe Bryant final game uniform photo"
             assert result.edge.metadata.get("relation_rewrite_applied") is True
             assert result.grounded_edges
+            assert len(result.grounded_edges) == 1
+            assert len(result.queued_tasks) == 1
+            assert result.metadata.get("visual_plan_post_grounding_filter", {}).get("self_qa_applied") is True
+            assert result.metadata.get("visual_plan_post_grounding_filter", {}).get("kept_in_graph") is True
             assert result.image_node.metadata.get("image_grounding", {}).get("context") is not None
             assert store.stats()["nodes"] == 3
+
+            answerable_store = make_seed_store("answerable_visual_plan")
+            answerable_builder = ImageDiscoveryBuilder(
+                store=answerable_store,
+                search_client=MockImageSearchClient(),
+                config=ImageDiscoveryConfig(
+                    per_query_limit=1,
+                    max_images_per_plan=1,
+                    enable_retrieval_consistency_check=False,
+                    precheck_image_urls=False,
+                ),
+                model_client=MockAnswerableInlineModel(),
+                wiki_resolver=MockWikiResolver(),
+            )
+            answerable_visual = answerable_builder.discover_for_plan(plan, run_id="run_smoke_answerable_visual")
+            assert answerable_visual.image_node is None
+            assert answerable_visual.primary_image() is None
+            assert len(answerable_visual.accepted_images()) == 0
+            assert answerable_visual.candidates[0].validation.reason == "model_answered_generated_question"
+            assert answerable_visual.metadata.get("visual_plan_post_grounding_filter", {}).get("self_qa_applied") is True
+            assert answerable_visual.metadata.get("visual_plan_post_grounding_filter", {}).get("filter_reason") == "model_answered_generated_question"
+            assert answerable_store.stats()["nodes"] == 2
+
+            single_entity_store = make_seed_store("single_entity_visual_plan")
+            single_entity_builder = ImageDiscoveryBuilder(
+                store=single_entity_store,
+                search_client=MockImageSearchClient(),
+                config=ImageDiscoveryConfig(
+                    per_query_limit=1,
+                    max_images_per_plan=1,
+                    enable_retrieval_consistency_check=False,
+                    precheck_image_urls=False,
+                ),
+                model_client=MockSingleEntityGroundModel(),
+                wiki_resolver=MockWikiResolver(),
+            )
+            single_entity_visual = single_entity_builder.discover_for_plan(plan, run_id="run_smoke_single_entity_visual")
+            assert single_entity_visual.image_node is None
+            assert single_entity_visual.primary_image() is None
+            assert len(single_entity_visual.accepted_images()) == 0
+            assert single_entity_visual.candidates[0].validation.reason == "expandable_entity_count_below_threshold"
+            assert single_entity_visual.metadata.get("visual_plan_post_grounding_filter", {}).get("expandable_entity_count") == 1
+            assert single_entity_visual.metadata.get("visual_plan_post_grounding_filter", {}).get("filter_reason") == "expandable_entity_count_below_threshold"
+            assert single_entity_store.stats()["nodes"] == 2
 
             first_candidate = result.candidates[0]
             second_candidate = ImageSearchCandidate(
@@ -4938,6 +5533,103 @@ caption: Kobe Bryant courtside photo
             assert not drop_inline_builder._resolved_image_cache
             assert not drop_inline_builder._transient_image_cache
             assert store.stats()["nodes"] == before_drop_node_count
+
+            cloud_node = TextNode.from_wiki_entity(
+                "Q183165",
+                "Cumulonimbus cloud",
+                source_url="https://en.wikipedia.org/wiki/Cumulonimbus_cloud",
+            )
+            cloud_store = JsonlGraphStore(Path(tmpdir) / "generic_inline")
+            cloud_store.upsert_node(cloud_node)
+            generic_inline_target = Evidence.create(
+                EvidenceType.VISUAL_TARGET,
+                content="Cumulonimbus cloud formation photo",
+                node_ids=[cloud_node.node_id],
+                metadata={"expected_visual": "An anvil-topped cumulonimbus cloud"},
+            )
+            generic_inline_query = SearchQuerySpec.create(
+                "Cumulonimbus cloud formation photo",
+                generic_inline_target.evidence_id,
+                expected_visual="An anvil-topped cumulonimbus cloud",
+            )
+            generic_inline_plan = VisualSearchPlan.create(
+                generic_inline_target,
+                queries=[generic_inline_query],
+                source_node_id=cloud_node.node_id,
+                source_evidence_ids=["evidence_text"],
+                planner="wikipedia_inline_image_planner",
+                metadata={"plan_source": "wikipedia_inline_image"},
+            )
+            generic_inline_search_result = ImageSearchResult(
+                title="Cumulonimbus cloud illustration",
+                image_url="https://example.com/wiki-inline-cloud.jpg",
+                source_page_url="https://en.wikipedia.org/wiki/Cumulonimbus_cloud",
+                snippet="Anvil-topped cumulonimbus cloud",
+                source="wikipedia_inline",
+            )
+            generic_inline_builder = ImageDiscoveryBuilder(
+                store=cloud_store,
+                search_client=MockImageSearchClient(),
+                config=ImageDiscoveryConfig(
+                    per_query_limit=1,
+                    max_images_per_plan=1,
+                    enable_retrieval_consistency_check=False,
+                    precheck_image_urls=True,
+                    upload_cached_images=False,
+                    try_source_page_recovery=False,
+                ),
+                model_client=MockGenericCategoryInlineModel(),
+                wiki_resolver=MockWikiResolver(),
+            )
+            generic_persist_calls: list[bool] = []
+
+            def fake_generic_inline_download_and_prepare_image_asset(
+                image_url: str | None,
+                *,
+                source_page_url: str | None,
+                strategy: str,
+                cache_key: str,
+                persist_asset: bool = True,
+            ) -> tuple[ResolvedImageAsset | None, str | None]:
+                generic_persist_calls.append(persist_asset)
+                if not image_url:
+                    return None, "missing_image_url"
+                asset_uri = f"/tmp/{cache_key}.jpg" if persist_asset else image_url
+                cache_path = f"/tmp/{cache_key}.jpg" if persist_asset else None
+                return (
+                    ResolvedImageAsset(
+                        cache_key=cache_key,
+                        original_url=image_url,
+                        resolved_url=image_url,
+                        source_page_url=source_page_url,
+                        model_url="data:image/jpeg;base64,AA==",
+                        asset_uri=asset_uri,
+                        cache_path=cache_path,
+                        content_type="image/jpeg",
+                        width=640,
+                        height=480,
+                        strategy=strategy,
+                    ),
+                    None,
+                )
+
+            generic_inline_builder._download_and_prepare_image_asset = fake_generic_inline_download_and_prepare_image_asset  # type: ignore[method-assign]
+            before_generic_node_count = cloud_store.stats()["nodes"]
+            generic_inline = generic_inline_builder.discover_for_wiki_inline_image(
+                generic_inline_plan,
+                search_result=generic_inline_search_result,
+                run_id="run_smoke",
+                persist=True,
+            )
+            assert generic_inline.image_node is None
+            assert generic_inline.metadata.get("wiki_inline_keep_in_graph") is False
+            assert generic_inline.metadata.get("wiki_inline_skip_reason") == "no_unique_canonical_grounded_entities"
+            assert generic_inline.metadata.get("wiki_inline_entity_uniqueness_filter", {}).get("applied") is True
+            assert generic_inline.metadata.get("wiki_inline_entity_uniqueness_filter", {}).get("kept_entity_count") == 0
+            assert generic_persist_calls and set(generic_persist_calls) == {False}
+            assert not generic_inline_builder._resolved_image_cache
+            assert not generic_inline_builder._transient_image_cache
+            assert cloud_store.stats()["nodes"] == before_generic_node_count
     finally:
         if old_check is None:
             os.environ.pop("IMAGE_CHECK_MODEL", None)
