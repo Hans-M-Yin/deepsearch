@@ -2006,9 +2006,11 @@ class WikiTextBuilder:
     def _clean_markdown_href(href: str) -> str:
         href = href.strip()
         if href.startswith("<") and ">" in href:
-            return href[1 : href.find(">")].strip()
-        match = re.match(r"""^(\S+)(?:\s+['"].*['"])?\s*$""", href, flags=re.DOTALL)
-        return (match.group(1) if match else href).strip()
+            href = href[1 : href.find(">")].strip()
+        else:
+            match = re.match(r"""^(\S+)(?:\s+['"].*['"])?\s*$""", href, flags=re.DOTALL)
+            href = (match.group(1) if match else href).strip()
+        return re.sub(r"\\([\\`*_{}\[\]()#+\-.!])", r"\1", href)
 
     @staticmethod
     def _wiki_url_from_href(href: str, *, source_url: str) -> str | None:
@@ -2167,6 +2169,14 @@ def _smoke_test() -> None:
             assert len(diverse_links) == 2
             assert any(link.title == "Jerry West" for link in diverse_links)
             assert all(link.window_id is not None for link in diverse_links)
+            escaped_markdown = "[Hokusai Manga](/wiki/Hokusai\\_Manga)"
+            escaped_links = builder.extract_wiki_links(
+                escaped_markdown,
+                source_url="https://en.wikipedia.org/wiki/Hokusai",
+            )
+            assert len(escaped_links) == 1
+            assert escaped_links[0].url == "https://en.wikipedia.org/wiki/Hokusai_Manga"
+            assert escaped_links[0].title == "Hokusai Manga"
             evidence = builder.extract_attributes(
                 result.node,
                 source_evidence_ids=[result.text_evidence.evidence_id],
