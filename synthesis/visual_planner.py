@@ -138,10 +138,19 @@ For an event photograph, check whether the query identifies all of the following
 - one particular event sub-scene or action.
 
 Reject a query when many visibly different photographs would still be equally correct, even if they concern the same historical topic or the same named event.
-For non-event objective subjects—such as buildings, artworks, covers and posters, or fine-grained biological categories—return TRUE as well when, despite possible differences in shooting angle or time, the image content remains essentially the same, and the images retrieved on the internet are generally highly similar.
+For non-event objective subjects—such as artworks, covers and posters, or fine-grained biological categories—return TRUE as well when, despite possible differences in shooting angle or time, the image content remains essentially the same, and the images retrieved on the internet are generally highly similar.
 Note that you should judge whether the images returned by the search are actually likely to satisfy content consistency. For example, the San Francisco skyline or Beijing CBD, although they are also objective subjects, should return FALSE, because differences in viewpoint and time can lead to major changes in visual content.
 
 Examples:
+
+Query: An illuminated page from a 15th-century Gutenberg Bible, showing the decorative initials and two-column Latin text
+Answer: FALSE
+Reason: The provided query does not specify which exact page it refers to, so any illuminated page from the Gutenberg Bible could match this query, resulting in inconsistent content.
+
+
+Query: Aerial view of the Martin Marietta Beckmann Quarry near San Antonio, Texas
+Answer: FALSE
+Reason: Although Martin Marietta Beckmann Quarry is a specific building, different shooting angles and heights can result in completely different image content.
 
 Query: healthcare workers in protective clothing during the 2003 Hong Kong SARS outbreak
 Answer: FALSE
