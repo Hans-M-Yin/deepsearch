@@ -132,14 +132,14 @@ def _log_serper_request(*, url: str, body: dict[str, Any]) -> None:
 def _log_serper_raw_response(*, url: str, status_code: int, raw: dict[str, Any]) -> None:
     """Log Serper's unmodified parsed JSON response before result parsing."""
 
-    print(
-        "[serper-raw-response]"
-        f" url={url!r}"
-        f" status_code={status_code}"
-        f" raw={json.dumps(raw, ensure_ascii=False, default=str)}",
-        file=sys.stderr,
-        flush=True,
-    )
+    # print(
+    #     "[serper-raw-response]"
+    #     f" url={url!r}"
+    #     f" status_code={status_code}"
+    #     f" raw={json.dumps(raw, ensure_ascii=False, default=str)}",
+    #     file=sys.stderr,
+    #     flush=True,
+    # )
 
 
 def _log_serper_results(response: SearchResponse) -> None:

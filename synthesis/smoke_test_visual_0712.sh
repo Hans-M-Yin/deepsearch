@@ -1,9 +1,9 @@
-mkdir -p runs/0712_multi_seed_visual_test_8192_2
+mkdir -p runs/0712_multi_seed_visual_test_8192_3
 echo "Start Generate."
 source synthesis/.env
-python synthesis/run_min_graph.py \
+nohup python synthesis/run_min_graph.py \
   --seed-urls-file synthesis/seeds.txt \
-  --store-dir runs/0712_multi_seed_visual_test_8192_2\
+  --store-dir runs/0712_multi_seed_visual_test_8192_3 \
   --reader-base-url http://localhost:8004 \
   --skip-attributes \
   --max-neighbors 4 \
@@ -12,4 +12,5 @@ python synthesis/run_min_graph.py \
   --max-depth 128 \
   --parallel-workers 100 \
   --batch-size 100 \
-  --image-backend serper 
+  --image-backend serper \
+  > synthesis/ignore/output.log 2>&1 &
