@@ -273,7 +273,6 @@ Decide for each candidate whether it should be blocked because it is already men
 
 Block an entity if:
 - it is the same entity as one already mentioned in the query
-- it is only an alias, OCR handle, username, nickname, or alternate surface form of an entity already mentioned in the query
 
 Keep an entity if:
 - it is a new entity not already present in the query
@@ -285,8 +284,8 @@ Important:
 
 Output exactly one block:
 <filter>
-<entity>candidate name | block|keep | short reason</entity>
-<entity>candidate name | block|keep | short reason</entity>
+<entity>candidate name | block/keep | short reason</entity>
+<entity>candidate name | block/keep | short reason</entity>
 </filter>
 
 Every candidate must be written inside its own <entity>...</entity> tag. Do not
