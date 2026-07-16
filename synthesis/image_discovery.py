@@ -269,7 +269,7 @@ Given:
 - the visual query text
 - a list of grounded candidate entities from the image
 
-Decide for each candidate whether it should be blocked because it is already explicitly mentioned in the query, or is just an alias / handle / surface form of an entity already mentioned in the query.
+Decide for each candidate whether it should be blocked because it is already mentioned in the query, or is just an alias / handle / surface form of an entity already mentioned in the query.
 
 Block an entity if:
 - it is the same entity as one already mentioned in the query
@@ -279,16 +279,19 @@ Keep an entity if:
 - it is a new entity not already present in the query
 - it is related to the query subject but still introduces a distinct new entity
 
-Important:
-- Be conservative. Only block when the overlap is clear.
+Important:  
 - Do not block entities merely because they are associated with the query subject.
 - Example: if the query mentions Lionel Messi, block "Messi" or "leomessi", but keep "Argentina national football team" unless the query already mentions it.
 
 Output exactly one block:
 <filter>
-entity: candidate name | block|keep | short reason
-entity: candidate name | block|keep | short reason
+<entity>candidate name | block|keep | short reason</entity>
+<entity>candidate name | block|keep | short reason</entity>
 </filter>
+
+Every candidate must be written inside its own <entity>...</entity> tag. Do not
+use Markdown bullets, a field prefix such as "entity:", or any text outside
+the <filter> block.
 """
 
 
@@ -4250,11 +4253,13 @@ class ImageDiscoveryBuilder:
         match = re.search(r"<filter>(.*?)</filter>", text, flags=re.DOTALL | re.IGNORECASE)
         block = match.group(1) if match else text
         blocked: set[str] = set()
-        for raw_line in block.splitlines():
-            line = raw_line.strip()
-            if not line.lower().startswith("entity:"):
-                continue
-            value = line.split(":", 1)[1].strip()
+        tagged_entities = re.findall(r"<entity>\s*(.*?)\s*</entity>", block, flags=re.DOTALL | re.IGNORECASE)
+        # Accept legacy / malformed untagged records as a compatibility fallback.
+        records = tagged_entities or [line.strip() for line in block.splitlines()]
+        for record in records:
+            value = record.strip()
+            if value.lower().startswith("entity:"):
+                value = value.split(":", 1)[1].strip()
             parts = [part.strip() for part in value.split("|")]
             if len(parts) < 2:
                 continue
