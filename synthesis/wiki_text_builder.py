@@ -152,7 +152,7 @@ Rules:
 6. Keep direction as source_to_target unless the local context clearly says the target acts on the source.
 7. Do not output explanations or markdown.
 8. The local context may contain multiple facts and entities. Identify the text that specifically connects the source entity to the target entity. You may combine multiple explicitly supported details from the local context to form a uniquely identifying relation. Do not use facts that refer to other entities, and never invent qualifiers.
-9. Do not include the target entity's name, aliases, abbreviations, or other answer-revealing identifiers in the relation. The target will be used as the answer in downstream multi-hop questions, so the relation must describe the target without naming it.
+9. Do not include the target entity's name, aliases, abbreviations, or other answer-revealing identifiers in the relation. The target will be used as the answer in downstream multi-hop questions, so the relation must describe the target without naming it. Ensure that the source entity or a pronoun referring to the source entity appears in the relation.
 
 Output exactly:
 <relation>
