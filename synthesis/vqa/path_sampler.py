@@ -46,6 +46,7 @@ Important evaluation principles:
 4. Penalize candidates that look like broad encyclopedia links, weak topic drift, or dead-end facts.
 5. If an image hop is involved, prefer it only when the image is likely to provide necessary evidence rather than decorative context.
 6. Avoid near-duplicate entities that are too close to entities already present in the trajectory. For example, if the trajectory already contains "iPhone 4S", then "iPhone 5" is usually too similar and should be penalized unless the relation creates a genuinely necessary contrast.
+7. Avoid a candidate whose target has already been explicitly named in the relation text of an earlier hop, even when that target has not yet appeared as a trajectory node. Such a candidate repeats information that the chain has already exposed instead of adding a new inference step. For example, if an earlier hop reads "A -- is associated with C --> B", then a later candidate "B --> C" should receive a very low score, because C has already been revealed by the earlier relation.
 
 Common bad candidates:
 - generic links that could connect to many entities
@@ -54,6 +55,7 @@ Common bad candidates:
 - candidates that lead to thin targets with little downstream askability
 - candidates that make the chain read like a loose summary instead of a reasoning path
 - candidates whose target is just a near-duplicate, sibling variant, adjacent model/version, or minimally changed entity relative to something already in the trajectory
+- candidates whose target was already directly mentioned in an earlier relation, even if it was not yet a node in the trajectory
 
 You will receive:
 - a trajectory summary in hop format
