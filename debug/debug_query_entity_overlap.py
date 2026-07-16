@@ -32,7 +32,12 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from synthesis.image_discovery import ImageDiscoveryBuilder, ImageDiscoveryConfig
+from synthesis.image_discovery import (
+    PROMPT_IMAGE_QUERY_ENTITY_FILTER,
+    ImageDiscoveryBuilder,
+    ImageDiscoveryConfig,
+)
+from synthesis.model_worker import ModelMessage, ModelRequest
 from synthesis.run_min_graph import DEFAULT_ENV_PATH, load_env_file
 from synthesis.store import JsonlGraphStore
 
@@ -105,6 +110,48 @@ def _model_alias(builder: ImageDiscoveryBuilder) -> str | None:
     )
 
 
+def _run_llm_filter_debug(
+    *,
+    builder: ImageDiscoveryBuilder,
+    model_alias: str,
+    query: str,
+    source_title: str,
+    entity_names: list[str],
+) -> dict[str, Any]:
+    """Mirror the production request while retaining the normally-discarded reply."""
+    try:
+        response = builder.model_client.generate(
+            ModelRequest(
+                model=model_alias,
+                messages=[
+                    ModelMessage(role="system", content=PROMPT_IMAGE_QUERY_ENTITY_FILTER),
+                    ModelMessage(
+                        role="user",
+                        content=(
+                            f"Source text node title:\n{source_title}\n\n"
+                            f"Visual query text:\n{query}\n\n"
+                            "Grounded candidate entities:\n"
+                            + "\n".join(f"- {name}" for name in entity_names)
+                        ),
+                    ),
+                ],
+                metadata={
+                    "trace_label": f"image_query_entity_filter:{source_title}:{query[:80]}"
+                },
+            )
+        )
+    except Exception as exc:
+        return {"attempted": True, "raw_output": None, "blocked_labels": set(), "error": repr(exc)}
+
+    raw_output = str(response.content or "")
+    return {
+        "attempted": True,
+        "raw_output": raw_output,
+        "blocked_labels": builder._parse_query_entity_filter_response(raw_output),
+        "error": None,
+    }
+
+
 def build_report(args: argparse.Namespace) -> dict[str, Any]:
     load_env_file(Path(args.env_file))
     entity_names = [str(name).strip() for name in args.entity if str(name).strip()]
@@ -127,12 +174,21 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
     )
     model_alias = _model_alias(builder)
     llm_blocked: set[str] = set()
+    llm_debug: dict[str, Any] = {
+        "attempted": False,
+        "raw_output": None,
+        "blocked_labels": set(),
+        "error": None,
+    }
     if not args.no_llm and model_alias:
-        llm_blocked = builder._query_implied_entity_labels_with_llm(
-            args.query,
-            source_node_title=source_title,
-            grounded_entities=entities,
+        llm_debug = _run_llm_filter_debug(
+            builder=builder,
+            model_alias=model_alias,
+            query=args.query,
+            source_title=source_title,
+            entity_names=entity_names,
         )
+        llm_blocked = set(llm_debug["blocked_labels"])
 
     # This is the production selection rule: use the LLM set only if it blocks
     # at least one candidate; otherwise use the lexical fallback set.
@@ -157,6 +213,9 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
         "lexical_label_source": "graph text nodes and aliases" if args.graph_dir else "temporary labels from source title and supplied entities",
         "llm_requested": not args.no_llm,
         "llm_model_alias": model_alias,
+        "llm_attempted": llm_debug["attempted"],
+        "llm_raw_output": llm_debug["raw_output"],
+        "llm_error": llm_debug["error"],
         "llm_blocked_labels": sorted(llm_blocked),
         "lexical_fallback_blocked_labels": sorted(fallback_blocked),
         "final_decision_source": decision_source,
@@ -169,6 +228,11 @@ def print_report(report: dict[str, Any]) -> None:
     print(f"Query: {report['query']}")
     print(f"Source title: {report['source_node_title'] or '<none>'}")
     print(f"LLM requested: {report['llm_requested']}; model: {report['llm_model_alias'] or '<none>'}")
+    if report.get("llm_error"):
+        print(f"LLM error: {report['llm_error']}")
+    elif report.get("llm_attempted"):
+        print("LLM raw output:")
+        print(report.get("llm_raw_output") or "<empty>")
     print(f"LLM blocked: {report['llm_blocked_labels']}")
     print(f"Lexical fallback blocked: {report['lexical_fallback_blocked_labels']}")
     print(f"Final decision source: {report['final_decision_source']}")
