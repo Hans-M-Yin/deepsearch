@@ -272,7 +272,7 @@ Given:
 Decide for each candidate whether it should be blocked because it is already mentioned in the query, or is just an alias / handle / surface form of an entity already mentioned in the query.
 
 Block an entity if:
-- it is the same entity as one already mentioned in the query
+- it is the same entity as one already mentioned or implied in the query
 - any form of its name is explicitly present in the query, even when it appears
   inside a larger phrase; do not keep it merely because it is still a distinct
   geographic, organizational, or other real-world entity
