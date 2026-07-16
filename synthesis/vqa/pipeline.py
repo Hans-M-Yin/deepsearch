@@ -56,11 +56,17 @@ class VqaGenerationPipeline:
         self.sampler.config = self.config
         writer_model = os.environ.get("VQA_WRITER_MODEL")
         compress_hop_model = os.environ.get("VQA_COMPRESS_HOP_MODEL")
+        image_bridge_model = os.environ.get("VQA_IMAGE_BRIDGE_MODEL")
+        image_target_ask_model = os.environ.get("VQA_IMAGE_TARGET_ASK_MODEL")
         self.writer = self.writer or QuestionWriter(
             model_client=LLM_WORKER if writer_model else None,
             model=writer_model,
             compress_hop_model_client=LLM_WORKER if compress_hop_model else None,
             compress_hop_model=compress_hop_model,
+            image_bridge_model_client=LLM_WORKER if image_bridge_model else None,
+            image_bridge_model=image_bridge_model,
+            image_target_ask_model_client=LLM_WORKER if image_target_ask_model else None,
+            image_target_ask_model=image_target_ask_model,
         )
         self.verifier = self.verifier or SampleVerifier()
 

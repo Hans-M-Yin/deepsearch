@@ -1,13 +1,15 @@
 """LLM-backed question writer for graph trajectories.
 
 The writer now works directly from ``PathCandidate + GraphView`` instead of a
-separate evidence-builder stage. Internally it follows a five-step process:
+separate evidence-builder stage. Internally it follows a seven-step process:
 
 1. compress each hop into a short statement
-2. derive an opening package for the first source + first hop
-3. select an askable target from the final node
-4. compose and polish the final multi-hop question
-5. obfuscate shortcut clues while preserving the reasoning path
+2. normalize hidden image bridges when they are only evidence carriers
+3. derive an opening package for the first source + first hop
+4. select a raw askable target from the final node
+5. normalize a hidden final image terminal step when needed
+6. compose and polish the final multi-hop question
+7. obfuscate shortcut clues while preserving the reasoning path
 """
 
 from __future__ import annotations
@@ -280,7 +282,7 @@ Input:
 }
 Output:
 {
-  "statement": "In the photo of a player taking the decisive penalty in a World Cup final, the player taking the penalty in the image is Gonzalo Montiel.",
+  "statement": "In this photo of a player taking the decisive penalty in 2022 World Cup final, the player taking the penalty in the image is Gonzalo Montiel.",
   "source": "photo of a player taking the decisive penalty in a World Cup final",
   "target": "Gonzalo Montiel",
   "relation": "the player taking the penalty in the image is",
@@ -486,6 +488,176 @@ Output format:
   "rewritten_statement": "sentence rewritten to refer to the source image as 'this image'"
 }
 """
+
+
+PROMPT_NORMALIZE_IMAGE_BRIDGE = """You will be given two declarative statements involving three objects: a source, an intermediate image, and a target. The actual intermediate image will also be provided with the request.
+
+Input format:
+statement1: ...
+statement2: ...
+source: ...
+mid-image: ...
+target: ...
+
+Task:
+Merge the two statements into a single source-to-target step.
+
+This process has two steps.
+
+Step 1: Determine whether the intermediate image can be skipped.
+- Prefer `hide_image` when the image mainly records a real-world event, activity, occasion, or scene that exists independently of the photograph, and the target is related to that real-world situation rather than to the photograph as an artifact.
+- A clear time reference is a strong signal in favor of `hide_image`, but it is not the only criterion.
+- Do not decide based only on the target type. Even a logo, clothing item, object, or number can still support `hide_image` if it belongs to the real-world event or scene rather than to the photograph as an artifact.
+- Prefer `keep_image` when the intermediate image is itself the essential object or reference frame, such as a manuscript page, document page, poster, artwork, portrait, cover, screenshot, interface, map, diagram, chart, or similar artifact.
+- If removing the explicit mention of the intermediate image would change the meaning or lose the needed reference frame, choose `keep_image`.
+
+Step 2: Merge the statements accordingly.
+- If you choose `hide_image`, use the event / activity / scene corresponding to the image instead of explicit media wording.
+- If you choose `keep_image`, keep the image / page / artwork / artifact framing explicit and merge the two statements into one natural sentence.
+
+Output requirements:
+- Return both a `rewritten_statement` and a `rewritten_relation`.
+- `rewritten_relation` should be a short source-to-target relation phrase aligned with the merged sentence. The target itself must not appear directly in the relation.
+- `rewritten_statement` should be one complete declarative sentence from the source to the target, and the target should appear explicitly in that sentence.
+- If you choose `hide_image`, the final statement and relation must not contain words such as `image`, `photo`, `picture`, or similar media terms.
+- Preserve all necessary information. Do not delete important details or add new facts.
+- Make the final statement and relation fluent and natural.
+- Return only valid JSON.
+
+Return valid JSON with exactly these fields:
+{
+  "decision": "hide_image" or "keep_image",
+  "reason": "brief explanation",
+  "rewritten_relation": "short source-to-target relation phrase",
+  "rewritten_statement": "one declarative sentence from source to target"
+}
+
+Example 1:
+Input:
+statement1: Joe Biden is related to an image of him delivering the State of the Union address at a joint session of the U.S. Congress in 2023
+statement2: In this image of a 2023 joint session of the U.S. Congress listening to President Joe Biden deliver the State of the Union address, the person sitting behind Joe Biden on the right is Kevin McCarthy
+source: Joe Biden
+mid-image: Image: In 2023, a joint session of the U.S. Congress is listening to President Joe Biden deliver the State of the Union address
+target: Kevin McCarthy
+Output:
+{
+  "decision": "hide_image",
+  "reason": "The intermediate image records a specific real-world event with a concrete time reference, so the event can replace the photo framing.",
+  "rewritten_relation": "the person sitting behind him on the right when he delivered the State of the Union address at a 2023 joint session of the U.S. Congress was",
+  "rewritten_statement": "When Joe Biden delivered the State of the Union address at a 2023 joint session of the U.S. Congress, the person sitting behind him on the right was Kevin McCarthy."
+}
+
+Example 2:
+Input:
+statement1: Katherine Johnson is related to an image of her receiving the Silver Snoopy Award from astronaut Leland Melvin in 2017
+statement2: In this image, the logo on the chest of the blue flight suit is NASA
+source: Katherine Johnson
+mid-image: Image: Astronaut Leland Melvin presenting the Silver Snoopy Award to Katherine Johnson in 2017
+target: NASA
+Output:
+{
+  "decision": "hide_image",
+  "reason": "The intermediate image records a specific award presentation in 2017, so the event can replace the image while preserving the target description.",
+  "rewritten_relation": "the logo on the chest of the presenter's blue flight suit when she received the Silver Snoopy Award in 2017 was",
+  "rewritten_statement": "When Katherine Johnson received the Silver Snoopy Award in 2017, the logo on the chest of the presenter's blue flight suit was NASA."
+}
+
+Example 3:
+Input:
+statement1: The United States Constitution is related to an image of its first handwritten page beginning with We the People
+statement2: In this image, the chamber of Congress named at the end of Article I, Section 1 is the United States House of Representatives
+source: United States Constitution
+mid-image: Image: The first handwritten page of the original United States Constitution beginning with We the People
+target: United States House of Representatives
+Output:
+{
+  "decision": "keep_image",
+  "reason": "The intermediate image is a document page whose textual content and page identity are essential, so the image cannot be skipped.",
+  "rewritten_relation": "in its first handwritten page beginning with We the People, the chamber of Congress named at the end of Article I, Section 1 is",
+  "rewritten_statement": "In the first handwritten page of the original United States Constitution beginning with We the People, the chamber of Congress named at the end of Article I, Section 1 is the United States House of Representatives."
+}
+"""
+
+PROMPT_NORMALIZE_FINAL_IMAGE_TARGET_ASK = """You will be given one declarative statement involving a source and a final image, plus a final question whose answer is the final target. The actual final image will also be provided with the request.
+
+Input format:
+statement1: ...
+question: ...
+answer: ...
+source: ...
+mid-image: ...
+
+Task:
+The `answer` is the final queried target.
+You need to rewrite the terminal step so that the question-facing chain can use one merged source-to-target bridge instead of the original source-to-image hop.
+
+This process has two steps.
+
+Step 1: Determine whether the final image can be skipped.
+- Prefer `hide_image` when the image mainly records a real-world event, activity, occasion, or scene that exists independently of the photograph, and the final target belongs to that real-world situation rather than to the photograph as an artifact.
+- A clear time reference is a strong signal in favor of `hide_image`, but it is not the only criterion.
+- Do not decide based only on the target type. Even a logo, clothing item, object, number, or attribute can still support `hide_image` if it belongs to the real-world event or scene rather than to the photograph as an artifact.
+- Prefer `keep_image` when the final image is itself the essential object or reference frame, such as a manuscript page, document page, poster, artwork, portrait, cover, screenshot, interface, map, diagram, chart, or similar artifact.
+- If removing the explicit mention of the image would change the meaning or lose the needed reference frame, choose `keep_image`.
+
+Step 2: Rewrite the terminal step accordingly.
+- Return one merged declarative source-to-target bridge.
+- Return one rewritten final ask whose answer remains exactly the provided `answer`.
+- If you choose `hide_image`, use the event / activity / scene corresponding to the image instead of explicit media wording.
+- If you choose `keep_image`, keep the image / page / artwork / artifact framing explicit when it is necessary.
+
+Output requirements:
+- Return `rewritten_statement`, `rewritten_relation`, and `rewritten_ask_target`.
+- `rewritten_relation` should be a short source-to-target relation phrase aligned with the merged sentence. The target itself must not appear directly in the relation.
+- `rewritten_statement` should be one complete declarative sentence from the source to the target, and the target should appear explicitly in that sentence.
+- `rewritten_ask_target` should be a natural final question whose answer is still exactly the provided `answer`.
+- If you choose `hide_image`, the rewritten statement, relation, and ask must not contain words such as `image`, `photo`, `picture`, or similar media terms.
+- Preserve all necessary information. Do not delete important details or add new facts.
+- Make the outputs fluent and natural.
+- Return only valid JSON.
+
+Return valid JSON with exactly these fields:
+{
+  "decision": "hide_image" or "keep_image",
+  "reason": "brief explanation",
+  "rewritten_relation": "short source-to-target relation phrase",
+  "rewritten_statement": "one declarative sentence from source to target",
+  "rewritten_ask_target": "one final question whose answer remains the provided answer"
+}
+
+Example 1:
+Input:
+statement1: Lionel Messi is related to an image of him during the 2022 FIFA World Cup final
+question: What logo appears on the front of the jersey in the image?
+answer: Adidas
+source: Lionel Messi
+mid-image: Image: Lionel Messi during the 2022 FIFA World Cup final
+Output:
+{
+  "decision": "hide_image",
+  "reason": "The final image records a specific real-world event with a concrete time reference, so the event can replace the photo framing.",
+  "rewritten_relation": "the logo on the front of the jersey he wore during the 2022 FIFA World Cup final was",
+  "rewritten_statement": "During the 2022 FIFA World Cup final, the logo on the front of Lionel Messi's jersey was Adidas.",
+  "rewritten_ask_target": "During that appearance, what logo was on the front of the jersey of Lionel Messi?"
+}
+
+Example 2:
+Input:
+statement1: The United States Constitution is related to an image of its first handwritten page beginning with We the People
+question: Which chamber of Congress is named at the end of Article I, Section 1 on that page?
+answer: United States House of Representatives
+source: United States Constitution
+mid-image: Image: The first handwritten page of the original United States Constitution beginning with We the People
+Output:
+{
+  "decision": "keep_image",
+  "reason": "The final image is a document page whose textual content and page identity are essential, so the image cannot be skipped.",
+  "rewritten_relation": "in its first handwritten page beginning with We the People, the chamber of Congress named at the end of Article I, Section 1 is",
+  "rewritten_statement": "In the first handwritten page of the original United States Constitution beginning with We the People, the chamber of Congress named at the end of Article I, Section 1 is the United States House of Representatives.",
+  "rewritten_ask_target": "Which chamber of Congress is named at the end of Article I, Section 1 on that page?"
+}
+"""
+
 
 PROMPT_COMPOSE_QUESTION = """
 You are an expert at composing multi-hop search questions. Below, you will be given the specific structure of each hop in the data, and your task is to assemble these separated pieces into a continuous reasoning question that hides the intermediate steps and is meant for a user to answer.
@@ -860,6 +1032,10 @@ class QuestionWriter:
     model: str | None = None
     compress_hop_model_client: ModelWorkerClient | None = None
     compress_hop_model: str | None = None
+    image_bridge_model_client: ModelWorkerClient | None = None
+    image_bridge_model: str | None = None
+    image_target_ask_model_client: ModelWorkerClient | None = None
+    image_target_ask_model: str | None = None
     temperature: float | None = None
     max_tokens: int = 800
     json_retry_attempts: int = 2
@@ -1109,29 +1285,57 @@ class QuestionWriter:
         context: WriterContext | None = None,
     ) -> QuestionDraft:
         context = context or self.build_writer_context(path=path, graph=graph)
-        hop_summaries = self._compress_hops(context.hops)
-        opening_package = self.select_opening_package(context=context, hop_summaries=hop_summaries)
-        target_ask = self.select_target_ask(context=context)
-        draft_warnings = self._collect_writer_warnings(hop_summaries, opening_package, target_ask)
+        raw_hop_summaries = self._compress_hops(context.hops)
         opening_mode = "image_start" if path.trajectory.starts_with_image else "text_start"
+        question_hop_summaries, image_bridge_normalization = self._normalize_question_hops(
+            path=path,
+            context=context,
+            hop_summaries=raw_hop_summaries,
+        )
+        opening_package = self.select_opening_package(
+            context=context,
+            hop_summaries=question_hop_summaries,
+        )
+        raw_target_ask = self.select_target_ask(context=context)
+        question_hop_summaries, question_target_ask, question_terminal_bridge, image_target_terminal_normalization = self._normalize_question_terminal_step(
+            path=path,
+            context=context,
+            hop_summaries=question_hop_summaries,
+            raw_target_ask=raw_target_ask,
+        )
+        draft_warnings = self._collect_writer_warnings(
+            raw_hop_summaries,
+            question_hop_summaries,
+            image_bridge_normalization,
+            opening_package,
+            raw_target_ask,
+            image_target_terminal_normalization,
+        )
         answer_type = self._default_answer_type(context.target_node)
+        starting_image_url = self._starting_image_url(path=path, graph=graph)
         if self.model_client is None:
             return self._draft_with_writer_warnings(self._fallback_compose_question(
                 path=path,
-                hop_summaries=hop_summaries,
+                hop_summaries=question_hop_summaries,
                 opening_package=opening_package,
-                target_ask=target_ask,
+                target_ask=question_target_ask,
                 opening_mode=opening_mode,
                 answer_type=answer_type,
+                raw_target_ask=raw_target_ask,
+                raw_hop_summaries=raw_hop_summaries,
+                image_bridge_normalization=image_bridge_normalization,
+                image_target_terminal_normalization=image_target_terminal_normalization,
+                question_terminal_bridge=question_terminal_bridge,
+                starting_image_url=starting_image_url,
+                writer_context=context.to_dict(),
             ), warnings=draft_warnings)
-        compose_hops = hop_summaries
+        compose_hops = question_hop_summaries
         compose_payload = self._compose_question_payload(
             opening_mode=opening_mode,
             opening_package=opening_package,
             hop_summaries=compose_hops,
-            target_ask=target_ask,
+            target_ask=question_target_ask,
         )
-        starting_image_url = self._starting_image_url(path=path, graph=graph)
         try:
             parsed = self._generate_json(
                 system=PROMPT_COMPOSE_QUESTION,
@@ -1144,16 +1348,23 @@ class QuestionWriter:
             return self._draft_with_writer_warnings(
                 self._fallback_compose_question(
                     path=path,
-                    hop_summaries=hop_summaries,
+                    hop_summaries=question_hop_summaries,
                     opening_package=opening_package,
-                    target_ask=target_ask,
+                    target_ask=question_target_ask,
                     opening_mode=opening_mode,
                     answer_type=answer_type,
+                    raw_target_ask=raw_target_ask,
+                    raw_hop_summaries=raw_hop_summaries,
+                    image_bridge_normalization=image_bridge_normalization,
+                    image_target_terminal_normalization=image_target_terminal_normalization,
+                    question_terminal_bridge=question_terminal_bridge,
+                    starting_image_url=starting_image_url,
+                    writer_context=context.to_dict(),
                 ),
                 warnings=draft_warnings,
             )
         question = self._clean_composed_question(str(parsed.get("question") or "").strip())
-        answer = str(target_ask.get("answer") or "").strip()
+        answer = str(raw_target_ask.get("answer") or "").strip()
         if (
             not question
             or not answer
@@ -1165,7 +1376,7 @@ class QuestionWriter:
                     opening_mode=opening_mode,
                     hop_summaries=compose_hops,
                     opening_package=opening_package,
-                    target_ask=target_ask,
+                    target_ask=question_target_ask,
                 )
             except Exception as exc:
                 draft_warnings.append(self._writer_warning_entry(stage="rewrite_chain_narration", error=exc))
@@ -1179,24 +1390,36 @@ class QuestionWriter:
         ):
             return self._draft_with_writer_warnings(self._fallback_compose_question(
                 path=path,
-                hop_summaries=hop_summaries,
+                hop_summaries=question_hop_summaries,
                 opening_package=opening_package,
-                target_ask=target_ask,
+                target_ask=question_target_ask,
                 opening_mode=opening_mode,
                 answer_type=answer_type,
+                raw_target_ask=raw_target_ask,
+                raw_hop_summaries=raw_hop_summaries,
+                image_bridge_normalization=image_bridge_normalization,
+                image_target_terminal_normalization=image_target_terminal_normalization,
+                question_terminal_bridge=question_terminal_bridge,
+                starting_image_url=starting_image_url,
+                writer_context=context.to_dict(),
             ), warnings=draft_warnings)
         return self._draft_with_writer_warnings(QuestionDraft(
             question=question,
             answer=answer,
             answer_type=answer_type,
-            reasoning_steps=hop_summaries,
+            reasoning_steps=question_hop_summaries,
             used_evidence_ids=[hop.edge_id for hop in context.hops],
             metadata={
                 "path_id": path.path_id,
                 "opening_package": opening_package,
                 "compose_payload": compose_payload,
+                "raw_hop_summaries": raw_hop_summaries,
+                "image_bridge_normalization": image_bridge_normalization,
                 "starting_image_url": starting_image_url,
-                "target_ask": target_ask,
+                "target_ask": raw_target_ask,
+                "question_target_ask": question_target_ask,
+                "question_terminal_bridge": question_terminal_bridge,
+                "image_target_terminal_normalization": image_target_terminal_normalization,
                 "writer_context": context.to_dict(),
             },
         ), warnings=draft_warnings)
@@ -1211,11 +1434,11 @@ class QuestionWriter:
             question=draft.question,
             hops=draft.reasoning_steps,
         )
-        target_ask = draft.metadata.get("target_ask") or {}
+        question_target_ask = draft.metadata.get("question_target_ask") or draft.metadata.get("target_ask") or {}
         obfuscation_payload = self._obfuscation_question_payload(
             question=draft.question,
             hops=draft.reasoning_steps,
-            final_ask=str(target_ask.get("ask_target") or "").strip(),
+            final_ask=str(question_target_ask.get("ask_target") or "").strip(),
         )
         starting_image_url = self._starting_image_url(path=path, graph=graph)
         diagnostics: dict[str, dict[str, Any]] = {}
@@ -1537,7 +1760,7 @@ class QuestionWriter:
         self,
         *,
         system: str,
-        user_payload: dict[str, Any],
+        user_payload: Any,
         trace_label: str,
         image_url: str | None = None,
         model_client: ModelWorkerClient | None = None,
@@ -1595,6 +1818,477 @@ class QuestionWriter:
         with ThreadPoolExecutor(max_workers=min(len(hops), 8)) as executor:
             return list(executor.map(lambda hop: self.compress_hop(hop=hop), hops))
 
+    def _normalize_question_hops(
+        self,
+        *,
+        path: PathCandidate,
+        context: WriterContext,
+        hop_summaries: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        if not context.hops or not hop_summaries:
+            return list(hop_summaries), []
+
+        normalized: list[dict[str, Any]] = []
+        diagnostics: list[dict[str, Any]] = []
+        hop_index = 0
+        while hop_index < len(context.hops):
+            incoming_hop = context.hops[hop_index]
+            incoming_summary = hop_summaries[hop_index]
+
+            if hop_index + 1 < len(context.hops):
+                outgoing_hop = context.hops[hop_index + 1]
+                outgoing_summary = hop_summaries[hop_index + 1]
+                if self._can_normalize_hidden_image_bridge(
+                    path=path,
+                    incoming_hop=incoming_hop,
+                    outgoing_hop=outgoing_hop,
+                ):
+                    synthetic_summary, diagnostic = self._normalize_image_bridge(
+                        incoming_hop=incoming_hop,
+                        incoming_summary=incoming_summary,
+                        outgoing_hop=outgoing_hop,
+                        outgoing_summary=outgoing_summary,
+                    )
+                    diagnostics.append(diagnostic)
+                    if synthetic_summary is not None:
+                        normalized.append(synthetic_summary)
+                        hop_index += 2
+                        continue
+
+            normalized.append(incoming_summary)
+            hop_index += 1
+
+        return normalized, diagnostics
+
+    @classmethod
+    def _can_normalize_hidden_image_bridge(
+        cls,
+        *,
+        path: PathCandidate,
+        incoming_hop: HopContext,
+        outgoing_hop: HopContext,
+    ) -> bool:
+        if (incoming_hop.src_modality, incoming_hop.dst_modality) != ("text", "image"):
+            return False
+        if (outgoing_hop.src_modality, outgoing_hop.dst_modality) != ("image", "text"):
+            return False
+        if incoming_hop.dst_node_id != outgoing_hop.src_node_id:
+            return False
+        if cls._is_image_node_visible_in_question(path=path, image_node_id=incoming_hop.dst_node_id):
+            return False
+        return True
+
+    @staticmethod
+    def _is_image_node_visible_in_question(*, path: PathCandidate, image_node_id: str) -> bool:
+        return bool(
+            path.trajectory.starts_with_image
+            and path.node_ids
+            and path.node_ids[0] == image_node_id
+        )
+
+    def _normalize_image_bridge(
+        self,
+        *,
+        incoming_hop: HopContext,
+        incoming_summary: dict[str, Any],
+        outgoing_hop: HopContext,
+        outgoing_summary: dict[str, Any],
+    ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+        image_content = incoming_hop.dst_content or outgoing_hop.src_content or {}
+        image_label = self._compress_hop_prompt_label(image_content, fallback=incoming_hop.dst_node_id)
+        model_client = self.image_bridge_model_client or self.model_client
+        model = self.image_bridge_model or self.model
+        diagnostic: dict[str, Any] = {
+            "incoming_hop_index": incoming_hop.hop_index,
+            "outgoing_hop_index": outgoing_hop.hop_index,
+            "image_node_id": incoming_hop.dst_node_id,
+            "image_label": image_label,
+            "model_alias": model,
+            "decision": "keep_image",
+            "reason": "no_image_bridge_model_available",
+            "applied": False,
+        }
+        if model_client is None or not model:
+            return None, diagnostic
+
+        image_url = self._target_image_url(image_content)
+        trace_label = f"normalize_image_bridge_{incoming_hop.hop_index}_{outgoing_hop.hop_index}"
+        try:
+            parsed = self._generate_json(
+                system=PROMPT_NORMALIZE_IMAGE_BRIDGE,
+                user_payload=self._image_bridge_prompt_text(
+                    incoming_hop=incoming_hop,
+                    incoming_summary=incoming_summary,
+                    outgoing_hop=outgoing_hop,
+                    outgoing_summary=outgoing_summary,
+                ),
+                trace_label=trace_label,
+                image_url=image_url,
+                model_client=model_client,
+                model=model,
+            )
+        except Exception as exc:
+            diagnostic["reason"] = "image_bridge_model_error"
+            diagnostic["writer_warning"] = self._writer_warning_entry(stage=trace_label, error=exc)
+            return None, diagnostic
+
+        decision = str(parsed.get("decision") or "").strip().lower()
+        reason = str(parsed.get("reason") or "").strip()
+        rewritten_statement = self._ensure_declarative_statement(
+            str(parsed.get("rewritten_statement") or "").strip()
+        )
+        rewritten_relation = str(parsed.get("rewritten_relation") or "").strip()
+        if decision not in {"hide_image", "keep_image"}:
+            decision = "keep_image"
+            if not reason:
+                reason = "unexpected_model_decision"
+
+        diagnostic["decision"] = decision
+        diagnostic["reason"] = reason or ("hide_image" if decision == "hide_image" else "keep_image")
+        if not rewritten_statement:
+            fallback_statement, fallback_relation = self._fallback_merge_image_bridge(
+                incoming_summary=incoming_summary,
+                outgoing_summary=outgoing_summary,
+                hide_image=(decision == "hide_image"),
+            )
+            rewritten_statement = self._ensure_declarative_statement(fallback_statement)
+            rewritten_relation = rewritten_relation or fallback_relation
+            if not rewritten_statement:
+                diagnostic["decision"] = "keep_image"
+                diagnostic["reason"] = reason or "empty_rewritten_statement"
+                return None, diagnostic
+            diagnostic["fallback_merged_statement_used"] = True
+
+        synthetic_summary = {
+            "hop_index": incoming_summary.get("hop_index"),
+            "statement": rewritten_statement,
+            "source": incoming_summary.get("source"),
+            "target": outgoing_summary.get("target"),
+            "relation": rewritten_relation or str(outgoing_summary.get("relation") or "").strip(),
+            "retrieval_query": (
+                str(incoming_summary.get("retrieval_query") or "").strip()
+                if decision == "keep_image"
+                else ""
+            ),
+            "edge_id": "|".join(
+                item
+                for item in (
+                    str(incoming_summary.get("edge_id") or "").strip(),
+                    str(outgoing_summary.get("edge_id") or "").strip(),
+                )
+                if item
+            ),
+            "src_node_id": incoming_summary.get("src_node_id"),
+            "dst_node_id": outgoing_summary.get("dst_node_id"),
+            "image_bridge_hidden": decision == "hide_image",
+            "image_bridge_decision": decision,
+            "bridge_image_node_id": incoming_hop.dst_node_id,
+        }
+        if decision == "hide_image":
+            synthetic_summary["hidden_image_node_id"] = incoming_hop.dst_node_id
+        diagnostic["applied"] = True
+        diagnostic["rewritten_statement"] = rewritten_statement
+        return synthetic_summary, diagnostic
+
+    @staticmethod
+    def _fallback_merge_image_bridge(
+        *,
+        incoming_summary: dict[str, Any],
+        outgoing_summary: dict[str, Any],
+        hide_image: bool,
+    ) -> tuple[str, str]:
+        incoming_statement = str(incoming_summary.get("statement") or "").strip()
+        outgoing_statement = str(outgoing_summary.get("statement") or "").strip()
+        if hide_image:
+            merged_statement = outgoing_statement or incoming_statement
+            merged_relation = str(outgoing_summary.get("relation") or "").strip()
+        else:
+            merged_statement = " ".join(item for item in (incoming_statement, outgoing_statement) if item)
+            merged_relation = str(outgoing_summary.get("relation") or incoming_summary.get("relation") or "").strip()
+        return merged_statement, merged_relation
+
+    @classmethod
+    def _image_bridge_prompt_text(
+        cls,
+        *,
+        incoming_hop: HopContext,
+        incoming_summary: dict[str, Any],
+        outgoing_hop: HopContext,
+        outgoing_summary: dict[str, Any],
+    ) -> str:
+        image_content = incoming_hop.dst_content or outgoing_hop.src_content or {}
+        source = incoming_summary.get("source") or cls._compress_hop_prompt_label(
+            incoming_hop.src_content,
+            fallback=incoming_hop.src_node_id,
+        )
+        target = outgoing_summary.get("target") or cls._compress_hop_prompt_label(
+            outgoing_hop.dst_content,
+            fallback=outgoing_hop.dst_node_id,
+        )
+        lines = [
+            f"statement1: {cls._prompt_text_value(incoming_summary.get('statement') or '')}",
+            f"statement2: {cls._prompt_text_value(outgoing_summary.get('statement') or '')}",
+            f"source: {cls._prompt_text_value(source)}",
+            f"mid-image: {cls._mid_image_prompt_value(image_content, fallback=incoming_hop.dst_node_id)}",
+            f"target: {cls._prompt_text_value(target)}",
+        ]
+        return "\n".join(lines)
+
+    def _normalize_question_terminal_step(
+        self,
+        *,
+        path: PathCandidate,
+        context: WriterContext,
+        hop_summaries: list[dict[str, Any]],
+        raw_target_ask: dict[str, Any],
+    ) -> tuple[list[dict[str, Any]], dict[str, Any], dict[str, Any] | None, dict[str, Any] | None]:
+        question_hop_summaries = list(hop_summaries)
+        question_target_ask = dict(raw_target_ask)
+        if context.target_node.get("node_type") != "image":
+            return question_hop_summaries, question_target_ask, None, None
+
+        final_hop = context.hops[-1] if context.hops else None
+        if final_hop is None or not question_hop_summaries:
+            diagnostic = {
+                "hop_index": final_hop.hop_index if final_hop is not None else None,
+                "image_node_id": str(context.target_node.get("node_id") or ""),
+                "decision": "keep_image",
+                "reason": "missing_final_hop",
+                "applied": False,
+                "raw_ask_target": str(raw_target_ask.get("ask_target") or "").strip(),
+            }
+            return question_hop_summaries, question_target_ask, None, diagnostic
+        if (final_hop.src_modality, final_hop.dst_modality) != ("text", "image"):
+            diagnostic = {
+                "hop_index": final_hop.hop_index,
+                "image_node_id": final_hop.dst_node_id,
+                "decision": "keep_image",
+                "reason": f"unsupported_final_hop_type:{final_hop.src_modality}->{final_hop.dst_modality}",
+                "applied": False,
+                "raw_ask_target": str(raw_target_ask.get("ask_target") or "").strip(),
+            }
+            return question_hop_summaries, question_target_ask, None, diagnostic
+        if self._is_image_node_visible_in_question(path=path, image_node_id=final_hop.dst_node_id):
+            diagnostic = {
+                "hop_index": final_hop.hop_index,
+                "image_node_id": final_hop.dst_node_id,
+                "decision": "keep_image",
+                "reason": "target_image_visible_in_question",
+                "applied": False,
+                "raw_ask_target": str(raw_target_ask.get("ask_target") or "").strip(),
+            }
+            return question_hop_summaries, question_target_ask, None, diagnostic
+
+        final_hop_summary = hop_summaries[-1]
+        terminal_summary, question_target_ask, diagnostic = self._normalize_final_image_target_terminal(
+            final_hop=final_hop,
+            final_hop_summary=final_hop_summary,
+            raw_target_ask=raw_target_ask,
+        )
+        updated_hops = list(question_hop_summaries[:-1])
+        updated_hops.append(terminal_summary)
+        diagnostic["terminal_summary"] = dict(terminal_summary)
+        diagnostic["question_target_ask"] = dict(question_target_ask)
+        return updated_hops, question_target_ask, terminal_summary, diagnostic
+
+    def _normalize_final_image_target_terminal(
+        self,
+        *,
+        final_hop: HopContext,
+        final_hop_summary: dict[str, Any],
+        raw_target_ask: dict[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+        image_content = final_hop.dst_content or {}
+        image_label = self._compress_hop_prompt_label(image_content, fallback=final_hop.dst_node_id)
+        model_client = self.image_target_ask_model_client or self.image_bridge_model_client or self.model_client
+        model = self.image_target_ask_model or self.image_bridge_model or self.model
+        question_target_ask = dict(raw_target_ask)
+        target_value = str(raw_target_ask.get("answer") or final_hop_summary.get("target") or "").strip()
+        diagnostic: dict[str, Any] = {
+            "hop_index": final_hop.hop_index,
+            "image_node_id": final_hop.dst_node_id,
+            "image_label": image_label,
+            "model_alias": model,
+            "decision": "keep_image",
+            "reason": "no_image_target_ask_model_available",
+            "applied": False,
+            "raw_ask_target": str(raw_target_ask.get("ask_target") or "").strip(),
+            "raw_answer": target_value,
+        }
+        if model_client is None or not model:
+            rewritten_statement, rewritten_relation, rewritten_ask_target = self._fallback_merge_image_target_terminal(
+                final_hop_summary=final_hop_summary,
+                raw_target_ask=raw_target_ask,
+                hide_image=False,
+            )
+            terminal_summary = self._build_final_image_target_terminal_summary(
+                final_hop=final_hop,
+                final_hop_summary=final_hop_summary,
+                target_value=target_value,
+                rewritten_statement=rewritten_statement,
+                rewritten_relation=rewritten_relation,
+                decision="keep_image",
+            )
+            question_target_ask["ask_target"] = rewritten_ask_target
+            diagnostic["applied"] = True
+            diagnostic["fallback_used"] = True
+            diagnostic["rewritten_statement"] = rewritten_statement
+            diagnostic["rewritten_ask_target"] = rewritten_ask_target
+            return terminal_summary, question_target_ask, diagnostic
+
+        image_url = self._target_image_url(image_content)
+        trace_label = f"normalize_image_target_terminal_{final_hop.hop_index}"
+        try:
+            parsed = self._generate_json(
+                system=PROMPT_NORMALIZE_FINAL_IMAGE_TARGET_ASK,
+                user_payload=self._image_target_terminal_prompt_text(
+                    final_hop=final_hop,
+                    final_hop_summary=final_hop_summary,
+                    raw_target_ask=raw_target_ask,
+                ),
+                trace_label=trace_label,
+                image_url=image_url,
+                model_client=model_client,
+                model=model,
+            )
+        except Exception as exc:
+            diagnostic["reason"] = "image_target_terminal_model_error"
+            diagnostic["writer_warning"] = self._writer_warning_entry(stage=trace_label, error=exc)
+            rewritten_statement, rewritten_relation, rewritten_ask_target = self._fallback_merge_image_target_terminal(
+                final_hop_summary=final_hop_summary,
+                raw_target_ask=raw_target_ask,
+                hide_image=False,
+            )
+            terminal_summary = self._build_final_image_target_terminal_summary(
+                final_hop=final_hop,
+                final_hop_summary=final_hop_summary,
+                target_value=target_value,
+                rewritten_statement=rewritten_statement,
+                rewritten_relation=rewritten_relation,
+                decision="keep_image",
+            )
+            question_target_ask["ask_target"] = rewritten_ask_target
+            diagnostic["applied"] = True
+            diagnostic["fallback_used"] = True
+            diagnostic["rewritten_statement"] = rewritten_statement
+            diagnostic["rewritten_ask_target"] = rewritten_ask_target
+            return terminal_summary, question_target_ask, diagnostic
+
+        decision = str(parsed.get("decision") or "").strip().lower()
+        reason = str(parsed.get("reason") or "").strip()
+        rewritten_statement = self._ensure_declarative_statement(
+            str(parsed.get("rewritten_statement") or "").strip()
+        )
+        rewritten_relation = str(parsed.get("rewritten_relation") or "").strip()
+        rewritten_ask_target = self._ensure_question(str(parsed.get("rewritten_ask_target") or "").strip())
+        if decision not in {"hide_image", "keep_image"}:
+            decision = "keep_image"
+            if not reason:
+                reason = "unexpected_model_decision"
+
+        diagnostic["decision"] = decision
+        diagnostic["reason"] = reason or ("hide_image" if decision == "hide_image" else "keep_image")
+        if not rewritten_statement or not rewritten_ask_target:
+            fallback_statement, fallback_relation, fallback_ask_target = self._fallback_merge_image_target_terminal(
+                final_hop_summary=final_hop_summary,
+                raw_target_ask=raw_target_ask,
+                hide_image=(decision == "hide_image"),
+            )
+            rewritten_statement = rewritten_statement or fallback_statement
+            rewritten_relation = rewritten_relation or fallback_relation
+            rewritten_ask_target = rewritten_ask_target or fallback_ask_target
+            diagnostic["fallback_used"] = True
+
+        terminal_summary = self._build_final_image_target_terminal_summary(
+            final_hop=final_hop,
+            final_hop_summary=final_hop_summary,
+            target_value=target_value,
+            rewritten_statement=rewritten_statement,
+            rewritten_relation=rewritten_relation,
+            decision=decision,
+        )
+        question_target_ask["ask_target"] = rewritten_ask_target
+        diagnostic["applied"] = True
+        diagnostic["rewritten_statement"] = rewritten_statement
+        diagnostic["rewritten_ask_target"] = rewritten_ask_target
+        return terminal_summary, question_target_ask, diagnostic
+
+    def _build_final_image_target_terminal_summary(
+        self,
+        *,
+        final_hop: HopContext,
+        final_hop_summary: dict[str, Any],
+        target_value: str,
+        rewritten_statement: str,
+        rewritten_relation: str,
+        decision: str,
+    ) -> dict[str, Any]:
+        summary = {
+            "hop_index": final_hop_summary.get("hop_index"),
+            "statement": self._ensure_declarative_statement(rewritten_statement),
+            "source": final_hop_summary.get("source"),
+            "target": target_value or final_hop_summary.get("target"),
+            "relation": rewritten_relation or "the final queried target is",
+            "retrieval_query": "",
+            "edge_id": final_hop_summary.get("edge_id"),
+            "src_node_id": final_hop_summary.get("src_node_id"),
+            "dst_node_id": None,
+            "terminal_question_bridge": True,
+            "terminal_bridge_decision": decision,
+            "terminal_image_node_id": final_hop.dst_node_id,
+        }
+        if decision == "hide_image":
+            summary["hidden_image_node_id"] = final_hop.dst_node_id
+        return summary
+
+    @staticmethod
+    def _fallback_merge_image_target_terminal(
+        *,
+        final_hop_summary: dict[str, Any],
+        raw_target_ask: dict[str, Any],
+        hide_image: bool,
+    ) -> tuple[str, str, str]:
+        answer = str(raw_target_ask.get("answer") or "").strip() or "unknown"
+        ask_target = QuestionWriter._ensure_question(str(raw_target_ask.get("ask_target") or "").strip())
+        source = str(final_hop_summary.get("source") or "the source").strip() or "the source"
+        final_statement = QuestionWriter._ensure_declarative_statement(
+            str(final_hop_summary.get("statement") or "").strip()
+        )
+        if hide_image:
+            ask_target = QuestionWriter._fallback_hide_image_terminal_ask(ask_target)
+            statement = f"The final queried detail connected to {source} is {answer}."
+            relation = "the final queried detail is"
+        else:
+            if final_statement:
+                statement = f"{final_statement.rstrip('.')} The answer to the final question about that image is {answer}."
+            else:
+                statement = f"The answer to the final question about the image connected to {source} is {answer}."
+            relation = "the answer to the final question about that image is"
+        return QuestionWriter._ensure_declarative_statement(statement), relation, ask_target
+
+    @classmethod
+    def _image_target_terminal_prompt_text(
+        cls,
+        *,
+        final_hop: HopContext,
+        final_hop_summary: dict[str, Any],
+        raw_target_ask: dict[str, Any],
+    ) -> str:
+        image_content = final_hop.dst_content or {}
+        source = final_hop_summary.get("source") or cls._compress_hop_prompt_label(
+            final_hop.src_content,
+            fallback=final_hop.src_node_id,
+        )
+        answer = cls._prompt_text_value(raw_target_ask.get("answer") or "")
+        lines = [
+            f"statement1: {cls._prompt_text_value(final_hop_summary.get('statement') or '')}",
+            f"question: {cls._prompt_text_value(raw_target_ask.get('ask_target') or '')}",
+            f"answer: {answer}",
+            f"source: {cls._prompt_text_value(source)}",
+            f"mid-image: {cls._mid_image_prompt_value(image_content, fallback=final_hop.dst_node_id)}",
+        ]
+        return "\n".join(lines)
+
     def _run_polish_subtask(
         self,
         *,
@@ -1651,11 +2345,14 @@ class QuestionWriter:
 
     @staticmethod
     def _user_message_content(
-        user_payload: dict[str, Any],
+        user_payload: Any,
         *,
         image_url: str | None = None,
     ) -> str | list[dict[str, Any]]:
-        prompt_text = json.dumps(user_payload, ensure_ascii=False, indent=2)
+        if isinstance(user_payload, str):
+            prompt_text = user_payload
+        else:
+            prompt_text = json.dumps(user_payload, ensure_ascii=False, indent=2)
         if not image_url:
             return prompt_text
         resolved_image_url = QuestionWriter._resolve_multimodal_image_url(image_url)
@@ -1721,6 +2418,7 @@ class QuestionWriter:
 
     def _node_payload(self, node: dict[str, Any], *, full: bool) -> dict[str, Any]:
         node_type = node.get("node_type")
+        node_source = node.get("source") or {}
         payload: dict[str, Any] = {
             "node_id": node.get("node_id"),
             "node_type": node_type,
@@ -1733,6 +2431,14 @@ class QuestionWriter:
             payload["oss_uri"] = node.get("oss_uri")
             payload["thumb_oss_uri"] = node.get("thumb_oss_uri")
             payload["search_query"] = metadata.get("search_query") if isinstance(metadata, dict) else None
+            payload["source_type"] = (
+                node_source.get("source_type") if isinstance(node_source, dict) else None
+            )
+            payload["image_origin"] = metadata.get("image_origin") if isinstance(metadata, dict) else None
+            payload["source_text_node_id"] = (
+                metadata.get("source_text_node_id") if isinstance(metadata, dict) else None
+            )
+            payload["visual_target"] = metadata.get("visual_target") if isinstance(metadata, dict) else None
             payload["visual_facts"] = list((metadata.get("visual_facts") or [])[: (999 if full else 2)]) if isinstance(metadata, dict) else []
             payload["ocr_texts"] = list((metadata.get("ocr_texts") or [])[: (999 if full else 2)]) if isinstance(metadata, dict) else []
             payload["grounded_entities"] = list((metadata.get("grounded_entities") or [])[: (999 if full else 3)]) if isinstance(metadata, dict) else []
@@ -1765,6 +2471,34 @@ class QuestionWriter:
         return text.rstrip(".!") + "?"
 
     @staticmethod
+    def _fallback_hide_image_terminal_ask(text: str) -> str:
+        normalized = re.sub(r"\s+", " ", str(text or "")).strip()
+        if not normalized:
+            return ""
+        rewritten = normalized
+        removal_patterns = [
+            r"\b(?:shown|visible|seen)\s+in\s+(?:the|this|that)\s+(?:image|photo|picture)\b",
+            r"\bin\s+(?:the|this|that)\s+(?:image|photo|picture)\b",
+            r"\bfrom\s+(?:the|this|that)\s+(?:image|photo|picture)\b",
+        ]
+        for pattern in removal_patterns:
+            rewritten = re.sub(pattern, "", rewritten, flags=re.IGNORECASE)
+        rewritten = re.sub(r"\s+", " ", rewritten).strip(" ,")
+        rewritten = re.sub(r"\s+([?.!,;:])", r"\1", rewritten)
+        return QuestionWriter._ensure_question(rewritten or normalized)
+
+    @staticmethod
+    def _ensure_declarative_statement(text: str) -> str:
+        normalized = re.sub(r"\s+", " ", str(text or "")).strip()
+        if not normalized:
+            return ""
+        if normalized.endswith("?"):
+            normalized = normalized.rstrip("?").rstrip()
+        if not re.search(r"[.?!]$", normalized):
+            normalized = normalized.rstrip(" ,;:") + "."
+        return normalized
+
+    @staticmethod
     def _normalized_compact_text(text: Any) -> str:
         return re.sub(r"\s+", " ", str(text or "")).strip().lower()
 
@@ -1777,6 +2511,20 @@ class QuestionWriter:
         if sep and prefix.strip().lower() == "image":
             return remainder.strip()
         return normalized
+
+
+    @staticmethod
+    def _prompt_text_value(text: Any) -> str:
+        return re.sub(r"\s+", " ", str(text or "")).strip()
+
+    @classmethod
+    def _mid_image_prompt_value(cls, content: dict[str, Any], *, fallback: str) -> str:
+        label = cls._strip_image_title_prefix(
+            cls._prompt_text_value(cls._compress_hop_prompt_label(content, fallback=fallback))
+        )
+        if not label:
+            label = cls._prompt_text_value(fallback)
+        return f"Image: {label}" if label else "Image"
 
     @classmethod
     def _image_search_query(cls, content: dict[str, Any]) -> str:
@@ -2205,11 +2953,20 @@ class QuestionWriter:
         target_ask: dict[str, Any],
         opening_mode: str,
         answer_type: str,
+        raw_target_ask: dict[str, Any] | None = None,
+        raw_hop_summaries: list[dict[str, Any]] | None = None,
+        image_bridge_normalization: list[dict[str, Any]] | None = None,
+        image_target_terminal_normalization: dict[str, Any] | None = None,
+        question_terminal_bridge: dict[str, Any] | None = None,
+        starting_image_url: str | None = None,
+        writer_context: dict[str, Any] | None = None,
     ) -> QuestionDraft:
+        raw_target_ask = dict(raw_target_ask or target_ask)
+        question_target_ask = dict(target_ask)
         remaining_hops = hop_summaries[1:] if opening_package.get("packaged_first_hop") else hop_summaries
         hop_text = " ".join(item.get("statement", "") for item in remaining_hops if item.get("statement"))
-        ask_target = str(target_ask.get("ask_target") or "What is the final answer?")
-        answer = str(target_ask.get("answer") or "unknown")
+        ask_target = str(question_target_ask.get("ask_target") or "What is the final answer?")
+        answer = str(raw_target_ask.get("answer") or question_target_ask.get("answer") or "unknown")
         opening_bridge = str(opening_package.get("packaged_first_hop") or "").strip()
         if opening_mode == "image_start":
             question = (
@@ -2226,13 +2983,30 @@ class QuestionWriter:
             masked_hop_text = QuestionWriter._remove_forbidden_labels(hop_text, forbidden)
             question = f"{opening_bridge} {masked_hop_text} {ask_target}"
         question = QuestionWriter._clean_composed_question(question)
+        metadata: dict[str, Any] = {
+            "opening_package": opening_package,
+            "target_ask": raw_target_ask,
+            "question_target_ask": question_target_ask,
+        }
+        if raw_hop_summaries is not None:
+            metadata["raw_hop_summaries"] = raw_hop_summaries
+        if image_bridge_normalization is not None:
+            metadata["image_bridge_normalization"] = image_bridge_normalization
+        if image_target_terminal_normalization is not None:
+            metadata["image_target_terminal_normalization"] = image_target_terminal_normalization
+        if question_terminal_bridge is not None:
+            metadata["question_terminal_bridge"] = question_terminal_bridge
+        if starting_image_url:
+            metadata["starting_image_url"] = starting_image_url
+        if writer_context is not None:
+            metadata["writer_context"] = writer_context
         return QuestionDraft(
             question=question,
             answer=answer,
             answer_type=answer_type,
             reasoning_steps=hop_summaries,
             used_evidence_ids=[item.get("edge_id", "") for item in hop_summaries if item.get("edge_id")],
-            metadata={"opening_package": opening_package, "target_ask": target_ask},
+            metadata=metadata,
         )
 
     @staticmethod
@@ -2337,6 +3111,16 @@ def _debug_main() -> None:
         help="Optional model alias registered in synthesis/models.json for compress_hop.",
     )
     parser.add_argument(
+        "--image-bridge-model-alias",
+        default=None,
+        help="Optional model alias registered in synthesis/models.json for hidden image-bridge normalization.",
+    )
+    parser.add_argument(
+        "--image-target-ask-model-alias",
+        default=None,
+        help="Optional model alias registered in synthesis/models.json for hidden final-image target-ask normalization.",
+    )
+    parser.add_argument(
         "--hop-sampling-strategy",
         choices=("uniform", "middle_biased"),
         default="middle_biased",
@@ -2382,19 +3166,50 @@ def _debug_main() -> None:
         model=args.model_alias,
         compress_hop_model_client=LLM_WORKER if args.compress_hop_model_alias else None,
         compress_hop_model=args.compress_hop_model_alias,
+        image_bridge_model_client=LLM_WORKER if args.image_bridge_model_alias else None,
+        image_bridge_model=args.image_bridge_model_alias,
+        image_target_ask_model_client=LLM_WORKER if args.image_target_ask_model_alias else None,
+        image_target_ask_model=args.image_target_ask_model_alias,
     )
     context = writer.build_writer_context(path=path, graph=graph)
-    hop_summaries = [writer.compress_hop(hop=hop) for hop in context.hops]
+    raw_hop_summaries = [writer.compress_hop(hop=hop) for hop in context.hops]
+    normalized_hop_summaries, image_bridge_normalization = writer._normalize_question_hops(
+        path=path,
+        context=context,
+        hop_summaries=raw_hop_summaries,
+    )
     debug_hop_summaries = [
         {
             key: value
             for key, value in item.items()
             if key not in {"edge_id", "src_node_id", "dst_node_id"}
         }
-        for item in hop_summaries
+        for item in raw_hop_summaries
     ]
-    opening_package = writer.select_opening_package(context=context, hop_summaries=hop_summaries)
+    debug_normalized_hop_summaries = [
+        {
+            key: value
+            for key, value in item.items()
+            if key not in {"edge_id", "src_node_id", "dst_node_id"}
+        }
+        for item in normalized_hop_summaries
+    ]
+    opening_package = writer.select_opening_package(context=context, hop_summaries=normalized_hop_summaries)
     draft = writer.compose_question(path=path, graph=graph, context=context)
+    raw_target_ask = draft.metadata.get("target_ask") if isinstance(draft.metadata, dict) else None
+    question_target_ask = draft.metadata.get("question_target_ask") if isinstance(draft.metadata, dict) else None
+    question_terminal_bridge = draft.metadata.get("question_terminal_bridge") if isinstance(draft.metadata, dict) else None
+    image_target_terminal_normalization = (
+        draft.metadata.get("image_target_terminal_normalization") if isinstance(draft.metadata, dict) else None
+    )
+    debug_question_hop_summaries = [
+        {
+            key: value
+            for key, value in item.items()
+            if key not in {"edge_id", "src_node_id", "dst_node_id"}
+        }
+        for item in (draft.reasoning_steps or [])
+    ]
     polished = writer.polish(draft=draft, path=path, graph=graph)
     obfuscated = writer.obfuscate(draft=polished, path=path, graph=graph)
     polish_result = polished.metadata.get("polish_result") if isinstance(polished.metadata, dict) else None
@@ -2408,11 +3223,30 @@ def _debug_main() -> None:
     print(json.dumps(path.to_dict(), ensure_ascii=False, indent=2))
     print(f"writer_model: {args.model_alias or 'fallback(no llm)'}")
     print(f"sampler_model: {args.sampler_model_alias or 'fallback(no llm)'}")
+    print(f"image_bridge_model: {args.image_bridge_model_alias or args.model_alias or 'fallback(no llm)'}")
+    print(
+        f"image_target_ask_model: "
+        f"{args.image_target_ask_model_alias or args.image_bridge_model_alias or args.model_alias or 'fallback(no llm)'}"
+    )
     print(f"neighbor_selection_strategy: {args.neighbor_selection_strategy}")
-    print("hop_summaries:")
+    print("raw_hop_summaries:")
     print(json.dumps(debug_hop_summaries, ensure_ascii=False, indent=2))
+    print("bridge_normalized_hop_summaries:")
+    print(json.dumps(debug_normalized_hop_summaries, ensure_ascii=False, indent=2))
+    print("question_hop_summaries:")
+    print(json.dumps(debug_question_hop_summaries, ensure_ascii=False, indent=2))
+    print("image_bridge_normalization:")
+    print(json.dumps(image_bridge_normalization, ensure_ascii=False, indent=2))
     print("opening_package:")
     print(json.dumps(opening_package, ensure_ascii=False, indent=2))
+    print("raw_target_ask:")
+    print(json.dumps(raw_target_ask or {}, ensure_ascii=False, indent=2))
+    print("question_target_ask:")
+    print(json.dumps(question_target_ask or {}, ensure_ascii=False, indent=2))
+    print("question_terminal_bridge:")
+    print(json.dumps(question_terminal_bridge or {}, ensure_ascii=False, indent=2))
+    print("image_target_terminal_normalization:")
+    print(json.dumps(image_target_terminal_normalization or {}, ensure_ascii=False, indent=2))
     print("draft_question:")
     print(json.dumps(
         {

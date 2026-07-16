@@ -57,6 +57,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Optional model alias for compress_hop. Defaults to VQA_COMPRESS_HOP_MODEL.",
     )
     parser.add_argument(
+        "--image-bridge-model-alias",
+        default=None,
+        help="Optional model alias for hidden image-bridge normalization. Defaults to VQA_IMAGE_BRIDGE_MODEL.",
+    )
+    parser.add_argument(
+        "--image-target-ask-model-alias",
+        default=None,
+        help="Optional model alias for hidden final-image target-ask normalization. Defaults to VQA_IMAGE_TARGET_ASK_MODEL.",
+    )
+    parser.add_argument(
         "--neighbor-selection-strategy",
         choices=("random", "llm_guided"),
         default="random",
@@ -82,6 +92,8 @@ def main(argv: list[str] | None = None) -> int:
     model_alias = args.model_alias or os.environ.get("VQA_WRITER_MODEL")
     sampler_model_alias = args.sampler_model_alias or os.environ.get("VQA_SAMPLER_MODEL")
     compress_hop_model_alias = args.compress_hop_model_alias or os.environ.get("VQA_COMPRESS_HOP_MODEL")
+    image_bridge_model_alias = args.image_bridge_model_alias or os.environ.get("VQA_IMAGE_BRIDGE_MODEL")
+    image_target_ask_model_alias = args.image_target_ask_model_alias or os.environ.get("VQA_IMAGE_TARGET_ASK_MODEL")
     config = SamplerConfiguration(
         min_hops=args.min_hops,
         max_hops=args.max_hops,
@@ -106,6 +118,10 @@ def main(argv: list[str] | None = None) -> int:
         model=model_alias,
         compress_hop_model_client=LLM_WORKER if compress_hop_model_alias else None,
         compress_hop_model=compress_hop_model_alias,
+        image_bridge_model_client=LLM_WORKER if image_bridge_model_alias else None,
+        image_bridge_model=image_bridge_model_alias,
+        image_target_ask_model_client=LLM_WORKER if image_target_ask_model_alias else None,
+        image_target_ask_model=image_target_ask_model_alias,
     )
     pipeline = VqaGenerationPipeline(
         store=store,
@@ -144,6 +160,8 @@ def main(argv: list[str] | None = None) -> int:
                 "writer_model_alias": model_alias,
                 "sampler_model_alias": sampler_model_alias,
                 "compress_hop_model_alias": compress_hop_model_alias,
+                "image_bridge_model_alias": image_bridge_model_alias,
+                "image_target_ask_model_alias": image_target_ask_model_alias,
             },
             "sampler_state_request": {
                 "input_path": str(sampler_state_input_path) if sampler_state_input_path else None,

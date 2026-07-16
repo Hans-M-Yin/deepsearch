@@ -745,6 +745,10 @@ class VqaBatchRunner:
             or sample.get("draft")
             or {}
         )
+        raw_hop_summaries = VqaBatchRunner._extract_stage_metadata_value(
+            sample,
+            field_name="raw_hop_summaries",
+        )
         return {
             "sample_id": sample.get("sample_id"),
             "status": sample.get("status"),
@@ -775,6 +779,21 @@ class VqaBatchRunner:
                     "src_node_id": item.get("src_node_id"),
                     "dst_node_id": item.get("dst_node_id"),
                 }
+                for item in (raw_hop_summaries or final_question.get("reasoning_steps") or [])
+                if isinstance(item, dict)
+            ],
+            "question_hop_chain": [
+                {
+                    "hop_index": item.get("hop_index"),
+                    "source": item.get("source"),
+                    "target": item.get("target"),
+                    "statement": item.get("statement"),
+                    "relation": item.get("relation"),
+                    "retrieval_query": item.get("retrieval_query"),
+                    "edge_id": item.get("edge_id"),
+                    "src_node_id": item.get("src_node_id"),
+                    "dst_node_id": item.get("dst_node_id"),
+                }
                 for item in (final_question.get("reasoning_steps") or [])
                 if isinstance(item, dict)
             ],
@@ -790,6 +809,22 @@ class VqaBatchRunner:
             "target_ask": VqaBatchRunner._extract_stage_metadata_value(
                 sample,
                 field_name="target_ask",
+            ),
+            "question_target_ask": VqaBatchRunner._extract_stage_metadata_value(
+                sample,
+                field_name="question_target_ask",
+            ),
+            "question_terminal_bridge": VqaBatchRunner._extract_stage_metadata_value(
+                sample,
+                field_name="question_terminal_bridge",
+            ),
+            "image_bridge_normalization": VqaBatchRunner._extract_stage_metadata_value(
+                sample,
+                field_name="image_bridge_normalization",
+            ),
+            "image_target_terminal_normalization": VqaBatchRunner._extract_stage_metadata_value(
+                sample,
+                field_name="image_target_terminal_normalization",
             ),
             "verification": sample.get("verification") or {},
             "progress": sample.get("progress") or {},
