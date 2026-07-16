@@ -578,7 +578,7 @@ Output:
 }
 """
 
-PROMPT_NORMALIZE_FINAL_IMAGE_TARGET_ASK = """You will be given one declarative statement involving a source and a final image, plus a final question whose answer is the final target. The actual final image will also be provided with the request.
+PROMPT_NORMALIZE_FINAL_IMAGE_TARGET_ASK = """You will be given a declarative statement and a question involving three elements: a source, an intermediate image, and a final answer. The actual intermediate image will also be provided with the request.
 
 Input format:
 statement1: ...
@@ -588,40 +588,39 @@ source: ...
 mid-image: ...
 
 Task:
-The `answer` is the final queried target.
-You need to rewrite the terminal step so that the question-facing chain can use one merged source-to-target bridge instead of the original source-to-image hop.
+The statement links the source to an intermediate image. The question asks about a visual detail in that image, and the provided `answer` is the final target.
 
-This process has two steps.
+You are rewriting the question-facing terminal step.
+This rewrite will replace the original final `text -> image` hop plus the raw final question.
+Do not output a declarative bridge statement. The only question-facing output should be the rewritten final question.
 
-Step 1: Determine whether the final image can be skipped.
-- Prefer `hide_image` when the image mainly records a real-world event, activity, occasion, or scene that exists independently of the photograph, and the final target belongs to that real-world situation rather than to the photograph as an artifact.
+Step 1: Determine whether the intermediate image can be skipped.
+- Prefer `hide_image` when the image mainly records a real-world event, activity, occasion, or scene that exists independently of the image, and the asked visual detail belongs to that real-world situation rather than to the image as an artifact.
 - A clear time reference is a strong signal in favor of `hide_image`, but it is not the only criterion.
-- Do not decide based only on the target type. Even a logo, clothing item, object, number, or attribute can still support `hide_image` if it belongs to the real-world event or scene rather than to the photograph as an artifact.
-- Prefer `keep_image` when the final image is itself the essential object or reference frame, such as a manuscript page, document page, poster, artwork, portrait, cover, screenshot, interface, map, diagram, chart, or similar artifact.
-- If removing the explicit mention of the image would change the meaning or lose the needed reference frame, choose `keep_image`.
+- Do not decide based only on the target type. Even a logo, clothing item, object, number, or attribute can still support `hide_image` if it belongs to the real-world event or scene rather than to the image as an artifact.
+- Prefer `keep_image` when the intermediate image is itself the essential object or reference frame, such as a manuscript page, document page, poster, artwork, portrait, cover, screenshot, interface, map, diagram, chart, or similar artifact.
+- If removing the explicit mention of the intermediate image would change the meaning, lose the needed reference frame, or make the question depend on layout, cropping, or textual arrangement that only exists inside the image, choose `keep_image`.
 
-Step 2: Rewrite the terminal step accordingly.
-- Return one merged declarative source-to-target bridge.
-- Return one rewritten final ask whose answer remains exactly the provided `answer`.
-- If you choose `hide_image`, use the event / activity / scene corresponding to the image instead of explicit media wording.
-- If you choose `keep_image`, keep the image / page / artwork / artifact framing explicit when it is necessary.
+Step 2: Rewrite the final question accordingly.
+- If you choose `hide_image`, rewrite the question through the underlying event / activity / scene instead of explicit media wording.
+- If you choose `keep_image`, keep the image / page / artwork / artifact framing explicit.
+- The rewritten question must carry enough information on its own, because the original final `text -> image` hop will not be provided separately during downstream question generation.
+- Use the actual image to resolve ambiguity when necessary, but do not add any fact that is not supported by the input or the image.
 
 Output requirements:
-- Return `rewritten_statement`, `rewritten_relation`, and `rewritten_ask_target`.
-- `rewritten_relation` should be a short source-to-target relation phrase aligned with the merged sentence. The target itself must not appear directly in the relation.
-- `rewritten_statement` should be one complete declarative sentence from the source to the target, and the target should appear explicitly in that sentence.
-- `rewritten_ask_target` should be a natural final question whose answer is still exactly the provided `answer`.
-- If you choose `hide_image`, the rewritten statement, relation, and ask must not contain words such as `image`, `photo`, `picture`, or similar media terms.
+- Return only `rewritten_ask_target`.
+- `rewritten_ask_target` should be one natural final question whose answer remains exactly the provided `answer`.
+- It should replace the original last hop plus the raw question in downstream question generation.
+- Do not reveal the answer inside the question.
+- If you choose `hide_image`, the rewritten question must not contain words such as `image`, `photo`, `picture`, or similar media terms.
 - Preserve all necessary information. Do not delete important details or add new facts.
-- Make the outputs fluent and natural.
+- Make the rewritten question fluent and natural.
 - Return only valid JSON.
 
 Return valid JSON with exactly these fields:
 {
   "decision": "hide_image" or "keep_image",
   "reason": "brief explanation",
-  "rewritten_relation": "short source-to-target relation phrase",
-  "rewritten_statement": "one declarative sentence from source to target",
   "rewritten_ask_target": "one final question whose answer remains the provided answer"
 }
 
@@ -635,26 +634,50 @@ mid-image: Image: Lionel Messi during the 2022 FIFA World Cup final
 Output:
 {
   "decision": "hide_image",
-  "reason": "The final image records a specific real-world event with a concrete time reference, so the event can replace the photo framing.",
-  "rewritten_relation": "the logo on the front of the jersey he wore during the 2022 FIFA World Cup final was",
-  "rewritten_statement": "During the 2022 FIFA World Cup final, the logo on the front of Lionel Messi's jersey was Adidas.",
-  "rewritten_ask_target": "During that appearance, what logo was on the front of the jersey of Lionel Messi?"
+  "reason": "The intermediate image records a specific real-world event, and the asked jersey logo belongs to that event scene rather than to the image as an artifact.",
+  "rewritten_ask_target": "During the 2022 FIFA World Cup final, what logo was on the front of Lionel Messi's jersey?"
 }
 
 Example 2:
 Input:
+statement1: Southern Methodist University is related to an image of five U.S. presidents at the dedication ceremony for the George W. Bush Presidential Center on April 25, 2013
+question: How many of the attending presidents in the image are wearing red ties?
+answer: 3
+source: Southern Methodist University
+mid-image: Image: Five U.S. presidents Obama, George W. Bush, Clinton, George H.W. Bush, and Carter together on stage at the George W. Bush Presidential Center dedication ceremony at Southern Methodist University on April 25, 2013
+Output:
+{
+  "decision": "hide_image",
+  "reason": "The intermediate image records a specific ceremony with a concrete time reference, so the event can replace the image framing while preserving the restricted group shown in the scene.",
+  "rewritten_ask_target": "At the George W. Bush Presidential Center dedication ceremony at Southern Methodist University on April 25, 2013, how many of the attending presidents were wearing red ties?"
+}
+
+Example 3:
+Input:
+statement1: Marc Kinchen is related to the cover art for the Storm Queen single 'Look Right Through (MK Remix)'
+question: In the cover art, what letters appear on the second-to-last line, and what color is each of them?
+answer: GH and MK; GH is black and MK is red
+source: Marc Kinchen
+mid-image: Image: Cover art for the Storm Queen single 'Look Right Through (MK Remix)'
+Output:
+{
+  "decision": "keep_image",
+  "reason": "The intermediate image is cover art, which is itself the essential artifact and reference frame for the asked visual text layout.",
+  "rewritten_ask_target": "In Marc Kinchen's cover art for the Storm Queen single 'Look Right Through (MK Remix)', what letters appear on the second-to-last line, and what color is each of them?"
+}
+
+Example 4:
+Input:
 statement1: The United States Constitution is related to an image of its first handwritten page beginning with We the People
-question: Which chamber of Congress is named at the end of Article I, Section 1 on that page?
-answer: United States House of Representatives
+question: What chamber of Congress is named at the end of Article I, Section 1 in the image?
+answer: the United States House of Representatives
 source: United States Constitution
 mid-image: Image: The first handwritten page of the original United States Constitution beginning with We the People
 Output:
 {
   "decision": "keep_image",
-  "reason": "The final image is a document page whose textual content and page identity are essential, so the image cannot be skipped.",
-  "rewritten_relation": "in its first handwritten page beginning with We the People, the chamber of Congress named at the end of Article I, Section 1 is",
-  "rewritten_statement": "In the first handwritten page of the original United States Constitution beginning with We the People, the chamber of Congress named at the end of Article I, Section 1 is the United States House of Representatives.",
-  "rewritten_ask_target": "Which chamber of Congress is named at the end of Article I, Section 1 on that page?"
+  "reason": "The intermediate image is a document page whose textual content and page identity are essential, so the image cannot be skipped.",
+  "rewritten_ask_target": "In the first handwritten page of the original United States Constitution beginning with We the People, what chamber of Congress is named at the end of Article I, Section 1?"
 }
 """
 
@@ -2080,16 +2103,33 @@ class QuestionWriter:
             return question_hop_summaries, question_target_ask, None, diagnostic
 
         final_hop_summary = hop_summaries[-1]
-        terminal_summary, question_target_ask, diagnostic = self._normalize_final_image_target_terminal(
+        question_target_ask, question_terminal_bridge, diagnostic = self._normalize_final_image_target_terminal(
             final_hop=final_hop,
             final_hop_summary=final_hop_summary,
             raw_target_ask=raw_target_ask,
         )
-        updated_hops = list(question_hop_summaries[:-1])
-        updated_hops.append(terminal_summary)
-        diagnostic["terminal_summary"] = dict(terminal_summary)
         diagnostic["question_target_ask"] = dict(question_target_ask)
-        return updated_hops, question_target_ask, terminal_summary, diagnostic
+        if not diagnostic.get("applied"):
+            return question_hop_summaries, question_target_ask, question_terminal_bridge, diagnostic
+
+        updated_hops = list(question_hop_summaries[:-1])
+        diagnostic["question_hop_count_before"] = len(question_hop_summaries)
+        diagnostic["question_hop_count_after"] = len(updated_hops)
+        diagnostic["removed_question_hop"] = {
+            key: final_hop_summary.get(key)
+            for key in (
+                "hop_index",
+                "source",
+                "target",
+                "statement",
+                "relation",
+                "retrieval_query",
+                "edge_id",
+                "src_node_id",
+                "dst_node_id",
+            )
+        }
+        return updated_hops, question_target_ask, question_terminal_bridge, diagnostic
 
     def _normalize_final_image_target_terminal(
         self,
@@ -2097,7 +2137,7 @@ class QuestionWriter:
         final_hop: HopContext,
         final_hop_summary: dict[str, Any],
         raw_target_ask: dict[str, Any],
-    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    ) -> tuple[dict[str, Any], dict[str, Any] | None, dict[str, Any]]:
         image_content = final_hop.dst_content or {}
         image_label = self._compress_hop_prompt_label(image_content, fallback=final_hop.dst_node_id)
         model_client = self.image_target_ask_model_client or self.image_bridge_model_client or self.model_client
@@ -2116,25 +2156,7 @@ class QuestionWriter:
             "raw_answer": target_value,
         }
         if model_client is None or not model:
-            rewritten_statement, rewritten_relation, rewritten_ask_target = self._fallback_merge_image_target_terminal(
-                final_hop_summary=final_hop_summary,
-                raw_target_ask=raw_target_ask,
-                hide_image=False,
-            )
-            terminal_summary = self._build_final_image_target_terminal_summary(
-                final_hop=final_hop,
-                final_hop_summary=final_hop_summary,
-                target_value=target_value,
-                rewritten_statement=rewritten_statement,
-                rewritten_relation=rewritten_relation,
-                decision="keep_image",
-            )
-            question_target_ask["ask_target"] = rewritten_ask_target
-            diagnostic["applied"] = True
-            diagnostic["fallback_used"] = True
-            diagnostic["rewritten_statement"] = rewritten_statement
-            diagnostic["rewritten_ask_target"] = rewritten_ask_target
-            return terminal_summary, question_target_ask, diagnostic
+            return question_target_ask, None, diagnostic
 
         image_url = self._target_image_url(image_content)
         trace_label = f"normalize_image_target_terminal_{final_hop.hop_index}"
@@ -2154,32 +2176,10 @@ class QuestionWriter:
         except Exception as exc:
             diagnostic["reason"] = "image_target_terminal_model_error"
             diagnostic["writer_warning"] = self._writer_warning_entry(stage=trace_label, error=exc)
-            rewritten_statement, rewritten_relation, rewritten_ask_target = self._fallback_merge_image_target_terminal(
-                final_hop_summary=final_hop_summary,
-                raw_target_ask=raw_target_ask,
-                hide_image=False,
-            )
-            terminal_summary = self._build_final_image_target_terminal_summary(
-                final_hop=final_hop,
-                final_hop_summary=final_hop_summary,
-                target_value=target_value,
-                rewritten_statement=rewritten_statement,
-                rewritten_relation=rewritten_relation,
-                decision="keep_image",
-            )
-            question_target_ask["ask_target"] = rewritten_ask_target
-            diagnostic["applied"] = True
-            diagnostic["fallback_used"] = True
-            diagnostic["rewritten_statement"] = rewritten_statement
-            diagnostic["rewritten_ask_target"] = rewritten_ask_target
-            return terminal_summary, question_target_ask, diagnostic
+            return question_target_ask, None, diagnostic
 
         decision = str(parsed.get("decision") or "").strip().lower()
         reason = str(parsed.get("reason") or "").strip()
-        rewritten_statement = self._ensure_declarative_statement(
-            str(parsed.get("rewritten_statement") or "").strip()
-        )
-        rewritten_relation = str(parsed.get("rewritten_relation") or "").strip()
         rewritten_ask_target = self._ensure_question(str(parsed.get("rewritten_ask_target") or "").strip())
         if decision not in {"hide_image", "keep_image"}:
             decision = "keep_image"
@@ -2188,83 +2188,63 @@ class QuestionWriter:
 
         diagnostic["decision"] = decision
         diagnostic["reason"] = reason or ("hide_image" if decision == "hide_image" else "keep_image")
-        if not rewritten_statement or not rewritten_ask_target:
-            fallback_statement, fallback_relation, fallback_ask_target = self._fallback_merge_image_target_terminal(
-                final_hop_summary=final_hop_summary,
-                raw_target_ask=raw_target_ask,
-                hide_image=(decision == "hide_image"),
-            )
-            rewritten_statement = rewritten_statement or fallback_statement
-            rewritten_relation = rewritten_relation or fallback_relation
-            rewritten_ask_target = rewritten_ask_target or fallback_ask_target
-            diagnostic["fallback_used"] = True
+        if not rewritten_ask_target:
+            if not reason:
+                diagnostic["reason"] = "empty_rewritten_ask_target"
+            return question_target_ask, None, diagnostic
 
-        terminal_summary = self._build_final_image_target_terminal_summary(
+        question_target_ask["ask_target"] = rewritten_ask_target
+        question_terminal_bridge = self._build_final_image_target_terminal_bridge(
             final_hop=final_hop,
             final_hop_summary=final_hop_summary,
+            raw_target_ask=raw_target_ask,
             target_value=target_value,
-            rewritten_statement=rewritten_statement,
-            rewritten_relation=rewritten_relation,
+            rewritten_ask_target=rewritten_ask_target,
             decision=decision,
         )
-        question_target_ask["ask_target"] = rewritten_ask_target
         diagnostic["applied"] = True
-        diagnostic["rewritten_statement"] = rewritten_statement
         diagnostic["rewritten_ask_target"] = rewritten_ask_target
-        return terminal_summary, question_target_ask, diagnostic
+        diagnostic["question_terminal_bridge"] = dict(question_terminal_bridge)
+        return question_target_ask, question_terminal_bridge, diagnostic
 
-    def _build_final_image_target_terminal_summary(
-        self,
+    @staticmethod
+    def _build_final_image_target_terminal_bridge(
         *,
         final_hop: HopContext,
         final_hop_summary: dict[str, Any],
+        raw_target_ask: dict[str, Any],
         target_value: str,
-        rewritten_statement: str,
-        rewritten_relation: str,
+        rewritten_ask_target: str,
         decision: str,
     ) -> dict[str, Any]:
-        summary = {
-            "hop_index": final_hop_summary.get("hop_index"),
-            "statement": self._ensure_declarative_statement(rewritten_statement),
-            "source": final_hop_summary.get("source"),
-            "target": target_value or final_hop_summary.get("target"),
-            "relation": rewritten_relation or "the final queried target is",
-            "retrieval_query": "",
-            "edge_id": final_hop_summary.get("edge_id"),
-            "src_node_id": final_hop_summary.get("src_node_id"),
-            "dst_node_id": None,
+        bridge = {
             "terminal_question_bridge": True,
             "terminal_bridge_decision": decision,
             "terminal_image_node_id": final_hop.dst_node_id,
+            "replaces_terminal_text_to_image_hop": True,
+            "source": final_hop_summary.get("source"),
+            "target_image": final_hop_summary.get("target"),
+            "answer": target_value or str(raw_target_ask.get("answer") or "").strip(),
+            "raw_ask_target": str(raw_target_ask.get("ask_target") or "").strip(),
+            "rewritten_ask_target": rewritten_ask_target,
+            "removed_question_hop": {
+                key: final_hop_summary.get(key)
+                for key in (
+                    "hop_index",
+                    "source",
+                    "target",
+                    "statement",
+                    "relation",
+                    "retrieval_query",
+                    "edge_id",
+                    "src_node_id",
+                    "dst_node_id",
+                )
+            },
         }
         if decision == "hide_image":
-            summary["hidden_image_node_id"] = final_hop.dst_node_id
-        return summary
-
-    @staticmethod
-    def _fallback_merge_image_target_terminal(
-        *,
-        final_hop_summary: dict[str, Any],
-        raw_target_ask: dict[str, Any],
-        hide_image: bool,
-    ) -> tuple[str, str, str]:
-        answer = str(raw_target_ask.get("answer") or "").strip() or "unknown"
-        ask_target = QuestionWriter._ensure_question(str(raw_target_ask.get("ask_target") or "").strip())
-        source = str(final_hop_summary.get("source") or "the source").strip() or "the source"
-        final_statement = QuestionWriter._ensure_declarative_statement(
-            str(final_hop_summary.get("statement") or "").strip()
-        )
-        if hide_image:
-            ask_target = QuestionWriter._fallback_hide_image_terminal_ask(ask_target)
-            statement = f"The final queried detail connected to {source} is {answer}."
-            relation = "the final queried detail is"
-        else:
-            if final_statement:
-                statement = f"{final_statement.rstrip('.')} The answer to the final question about that image is {answer}."
-            else:
-                statement = f"The answer to the final question about the image connected to {source} is {answer}."
-            relation = "the answer to the final question about that image is"
-        return QuestionWriter._ensure_declarative_statement(statement), relation, ask_target
+            bridge["hidden_image_node_id"] = final_hop.dst_node_id
+        return bridge
 
     @classmethod
     def _image_target_terminal_prompt_text(
@@ -3005,7 +2985,11 @@ class QuestionWriter:
             answer=answer,
             answer_type=answer_type,
             reasoning_steps=hop_summaries,
-            used_evidence_ids=[item.get("edge_id", "") for item in hop_summaries if item.get("edge_id")],
+            used_evidence_ids=[
+                item.get("edge_id", "")
+                for item in (raw_hop_summaries or hop_summaries)
+                if item.get("edge_id")
+            ],
             metadata=metadata,
         )
 
