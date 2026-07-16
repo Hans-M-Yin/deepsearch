@@ -48,7 +48,7 @@ The image must be the only image that truly satisfies the passage. In simple ter
 For passages that do not naturally correspond to a unique image, you may rewrite or refine the passage so that it points to only one unique image target.
 
 Some categories of images are considered inherently unique.
-Examples include paintings, buildings, album covers, or specific moments from historical events. Even if different photographers captured different photos, the underlying visual content is effectively the same, so this still satisfies uniqueness.
+Examples include paintings, album covers, or specific moments from historical events. Even if different photographers captured different photos, the underlying visual content is effectively the same, so this still satisfies uniqueness.
 
 However, the event itself must be **specific and unambiguous**.
 
@@ -86,7 +86,7 @@ The query must not contain any explicit URL, domain name, filename, image identi
 
 5. We will directly use your rewritten text for image search. Please strictly follow the format below:
 
-You can validate your query as follows: for photographs of a specific event, check whether the event's date or time is included, whether the main people or subject are identified, and whether one particular event scene, action, or moment is identified; for photographs of a specific object or entity, check whether the object or entity is unique in the world.
+You can validate your query as follows: for photographs of a specific event, check whether the event's *date or time* is included, whether the main people or subject are identified, and whether one particular event scene, action, or moment is identified; for photographs of a specific object or entity, check whether the object or entity is unique in the world.
 
 ```text
 <query>Your rewritten text</query>
@@ -147,11 +147,6 @@ Query: An illuminated page from a 15th-century Gutenberg Bible, showing the deco
 Answer: FALSE
 Reason: The provided query does not specify which exact page it refers to, so any illuminated page from the Gutenberg Bible could match this query, resulting in inconsistent content.
 
-
-Query: Aerial view of the Martin Marietta Beckmann Quarry near San Antonio, Texas
-Answer: FALSE
-Reason: Although Martin Marietta Beckmann Quarry is a specific building, different shooting angles and heights can result in completely different image content.
-
 Query: healthcare workers in protective clothing during the 2003 Hong Kong SARS outbreak
 Answer: FALSE
 Reason: The year and outbreak are specific, but many hospitals, workers, dates, and scenes satisfy the query. Search results need not show the same main visual content.
@@ -167,6 +162,11 @@ Reason: It identifies one parade year but not one sub-scene. Many different mome
 Query: cover of Justin Bieber's album Changes
 Answer: TRUE
 Reason: It identifies one canonical album artwork. Different copies preserve the same main visual content.
+
+Query: Queen Elizabeth II presented the Venus Rosewater Dish to Virginia Wade after the 1977 Wimbledon women’s singles final.
+Answer: TRUE
+Reason: Although the time is not specified down to the exact date, the year, the specific occasion, and the captured action are enough to narrow the photo down to the moment when the Queen presented the award to Virginia Wade, so this query describes a specific event moment.
+
 
 Output exactly:
 <thinking>Your reasoning process</thinking>
