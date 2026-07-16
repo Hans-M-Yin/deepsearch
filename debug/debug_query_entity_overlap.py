@@ -190,10 +190,15 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
         )
         llm_blocked = set(llm_debug["blocked_labels"])
 
-    # This is the production selection rule: use the LLM set only if it blocks
-    # at least one candidate; otherwise use the lexical fallback set.
-    final_blocked = llm_blocked if llm_blocked else fallback_blocked
-    decision_source = "llm" if llm_blocked else "lexical_fallback"
+    # This mirrors production: lexical matches are hard filters, while the LLM
+    # contributes extra semantic matches such as aliases.
+    final_blocked = llm_blocked | fallback_blocked
+    if llm_blocked and fallback_blocked:
+        decision_source = "llm_and_lexical_fallback"
+    elif llm_blocked:
+        decision_source = "llm"
+    else:
+        decision_source = "lexical_fallback"
     results = []
     for name in entity_names:
         normalized = builder._normalize_entity_label(name)

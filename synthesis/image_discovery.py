@@ -273,6 +273,9 @@ Decide for each candidate whether it should be blocked because it is already men
 
 Block an entity if:
 - it is the same entity as one already mentioned in the query
+- any form of its name is explicitly present in the query, even when it appears
+  inside a larger phrase; do not keep it merely because it is still a distinct
+  geographic, organizational, or other real-world entity
 
 Keep an entity if:
 - it is a new entity not already present in the query
@@ -4161,10 +4164,8 @@ class ImageDiscoveryBuilder:
             source_node_title=source_node_title,
             grounded_entities=grounded_entities or [],
         )
-        if blocked_from_llm:
-            return blocked_from_llm
         if self.store is None:
-            return set()
+            return blocked_from_llm
         normalized_query = self._normalize_entity_label(query_text)
         if not normalized_query:
             return set()
@@ -4196,7 +4197,10 @@ class ImageDiscoveryBuilder:
                     or (len(label_tokens) == 1 and next(iter(label_tokens)) in query_tokens)
                 ):
                     blocked.add(normalized_label)
-        return blocked
+        # Explicit lexical matches are hard filters: an LLM "keep" must not
+        # re-enable an entity that the search query already names. The LLM can
+        # still add semantic matches such as aliases and alternate names.
+        return blocked | blocked_from_llm
 
     def _query_implied_entity_labels_with_llm(
         self,
