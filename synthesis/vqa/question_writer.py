@@ -954,15 +954,16 @@ Strict requirements:
 1. Do not change the core question or the final answer.
 2. Do not merely perform synonym substitution; you must genuinely reduce the salience of intermediate entities.
 3. A replacement expression must satisfy this condition: by itself it should not directly identify the target entity, but within the full question context it should still help uniquely constrain the correct path.
-4. While reducing salience, you must preserve or introduce enough non-shortcut constraints to keep the question uniquely solvable. For example, you may retain the name of one or two objects mentioned at the beginning of the original question to provide an entry point for identification and reasoning.
+4. While reducing salience, you must preserve or introduce enough non-shortcut constraints to keep the question uniquely solvable. Recommendation: retain the name of one or two objects mentioned at the beginning of the original question to provide an entry point for identification and reasoning if there's no images attached to the questions.
 5. If the original question is artificially tied to a specific source framing (“according to profile X,” “in source Y’s description,” etc.) but the answer is really a real-world fact rather than a document-specific wording question, remove or naturalize that framing instead of keeping it mechanically.
-6. If there is an image attached to the question, keep the connection between the question and the image content. Note that the original question may contain a cue sentence like "In the provided image." In the final version of the question, however, the user will only be given the image if it appears at the beginning. So if such a cue does not appear at the beginning, or if the image has not been provided to you, that means the user would need to search for the image online themselves. In that case, to increase the difficulty of the question, you should hide obvious image-related cues. The goal is to avoid signaling in the question that an image search is needed, while still making the rewritten question depend on a particular image in order to be solved. See the examples below.
+6. Note that there might be an image attached to the question, keep the connection between the question and the image content
+7. Do not fabricate any information, and do not make any changes unless you are explicitly certain about them.
 
 Preferred rewriting strategies:
 1. Use relational, structural, or contextual constraints instead of highly distinctive signals including famous titles, people names, signature works, unique achievements, strong year markers, or iconic paper titles.
 2. Remove features that directly expose intermediate entities, but replace them with weaker contextual descriptions rather than simply deleting them.
 3. If obfuscation introduces ambiguity, add non-shortcut constraints to eliminate wrong candidates.
-4. Avoid an overly explicit hop-by-hop reasoning structure; the order of clues should not mechanically mirror the order of inference steps.
+4. Avoid an overly explicit hop-by-hop reasoning structure; The order of the clues may be adjusted appropriately according to semantics and logic.
 5. Keep the question natural, concise, and benchmark-like rather than turning it into a pile of hints.
 
 Below are examples. Learn the rewriting style from them.
