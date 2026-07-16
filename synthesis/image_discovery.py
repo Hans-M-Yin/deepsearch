@@ -238,6 +238,7 @@ Output guidance:
 10. `evidence` should be one short sentence explaining the visible cue that supports the grounding.
 11. If two surface forms refer to the same entity, output only the canonical one and mention the alias/handle inside `evidence`.
 12. Do not ground watermarks, publisher logos, channel bugs, UI overlays, copyright marks...
+13. Avoid grounding entities that do not actually require the image and could be identified through text-only search alone—for example, grounding the director from a movie poster when the director’s name can be found directly by searching the film title in text. You should focus on the visual relationships between entities rather than knowledge-based inference jumps.
 NOTICE:If there are more than 5 entities, keep only the 5 clearest, most salient, and most certain entities, and ignore the rest.
 
 Examples:
