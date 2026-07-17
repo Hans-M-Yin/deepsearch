@@ -120,33 +120,13 @@ You will receive:
 Rules:
 - Use only the provided repository materials. Do not use outside knowledge.
 - Treat document labels like [DOC 1] and image labels like [IMG 2] as the citation handles.
-- When you cite evidence, output the normalized labels without brackets, for example: \"DOC 1\" or \"IMG 2\".
-- If the repository does not contain enough evidence to finish the reasoning chain, return \"insufficient_evidence\".
-- If you solve it, provide a concise but complete reasoning chain. Every reasoning step must cite at least one repository item.
-
-Return JSON in exactly this format:
-{
-  "status": "solved",
-  "answer": "",
-  "reasoning_steps": [
-    {
-      "step": 1,
-      "claim": "",
-      "citations": ["DOC 1", "IMG 1"]
-    }
-  ],
-  "used_evidence": ["DOC 1", "IMG 1"],
-  "insufficient_reason": ""
-}
-
-If evidence is insufficient, return:
-{
-  "status": "insufficient_evidence",
-  "answer": "",
-  "reasoning_steps": [],
-  "used_evidence": [],
-  "insufficient_reason": ""
-}
+- When you make a factual claim based on a repository item, cite it inline using labels like [DOC 1] or [IMG 2].
+- Every major reasoning step must include at least one inline citation.
+- If the repository does not contain enough evidence to finish the reasoning chain, write exactly one line beginning with:
+  Insufficient evidence: <brief reason>
+- If you solve it, write a concise but complete natural-language reasoning chain.
+- End every solved response with exactly one final line:
+  Final answer: <answer>
 """
 
 
@@ -185,22 +165,10 @@ Requirements:
 - You do not have access to external documents, web search, or tools.
 - The question may be difficult, but there may also be shortcuts. Your only goal is to provide the correct answer, and you may avoid difficult intermediate reasoning if a shortcut is enough.
 - If you are confident, prefer step-by-step reasoning before answering.
-
-Return JSON in exactly this format:
-{
-  "status": "answered",
-  "answer": "",
-  "shortcut_basis": "",
-  "confidence": 0.0
-}
-
-If you think the question is ambiguous, or if it contains an obvious factual error, return:
-{
-  "status": "cannot_answer",
-  "answer": "the reason why you think the question cannot be answered.",
-  "shortcut_basis": "",
-  "confidence": 0.0
-}
+- If you answer, end with exactly one final line:
+  Final answer: <answer>
+- If you think the question is ambiguous, or if it contains an obvious factual error, write exactly one line beginning with:
+  Cannot answer: <brief reason>
 """
 
 
@@ -218,7 +186,6 @@ def build_repository_solver_request(
             ModelMessage(role="system", content=PROMPT_REPOSITORY_SOLVER),
             ModelMessage(role="user", content=user_content),
         ],
-        response_format={"type": "json_object"},
         max_tokens=answer_max_tokens,
         metadata={"trace_label": f"repository_solve:{question_id}"},
     )
@@ -266,7 +233,7 @@ def build_question_only_shortcut_request(
                     f"Question:\n{question}\n\n"
                     "The next image is the image attached to the question. "
                     "Use only the question text and this attached image.\n\n"
-                    "Return JSON only."
+                    "Answer naturally."
                 ),
             },
             {
@@ -275,14 +242,13 @@ def build_question_only_shortcut_request(
             },
         ]
     else:
-        user_content = f"Question:\n{question}\n\nReturn JSON only."
+        user_content = f"Question:\n{question}\n\nAnswer naturally."
     return ModelRequest(
         model=answer_model_alias,
         messages=[
             ModelMessage(role="system", content=PROMPT_QUESTION_ONLY_SHORTCUT_SOLVER),
             ModelMessage(role="user", content=user_content),
         ],
-        response_format={"type": "json_object"},
         max_tokens=answer_max_tokens,
         metadata={"trace_label": f"question_only_shortcut:{question_id}"},
     )
@@ -432,6 +398,102 @@ def _normalize_citation_label(label: Any) -> str:
     return f"{prefix} {number}"
 
 
+def _extract_citation_labels(text: str) -> list[str]:
+    labels: list[str] = []
+    seen: set[str] = set()
+    for match in re.finditer(r"\[\s*(doc|img)\s*[-_ ]?(\d+)\s*\]", str(text or ""), flags=re.IGNORECASE):
+        label = f"{match.group(1).upper()} {int(match.group(2))}"
+        if label not in seen:
+            seen.add(label)
+            labels.append(label)
+    return labels
+
+
+def _strip_citation_labels(text: str) -> str:
+    return re.sub(r"\s*\[\s*(?:doc|img)\s*[-_ ]?\d+\s*\]", "", str(text or ""), flags=re.IGNORECASE).strip()
+
+
+def _split_reasoning_paragraphs(text: str) -> list[str]:
+    body = str(text or "").strip()
+    body = re.sub(r"(?im)^\s*final\s+answer\s*:\s*.*$", "", body).strip()
+    body = re.sub(r"(?im)^\s*insufficient\s+evidence\s*:\s*.*$", "", body).strip()
+    body = re.sub(r"(?im)^\s*cannot\s+answer\s*:\s*.*$", "", body).strip()
+    paragraphs = [part.strip() for part in re.split(r"\n\s*\n", body) if part.strip()]
+    if len(paragraphs) <= 1:
+        lines = [line.strip() for line in body.splitlines() if line.strip()]
+        if len(lines) > 1:
+            paragraphs = lines
+    return paragraphs
+
+
+def _parse_final_answer(text: str) -> str:
+    matches = list(re.finditer(r"(?im)^\s*final\s+answer\s*:\s*(.+?)\s*$", str(text or "")))
+    if not matches:
+        return ""
+    return _strip_citation_labels(matches[-1].group(1).strip())
+
+
+def _parse_prefixed_reason(text: str, *, prefix: str) -> str:
+    pattern = rf"(?im)^\s*{re.escape(prefix)}\s*:\s*(.+?)\s*$"
+    match = re.search(pattern, str(text or ""))
+    return match.group(1).strip() if match else ""
+
+
+def _parse_freeform_solver_response(text: str) -> dict[str, Any]:
+    raw_text = str(text or "").strip()
+    insufficient_reason = _parse_prefixed_reason(raw_text, prefix="Insufficient evidence")
+    if insufficient_reason:
+        return {
+            "status": "insufficient_evidence",
+            "answer": "",
+            "reasoning_steps": [],
+            "used_evidence": [],
+            "insufficient_reason": insufficient_reason,
+            "raw_text": raw_text,
+        }
+
+    reasoning_steps: list[dict[str, Any]] = []
+    for index, paragraph in enumerate(_split_reasoning_paragraphs(raw_text), start=1):
+        citations = _extract_citation_labels(paragraph)
+        claim = _strip_citation_labels(paragraph)
+        if claim or citations:
+            reasoning_steps.append({"step": index, "claim": claim, "citations": citations})
+    used_evidence = sorted({label for step in reasoning_steps for label in (step.get("citations") or [])})
+    answer = _parse_final_answer(raw_text)
+    return {
+        "status": "solved" if answer else "insufficient_evidence",
+        "answer": answer,
+        "reasoning_steps": reasoning_steps,
+        "used_evidence": used_evidence,
+        "insufficient_reason": "" if answer else "missing_final_answer",
+        "raw_text": raw_text,
+    }
+
+
+def _parse_freeform_question_only_response(text: str) -> dict[str, Any]:
+    raw_text = str(text or "").strip()
+    cannot_answer_reason = _parse_prefixed_reason(raw_text, prefix="Cannot answer")
+    if cannot_answer_reason:
+        return {
+            "status": "cannot_answer",
+            "answer": "",
+            "shortcut_basis": "",
+            "cannot_answer_reason": cannot_answer_reason,
+            "confidence": 0.0,
+            "raw_text": raw_text,
+        }
+    answer = _parse_final_answer(raw_text)
+    shortcut_basis = "\n\n".join(_split_reasoning_paragraphs(raw_text))
+    return {
+        "status": "answered" if answer else "cannot_answer",
+        "answer": answer,
+        "shortcut_basis": shortcut_basis,
+        "cannot_answer_reason": "" if answer else "missing_final_answer",
+        "confidence": 0.0,
+        "raw_text": raw_text,
+    }
+
+
 def _resolve_multimodal_image_url(image_url: str) -> str:
     normalized = str(image_url or "").strip()
     if not normalized:
@@ -453,6 +515,9 @@ def _resolve_multimodal_image_url(image_url: str) -> str:
 
 
 class JsonGeneratingModelClient(Protocol):
+    def generate(self, request: ModelRequest) -> Any:
+        """Run one request and return a model response."""
+
     def generate_json(self, request: ModelRequest) -> dict[str, Any]:
         """Run one request and return a JSON object."""
 
@@ -549,10 +614,11 @@ class RepositoryAssembler:
         path_node_id_set = set(path_node_ids)
 
         relevant_docs = self._collect_relevant_docs(relevant_edges)
+        writer_docs = self._collect_writer_stage_docs(sample_record)
         distractor_docs = self._collect_doc_distractors(
             relevant_edges=relevant_edges,
             excluded_edge_ids=path_edge_ids,
-            excluded_doc_keys={item["doc_key"] for item in relevant_docs},
+            excluded_doc_keys={item["doc_key"] for item in [*relevant_docs, *writer_docs]},
             rng=rng,
         )
         relevant_images = self._collect_relevant_images(path_node_ids)
@@ -564,6 +630,7 @@ class RepositoryAssembler:
 
         raw_items = [
             *relevant_docs,
+            *writer_docs,
             *relevant_images,
             *distractor_docs,
             *distractor_images,
@@ -617,6 +684,11 @@ class RepositoryAssembler:
                 "image_count": sum(1 for item in items if item.item_type == "image"),
                 "relevant_doc_count": sum(1 for item in items if item.item_type == "doc" and item.is_relevant),
                 "relevant_image_count": sum(1 for item in items if item.item_type == "image" and item.is_relevant),
+                "writer_stage_doc_count": sum(
+                    1
+                    for item in items
+                    if item.item_type == "doc" and str(item.selection_reason or "").startswith("writer_")
+                ),
             },
         )
 
@@ -645,10 +717,22 @@ class RepositoryAssembler:
                     }
                 )
                 continue
+            caption = str((item.metadata or {}).get("caption") or "").strip()
+            if caption:
+                image_intro = (
+                    f"[{item.label}]\n"
+                    f"Caption: {caption}\n"
+                    f"The next image is repository item {item.label}. Cite it as {item.label} if you use it."
+                )
+            else:
+                image_intro = (
+                    f"[{item.label}]\n"
+                    f"The next image is repository item {item.label}. Cite it as {item.label} if you use it."
+                )
             blocks.append(
                 {
                     "type": "text",
-                    "text": f"[{item.label}]\nThe next image is repository item {item.label}. Cite it as {item.label} if you use it.",
+                    "text": image_intro,
                 }
             )
             blocks.append(
@@ -661,8 +745,9 @@ class RepositoryAssembler:
             {
                 "type": "text",
                 "text": (
-                    "Return JSON only. If you solve the question, cite the repository labels you used. "
-                    "If evidence is insufficient, return status=insufficient_evidence."
+                    "Answer naturally with inline citations such as [DOC 1] or [IMG 2]. "
+                    "If evidence is insufficient, start one line with 'Insufficient evidence:'. "
+                    "If you solve it, end with one line 'Final answer: <answer>'."
                 ),
             }
         )
@@ -779,6 +864,104 @@ class RepositoryAssembler:
                 break
         return results
 
+    def _collect_writer_stage_docs(self, sample_record: dict[str, Any]) -> list[dict[str, Any]]:
+        results: list[dict[str, Any]] = []
+        seen_doc_keys: set[str] = set()
+
+        def add_doc(*, text: Any, selection_reason: str, metadata: dict[str, Any]) -> None:
+            normalized = str(text or "").strip()
+            if not normalized:
+                return
+            doc_key = _normalize_text_key(f"{selection_reason}\n{normalized}")
+            if not doc_key or doc_key in seen_doc_keys:
+                return
+            seen_doc_keys.add(doc_key)
+            results.append(
+                {
+                    "item_type": "doc",
+                    "text": normalized,
+                    "doc_key": doc_key,
+                    "is_relevant": True,
+                    "selection_reason": selection_reason,
+                    "source_edge_id": None,
+                    "source_node_id": None,
+                    "evidence_id": None,
+                    "metadata": metadata,
+                }
+            )
+
+        opening_package = sample_record.get("opening_package") or {}
+        if isinstance(opening_package, dict):
+            for fact in self._string_list(opening_package.get("source_supporting_facts")):
+                add_doc(
+                    text=fact,
+                    selection_reason="writer_opening_source_supporting_fact",
+                    metadata={
+                        "writer_stage": "opening_package",
+                        "source_clue": opening_package.get("source_clue"),
+                        "packaged_first_hop": opening_package.get("packaged_first_hop"),
+                    },
+                )
+            for field_name, reason in (
+                ("packaged_first_hop", "writer_opening_packaged_first_hop"),
+                ("why_relevant", "writer_opening_why_relevant"),
+                ("first_hop_support", "writer_opening_first_hop_support"),
+            ):
+                add_doc(
+                    text=opening_package.get(field_name),
+                    selection_reason=reason,
+                    metadata={
+                        "writer_stage": "opening_package",
+                        "source_clue": opening_package.get("source_clue"),
+                    },
+                )
+
+        for stage_name in ("question_target_ask", "target_ask"):
+            target_ask = sample_record.get(stage_name) or {}
+            if not isinstance(target_ask, dict):
+                continue
+            for fact in self._string_list(target_ask.get("supporting_facts")):
+                add_doc(
+                    text=fact,
+                    selection_reason=f"writer_{stage_name}_supporting_fact",
+                    metadata={
+                        "writer_stage": stage_name,
+                        "ask_target": target_ask.get("ask_target"),
+                        "answer": target_ask.get("answer"),
+                    },
+                )
+            for field_name, reason_suffix in (
+                ("reasoning", "reasoning"),
+                ("support", "support"),
+            ):
+                add_doc(
+                    text=target_ask.get(field_name),
+                    selection_reason=f"writer_{stage_name}_{reason_suffix}",
+                    metadata={
+                        "writer_stage": stage_name,
+                        "ask_target": target_ask.get("ask_target"),
+                        "answer": target_ask.get("answer"),
+                    },
+                )
+
+        question_terminal_bridge = sample_record.get("question_terminal_bridge") or {}
+        if isinstance(question_terminal_bridge, dict):
+            for field_name, reason in (
+                ("raw_ask_target", "writer_question_terminal_raw_ask_target"),
+                ("rewritten_ask_target", "writer_question_terminal_rewritten_ask_target"),
+                ("target_image", "writer_question_terminal_target_image"),
+            ):
+                add_doc(
+                    text=question_terminal_bridge.get(field_name),
+                    selection_reason=reason,
+                    metadata={
+                        "writer_stage": "question_terminal_bridge",
+                        "answer": question_terminal_bridge.get("answer"),
+                    },
+                )
+
+        return results
+
     def _collect_relevant_images(self, path_node_ids: list[str]) -> list[dict[str, Any]]:
         results: list[dict[str, Any]] = []
         seen_node_ids: set[str] = set()
@@ -802,6 +985,7 @@ class RepositoryAssembler:
                     "source_node_id": node_id,
                     "metadata": {
                         "title": node.get("title"),
+                        "caption": self._image_caption(node),
                         "source_text_node_id": metadata.get("source_text_node_id"),
                         "image_origin": metadata.get("image_origin"),
                     },
@@ -854,6 +1038,7 @@ class RepositoryAssembler:
                         "source_node_id": candidate_node_id,
                         "metadata": {
                             "title": candidate.get("title"),
+                            "caption": self._image_caption(candidate),
                             "source_text_node_id": candidate_metadata.get("source_text_node_id"),
                         },
                     }
@@ -878,10 +1063,39 @@ class RepositoryAssembler:
                     "is_relevant": False,
                     "selection_reason": "random_image_distractor",
                     "source_node_id": candidate_node_id,
-                    "metadata": {"title": candidate.get("title")},
+                    "metadata": {"title": candidate.get("title"), "caption": self._image_caption(candidate)},
                 }
             )
         return results
+
+    @staticmethod
+    def _string_list(value: Any) -> list[str]:
+        if isinstance(value, list):
+            return [str(item).strip() for item in value if str(item or "").strip()]
+        text = str(value or "").strip()
+        return [text] if text else []
+
+    @staticmethod
+    def _image_caption(node: dict[str, Any]) -> str:
+        candidates: list[Any] = [
+            node.get("caption"),
+            node.get("summary"),
+        ]
+        metadata = node.get("metadata") or {}
+        if isinstance(metadata, dict):
+            candidates.extend(
+                [
+                    metadata.get("caption"),
+                    metadata.get("search_caption"),
+                    metadata.get("image_caption"),
+                    metadata.get("visual_target"),
+                ]
+            )
+        for candidate in candidates:
+            text = str(candidate or "").strip()
+            if text:
+                return text
+        return ""
 
     def _doc_candidates_from_edge(
         self,
@@ -1208,7 +1422,7 @@ class OfflineGraphRepositoryVerifier:
             user_content=self.assembler.build_solver_user_content(bundle=bundle),
         )
         try:
-            parsed = self.model_client.generate_json(request)
+            response = self.model_client.generate(request)
         except Exception as exc:
             return {
                 "status": "error",
@@ -1218,6 +1432,8 @@ class OfflineGraphRepositoryVerifier:
                 "insufficient_reason": "",
                 "error": f"{exc.__class__.__name__}: {exc}",
             }
+
+        parsed = _parse_freeform_solver_response(str(getattr(response, "content", response) or ""))
 
         raw_status = str(parsed.get("status") or parsed.get("final_status") or "").strip().lower()
         status = raw_status if raw_status in {"solved", "insufficient_evidence"} else ("solved" if parsed.get("answer") else "insufficient_evidence")
@@ -1265,6 +1481,7 @@ class OfflineGraphRepositoryVerifier:
             "reasoning_steps": reasoning_steps,
             "used_evidence": normalized_used,
             "insufficient_reason": str(parsed.get("insufficient_reason") or "").strip(),
+            "raw_text": str(parsed.get("raw_text") or ""),
             "raw": parsed,
         }
 
@@ -1283,7 +1500,7 @@ class OfflineGraphRepositoryVerifier:
             image_url=image_url,
         )
         try:
-            parsed = self.model_client.generate_json(request)
+            response = self.model_client.generate(request)
         except Exception as exc:
             return {
                 "status": "error",
@@ -1292,6 +1509,7 @@ class OfflineGraphRepositoryVerifier:
                 "confidence": 0.0,
                 "error": f"{exc.__class__.__name__}: {exc}",
             }
+        parsed = _parse_freeform_question_only_response(str(getattr(response, "content", response) or ""))
         raw_status = str(parsed.get("status") or "").strip().lower()
         raw_answer = str(parsed.get("answer") or parsed.get("final_answer") or "").strip()
         raw_shortcut_basis = str(parsed.get("shortcut_basis") or parsed.get("reason") or parsed.get("analysis") or "").strip()
@@ -1300,7 +1518,7 @@ class OfflineGraphRepositoryVerifier:
         answer = raw_answer
         shortcut_basis = raw_shortcut_basis
         if status == "cannot_answer":
-            cannot_answer_reason = raw_answer or raw_shortcut_basis
+            cannot_answer_reason = str(parsed.get("cannot_answer_reason") or "").strip() or raw_answer or raw_shortcut_basis
             answer = ""
         return {
             "status": status,
@@ -1308,6 +1526,7 @@ class OfflineGraphRepositoryVerifier:
             "shortcut_basis": shortcut_basis,
             "cannot_answer_reason": cannot_answer_reason,
             "confidence": _safe_float(parsed.get("confidence")),
+            "raw_text": str(parsed.get("raw_text") or ""),
             "raw": parsed,
         }
 

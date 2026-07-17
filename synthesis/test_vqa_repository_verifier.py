@@ -23,10 +23,32 @@ from synthesis.vqa.repository_verifier import (
 )
 
 
+class FakeTextResponse:
+    def __init__(self, content: str):
+        self.content = content
+
+
 class FakeJsonClient:
     def __init__(self, responses: list[dict]):
         self._responses = list(responses)
         self.requests = []
+
+    def generate(self, request):
+        self.requests.append(request)
+        if not self._responses:
+            raise AssertionError("No fake response queued for generate")
+        response = self._responses.pop(0)
+        if isinstance(response, str):
+            if response.lstrip().startswith("{"):
+                try:
+                    parsed = json.loads(response)
+                except json.JSONDecodeError:
+                    return FakeTextResponse(response)
+                self._responses.insert(0, parsed)
+                self.requests.pop()
+                return self.generate_json(request)
+            return FakeTextResponse(response)
+        return FakeTextResponse(json.dumps(response, ensure_ascii=False))
 
     def generate_json(self, request):
         self.requests.append(request)
@@ -68,16 +90,19 @@ def _build_fixture(tmp_path: Path) -> FixtureData:
     relevant_image = ImageNode.from_url(
         "https://images.example.org/relevant.jpg",
         title="Relevant poster",
+        caption="A commemorative poster with the distinctive emblem of Target Entity.",
         metadata={"source_text_node_id": mid_node.node_id, "image_origin": "visual_plan"},
     )
     sibling_image = ImageNode.from_url(
         "https://images.example.org/sibling.jpg",
         title="Sibling poster",
+        caption="A sibling poster for an unrelated topic.",
         metadata={"source_text_node_id": mid_node.node_id, "image_origin": "visual_plan"},
     )
     random_image = ImageNode.from_url(
         "https://images.example.org/random.jpg",
         title="Random object",
+        caption="A random object that is unrelated to the target entity.",
         metadata={"source_text_node_id": extra_source.node_id, "image_origin": "visual_plan"},
     )
 
@@ -210,6 +235,21 @@ def _build_fixture(tmp_path: Path) -> FixtureData:
             {"hop_index": 1, "edge_id": edge_mid_image.edge_id, "src_node_id": mid_node.node_id, "dst_node_id": relevant_image.node_id},
             {"hop_index": 2, "edge_id": edge_image_target.edge_id, "src_node_id": relevant_image.node_id, "dst_node_id": target_node.node_id},
         ],
+        "opening_package": {
+            "source_clue": "the source page clue",
+            "source_supporting_facts": ["Opening clue fact from the source page."],
+            "packaged_first_hop": "The source page clue points to Mid Topic.",
+            "first_hop_support": "The opening clue remains searchable.",
+            "why_relevant": "The opening clue identifies the source without naming it.",
+            "forbidden_labels": ["Source Page"],
+        },
+        "target_ask": {
+            "ask_target": "Which entity is identified by the emblem?",
+            "answer": "Target Entity",
+            "supporting_facts": ["The emblem identifies Target Entity."],
+            "reasoning": "The emblem uniquely maps to Target Entity.",
+            "support": "The target answer is evidence-supported.",
+        },
     }
     question_record = {
         "question_id": "q_000001",
@@ -261,10 +301,16 @@ class RepositoryVerifierTests(unittest.TestCase):
         self.assertTrue(any((not item.is_relevant) and item.item_type == "image" for item in bundle.items))
         self.assertTrue(any(item.selection_reason == "sibling_image_distractor" for item in bundle.items if not item.is_relevant))
         self.assertTrue(any(item.selection_reason == "sibling_distractor_edge_quote" for item in bundle.items if not item.is_relevant and item.item_type == "doc"))
+        self.assertTrue(any(item.selection_reason == "writer_opening_source_supporting_fact" for item in bundle.items))
+        self.assertTrue(any(item.selection_reason == "writer_target_ask_supporting_fact" for item in bundle.items))
+        self.assertGreater(bundle.metadata.get("writer_stage_doc_count") or 0, 0)
 
         blocks = assembler.build_solver_user_content(bundle=bundle)
         self.assertTrue(any(block.get("type") == "image_url" for block in blocks))
         self.assertTrue(any("[DOC " in block.get("text", "") for block in blocks if block.get("type") == "text"))
+        self.assertTrue(any("Opening clue fact from the source page." in block.get("text", "") for block in blocks if block.get("type") == "text"))
+        self.assertTrue(any("The emblem identifies Target Entity." in block.get("text", "") for block in blocks if block.get("type") == "text"))
+        self.assertTrue(any("Caption: A commemorative poster with the distinctive emblem of Target Entity." in block.get("text", "") for block in blocks if block.get("type") == "text"))
 
     def test_solver_request_uses_multimodal_user_blocks(self):
         fixture = self._fixture()
@@ -283,7 +329,7 @@ class RepositoryVerifierTests(unittest.TestCase):
 
         payload = request.to_dict()
         self.assertEqual(payload["model"], "answer-model")
-        self.assertEqual(payload["response_format"], {"type": "json_object"})
+        self.assertIsNone(payload["response_format"])
         self.assertEqual(payload["max_tokens"], 321)
         self.assertEqual(payload["messages"][0]["role"], "system")
         self.assertIsInstance(payload["messages"][0]["content"], str)
@@ -291,6 +337,7 @@ class RepositoryVerifierTests(unittest.TestCase):
         self.assertIsInstance(payload["messages"][1]["content"], list)
         self.assertTrue(any(block.get("type") == "text" for block in payload["messages"][1]["content"]))
         self.assertTrue(any(block.get("type") == "image_url" for block in payload["messages"][1]["content"]))
+        self.assertIn("Final answer:", payload["messages"][0]["content"])
 
     def test_judge_request_uses_json_string_user_payload(self):
         request = build_repository_answer_judge_request(
@@ -324,7 +371,7 @@ class RepositoryVerifierTests(unittest.TestCase):
 
         payload = request.to_dict()
         self.assertEqual(payload["model"], "answer-model")
-        self.assertEqual(payload["response_format"], {"type": "json_object"})
+        self.assertIsNone(payload["response_format"])
         self.assertEqual(payload["max_tokens"], 77)
         self.assertEqual(payload["messages"][0]["role"], "system")
         self.assertEqual(payload["messages"][1]["role"], "user")
@@ -342,7 +389,7 @@ class RepositoryVerifierTests(unittest.TestCase):
 
         payload = request.to_dict()
         self.assertEqual(payload["model"], "answer-model")
-        self.assertEqual(payload["response_format"], {"type": "json_object"})
+        self.assertIsNone(payload["response_format"])
         self.assertEqual(payload["max_tokens"], 88)
         self.assertEqual(payload["messages"][1]["role"], "user")
         self.assertIsInstance(payload["messages"][1]["content"], list)
@@ -357,16 +404,11 @@ class RepositoryVerifierTests(unittest.TestCase):
 
         client = FakeJsonClient(
             [
-                {
-                    "status": "solved",
-                    "answer": "Target Entity",
-                    "reasoning_steps": [
-                        {"step": 1, "claim": "The source page points to the official codename.", "citations": [relevant_doc]},
-                        {"step": 2, "claim": "The poster image identifies the target entity.", "citations": [relevant_image]},
-                    ],
-                    "used_evidence": [relevant_doc, relevant_image],
-                    "insufficient_reason": "",
-                },
+                (
+                    f"The source page points to the official codename. [{relevant_doc}]\n\n"
+                    f"The poster image identifies the target entity. [{relevant_image}]\n\n"
+                    "Final answer: Target Entity"
+                ),
                 {
                     "correct": True,
                     "confidence": 0.95,
@@ -374,12 +416,7 @@ class RepositoryVerifierTests(unittest.TestCase):
                     "normalized_gold_answer": "Target Entity",
                     "normalized_predicted_answer": "Target Entity",
                 },
-                {
-                    "status": "cannot_answer",
-                    "answer": "No reliable shortcut in the wording.",
-                    "shortcut_basis": "",
-                    "confidence": 0.05,
-                },
+                "Cannot answer: No reliable shortcut in the wording.",
                 {
                     "correct": False,
                     "confidence": 0.99,
@@ -421,15 +458,7 @@ class RepositoryVerifierTests(unittest.TestCase):
 
         client = FakeJsonClient(
             [
-                {
-                    "status": "solved",
-                    "answer": "Target Entity",
-                    "reasoning_steps": [
-                        {"step": 1, "claim": "Use one true clue and one false clue.", "citations": [relevant_doc, distractor]},
-                    ],
-                    "used_evidence": [relevant_doc, distractor],
-                    "insufficient_reason": "",
-                },
+                f"Use one true clue and one false clue. [{relevant_doc}] [{distractor}]\n\nFinal answer: Target Entity",
                 {
                     "correct": True,
                     "confidence": 0.9,
@@ -437,12 +466,7 @@ class RepositoryVerifierTests(unittest.TestCase):
                     "normalized_gold_answer": "Target Entity",
                     "normalized_predicted_answer": "Target Entity",
                 },
-                {
-                    "status": "cannot_answer",
-                    "answer": "",
-                    "shortcut_basis": "No shortcut.",
-                    "confidence": 0.02,
-                },
+                "Cannot answer: No shortcut.",
                 {
                     "correct": False,
                     "confidence": 0.99,
@@ -478,16 +502,11 @@ class RepositoryVerifierTests(unittest.TestCase):
 
         client = FakeJsonClient(
             [
-                {
-                    "status": "solved",
-                    "answer": "Target Entity",
-                    "reasoning_steps": [
-                        {"step": 1, "claim": "The source page points to the official codename.", "citations": [relevant_doc]},
-                        {"step": 2, "claim": "The poster image identifies the target entity.", "citations": [relevant_image]},
-                    ],
-                    "used_evidence": [relevant_doc, relevant_image],
-                    "insufficient_reason": "",
-                },
+                (
+                    f"The source page points to the official codename. [{relevant_doc}]\n\n"
+                    f"The poster image identifies the target entity. [{relevant_image}]\n\n"
+                    "Final answer: Target Entity"
+                ),
                 {
                     "correct": True,
                     "confidence": 0.95,
@@ -495,12 +514,7 @@ class RepositoryVerifierTests(unittest.TestCase):
                     "normalized_gold_answer": "Target Entity",
                     "normalized_predicted_answer": "Target Entity",
                 },
-                {
-                    "status": "answered",
-                    "answer": "Target Entity",
-                    "shortcut_basis": "The wording points directly to the emblem and the target entity.",
-                    "confidence": 0.91,
-                },
+                "The wording points directly to the emblem and the target entity.\n\nFinal answer: Target Entity",
                 {
                     "correct": True,
                     "confidence": 0.94,
@@ -537,16 +551,11 @@ class RepositoryVerifierTests(unittest.TestCase):
 
         client = FakeJsonClient(
             [
-                {
-                    "status": "solved",
-                    "answer": "Target Entity",
-                    "reasoning_steps": [
-                        {"step": 1, "claim": "The source page gives the codename clue.", "citations": [relevant_doc]},
-                        {"step": 2, "claim": "The poster image resolves the entity.", "citations": [relevant_image]},
-                    ],
-                    "used_evidence": [relevant_doc, relevant_image],
-                    "insufficient_reason": "",
-                },
+                (
+                    f"The source page gives the codename clue. [{relevant_doc}]\n\n"
+                    f"The poster image resolves the entity. [{relevant_image}]\n\n"
+                    "Final answer: Target Entity"
+                ),
                 {
                     "correct": True,
                     "confidence": 0.98,
@@ -554,12 +563,7 @@ class RepositoryVerifierTests(unittest.TestCase):
                     "normalized_gold_answer": "Target Entity",
                     "normalized_predicted_answer": "Target Entity",
                 },
-                {
-                    "status": "cannot_answer",
-                    "answer": "",
-                    "shortcut_basis": "No shortcut.",
-                    "confidence": 0.03,
-                },
+                "Cannot answer: No shortcut.",
                 {
                     "correct": False,
                     "confidence": 0.99,
@@ -630,7 +634,7 @@ class RepositoryVerifierTests(unittest.TestCase):
         self.assertIn("Answer Model Request", result.stdout)
         self.assertIn("Question-Only Shortcut Request", result.stdout)
         self.assertIn('"messages": [', result.stdout)
-        self.assertIn('"response_format": {', result.stdout)
+        self.assertIn('"response_format": null', result.stdout)
 
     def test_debug_repository_verifier_redacts_inline_image_data_urls(self):
         from synthesis.vqa.debug.debug_repository_verifier import _dump_stdout_safe_json
