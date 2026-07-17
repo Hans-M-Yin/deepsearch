@@ -16,6 +16,7 @@ from synthesis.vqa.repository_verifier import (
     OfflineGraphRepositoryVerifier,
     RepositoryAssembler,
     RepositoryVerificationConfig,
+    build_question_only_shortcut_request,
     build_repository_answer_judge_request,
     build_repository_solver_request,
 )
@@ -312,6 +313,41 @@ class RepositoryVerifierTests(unittest.TestCase):
         self.assertEqual(judge_payload["gold_answer"], "Gold")
         self.assertEqual(judge_payload["predicted_answer"], "Pred")
 
+    def test_question_only_request_uses_plain_text_question(self):
+        request = build_question_only_shortcut_request(
+            question="Who is this?",
+            answer_model_alias="answer-model",
+            answer_max_tokens=77,
+            question_id="q_2",
+        )
+
+        payload = request.to_dict()
+        self.assertEqual(payload["model"], "answer-model")
+        self.assertEqual(payload["response_format"], {"type": "json_object"})
+        self.assertEqual(payload["max_tokens"], 77)
+        self.assertEqual(payload["messages"][0]["role"], "system")
+        self.assertEqual(payload["messages"][1]["role"], "user")
+        self.assertIsInstance(payload["messages"][1]["content"], str)
+        self.assertIn("Question:\nWho is this?", payload["messages"][1]["content"])
+
+    def test_question_only_request_includes_attached_image_when_provided(self):
+        request = build_question_only_shortcut_request(
+            question="What logo is shown in this image?",
+            answer_model_alias="answer-model",
+            answer_max_tokens=88,
+            question_id="q_3",
+            image_url="https://images.example.org/question.jpg",
+        )
+
+        payload = request.to_dict()
+        self.assertEqual(payload["model"], "answer-model")
+        self.assertEqual(payload["response_format"], {"type": "json_object"})
+        self.assertEqual(payload["max_tokens"], 88)
+        self.assertEqual(payload["messages"][1]["role"], "user")
+        self.assertIsInstance(payload["messages"][1]["content"], list)
+        self.assertTrue(any(block.get("type") == "text" for block in payload["messages"][1]["content"]))
+        self.assertTrue(any(block.get("type") == "image_url" for block in payload["messages"][1]["content"]))
+
     def test_repository_verifier_passes_when_answer_and_citations_are_correct(self):
         fixture = self._fixture()
         assembler = _build_assembler(fixture.graph_dir, random_seed=11)
@@ -337,6 +373,19 @@ class RepositoryVerifierTests(unittest.TestCase):
                     "normalized_gold_answer": "Target Entity",
                     "normalized_predicted_answer": "Target Entity",
                 },
+                {
+                    "status": "cannot_answer",
+                    "answer": "No reliable shortcut in the wording.",
+                    "shortcut_basis": "",
+                    "confidence": 0.05,
+                },
+                {
+                    "correct": False,
+                    "confidence": 0.99,
+                    "reason": "No predicted answer.",
+                    "normalized_gold_answer": "Target Entity",
+                    "normalized_predicted_answer": "",
+                },
             ]
         )
         verifier = OfflineGraphRepositoryVerifier(
@@ -357,7 +406,11 @@ class RepositoryVerifierTests(unittest.TestCase):
         self.assertTrue(record["checks"]["citations_exist"]["passed"])
         self.assertTrue(record["checks"]["citations_within_relevant_scope"]["passed"])
         self.assertTrue(record["checks"]["answer_judgment"]["correct"])
+        self.assertTrue(record["checks"]["question_only_shortcut"]["passed"])
+        self.assertEqual(record["question_only_solver_result"]["answer"], "")
+        self.assertEqual(record["question_only_solver_result"]["cannot_answer_reason"], "No reliable shortcut in the wording.")
         self.assertTrue(any(block.get("type") == "image_url" for block in client.requests[0].messages[1].content))
+        self.assertIsInstance(client.requests[2].messages[1].content, str)
 
     def test_repository_verifier_rejects_distractor_citation(self):
         fixture = self._fixture()
@@ -383,6 +436,19 @@ class RepositoryVerifierTests(unittest.TestCase):
                     "normalized_gold_answer": "Target Entity",
                     "normalized_predicted_answer": "Target Entity",
                 },
+                {
+                    "status": "cannot_answer",
+                    "answer": "",
+                    "shortcut_basis": "No shortcut.",
+                    "confidence": 0.02,
+                },
+                {
+                    "correct": False,
+                    "confidence": 0.99,
+                    "reason": "No predicted answer.",
+                    "normalized_gold_answer": "Target Entity",
+                    "normalized_predicted_answer": "",
+                },
             ]
         )
         verifier = OfflineGraphRepositoryVerifier(
@@ -402,6 +468,65 @@ class RepositoryVerifierTests(unittest.TestCase):
         self.assertFalse(record["final_keep"])
         self.assertFalse(record["checks"]["citations_within_relevant_scope"]["passed"])
         self.assertIn("used_distractor_or_out_of_scope_evidence", record["reject_reasons"])
+
+    def test_repository_verifier_rejects_question_only_shortcut(self):
+        fixture = self._fixture()
+        assembler = _build_assembler(fixture.graph_dir, random_seed=19)
+        bundle = assembler.build_bundle(question_record=fixture.question_record, sample_record=fixture.sample_record)
+        relevant_doc, relevant_image, _ = _pick_labels(bundle)
+
+        client = FakeJsonClient(
+            [
+                {
+                    "status": "solved",
+                    "answer": "Target Entity",
+                    "reasoning_steps": [
+                        {"step": 1, "claim": "The source page points to the official codename.", "citations": [relevant_doc]},
+                        {"step": 2, "claim": "The poster image identifies the target entity.", "citations": [relevant_image]},
+                    ],
+                    "used_evidence": [relevant_doc, relevant_image],
+                    "insufficient_reason": "",
+                },
+                {
+                    "correct": True,
+                    "confidence": 0.95,
+                    "reason": "Semantic match.",
+                    "normalized_gold_answer": "Target Entity",
+                    "normalized_predicted_answer": "Target Entity",
+                },
+                {
+                    "status": "answered",
+                    "answer": "Target Entity",
+                    "shortcut_basis": "The wording points directly to the emblem and the target entity.",
+                    "confidence": 0.91,
+                },
+                {
+                    "correct": True,
+                    "confidence": 0.94,
+                    "reason": "The shortcut answer is still correct.",
+                    "normalized_gold_answer": "Target Entity",
+                    "normalized_predicted_answer": "Target Entity",
+                },
+            ]
+        )
+        verifier = OfflineGraphRepositoryVerifier(
+            assembler=assembler,
+            model_client=client,
+            answer_model_alias="fake-answer",
+            judge_model_alias="fake-judge",
+        )
+
+        record = verifier.verify_question_record(
+            question_record=fixture.question_record,
+            sample_record=fixture.sample_record,
+            question_index=1,
+            question_fingerprint="fingerprint",
+        )
+
+        self.assertFalse(record["final_keep"])
+        self.assertFalse(record["checks"]["question_only_shortcut"]["passed"])
+        self.assertIn("closed_book_shortcut", record["reject_reasons"])
+        self.assertEqual(record["question_only_solver_result"]["status"], "answered")
 
     def test_repository_verifier_run_writes_outputs(self):
         fixture = self._fixture()
@@ -428,6 +553,19 @@ class RepositoryVerifierTests(unittest.TestCase):
                     "normalized_gold_answer": "Target Entity",
                     "normalized_predicted_answer": "Target Entity",
                 },
+                {
+                    "status": "cannot_answer",
+                    "answer": "",
+                    "shortcut_basis": "No shortcut.",
+                    "confidence": 0.03,
+                },
+                {
+                    "correct": False,
+                    "confidence": 0.99,
+                    "reason": "No predicted answer.",
+                    "normalized_gold_answer": "Target Entity",
+                    "normalized_predicted_answer": "",
+                },
             ]
         )
         verifier = OfflineGraphRepositoryVerifier(
@@ -441,6 +579,7 @@ class RepositoryVerifierTests(unittest.TestCase):
 
         self.assertEqual(summary["verified_total"], 1)
         self.assertEqual(summary["final_keep_total"], 1)
+        self.assertEqual(summary["question_only_shortcut_total"], 0)
         results = [json.loads(line) for line in (fixture.vqa_dir / verifier.output_file_name).read_text(encoding="utf-8").splitlines() if line.strip()]
         self.assertEqual(len(results), 1)
         self.assertTrue(results[0]["final_keep"])
@@ -469,6 +608,7 @@ class RepositoryVerifierTests(unittest.TestCase):
         self.assertIn(fixture.question_record["question_id"], result.stdout)
         self.assertIn("Items", result.stdout)
         self.assertIn("Answer Model Request", result.stdout)
+        self.assertIn("Question-Only Shortcut Request", result.stdout)
         self.assertIn('"messages": [', result.stdout)
         self.assertIn('"response_format": {', result.stdout)
 

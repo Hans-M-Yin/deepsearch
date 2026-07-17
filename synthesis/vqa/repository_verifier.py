@@ -1,8 +1,74 @@
 """Graph-backed repository verifier for generated VQA samples.
 
-This verifier builds a mixed repository of relevant and distractor documents
-and images directly from the persisted synthesis graph, then asks a model to
-solve the question using only that repository.
+This module currently runs two verification branches for each question:
+
+1. repository-grounded verifier
+   - Builds a mixed repository of relevant and distractor documents/images from
+     the persisted synthesis graph.
+   - Asks the answer model to solve the question using only those repository
+     materials.
+   - Uses the judge model to check whether the predicted answer is correct.
+
+2. question-only shortcut verifier
+   - Gives the model only the question itself, plus the question-attached image
+     when the VQA sample includes one.
+   - Asks the model to answer from memory or shortcuts without external
+     documents, search, or tools.
+   - Uses the judge model to check whether that shortcut answer is correct.
+   - If this branch still answers correctly, the sample is rejected with
+     ``closed_book_shortcut``.
+
+CLI usage
+---------
+Run the full verifier over one VQA directory:
+
+    python -m synthesis.vqa.repository_verifier       --vqa-dir /path/to/vqa_dir       --graph-dir /path/to/graph_dir       --answer-model-alias <answer_model>       --judge-model-alias <judge_model>
+
+This single command runs both verifier branches above. The answer model is used
+for both the repository-grounded solve and the question-only shortcut attempt.
+The judge model is used to judge both predicted answers.
+
+Runtime outputs
+---------------
+Running this module writes two files into ``vqa_dir``:
+
+- ``repository_verification_results.jsonl``
+  One record per question. Each record includes:
+  - ``repository``: assembled mixed repository items
+  - ``solver_result``: raw result of the repository-grounded solve branch
+  - ``question_only_solver_result``: raw result of the shortcut branch
+  - ``checks``: per-check details, including ``answer_judgment`` and
+    ``question_only_shortcut``
+  - ``final_keep`` and ``reject_reasons``
+
+- ``repository_verification_summary.json``
+  Aggregate counts such as:
+  - ``verified_total``
+  - ``final_keep_total``
+  - ``answer_correct_total``
+  - ``question_only_shortcut_total``
+  - invalid / out-of-scope citation totals
+  - insufficient evidence total
+
+The CLI also prints a summary report to stdout.
+
+Debugging model inputs and outputs
+----------------------------------
+Yes. Use the dedicated debug entrypoint:
+
+    python -m synthesis.vqa.debug.debug_repository_verifier       --vqa-dir /path/to/vqa_dir       --graph-dir /path/to/graph_dir       --question-id q_000001
+
+This prints the repository bundle and the final model requests that would be
+sent for both branches:
+- ``Answer Model Request``
+- ``Question-Only Shortcut Request``
+
+If you also pass ``--run-verification`` together with model aliases, it will
+actually call the models and print the corresponding raw outputs too:
+- ``Answer Model Raw Output``
+- ``Question-Only Shortcut Raw Output``
+- ``Judge Model Request`` / ``Judge Model Raw Output``
+- ``Question-Only Judge Request`` / ``Question-Only Judge Raw Output``
 """
 
 from __future__ import annotations
@@ -93,6 +159,34 @@ Return JSON in exactly this format:
 """
 
 
+PROMPT_QUESTION_ONLY_SHORTCUT_SOLVER = """
+You are a knowledge expert. Below, you will be given a relatively complex knowledge question. In some cases, the image attached to the question will also be provided.
+
+Please answer the question based only on your own memory and the attached question image, if one is provided.
+
+Requirements:
+- You do not have access to external documents, web search, or tools.
+- The question may be difficult, but there may also be shortcuts. Your only goal is to provide the correct answer, and you may avoid difficult intermediate reasoning if a shortcut is enough.
+- If you are confident, prefer step-by-step reasoning before answering.
+
+Return JSON in exactly this format:
+{
+  "status": "answered",
+  "answer": "",
+  "shortcut_basis": "",
+  "confidence": 0.0
+}
+
+If you think the question is ambiguous, or if it contains an obvious factual error, return:
+{
+  "status": "cannot_answer",
+  "answer": "the reason why you think the question cannot be answered.",
+  "shortcut_basis": "",
+  "confidence": 0.0
+}
+"""
+
+
 def build_repository_solver_request(
     *,
     bundle: RepositoryBundle,
@@ -139,6 +233,44 @@ def build_repository_answer_judge_request(
     )
 
 
+def build_question_only_shortcut_request(
+    *,
+    question: str,
+    answer_model_alias: str | None,
+    answer_max_tokens: int,
+    question_id: str,
+    image_url: str | None = None,
+) -> ModelRequest:
+    if image_url:
+        user_content: str | list[dict[str, Any]] = [
+            {
+                "type": "text",
+                "text": (
+                    f"Question:\n{question}\n\n"
+                    "The next image is the image attached to the question. "
+                    "Use only the question text and this attached image.\n\n"
+                    "Return JSON only."
+                ),
+            },
+            {
+                "type": "image_url",
+                "image_url": {"url": _resolve_multimodal_image_url(image_url)},
+            },
+        ]
+    else:
+        user_content = f"Question:\n{question}\n\nReturn JSON only."
+    return ModelRequest(
+        model=answer_model_alias,
+        messages=[
+            ModelMessage(role="system", content=PROMPT_QUESTION_ONLY_SHORTCUT_SOLVER),
+            ModelMessage(role="user", content=user_content),
+        ],
+        response_format={"type": "json_object"},
+        max_tokens=answer_max_tokens,
+        metadata={"trace_label": f"question_only_shortcut:{question_id}"},
+    )
+
+
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -177,6 +309,27 @@ def _question_text(question_record: dict[str, Any]) -> str:
         if value:
             return value
     return ""
+
+
+def _extract_question_input_image_url(
+    *,
+    question_record: dict[str, Any],
+    sample_record: dict[str, Any] | None,
+) -> str | None:
+    candidates: list[Any] = [
+        question_record.get("image_url"),
+        question_record.get("input_image_url"),
+    ]
+    sample = sample_record or {}
+    candidates.append(sample.get("input_image_url"))
+    metadata = sample.get("metadata") or {}
+    if isinstance(metadata, dict):
+        candidates.append(metadata.get("input_image_url"))
+    for candidate in candidates:
+        value = str(candidate or "").strip()
+        if value:
+            return value
+    return None
 
 
 def _load_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -298,6 +451,7 @@ class RepositoryVerificationConfig:
     min_reasoning_steps: int = 1
     min_unique_citations: int = 2
     answer_max_tokens: int = 1200
+    question_only_answer_max_tokens: int = 256
     judge_max_tokens: int = 512
 
     def to_dict(self) -> dict[str, Any]:
@@ -861,6 +1015,7 @@ class OfflineGraphRepositoryVerifier:
             "reverified_total": 0,
             "final_keep_total": 0,
             "answer_correct_total": 0,
+            "question_only_shortcut_total": 0,
             "invalid_citation_total": 0,
             "out_of_scope_citation_total": 0,
             "insufficient_evidence_total": 0,
@@ -915,6 +1070,8 @@ class OfflineGraphRepositoryVerifier:
                     summary["out_of_scope_citation_total"] += 1
                 if (verification_record.get("solver_result") or {}).get("status") == "insufficient_evidence":
                     summary["insufficient_evidence_total"] += 1
+                if not ((verification_record.get("checks") or {}).get("question_only_shortcut") or {}).get("passed", True):
+                    summary["question_only_shortcut_total"] += 1
                 trajectory_type = str(verification_record.get("trajectory_type") or "unclassified")
                 if trajectory_type not in summary["trajectory_type_counts"]:
                     trajectory_type = "unclassified"
@@ -945,12 +1102,37 @@ class OfflineGraphRepositoryVerifier:
         reasoning_check = self._check_reasoning_complete(bundle=bundle, solver_result=solver_result)
         citations_exist = self._check_citations_exist(bundle=bundle, solver_result=solver_result)
         citations_scope = self._check_citations_within_scope(bundle=bundle, solver_result=solver_result)
+        question_id = str(question_record.get("question_id") or question_index)
+        question_input_image_url = _extract_question_input_image_url(
+            question_record=question_record,
+            sample_record=sample,
+        )
         answer_judgment = self._judge_answer(
             question=question,
             gold_answer=gold_answer,
             predicted_answer=str(solver_result.get("answer") or ""),
-            question_id=str(question_record.get("question_id") or question_index),
+            question_id=question_id,
         )
+        question_only_solver_result = self._solve_question_only_shortcut(
+            question=question,
+            question_id=question_id,
+            image_url=question_input_image_url,
+        )
+        question_only_answer_judgment = self._judge_answer(
+            question=question,
+            gold_answer=gold_answer,
+            predicted_answer=str(question_only_solver_result.get("answer") or ""),
+            question_id=f"{question_id}:question_only",
+        )
+        question_only_shortcut = {
+            "passed": not bool(question_only_answer_judgment.get("correct")),
+            "solver_status": question_only_solver_result.get("status") or "-",
+            "predicted_answer": str(question_only_solver_result.get("answer") or ""),
+            "shortcut_basis": str(question_only_solver_result.get("shortcut_basis") or ""),
+            "cannot_answer_reason": str(question_only_solver_result.get("cannot_answer_reason") or ""),
+            "confidence": _safe_float(question_only_solver_result.get("confidence")),
+            "answer_judgment": question_only_answer_judgment,
+        }
 
         checks = {
             "repository_non_empty": {
@@ -962,6 +1144,7 @@ class OfflineGraphRepositoryVerifier:
             "citations_exist": citations_exist,
             "citations_within_relevant_scope": citations_scope,
             "answer_judgment": answer_judgment,
+            "question_only_shortcut": question_only_shortcut,
         }
 
         reject_reasons: list[str] = []
@@ -975,6 +1158,8 @@ class OfflineGraphRepositoryVerifier:
             reject_reasons.append("used_distractor_or_out_of_scope_evidence")
         if not answer_judgment.get("correct"):
             reject_reasons.append("answer_incorrect")
+        if not question_only_shortcut.get("passed"):
+            reject_reasons.append("closed_book_shortcut")
 
         return {
             "question_number": question_index,
@@ -984,12 +1169,14 @@ class OfflineGraphRepositoryVerifier:
             "status": question_record.get("status"),
             "question": question,
             "gold_answer": gold_answer,
+            "question_input_image_url": question_input_image_url,
             "node_types": node_types,
             "trajectory_type": trajectory_type,
             "question_fingerprint": question_fingerprint,
             "verifier_config": self._verifier_config(),
             "repository": bundle.to_dict(),
             "solver_result": solver_result,
+            "question_only_solver_result": question_only_solver_result,
             "checks": checks,
             "final_keep": not reject_reasons,
             "reject_reasons": reject_reasons,
@@ -1061,6 +1248,49 @@ class OfflineGraphRepositoryVerifier:
             "reasoning_steps": reasoning_steps,
             "used_evidence": normalized_used,
             "insufficient_reason": str(parsed.get("insufficient_reason") or "").strip(),
+            "raw": parsed,
+        }
+
+    def _solve_question_only_shortcut(
+        self,
+        *,
+        question: str,
+        question_id: str,
+        image_url: str | None = None,
+    ) -> dict[str, Any]:
+        request = build_question_only_shortcut_request(
+            question=question,
+            answer_model_alias=self.answer_model_alias,
+            answer_max_tokens=self.assembler.config.question_only_answer_max_tokens,
+            question_id=question_id,
+            image_url=image_url,
+        )
+        try:
+            parsed = self.model_client.generate_json(request)
+        except Exception as exc:
+            return {
+                "status": "error",
+                "answer": "",
+                "shortcut_basis": "",
+                "confidence": 0.0,
+                "error": f"{exc.__class__.__name__}: {exc}",
+            }
+        raw_status = str(parsed.get("status") or "").strip().lower()
+        raw_answer = str(parsed.get("answer") or parsed.get("final_answer") or "").strip()
+        raw_shortcut_basis = str(parsed.get("shortcut_basis") or parsed.get("reason") or parsed.get("analysis") or "").strip()
+        status = raw_status if raw_status in {"answered", "cannot_answer"} else ("answered" if raw_answer else "cannot_answer")
+        cannot_answer_reason = ""
+        answer = raw_answer
+        shortcut_basis = raw_shortcut_basis
+        if status == "cannot_answer":
+            cannot_answer_reason = raw_answer or raw_shortcut_basis
+            answer = ""
+        return {
+            "status": status,
+            "answer": answer,
+            "shortcut_basis": shortcut_basis,
+            "cannot_answer_reason": cannot_answer_reason,
+            "confidence": _safe_float(parsed.get("confidence")),
             "raw": parsed,
         }
 
@@ -1217,6 +1447,7 @@ class OfflineGraphRepositoryVerifier:
         return {
             "answer_model_alias": self.answer_model_alias,
             "judge_model_alias": self.judge_model_alias,
+            "question_only_answer_model_alias": self.answer_model_alias,
             "repository_config": self.assembler.config.to_dict(),
         }
 
@@ -1280,6 +1511,7 @@ def format_repository_bundle(
 def format_verification_record(record: dict[str, Any], *, width: int = 100) -> str:
     checks = dict(record.get("checks") or {})
     solver = dict(record.get("solver_result") or {})
+    question_only_solver = dict(record.get("question_only_solver_result") or {})
     lines = [
         "=" * 96,
         f"Repository Verification | question_id={record.get('question_id') or '-'} | sample_id={record.get('sample_id') or '-'}",
@@ -1288,8 +1520,11 @@ def format_verification_record(record: dict[str, Any], *, width: int = 100) -> s
         f"  reject_reasons: {', '.join(record.get('reject_reasons') or []) or '-'}",
         f"  trajectory_type: {record.get('trajectory_type') or '-'}",
         f"  solver_status: {solver.get('status') or '-'}",
+        f"  question_only_solver_status: {question_only_solver.get('status') or '-'}",
     ]
     lines.extend(_format_wrapped("predicted_answer", str(solver.get("answer") or ""), width=width, indent=2))
+    lines.extend(_format_wrapped("question_only_answer", str(question_only_solver.get("answer") or ""), width=width, indent=2))
+    lines.extend(_format_wrapped("question_only_reason", str(question_only_solver.get("cannot_answer_reason") or question_only_solver.get("shortcut_basis") or ""), width=width, indent=2))
     lines.extend(_format_wrapped("gold_answer", str(record.get("gold_answer") or ""), width=width, indent=2))
     lines.append("-" * 96)
     lines.append("Checks")
@@ -1299,6 +1534,7 @@ def format_verification_record(record: dict[str, Any], *, width: int = 100) -> s
         "citations_exist",
         "citations_within_relevant_scope",
         "answer_judgment",
+        "question_only_shortcut",
     ):
         payload = checks.get(check_name) or {}
         lines.append(f"  {check_name}: {json.dumps(payload, ensure_ascii=False, sort_keys=True)}")
@@ -1316,6 +1552,7 @@ def print_summary_report(summary: dict[str, Any]) -> None:
     total = int(summary.get("verified_total") or 0)
     final_keep_total = int(summary.get("final_keep_total") or 0)
     answer_correct_total = int(summary.get("answer_correct_total") or 0)
+    question_only_shortcut_total = int(summary.get("question_only_shortcut_total") or 0)
     invalid_citation_total = int(summary.get("invalid_citation_total") or 0)
     out_of_scope_citation_total = int(summary.get("out_of_scope_citation_total") or 0)
     insufficient_evidence_total = int(summary.get("insufficient_evidence_total") or 0)
@@ -1325,6 +1562,7 @@ def print_summary_report(summary: dict[str, Any]) -> None:
     print(f"  total_questions: {total}")
     print(f"  final_keep: {final_keep_total}/{total} ({_format_ratio(final_keep_total, total)})")
     print(f"  answer_correct: {answer_correct_total}/{total} ({_format_ratio(answer_correct_total, total)})")
+    print(f"  question_only_shortcut: {question_only_shortcut_total}/{total} ({_format_ratio(question_only_shortcut_total, total)})")
     print(f"  invalid_citation: {invalid_citation_total}/{total} ({_format_ratio(invalid_citation_total, total)})")
     print(f"  out_of_scope_citation: {out_of_scope_citation_total}/{total} ({_format_ratio(out_of_scope_citation_total, total)})")
     print(f"  insufficient_evidence: {insufficient_evidence_total}/{total} ({_format_ratio(insufficient_evidence_total, total)})")
@@ -1338,7 +1576,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--vqa-dir", required=True, help="Directory containing questions.jsonl and samples.jsonl.")
     parser.add_argument("--graph-dir", default=None, help="Graph directory containing nodes.jsonl and edges.jsonl. Inferred from vqa_dir when omitted.")
-    parser.add_argument("--answer-model-alias", required=True, help="Model alias used to solve each repository-grounded question.")
+    parser.add_argument("--answer-model-alias", required=True, help="Model alias used to solve each repository-grounded question and each question-only shortcut attempt.")
     parser.add_argument("--judge-model-alias", required=True, help="Model alias used to judge the predicted answer.")
     parser.add_argument("--random-seed", type=int, default=0, help="Random seed used for distractor sampling.")
     parser.add_argument("--max-relevant-docs-per-edge", type=int, default=2)
@@ -1348,6 +1586,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-random-image-distractors", type=int, default=1)
     parser.add_argument("--min-reasoning-steps", type=int, default=1)
     parser.add_argument("--min-unique-citations", type=int, default=2)
+    parser.add_argument("--question-only-answer-max-tokens", type=int, default=256)
     return parser
 
 
@@ -1365,6 +1604,7 @@ def main(argv: list[str] | None = None) -> int:
         max_random_image_distractors=args.max_random_image_distractors,
         min_reasoning_steps=args.min_reasoning_steps,
         min_unique_citations=args.min_unique_citations,
+        question_only_answer_max_tokens=args.question_only_answer_max_tokens,
     )
 
     from synthesis.model_worker import LLM_WORKER

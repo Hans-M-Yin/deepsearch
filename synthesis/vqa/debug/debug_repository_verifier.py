@@ -22,8 +22,10 @@ from synthesis.vqa.repository_verifier import (
     OfflineGraphRepositoryVerifier,
     RepositoryAssembler,
     RepositoryVerificationConfig,
+    _extract_question_input_image_url,
     _infer_graph_dir,
     _load_jsonl,
+    build_question_only_shortcut_request,
     build_repository_answer_judge_request,
     build_repository_solver_request,
     format_repository_bundle,
@@ -53,6 +55,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-random-image-distractors", type=int, default=1)
     parser.add_argument("--min-reasoning-steps", type=int, default=1)
     parser.add_argument("--min-unique-citations", type=int, default=2)
+    parser.add_argument("--question-only-answer-max-tokens", type=int, default=256)
     parser.add_argument("--hide-hidden", action="store_true", help="Hide internal relevant/distractor labels and source ids.")
     return parser
 
@@ -127,6 +130,7 @@ def main(argv: list[str] | None = None) -> int:
         max_random_image_distractors=args.max_random_image_distractors,
         min_reasoning_steps=args.min_reasoning_steps,
         min_unique_citations=args.min_unique_citations,
+        question_only_answer_max_tokens=args.question_only_answer_max_tokens,
     )
     assembler = RepositoryAssembler(graph=graph, config=config)
 
@@ -157,6 +161,18 @@ def main(argv: list[str] | None = None) -> int:
         )
         outputs.append("Answer Model Request")
         outputs.append(json.dumps(solver_request.to_dict(), ensure_ascii=False, indent=2))
+        question_only_request = build_question_only_shortcut_request(
+            question=str(bundle.question or ""),
+            answer_model_alias=args.answer_model_alias,
+            answer_max_tokens=config.question_only_answer_max_tokens,
+            question_id=str(question_record.get("question_id") or question_record.get("sample_id") or f"case_{index}"),
+            image_url=_extract_question_input_image_url(
+                question_record=question_record,
+                sample_record=sample_record,
+            ),
+        )
+        outputs.append("Question-Only Shortcut Request")
+        outputs.append(json.dumps(question_only_request.to_dict(), ensure_ascii=False, indent=2))
         if verifier is not None:
             fingerprint = verifier._question_fingerprint(question_record=question_record, sample_record=sample_record)
             record = verifier.verify_question_record(
@@ -168,6 +184,8 @@ def main(argv: list[str] | None = None) -> int:
             outputs.append(format_verification_record(record, width=args.width))
             outputs.append("Answer Model Raw Output")
             outputs.append(json.dumps((record.get("solver_result") or {}).get("raw") or {}, ensure_ascii=False, indent=2))
+            outputs.append("Question-Only Shortcut Raw Output")
+            outputs.append(json.dumps((record.get("question_only_solver_result") or {}).get("raw") or {}, ensure_ascii=False, indent=2))
             judge_request = build_repository_answer_judge_request(
                 question=record.get("question") or question_record.get("question") or "",
                 gold_answer=record.get("gold_answer") or question_record.get("answer") or "",
@@ -180,6 +198,18 @@ def main(argv: list[str] | None = None) -> int:
             outputs.append(json.dumps(judge_request.to_dict(), ensure_ascii=False, indent=2))
             outputs.append("Judge Model Raw Output")
             outputs.append(json.dumps((((record.get("checks") or {}).get("answer_judgment") or {}).get("raw")) or {}, ensure_ascii=False, indent=2))
+            question_only_judge_request = build_repository_answer_judge_request(
+                question=record.get("question") or question_record.get("question") or "",
+                gold_answer=record.get("gold_answer") or question_record.get("answer") or "",
+                predicted_answer=((record.get("question_only_solver_result") or {}).get("answer") or ""),
+                judge_model_alias=args.judge_model_alias,
+                judge_max_tokens=config.judge_max_tokens,
+                question_id=str(question_record.get("question_id") or question_record.get("sample_id") or f"case_{index}") + ":question_only",
+            )
+            outputs.append("Question-Only Judge Request")
+            outputs.append(json.dumps(question_only_judge_request.to_dict(), ensure_ascii=False, indent=2))
+            outputs.append("Question-Only Judge Raw Output")
+            outputs.append(json.dumps(((((record.get("checks") or {}).get("question_only_shortcut") or {}).get("answer_judgment") or {}).get("raw")) or {}, ensure_ascii=False, indent=2))
     outputs.append(SEPARATOR)
     print("\n\n".join(outputs))
     return 0
