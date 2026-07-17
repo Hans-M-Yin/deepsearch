@@ -253,6 +253,42 @@ def _format_target_ask_section(sample: dict[str, Any], *, width: int) -> list[st
     return lines
 
 
+def _format_opening_package_section(sample: dict[str, Any], *, width: int) -> list[str]:
+    package = sample.get("opening_package") or {}
+    lines = ["Opening Package"]
+    if not isinstance(package, dict) or not package:
+        lines.append("  - No opening package record found.")
+        return lines
+
+    lines.extend(_format_field("source_clue", package.get("source_clue"), width=width, indent=2))
+    lines.extend(_format_field("packaged_first_hop", package.get("packaged_first_hop"), width=width, indent=2))
+    source_facts = package.get("source_supporting_facts") or []
+    if source_facts:
+        lines.extend(
+            _format_field(
+                "source_supporting_facts",
+                " | ".join(str(item) for item in source_facts),
+                width=width,
+                indent=2,
+            )
+        )
+    lines.extend(_format_field("first_hop_support", package.get("first_hop_support"), width=width, indent=2))
+    lines.extend(_format_field("why_relevant", package.get("why_relevant"), width=width, indent=2))
+    forbidden_labels = package.get("forbidden_labels") or []
+    if forbidden_labels:
+        lines.extend(
+            _format_field(
+                "forbidden_labels",
+                ", ".join(str(item) for item in forbidden_labels),
+                width=width,
+                indent=2,
+            )
+        )
+    if package.get("writer_warning"):
+        lines.extend(_format_field("writer_warning", package.get("writer_warning"), width=width, indent=2))
+    return lines
+
+
 def _format_questions_section(sample: dict[str, Any], *, width: int) -> list[str]:
     draft_question = _first_non_empty(_stage_question(sample, "draft"), sample.get("draft_question"))
     polished_question = _first_non_empty(_stage_question(sample, "polished"), sample.get("polished_question"))
@@ -301,6 +337,9 @@ def _format_sample(sample: dict[str, Any], *, ordinal: int, width: int) -> str:
 
     lines.append(SUB_SEPARATOR)
     lines.extend(_format_target_ask_section(sample, width=width))
+
+    lines.append(SUB_SEPARATOR)
+    lines.extend(_format_opening_package_section(sample, width=width))
 
     lines.append(SUB_SEPARATOR)
     lines.append("Question-Facing Hop Chain")
