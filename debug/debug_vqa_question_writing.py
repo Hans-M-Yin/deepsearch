@@ -289,6 +289,60 @@ def _format_opening_package_section(sample: dict[str, Any], *, width: int) -> li
     return lines
 
 
+def _json_text(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True)
+
+
+def _format_polish_section(sample: dict[str, Any], *, width: int) -> list[str]:
+    polish = sample.get("polish") or {}
+    if not isinstance(polish, dict):
+        polish = {}
+    payload = polish.get("payload") or {}
+    subtasks = polish.get("subtasks") or {}
+    rewrite_payload = polish.get("rewrite_payload") or {}
+    result = polish.get("result") or {}
+
+    lines = ["Polish Process"]
+    if not any((payload, subtasks, rewrite_payload, result, polish.get("rewrite_skipped") is not None)):
+        lines.append("  - No persisted polish diagnostics. Samples produced before this change do not contain them.")
+        return lines
+
+    if isinstance(payload, dict):
+        lines.append("  Input")
+        lines.extend(_format_field("question", payload.get("question"), width=width, indent=4))
+        for hop in payload.get("hops") or []:
+            if isinstance(hop, dict):
+                hop_index = hop.get("hop_index")
+                title = f"Polish Hop {hop_index}" if hop_index is not None else "Polish Hop"
+                lines.extend(_format_hop(hop, width=width, title=title))
+
+    if isinstance(subtasks, dict) and subtasks:
+        lines.append("  Subtask Diagnostics")
+        for task_name, diagnostic in subtasks.items():
+            if not isinstance(diagnostic, dict):
+                continue
+            lines.append(f"    {task_name}")
+            lines.extend(_format_field("has_feedback", diagnostic.get("has_feedback"), width=width, indent=6))
+            lines.extend(_format_field("issues", diagnostic.get("issues"), width=width, indent=6))
+            lines.extend(_format_field("advice", diagnostic.get("advice"), width=width, indent=6))
+            lines.extend(_format_field("image_attached", diagnostic.get("image_attached"), width=width, indent=6))
+            input_payload = diagnostic.get("input_payload") or {}
+            if isinstance(input_payload, dict) and input_payload:
+                lines.extend(_format_field("input_payload", _json_text(input_payload), width=width, indent=6))
+            raw = diagnostic.get("raw") or {}
+            if isinstance(raw, dict) and raw:
+                lines.extend(_format_field("raw_response", _json_text(raw), width=width, indent=6))
+
+    lines.append("  Aggregate Rewrite")
+    lines.extend(_format_field("rewrite_skipped", polish.get("rewrite_skipped"), width=width, indent=4))
+    lines.extend(_format_field("skip_reason", polish.get("rewrite_skip_reason"), width=width, indent=4))
+    if isinstance(rewrite_payload, dict) and rewrite_payload:
+        lines.extend(_format_field("rewrite_input", _json_text(rewrite_payload), width=width, indent=4))
+    if isinstance(result, dict) and result:
+        lines.extend(_format_field("rewrite_result", _json_text(result), width=width, indent=4))
+    return lines
+
+
 def _format_questions_section(sample: dict[str, Any], *, width: int) -> list[str]:
     draft_question = _first_non_empty(_stage_question(sample, "draft"), sample.get("draft_question"))
     polished_question = _first_non_empty(_stage_question(sample, "polished"), sample.get("polished_question"))
@@ -340,6 +394,9 @@ def _format_sample(sample: dict[str, Any], *, ordinal: int, width: int) -> str:
 
     lines.append(SUB_SEPARATOR)
     lines.extend(_format_opening_package_section(sample, width=width))
+
+    lines.append(SUB_SEPARATOR)
+    lines.extend(_format_polish_section(sample, width=width))
 
     lines.append(SUB_SEPARATOR)
     lines.append("Question-Facing Hop Chain")

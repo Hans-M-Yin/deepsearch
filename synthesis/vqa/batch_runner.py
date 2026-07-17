@@ -826,6 +826,32 @@ class VqaBatchRunner:
                 sample,
                 field_name="image_target_terminal_normalization",
             ),
+            "polish": {
+                "payload": VqaBatchRunner._extract_stage_metadata_value(
+                    sample,
+                    field_name="polish_payload",
+                ),
+                "subtasks": VqaBatchRunner._extract_stage_metadata_value(
+                    sample,
+                    field_name="polish_subtasks",
+                ),
+                "rewrite_payload": VqaBatchRunner._extract_stage_metadata_value(
+                    sample,
+                    field_name="polish_rewrite_payload",
+                ),
+                "result": VqaBatchRunner._extract_stage_metadata_value(
+                    sample,
+                    field_name="polish_result",
+                ),
+                "rewrite_skipped": VqaBatchRunner._extract_stage_metadata_value(
+                    sample,
+                    field_name="polish_rewrite_skipped",
+                ),
+                "rewrite_skip_reason": VqaBatchRunner._extract_stage_metadata_value(
+                    sample,
+                    field_name="polish_rewrite_skip_reason",
+                ),
+            },
             "verification": sample.get("verification") or {},
             "progress": sample.get("progress") or {},
             "metadata": {

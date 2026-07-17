@@ -1517,6 +1517,8 @@ class QuestionWriter:
                 "issues": issues,
                 "advice": advice,
                 "has_feedback": has_feedback,
+                "input_payload": dict(result.get("input_payload") or {}),
+                "image_attached": bool(result.get("image_attached")),
                 "raw": parsed,
             }
         effective_diagnostics = {
@@ -2285,9 +2287,21 @@ class QuestionWriter:
                 trace_label=f"polish_{task_name}",
                 image_url=image_url,
             )
-            return {"task_name": task_name, "parsed": parsed, "error": None}
+            return {
+                "task_name": task_name,
+                "input_payload": payload,
+                "image_attached": bool(image_url),
+                "parsed": parsed,
+                "error": None,
+            }
         except Exception as exc:
-            return {"task_name": task_name, "parsed": None, "error": exc}
+            return {
+                "task_name": task_name,
+                "input_payload": payload,
+                "image_attached": bool(image_url),
+                "parsed": None,
+                "error": exc,
+            }
 
     @staticmethod
     def _starting_image_url(*, path: PathCandidate, graph: GraphView) -> str | None:
