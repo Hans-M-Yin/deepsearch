@@ -100,11 +100,15 @@ class VqaGenerationPipeline:
             operation=lambda: self.writer.draft(path=path, graph=self.graph),
         )
         progress.drafted_at = _utc_now()
-        polished, polish_elapsed_s = self._run_timed_stage(
-            path=path,
-            stage="polish",
-            operation=lambda: self.writer.polish(draft=draft, path=path, graph=self.graph),
-        )
+        # Temporary experiment: send the draft directly to difficulty enhancement
+        # so its effect can be evaluated without aggregate polish rewrites.
+        # polished, polish_elapsed_s = self._run_timed_stage(
+        #     path=path,
+        #     stage="polish",
+        #     operation=lambda: self.writer.polish(draft=draft, path=path, graph=self.graph),
+        # )
+        polished = draft
+        polish_elapsed_s = 0.0
         progress.polished_at = _utc_now()
         obfuscated, difficulty_elapsed_s = self._run_timed_stage(
             path=path,
