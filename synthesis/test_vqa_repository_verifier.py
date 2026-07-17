@@ -6,6 +6,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 from synthesis.edges import Edge, EdgeType, EvidenceRef
 from synthesis.evidence import Evidence, EvidenceType
@@ -630,6 +631,60 @@ class RepositoryVerifierTests(unittest.TestCase):
         self.assertIn("Question-Only Shortcut Request", result.stdout)
         self.assertIn('"messages": [', result.stdout)
         self.assertIn('"response_format": {', result.stdout)
+
+    def test_debug_repository_verifier_redacts_inline_image_data_urls(self):
+        from synthesis.vqa.debug.debug_repository_verifier import _dump_stdout_safe_json
+
+        payload = {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Look at the image."},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "data:image/png;base64,QUJDREVGRw=="},
+                        },
+                    ],
+                }
+            ]
+        }
+
+        rendered = _dump_stdout_safe_json(payload)
+
+        self.assertIn("<redacted inline image data URL: mime=image/png", rendered)
+        self.assertNotIn("QUJDREVGRw==", rendered)
+
+    def test_debug_repository_verifier_stdout_omits_local_image_base64(self):
+        fixture = self._fixture()
+        local_image = fixture.vqa_dir / "question.png"
+        local_image.write_bytes(b"not a real png but enough for base64")
+        fixture.question_record["image_url"] = str(local_image)
+        (fixture.vqa_dir / "questions.jsonl").write_text(
+            json.dumps(fixture.question_record, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+
+        from synthesis.vqa.debug import debug_repository_verifier as debug_mod
+
+        argv = [
+            "--vqa-dir",
+            str(fixture.vqa_dir),
+            "--graph-dir",
+            str(fixture.graph_dir),
+            "--question-id",
+            fixture.question_record["question_id"],
+            "--limit",
+            "1",
+        ]
+        with mock.patch("sys.stdout") as fake_stdout:
+            result = debug_mod.main(argv)
+
+        self.assertEqual(result, 0)
+        printed = "\n".join(str(call.args[0]) for call in fake_stdout.write.call_args_list if call.args)
+        self.assertIn("Question-Only Shortcut Request", printed)
+        self.assertIn("<redacted inline image data URL: mime=image/png", printed)
+        self.assertNotIn("bm90IGEgcmVhbCBwbmcgYnV0IGVub3VnaCBmb3IgYmFzZTY0", printed)
 
 
 if __name__ == "__main__":

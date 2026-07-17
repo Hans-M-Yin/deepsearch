@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from pathlib import Path
 import sys
+from typing import Any
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -34,6 +36,37 @@ from synthesis.vqa.repository_verifier import (
 
 
 SEPARATOR = "=" * 96
+
+
+_DATA_URL_RE = re.compile(r"^data:([^;,]+)?(?:;[^,]*)?,(.*)$", flags=re.DOTALL)
+
+
+def _redact_image_data_for_stdout(value: Any) -> Any:
+    """Return a stdout-safe copy of a model payload.
+
+    The verifier really sends local image files as data URLs so the model can
+    see them.  Dumping ``ModelRequest.to_dict()`` directly also dumps those
+    base64 payloads, which makes verbose debug output huge and hard to read.
+    Keep the surrounding multimodal prompt shape intact, but replace inline
+    image bytes with a short placeholder.
+    """
+
+    if isinstance(value, dict):
+        return {key: _redact_image_data_for_stdout(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_redact_image_data_for_stdout(item) for item in value]
+    if not isinstance(value, str) or not value.startswith("data:"):
+        return value
+    match = _DATA_URL_RE.match(value)
+    if not match:
+        return "<redacted inline image data URL>"
+    mime_type = match.group(1) or "unknown"
+    payload = match.group(2) or ""
+    return f"<redacted inline image data URL: mime={mime_type}, payload_chars={len(payload)}>"
+
+
+def _dump_stdout_safe_json(value: Any) -> str:
+    return json.dumps(_redact_image_data_for_stdout(value), ensure_ascii=False, indent=2)
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -160,7 +193,7 @@ def main(argv: list[str] | None = None) -> int:
             user_content=assembler.build_solver_user_content(bundle=bundle),
         )
         outputs.append("Answer Model Request")
-        outputs.append(json.dumps(solver_request.to_dict(), ensure_ascii=False, indent=2))
+        outputs.append(_dump_stdout_safe_json(solver_request.to_dict()))
         question_only_request = build_question_only_shortcut_request(
             question=str(bundle.question or ""),
             answer_model_alias=args.answer_model_alias,
@@ -172,7 +205,7 @@ def main(argv: list[str] | None = None) -> int:
             ),
         )
         outputs.append("Question-Only Shortcut Request")
-        outputs.append(json.dumps(question_only_request.to_dict(), ensure_ascii=False, indent=2))
+        outputs.append(_dump_stdout_safe_json(question_only_request.to_dict()))
         if verifier is not None:
             fingerprint = verifier._question_fingerprint(question_record=question_record, sample_record=sample_record)
             record = verifier.verify_question_record(
@@ -195,7 +228,7 @@ def main(argv: list[str] | None = None) -> int:
                 question_id=str(question_record.get("question_id") or question_record.get("sample_id") or f"case_{index}"),
             )
             outputs.append("Judge Model Request")
-            outputs.append(json.dumps(judge_request.to_dict(), ensure_ascii=False, indent=2))
+            outputs.append(_dump_stdout_safe_json(judge_request.to_dict()))
             outputs.append("Judge Model Raw Output")
             outputs.append(json.dumps((((record.get("checks") or {}).get("answer_judgment") or {}).get("raw")) or {}, ensure_ascii=False, indent=2))
             question_only_judge_request = build_repository_answer_judge_request(
@@ -207,7 +240,7 @@ def main(argv: list[str] | None = None) -> int:
                 question_id=str(question_record.get("question_id") or question_record.get("sample_id") or f"case_{index}") + ":question_only",
             )
             outputs.append("Question-Only Judge Request")
-            outputs.append(json.dumps(question_only_judge_request.to_dict(), ensure_ascii=False, indent=2))
+            outputs.append(_dump_stdout_safe_json(question_only_judge_request.to_dict()))
             outputs.append("Question-Only Judge Raw Output")
             outputs.append(json.dumps(((((record.get("checks") or {}).get("question_only_shortcut") or {}).get("answer_judgment") or {}).get("raw")) or {}, ensure_ascii=False, indent=2))
     outputs.append(SEPARATOR)
