@@ -69,6 +69,83 @@ def _dump_stdout_safe_json(value: Any) -> str:
     return json.dumps(_redact_image_data_for_stdout(value), ensure_ascii=False, indent=2)
 
 
+def _raw_solver_output_text(result: dict[str, Any]) -> str:
+    raw_text = str(result.get("raw_text") or "").strip()
+    if raw_text:
+        return raw_text
+    raw = result.get("raw")
+    if isinstance(raw, dict):
+        raw_text = str(raw.get("raw_text") or "").strip()
+        if raw_text:
+            return raw_text
+        return json.dumps(raw, ensure_ascii=False, indent=2)
+    if raw is not None:
+        return str(raw)
+    return ""
+
+
+def _empty_io_summary() -> dict[str, dict[str, int]]:
+    return {
+        "repository_grounded": {
+            "total": 0,
+            "correct": 0,
+            "incorrect": 0,
+            "insufficient_evidence": 0,
+            "cannot_answer_or_question_issue": 0,
+            "model_error": 0,
+        },
+        "question_only": {
+            "total": 0,
+            "correct": 0,
+            "incorrect": 0,
+            "insufficient_evidence": 0,
+            "cannot_answer_or_question_issue": 0,
+            "model_error": 0,
+        },
+    }
+
+
+def _update_mode_summary(*, bucket: dict[str, int], solver_result: dict[str, Any], answer_judgment: dict[str, Any]) -> None:
+    bucket["total"] += 1
+    status = str(solver_result.get("status") or "").strip().lower()
+    if status == "error":
+        bucket["model_error"] += 1
+        bucket["incorrect"] += 1
+        return
+    if status == "insufficient_evidence":
+        bucket["insufficient_evidence"] += 1
+        bucket["incorrect"] += 1
+        return
+    if status == "cannot_answer":
+        bucket["cannot_answer_or_question_issue"] += 1
+        bucket["incorrect"] += 1
+        return
+    if bool(answer_judgment.get("correct")):
+        bucket["correct"] += 1
+    else:
+        bucket["incorrect"] += 1
+
+
+def _format_io_summary(summary: dict[str, dict[str, int]]) -> str:
+    lines = [SEPARATOR, "Verification IO Summary"]
+    labels = {
+        "repository_grounded": "Repository-grounded",
+        "question_only": "Question-only",
+    }
+    for key in ("repository_grounded", "question_only"):
+        bucket = summary[key]
+        total = bucket.get("total", 0)
+        lines.append(f"{labels[key]}:")
+        lines.append(f"  total: {total}")
+        lines.append(f"  correct: {bucket.get('correct', 0)}")
+        lines.append(f"  incorrect: {bucket.get('incorrect', 0)}")
+        lines.append(f"  insufficient_evidence: {bucket.get('insufficient_evidence', 0)}")
+        lines.append(f"  cannot_answer_or_question_issue: {bucket.get('cannot_answer_or_question_issue', 0)}")
+        lines.append(f"  model_error: {bucket.get('model_error', 0)}")
+    lines.append(SEPARATOR)
+    return "\n".join(lines)
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--vqa-dir", required=True, help="Directory containing questions.jsonl and samples.jsonl.")
@@ -181,6 +258,7 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     outputs: list[str] = []
+    io_summary = _empty_io_summary()
     for index, (question_record, sample_record) in enumerate(selected, start=1):
         bundle = assembler.build_bundle(question_record=question_record, sample_record=sample_record)
         outputs.append(SEPARATOR)
@@ -216,9 +294,9 @@ def main(argv: list[str] | None = None) -> int:
             )
             outputs.append(format_verification_record(record, width=args.width))
             outputs.append("Answer Model Raw Output")
-            outputs.append(json.dumps((record.get("solver_result") or {}).get("raw") or {}, ensure_ascii=False, indent=2))
+            outputs.append(_raw_solver_output_text(record.get("solver_result") or {}))
             outputs.append("Question-Only Shortcut Raw Output")
-            outputs.append(json.dumps((record.get("question_only_solver_result") or {}).get("raw") or {}, ensure_ascii=False, indent=2))
+            outputs.append(_raw_solver_output_text(record.get("question_only_solver_result") or {}))
             judge_request = build_repository_answer_judge_request(
                 question=record.get("question") or question_record.get("question") or "",
                 gold_answer=record.get("gold_answer") or question_record.get("answer") or "",
@@ -243,7 +321,20 @@ def main(argv: list[str] | None = None) -> int:
             outputs.append(_dump_stdout_safe_json(question_only_judge_request.to_dict()))
             outputs.append("Question-Only Judge Raw Output")
             outputs.append(json.dumps(((((record.get("checks") or {}).get("question_only_shortcut") or {}).get("answer_judgment") or {}).get("raw")) or {}, ensure_ascii=False, indent=2))
+            checks = record.get("checks") or {}
+            _update_mode_summary(
+                bucket=io_summary["repository_grounded"],
+                solver_result=record.get("solver_result") or {},
+                answer_judgment=checks.get("answer_judgment") or {},
+            )
+            _update_mode_summary(
+                bucket=io_summary["question_only"],
+                solver_result=record.get("question_only_solver_result") or {},
+                answer_judgment=((checks.get("question_only_shortcut") or {}).get("answer_judgment") or {}),
+            )
     outputs.append(SEPARATOR)
+    if verifier is not None:
+        outputs.append(_format_io_summary(io_summary))
     print("\n\n".join(outputs))
     return 0
 

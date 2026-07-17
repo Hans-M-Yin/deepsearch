@@ -148,7 +148,6 @@ Guidelines:
 Return JSON in exactly this format:
 {
   "correct": true,
-  "confidence": 0.0,
   "reason": "",
   "normalized_gold_answer": "",
   "normalized_predicted_answer": ""
@@ -479,7 +478,6 @@ def _parse_freeform_question_only_response(text: str) -> dict[str, Any]:
             "answer": "",
             "shortcut_basis": "",
             "cannot_answer_reason": cannot_answer_reason,
-            "confidence": 0.0,
             "raw_text": raw_text,
         }
     answer = _parse_final_answer(raw_text)
@@ -489,7 +487,6 @@ def _parse_freeform_question_only_response(text: str) -> dict[str, Any]:
         "answer": answer,
         "shortcut_basis": shortcut_basis,
         "cannot_answer_reason": "" if answer else "missing_final_answer",
-        "confidence": 0.0,
         "raw_text": raw_text,
     }
 
@@ -1361,7 +1358,6 @@ class OfflineGraphRepositoryVerifier:
             "predicted_answer": str(question_only_solver_result.get("answer") or ""),
             "shortcut_basis": str(question_only_solver_result.get("shortcut_basis") or ""),
             "cannot_answer_reason": str(question_only_solver_result.get("cannot_answer_reason") or ""),
-            "confidence": _safe_float(question_only_solver_result.get("confidence")),
             "answer_judgment": question_only_answer_judgment,
         }
 
@@ -1506,7 +1502,6 @@ class OfflineGraphRepositoryVerifier:
                 "status": "error",
                 "answer": "",
                 "shortcut_basis": "",
-                "confidence": 0.0,
                 "error": f"{exc.__class__.__name__}: {exc}",
             }
         parsed = _parse_freeform_question_only_response(str(getattr(response, "content", response) or ""))
@@ -1525,7 +1520,6 @@ class OfflineGraphRepositoryVerifier:
             "answer": answer,
             "shortcut_basis": shortcut_basis,
             "cannot_answer_reason": cannot_answer_reason,
-            "confidence": _safe_float(parsed.get("confidence")),
             "raw_text": str(parsed.get("raw_text") or ""),
             "raw": parsed,
         }
@@ -1551,15 +1545,14 @@ class OfflineGraphRepositoryVerifier:
         except Exception as exc:
             return {
                 "correct": False,
-                "confidence": 0.0,
                 "reason": "judge_model_error",
                 "normalized_gold_answer": gold_answer,
                 "normalized_predicted_answer": predicted_answer,
                 "error": f"{exc.__class__.__name__}: {exc}",
             }
+        parsed.pop("confidence", None)
         return {
             "correct": bool(parsed.get("correct")),
-            "confidence": _safe_float(parsed.get("confidence")),
             "reason": str(parsed.get("reason") or ""),
             "normalized_gold_answer": str(parsed.get("normalized_gold_answer") or gold_answer),
             "normalized_predicted_answer": str(parsed.get("normalized_predicted_answer") or predicted_answer),

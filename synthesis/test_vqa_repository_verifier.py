@@ -411,7 +411,6 @@ class RepositoryVerifierTests(unittest.TestCase):
                 ),
                 {
                     "correct": True,
-                    "confidence": 0.95,
                     "reason": "Semantic match.",
                     "normalized_gold_answer": "Target Entity",
                     "normalized_predicted_answer": "Target Entity",
@@ -419,7 +418,6 @@ class RepositoryVerifierTests(unittest.TestCase):
                 "Cannot answer: No reliable shortcut in the wording.",
                 {
                     "correct": False,
-                    "confidence": 0.99,
                     "reason": "No predicted answer.",
                     "normalized_gold_answer": "Target Entity",
                     "normalized_predicted_answer": "",
@@ -461,7 +459,6 @@ class RepositoryVerifierTests(unittest.TestCase):
                 f"Use one true clue and one false clue. [{relevant_doc}] [{distractor}]\n\nFinal answer: Target Entity",
                 {
                     "correct": True,
-                    "confidence": 0.9,
                     "reason": "Answer itself is correct.",
                     "normalized_gold_answer": "Target Entity",
                     "normalized_predicted_answer": "Target Entity",
@@ -469,7 +466,6 @@ class RepositoryVerifierTests(unittest.TestCase):
                 "Cannot answer: No shortcut.",
                 {
                     "correct": False,
-                    "confidence": 0.99,
                     "reason": "No predicted answer.",
                     "normalized_gold_answer": "Target Entity",
                     "normalized_predicted_answer": "",
@@ -509,7 +505,6 @@ class RepositoryVerifierTests(unittest.TestCase):
                 ),
                 {
                     "correct": True,
-                    "confidence": 0.95,
                     "reason": "Semantic match.",
                     "normalized_gold_answer": "Target Entity",
                     "normalized_predicted_answer": "Target Entity",
@@ -517,7 +512,6 @@ class RepositoryVerifierTests(unittest.TestCase):
                 "The wording points directly to the emblem and the target entity.\n\nFinal answer: Target Entity",
                 {
                     "correct": True,
-                    "confidence": 0.94,
                     "reason": "The shortcut answer is still correct.",
                     "normalized_gold_answer": "Target Entity",
                     "normalized_predicted_answer": "Target Entity",
@@ -558,7 +552,6 @@ class RepositoryVerifierTests(unittest.TestCase):
                 ),
                 {
                     "correct": True,
-                    "confidence": 0.98,
                     "reason": "Correct answer.",
                     "normalized_gold_answer": "Target Entity",
                     "normalized_predicted_answer": "Target Entity",
@@ -566,7 +559,6 @@ class RepositoryVerifierTests(unittest.TestCase):
                 "Cannot answer: No shortcut.",
                 {
                     "correct": False,
-                    "confidence": 0.99,
                     "reason": "No predicted answer.",
                     "normalized_gold_answer": "Target Entity",
                     "normalized_predicted_answer": "",
@@ -635,6 +627,58 @@ class RepositoryVerifierTests(unittest.TestCase):
         self.assertIn("Question-Only Shortcut Request", result.stdout)
         self.assertIn('"messages": [', result.stdout)
         self.assertIn('"response_format": null', result.stdout)
+
+    def test_combined_repository_verifier_prints_io_summary(self):
+        from synthesis.vqa.debug import debug_repository_verifier as debug_mod
+
+        fixture = self._fixture()
+
+        class FakeWorker(FakeJsonClient):
+            pass
+
+        fake_worker = FakeWorker(
+            [
+                "The source page gives the codename clue. [DOC 1]\n\nThe poster image resolves the entity. [IMG 3]\n\nFinal answer: Target Entity",
+                {
+                    "correct": True,
+                    "reason": "Correct answer.",
+                    "normalized_gold_answer": "Target Entity",
+                    "normalized_predicted_answer": "Target Entity",
+                },
+                "Cannot answer: No shortcut.",
+                {
+                    "correct": False,
+                    "reason": "No predicted answer.",
+                    "normalized_gold_answer": "Target Entity",
+                    "normalized_predicted_answer": "",
+                },
+            ]
+        )
+        argv = [
+            "--vqa-dir",
+            str(fixture.vqa_dir),
+            "--graph-dir",
+            str(fixture.graph_dir),
+            "--question-id",
+            fixture.question_record["question_id"],
+            "--limit",
+            "1",
+            "--run-verification",
+            "--answer-model-alias",
+            "fake-answer",
+            "--judge-model-alias",
+            "fake-judge",
+        ]
+        with mock.patch("synthesis.model_worker.LLM_WORKER", fake_worker), mock.patch("sys.stdout") as fake_stdout:
+            result = debug_mod.main(argv)
+
+        self.assertEqual(result, 0)
+        printed = "\n".join(str(call.args[0]) for call in fake_stdout.write.call_args_list if call.args)
+        self.assertIn("Verification IO Summary", printed)
+        self.assertIn("Repository-grounded:", printed)
+        self.assertIn("Question-only:", printed)
+        self.assertIn("  correct: 1", printed)
+        self.assertIn("  cannot_answer_or_question_issue: 1", printed)
 
     def test_debug_repository_verifier_redacts_inline_image_data_urls(self):
         from synthesis.vqa.debug.debug_repository_verifier import _dump_stdout_safe_json
