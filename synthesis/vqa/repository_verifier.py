@@ -1247,6 +1247,14 @@ class OfflineGraphRepositoryVerifier:
             "invalid_citation_total": 0,
             "out_of_scope_citation_total": 0,
             "insufficient_evidence_total": 0,
+            "citation_recall_sum": 0.0,
+            "citation_recall_count": 0,
+            "citation_recalled_total": 0,
+            "citation_expected_total": 0,
+            "doc_citation_recalled_total": 0,
+            "doc_citation_expected_total": 0,
+            "image_citation_recalled_total": 0,
+            "image_citation_expected_total": 0,
             "output_path": str(output_path),
             "answer_model_alias": self.answer_model_alias,
             "judge_model_alias": self.judge_model_alias,
@@ -1298,6 +1306,18 @@ class OfflineGraphRepositoryVerifier:
                     summary["out_of_scope_citation_total"] += 1
                 if (verification_record.get("solver_result") or {}).get("status") == "insufficient_evidence":
                     summary["insufficient_evidence_total"] += 1
+                citation_recall = ((verification_record.get("checks") or {}).get("citation_recall") or {})
+                if citation_recall:
+                    summary["citation_recall_sum"] += _safe_float(citation_recall.get("recall"))
+                    summary["citation_recall_count"] += 1
+                    summary["citation_recalled_total"] += int(citation_recall.get("recalled_count") or 0)
+                    summary["citation_expected_total"] += int(citation_recall.get("expected_count") or 0)
+                    doc_recall = citation_recall.get("doc_recall") or {}
+                    image_recall = citation_recall.get("image_recall") or {}
+                    summary["doc_citation_recalled_total"] += int(doc_recall.get("recalled_count") or 0)
+                    summary["doc_citation_expected_total"] += int(doc_recall.get("expected_count") or 0)
+                    summary["image_citation_recalled_total"] += int(image_recall.get("recalled_count") or 0)
+                    summary["image_citation_expected_total"] += int(image_recall.get("expected_count") or 0)
                 if not ((verification_record.get("checks") or {}).get("question_only_shortcut") or {}).get("passed", True):
                     summary["question_only_shortcut_total"] += 1
                 trajectory_type = str(verification_record.get("trajectory_type") or "unclassified")
@@ -1305,6 +1325,14 @@ class OfflineGraphRepositoryVerifier:
                     trajectory_type = "unclassified"
                 summary["trajectory_type_counts"][trajectory_type] += 1
 
+        recall_count = int(summary.get("citation_recall_count") or 0)
+        expected_total = int(summary.get("citation_expected_total") or 0)
+        doc_expected_total = int(summary.get("doc_citation_expected_total") or 0)
+        image_expected_total = int(summary.get("image_citation_expected_total") or 0)
+        summary["citation_recall_macro_avg"] = (summary["citation_recall_sum"] / recall_count) if recall_count else 0.0
+        summary["citation_recall_micro_avg"] = (summary["citation_recalled_total"] / expected_total) if expected_total else 0.0
+        summary["doc_citation_recall_micro_avg"] = (summary["doc_citation_recalled_total"] / doc_expected_total) if doc_expected_total else 0.0
+        summary["image_citation_recall_micro_avg"] = (summary["image_citation_recalled_total"] / image_expected_total) if image_expected_total else 0.0
         summary["updated_at"] = _utc_now()
         summary_path.write_text(
             json.dumps(summary, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
@@ -1330,6 +1358,7 @@ class OfflineGraphRepositoryVerifier:
         reasoning_check = self._check_reasoning_complete(bundle=bundle, solver_result=solver_result)
         citations_exist = self._check_citations_exist(bundle=bundle, solver_result=solver_result)
         citations_scope = self._check_citations_within_scope(bundle=bundle, solver_result=solver_result)
+        citation_recall = self._check_citation_recall(bundle=bundle, solver_result=solver_result)
         question_id = str(question_record.get("question_id") or question_index)
         question_input_image_url = _extract_question_input_image_url(
             question_record=question_record,
@@ -1370,6 +1399,7 @@ class OfflineGraphRepositoryVerifier:
             "reasoning_complete": reasoning_check,
             "citations_exist": citations_exist,
             "citations_within_relevant_scope": citations_scope,
+            "citation_recall": citation_recall,
             "answer_judgment": answer_judgment,
             "question_only_shortcut": question_only_shortcut,
         }
@@ -1653,6 +1683,48 @@ class OfflineGraphRepositoryVerifier:
             "out_of_scope_labels": out_of_scope,
         }
 
+    @staticmethod
+    def _check_citation_recall(
+        *,
+        bundle: RepositoryBundle,
+        solver_result: dict[str, Any],
+    ) -> dict[str, Any]:
+        expected = set(bundle.relevant_labels)
+        cited = {
+            _normalize_citation_label(label)
+            for label in (solver_result.get("used_evidence") or [])
+            if str(label or "").strip()
+        }
+        recalled = expected & cited
+        missed = expected - cited
+        expected_docs = {item.label for item in bundle.items if item.is_relevant and item.item_type == "doc"}
+        expected_images = {item.label for item in bundle.items if item.is_relevant and item.item_type == "image"}
+        recalled_docs = expected_docs & cited
+        recalled_images = expected_images & cited
+
+        def recall_payload(recalled_labels: set[str], expected_labels: set[str]) -> dict[str, Any]:
+            expected_count = len(expected_labels)
+            recalled_count = len(recalled_labels)
+            return {
+                "recalled_count": recalled_count,
+                "expected_count": expected_count,
+                "recall": (recalled_count / expected_count) if expected_count else 0.0,
+                "recalled_labels": sorted(recalled_labels),
+                "missed_labels": sorted(expected_labels - recalled_labels),
+            }
+
+        return {
+            "passed": not missed,
+            "recalled_count": len(recalled),
+            "expected_count": len(expected),
+            "recall": (len(recalled) / len(expected)) if expected else 0.0,
+            "expected_labels": sorted(expected),
+            "recalled_labels": sorted(recalled),
+            "missed_labels": sorted(missed),
+            "doc_recall": recall_payload(recalled_docs, expected_docs),
+            "image_recall": recall_payload(recalled_images, expected_images),
+        }
+
     def _question_fingerprint(
         self,
         *,
@@ -1762,6 +1834,7 @@ def format_verification_record(record: dict[str, Any], *, width: int = 100) -> s
         "reasoning_complete",
         "citations_exist",
         "citations_within_relevant_scope",
+        "citation_recall",
         "answer_judgment",
         "question_only_shortcut",
     ):
@@ -1785,6 +1858,10 @@ def print_summary_report(summary: dict[str, Any]) -> None:
     invalid_citation_total = int(summary.get("invalid_citation_total") or 0)
     out_of_scope_citation_total = int(summary.get("out_of_scope_citation_total") or 0)
     insufficient_evidence_total = int(summary.get("insufficient_evidence_total") or 0)
+    citation_recall_macro = _safe_float(summary.get("citation_recall_macro_avg"))
+    citation_recall_micro = _safe_float(summary.get("citation_recall_micro_avg"))
+    doc_citation_recall = _safe_float(summary.get("doc_citation_recall_micro_avg"))
+    image_citation_recall = _safe_float(summary.get("image_citation_recall_micro_avg"))
     trajectory_counts = dict(summary.get("trajectory_type_counts") or {})
 
     print("repository_verification_report:")
@@ -1795,6 +1872,10 @@ def print_summary_report(summary: dict[str, Any]) -> None:
     print(f"  invalid_citation: {invalid_citation_total}/{total} ({_format_ratio(invalid_citation_total, total)})")
     print(f"  out_of_scope_citation: {out_of_scope_citation_total}/{total} ({_format_ratio(out_of_scope_citation_total, total)})")
     print(f"  insufficient_evidence: {insufficient_evidence_total}/{total} ({_format_ratio(insufficient_evidence_total, total)})")
+    print(f"  citation_recall_macro: {citation_recall_macro:.2%}")
+    print(f"  citation_recall_micro: {citation_recall_micro:.2%}")
+    print(f"  doc_citation_recall_micro: {doc_citation_recall:.2%}")
+    print(f"  image_citation_recall_micro: {image_citation_recall:.2%}")
     print("  trajectory_types:")
     for key in ("text_only", "image_first", "image_end", "multi_image", "unclassified"):
         count = int(trajectory_counts.get(key) or 0)

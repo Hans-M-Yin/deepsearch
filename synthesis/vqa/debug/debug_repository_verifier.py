@@ -93,6 +93,14 @@ def _empty_io_summary() -> dict[str, dict[str, int]]:
             "insufficient_evidence": 0,
             "cannot_answer_or_question_issue": 0,
             "model_error": 0,
+            "citation_recall_sum": 0.0,
+            "citation_recall_count": 0,
+            "citation_recalled_total": 0,
+            "citation_expected_total": 0,
+            "doc_citation_recalled_total": 0,
+            "doc_citation_expected_total": 0,
+            "image_citation_recalled_total": 0,
+            "image_citation_expected_total": 0,
         },
         "question_only": {
             "total": 0,
@@ -126,6 +134,21 @@ def _update_mode_summary(*, bucket: dict[str, int], solver_result: dict[str, Any
         bucket["incorrect"] += 1
 
 
+def _update_repository_citation_recall_summary(*, bucket: dict[str, Any], citation_recall: dict[str, Any]) -> None:
+    if not citation_recall:
+        return
+    bucket["citation_recall_sum"] += float(citation_recall.get("recall") or 0.0)
+    bucket["citation_recall_count"] += 1
+    bucket["citation_recalled_total"] += int(citation_recall.get("recalled_count") or 0)
+    bucket["citation_expected_total"] += int(citation_recall.get("expected_count") or 0)
+    doc_recall = citation_recall.get("doc_recall") or {}
+    image_recall = citation_recall.get("image_recall") or {}
+    bucket["doc_citation_recalled_total"] += int(doc_recall.get("recalled_count") or 0)
+    bucket["doc_citation_expected_total"] += int(doc_recall.get("expected_count") or 0)
+    bucket["image_citation_recalled_total"] += int(image_recall.get("recalled_count") or 0)
+    bucket["image_citation_expected_total"] += int(image_recall.get("expected_count") or 0)
+
+
 def _format_io_summary(summary: dict[str, dict[str, int]]) -> str:
     lines = [SEPARATOR, "Verification IO Summary"]
     labels = {
@@ -142,6 +165,19 @@ def _format_io_summary(summary: dict[str, dict[str, int]]) -> str:
         lines.append(f"  insufficient_evidence: {bucket.get('insufficient_evidence', 0)}")
         lines.append(f"  cannot_answer_or_question_issue: {bucket.get('cannot_answer_or_question_issue', 0)}")
         lines.append(f"  model_error: {bucket.get('model_error', 0)}")
+        if key == "repository_grounded":
+            recall_count = bucket.get("citation_recall_count", 0)
+            expected_total = bucket.get("citation_expected_total", 0)
+            doc_expected = bucket.get("doc_citation_expected_total", 0)
+            image_expected = bucket.get("image_citation_expected_total", 0)
+            macro = (bucket.get("citation_recall_sum", 0.0) / recall_count) if recall_count else 0.0
+            micro = (bucket.get("citation_recalled_total", 0) / expected_total) if expected_total else 0.0
+            doc_micro = (bucket.get("doc_citation_recalled_total", 0) / doc_expected) if doc_expected else 0.0
+            image_micro = (bucket.get("image_citation_recalled_total", 0) / image_expected) if image_expected else 0.0
+            lines.append(f"  citation_recall_macro: {macro:.2%}")
+            lines.append(f"  citation_recall_micro: {micro:.2%} ({bucket.get('citation_recalled_total', 0)}/{expected_total})")
+            lines.append(f"  doc_citation_recall_micro: {doc_micro:.2%} ({bucket.get('doc_citation_recalled_total', 0)}/{doc_expected})")
+            lines.append(f"  image_citation_recall_micro: {image_micro:.2%} ({bucket.get('image_citation_recalled_total', 0)}/{image_expected})")
     lines.append(SEPARATOR)
     return "\n".join(lines)
 
@@ -326,6 +362,10 @@ def main(argv: list[str] | None = None) -> int:
                 bucket=io_summary["repository_grounded"],
                 solver_result=record.get("solver_result") or {},
                 answer_judgment=checks.get("answer_judgment") or {},
+            )
+            _update_repository_citation_recall_summary(
+                bucket=io_summary["repository_grounded"],
+                citation_recall=checks.get("citation_recall") or {},
             )
             _update_mode_summary(
                 bucket=io_summary["question_only"],
