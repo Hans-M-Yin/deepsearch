@@ -31,6 +31,13 @@ from .path_sampler import PathSampler, RandomPathSampler, SamplerConfiguration, 
 from .evidence_builder import EvidenceBuilder
 from .question_writer import QuestionWriter
 from .verifier import SampleVerifier
+from .repository_verifier import (
+    OfflineGraphRepositoryVerifier,
+    RepositoryAssembler,
+    RepositoryBundle,
+    RepositoryItem,
+    RepositoryVerificationConfig,
+)
 from .pipeline import VqaGenerationError, VqaGenerationPipeline
 from .batch_runner import VqaBatchRunner, VqaBatchSummary
 
@@ -54,6 +61,11 @@ __all__ = [
     "EvidenceBuilder",
     "QuestionWriter",
     "SampleVerifier",
+    "RepositoryVerificationConfig",
+    "RepositoryItem",
+    "RepositoryBundle",
+    "RepositoryAssembler",
+    "OfflineGraphRepositoryVerifier",
     "VqaGenerationError",
     "VqaGenerationPipeline",
     "VqaBatchRunner",
