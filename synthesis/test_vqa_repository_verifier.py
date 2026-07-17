@@ -585,6 +585,25 @@ class RepositoryVerifierTests(unittest.TestCase):
         self.assertTrue(results[0]["final_keep"])
         self.assertTrue((fixture.vqa_dir / verifier.summary_file_name).exists())
 
+    def test_combined_repository_verifier_wrapper_requires_model_aliases(self):
+        fixture = self._fixture()
+        repo_root = Path(__file__).resolve().parents[1]
+        command = [
+            sys.executable,
+            "-m",
+            "synthesis.vqa.run_repository_verifier_with_io",
+            "--vqa-dir",
+            str(fixture.vqa_dir),
+            "--graph-dir",
+            str(fixture.graph_dir),
+            "--limit",
+            "1",
+        ]
+        result = subprocess.run(command, cwd=repo_root, capture_output=True, text=True, check=False)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("--run-verification requires both --answer-model-alias and --judge-model-alias", result.stderr or result.stdout)
+
     def test_debug_repository_verifier_script_prints_repository_bundle(self):
         fixture = self._fixture()
         repo_root = Path(__file__).resolve().parents[1]

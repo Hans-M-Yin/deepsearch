@@ -18,15 +18,17 @@ This module currently runs two verification branches for each question:
    - If this branch still answers correctly, the sample is rejected with
      ``closed_book_shortcut``.
 
-CLI usage
----------
-Run the full verifier over one VQA directory:
+Important note
+--------------
+There is no standalone ``question_only`` CLI in this file.
 
-    python -m synthesis.vqa.repository_verifier       --vqa-dir /path/to/vqa_dir       --graph-dir /path/to/graph_dir       --answer-model-alias <answer_model>       --judge-model-alias <judge_model>
+The main command below already runs both branches above inside one verifier run:
 
-This single command runs both verifier branches above. The answer model is used
-for both the repository-grounded solve and the question-only shortcut attempt.
-The judge model is used to judge both predicted answers.
+    python -m synthesis.vqa.repository_verifier
+      --vqa-dir /path/to/vqa_dir
+      --graph-dir /path/to/graph_dir
+      --answer-model-alias <answer_model>
+      --judge-model-alias <judge_model>
 
 Runtime outputs
 ---------------
@@ -52,23 +54,38 @@ Running this module writes two files into ``vqa_dir``:
 
 The CLI also prints a summary report to stdout.
 
-Debugging model inputs and outputs
-----------------------------------
-Yes. Use the dedicated debug entrypoint:
+Verbose merged runner
+---------------------
+If you want one explicit command that runs both verifier branches and also
+prints the model inputs and outputs, use:
 
-    python -m synthesis.vqa.debug.debug_repository_verifier       --vqa-dir /path/to/vqa_dir       --graph-dir /path/to/graph_dir       --question-id q_000001
+    python -m synthesis.vqa.run_repository_verifier_with_io
+      --vqa-dir /path/to/vqa_dir
+      --graph-dir /path/to/graph_dir
+      --answer-model-alias <answer_model>
+      --judge-model-alias <judge_model>
 
-This prints the repository bundle and the final model requests that would be
-sent for both branches:
+This merged runner delegates to the debug verifier with
+``--run-verification`` enabled. It prints:
+- ``Repository Bundle``
 - ``Answer Model Request``
 - ``Question-Only Shortcut Request``
-
-If you also pass ``--run-verification`` together with model aliases, it will
-actually call the models and print the corresponding raw outputs too:
 - ``Answer Model Raw Output``
 - ``Question-Only Shortcut Raw Output``
 - ``Judge Model Request`` / ``Judge Model Raw Output``
 - ``Question-Only Judge Request`` / ``Question-Only Judge Raw Output``
+
+Subset debugging
+----------------
+If you want to inspect only specific questions or samples, use:
+
+    python -m synthesis.vqa.debug.debug_repository_verifier
+      --vqa-dir /path/to/vqa_dir
+      --graph-dir /path/to/graph_dir
+      --question-id q_000001
+      --run-verification
+      --answer-model-alias <answer_model>
+      --judge-model-alias <judge_model>
 """
 
 from __future__ import annotations
