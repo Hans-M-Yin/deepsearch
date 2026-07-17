@@ -3105,6 +3105,11 @@ def _debug_main() -> None:
         help="Optional model alias registered in synthesis/models.json for LLM-guided next-hop selection.",
     )
     parser.add_argument(
+        "--history-exposure-model-alias",
+        default=None,
+        help="Optional model alias registered in synthesis/models.json for sampler history-exposure filtering.",
+    )
+    parser.add_argument(
         "--compress-hop-model-alias",
         default=None,
         help="Optional model alias registered in synthesis/models.json for compress_hop.",
@@ -3151,6 +3156,8 @@ def _debug_main() -> None:
         config=config,
         model_client=LLM_WORKER if args.sampler_model_alias and args.neighbor_selection_strategy == "llm_guided" else None,
         model=args.sampler_model_alias,
+        history_exposure_model_client=LLM_WORKER if args.history_exposure_model_alias else None,
+        history_exposure_model=args.history_exposure_model_alias,
     )
     path = sampler.generate_one()
     print(f"graph_dir: {args.graph_dir}")

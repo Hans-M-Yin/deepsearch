@@ -52,6 +52,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Optional model alias for LLM-guided next-hop selection. Defaults to VQA_SAMPLER_MODEL.",
     )
     parser.add_argument(
+        "--history-exposure-model-alias",
+        default=None,
+        help="Optional model alias for sampler history-exposure filtering. Defaults to VQA_HISTORY_EXPOSURE_MODEL.",
+    )
+    parser.add_argument(
         "--compress-hop-model-alias",
         default=None,
         help="Optional model alias for compress_hop. Defaults to VQA_COMPRESS_HOP_MODEL.",
@@ -91,6 +96,7 @@ def main(argv: list[str] | None = None) -> int:
     sampler_state_input_path = args.sampler_state.resolve() if args.sampler_state else None
     model_alias = args.model_alias or os.environ.get("VQA_WRITER_MODEL")
     sampler_model_alias = args.sampler_model_alias or os.environ.get("VQA_SAMPLER_MODEL")
+    history_exposure_model_alias = args.history_exposure_model_alias or os.environ.get("VQA_HISTORY_EXPOSURE_MODEL")
     compress_hop_model_alias = args.compress_hop_model_alias or os.environ.get("VQA_COMPRESS_HOP_MODEL")
     image_bridge_model_alias = args.image_bridge_model_alias or os.environ.get("VQA_IMAGE_BRIDGE_MODEL")
     image_target_ask_model_alias = args.image_target_ask_model_alias or os.environ.get("VQA_IMAGE_TARGET_ASK_MODEL")
@@ -112,6 +118,8 @@ def main(argv: list[str] | None = None) -> int:
         config=config,
         model_client=LLM_WORKER if sampler_model_alias and args.neighbor_selection_strategy == "llm_guided" else None,
         model=sampler_model_alias,
+        history_exposure_model_client=LLM_WORKER if history_exposure_model_alias else None,
+        history_exposure_model=history_exposure_model_alias,
     )
     writer = QuestionWriter(
         model_client=LLM_WORKER if model_alias else None,
@@ -159,6 +167,7 @@ def main(argv: list[str] | None = None) -> int:
             "models": {
                 "writer_model_alias": model_alias,
                 "sampler_model_alias": sampler_model_alias,
+                "history_exposure_model_alias": history_exposure_model_alias,
                 "compress_hop_model_alias": compress_hop_model_alias,
                 "image_bridge_model_alias": image_bridge_model_alias,
                 "image_target_ask_model_alias": image_target_ask_model_alias,

@@ -152,7 +152,8 @@ Rules:
 6. Keep direction as source_to_target unless the local context clearly says the target acts on the source.
 7. Do not output explanations or markdown.
 8. The local context may contain multiple facts and entities. Identify the text that specifically connects the source entity to the target entity. You may combine multiple explicitly supported details from the local context to form a uniquely identifying relation. Do not use facts that refer to other entities, and never invent qualifiers.
-9. Do not include the target entity's name, aliases, abbreviations, or other answer-revealing identifiers in the relation. The target will be used as the answer in downstream multi-hop questions, so the relation must describe the target without naming it. Ensure that the source entity or a pronoun referring to the source entity appears in the relation.
+9. Do not include the target entity's name, aliases, abbreviations, or other answer-revealing identifiers in the relation. The target will be used as the answer in downstream multi-hop questions, so the relation must describe the target without naming it.
+10. The relation must be source-centered: it must explicitly mention the source entity, or use a clear pronoun / source description that refers to the source (for example, "it", "its", "the album", "the organization", "his", or "her" when unambiguous). Do not write a relation whose main subject is a third-party person, event, or organization rather than the source.
 
 Output exactly:
 <relation>
@@ -168,6 +169,7 @@ evidence: short quote from context
 PROMPT_FILTER_WIKI_NEIGHBORS = """You are selecting useful neighboring Wikipedia entities for building a multi-hop research graph.
 
 Given one source entity and candidate outgoing Wikipedia links, decide which candidates should be kept as expansion targets.
+Each candidate includes a proposed relation that was already extracted by a separate relation extractor. Do not invent a new relation. Use the proposed relation when scoring the candidate.
 
 The goal is not to keep the closest or most obvious links. Prefer candidates that can become useful intermediate hops for diverse, natural multi-hop questions.
 Prefer candidates that add new information rather than simply restating the source entity's most obvious identity.
@@ -182,6 +184,7 @@ Keep candidates that:
 - admit a relation description that can distinguish this target from other likely neighbors of the same source, possibly by adding explicit qualifiers from context;
 - can act as a useful bridge for multi-hop questions;
 - are supported by the local hyperlink context.
+- have a proposed relation that directly connects the source entity to the candidate target.
 
 Reject candidates that:
 - are too close to the source, such as the same entity, aliases, purely self-descriptive links, or repeated administrative editions;
@@ -193,14 +196,25 @@ Reject candidates that:
 - are generic geographic or administrative units such as countries, regions, provinces, states, cities, or districts unless the place itself is central to the source entity's identity or needed as a uniquely identifying bridge;
 - would only support a vague relation that is likely to map from the source to many different targets unless the local context clearly provides a stronger distinguishing qualifier;
 - are unlikely to have a stable Wikipedia page representing one specific target.
+- have a proposed relation that is mainly about a third-party person, event, organization, or background fact rather than the source entity;
+- require multiple implicit hops from source to target, such as source -> artist/person -> event -> candidate;
+- can identify the candidate even if the source entity is removed, because the relation is a standalone target clue rather than a source-to-target relation.
 
 Relation is open-ended.
 Do not force the relation into a fixed taxonomy, and do not overuse a small set of generic predicates.
-The relation should be written from the source to this candidate in a way that is as uniquely target-identifying as possible.
-If a broad predicate would fit multiple candidates for the same source, add qualifiers so the relation becomes more discriminative.
-Do not reveal the target directly in the relation. Do not copy the candidate title, and do not include the target's name, aliases, abbreviations, or obvious answer-revealing lexical spans inside the relation text.
+The proposed relation should read from the source to this candidate in a way that is as uniquely target-identifying as possible.
+If a broad predicate would fit multiple candidates for the same source, the relation should include qualifiers so the relation becomes more discriminative.
+Do not reward uniqueness when the unique details are unrelated to the source entity. High target uniqueness must not compensate for weak source-target relevance.
+Do not reveal the target directly in the relation. The proposed relation should not copy the candidate title, and should not include the target's name, aliases, abbreviations, or obvious answer-revealing lexical spans inside the relation text.
 If rejecting a candidate, relation can be a short rejection label such as too_generic, too_close, too_far, ambiguous_entity, list_page, reference_noise, or templatic_edition.
 When in doubt, prefer a canonical specific target page over an explanatory overview page.
+
+Hard scoring rules for proposed relation quality:
+- If the proposed relation does not directly connect the source and target, use keep="no" and score no higher than 2.0.
+- If the proposed relation is mainly about a third-party person, event, or organization, and the source is only the page that contains that fact, use keep="no" and score no higher than 1.5.
+- If the proposed relation compresses multiple implicit hops into one edge, use keep="no" and score no higher than 2.0.
+- If the proposed relation is direct but too broad to identify the candidate from the source, use keep="no" or score no higher than 2.5.
+- Keep the original candidate-quality logic above; these relation-quality rules are additional hard caps, not replacements.
 
 Examples we should keep:
  
@@ -274,6 +288,8 @@ explanations outside the tags.
 Output format:
 <neighbor id="1" title="Los Angeles Lakers" keep="yes" score="4.2" relation="played_for" reason="Specific team linked by source career context"/>
 <neighbor id="2" title="basketball" keep="no" score="1.0" relation="too_generic" reason="Broad class, not a unique entity"/>
+
+When keep="yes", copy the proposed relation exactly into the relation attribute. When keep="no", relation may be the copied proposed relation or a short rejection label.
 
 Scores are 0.0 to 5.0. Use keep="yes" only for candidates with score >= 3.0.
 """
@@ -439,6 +455,8 @@ class WikiLinkCandidate:
     window_id: int | None = None
     score: float = 0.0
     quality_reasons: list[str] = field(default_factory=list)
+    relation: str | None = None
+    relation_info: dict[str, Any] = field(default_factory=dict)
 
     @property
     def node_id(self) -> str:
@@ -954,6 +972,10 @@ class WikiTextBuilder:
                 )
             )
         candidates = self._uniformly_sample_candidates(candidates, self.max_raw_links)
+        candidates = self._attach_relations_to_candidates(
+            source_title=self._title_from_url(source_url) or source_url,
+            candidates=candidates,
+        )
         candidates = self._filter_links_with_llm(source_url=source_url, candidates=candidates)
         return self._select_position_diverse_links(candidates)
 
@@ -1038,6 +1060,8 @@ class WikiTextBuilder:
                 f"[neighbor-filter] stage=llm_call source={source_title!r} candidates={len(prompt_candidates)} elapsed_s={time.perf_counter() - llm_started:.3f}"
             )
             decisions = self._parse_neighbor_filter_response(response.content)
+            if not decisions:
+                raise ValueError("empty_neighbor_filter_decisions")
             if debug_enabled:
                 self._debug_print_neighbor_filter_raw(
                     source_title=source_title,
@@ -1105,8 +1129,6 @@ class WikiTextBuilder:
             )
 
         if not kept:
-            for candidate in candidates:
-                candidate.quality_reasons.append("llm_neighbor_filter_empty_fallback")
             if debug_enabled:
                 self._debug_print_neighbor_empty_fallback(
                     source_title=source_title,
@@ -1116,7 +1138,7 @@ class WikiTextBuilder:
                     total_candidates=len(candidates),
                     prompt_candidates=len(prompt_candidates),
                 )
-            reranked = candidates
+            reranked = []
         else:
             reranked = kept
 
@@ -1125,12 +1147,73 @@ class WikiTextBuilder:
             candidates=reranked,
             relations_by_url={
                 candidate.url: (
-                    (decisions.get(index) or {}).get("relation") or candidate.anchor_text
+                    (decisions.get(index) or {}).get("relation") or candidate.relation or candidate.anchor_text
                 )
                 for index, candidate in enumerate(prompt_candidates, start=1)
             },
         )
         return reranked
+
+    def _attach_relations_to_candidates(
+        self,
+        *,
+        source_title: str,
+        candidates: list[WikiLinkCandidate],
+    ) -> list[WikiLinkCandidate]:
+        if not candidates:
+            return candidates
+        model_alias = os.environ.get("WIKI_RELATION_MODEL")
+        if not model_alias:
+            for candidate in candidates:
+                candidate.relation = candidate.anchor_text
+                candidate.relation_info = {
+                    "source": source_title,
+                    "target": candidate.title,
+                    "relation": candidate.anchor_text,
+                    "direction": "source_to_target",
+                    "evidence": candidate.context,
+                    "method": "anchor_fallback",
+                }
+            return candidates
+        source_node = TextNode(
+            node_id=TextNode.make_id("wikipedia_page", f"relation_source:{source_title}"),
+            title=source_title,
+            subtype="wiki_page",
+        )
+
+        def _extract(index: int, candidate: WikiLinkCandidate) -> dict[str, Any]:
+            return self._extract_relation_for_link(
+                source_node,
+                candidate,
+                trace_label=f"wiki_relation:{source_title}:candidate_{index}:{candidate.title}",
+            )
+
+        max_workers = min(len(candidates), max(1, int(os.environ.get("WIKI_RELATION_MAX_WORKERS", "8"))))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_map = {
+                executor.submit(_extract, index, candidate): candidate
+                for index, candidate in enumerate(candidates, start=1)
+            }
+            for future in as_completed(future_map):
+                candidate = future_map[future]
+                try:
+                    relation_info = future.result()
+                except Exception as exc:
+                    relation_info = {
+                        "source": source_title,
+                        "target": candidate.title,
+                        "relation": candidate.anchor_text,
+                        "direction": "source_to_target",
+                        "evidence": candidate.context,
+                        "method": f"anchor_fallback_relation_error:{exc.__class__.__name__}",
+                        "error": str(exc),
+                    }
+                candidate.relation_info = dict(relation_info or {})
+                candidate.relation = candidate.relation_info.get("relation") or candidate.anchor_text
+                method = candidate.relation_info.get("method")
+                if method:
+                    candidate.quality_reasons.append(f"relation_method:{method}")
+        return candidates
 
     def _apply_neighbor_familiarity_penalty(
         self,
@@ -1553,6 +1636,7 @@ class WikiTextBuilder:
                     f"Title: {candidate.title}",
                     f"URL: {candidate.url}",
                     f"Anchor: {candidate.anchor_text}",
+                    f"Proposed relation: {candidate.relation or candidate.anchor_text}",
                     f"Rule score: {candidate.score:.2f}",
                     f"Local context: {context[:2000]}",
                     "",
@@ -1762,8 +1846,12 @@ class WikiTextBuilder:
         *,
         run_id: str | None,
     ) -> Edge:
-        relation_info = self._extract_relation_for_link(source_node, candidate)
-        relation = relation_info.get("relation") or candidate.anchor_text
+        relation_info = dict(candidate.relation_info or {})
+        if not relation_info:
+            relation_info = self._extract_relation_for_link(source_node, candidate)
+            candidate.relation_info = dict(relation_info or {})
+            candidate.relation = candidate.relation_info.get("relation") or candidate.anchor_text
+        relation = candidate.relation or relation_info.get("relation") or candidate.anchor_text
         return Edge.create(
             source_node.node_id,
             candidate.node_id,
@@ -1815,6 +1903,8 @@ class WikiTextBuilder:
         self,
         source_node: TextNode,
         candidate: WikiLinkCandidate,
+        *,
+        trace_label: str | None = None,
     ) -> dict[str, Any]:
         model_alias = os.environ.get("WIKI_RELATION_MODEL")
         if not model_alias:
@@ -1837,6 +1927,10 @@ class WikiTextBuilder:
                         content=self._relation_prompt_input(source_node, candidate),
                     ),
                 ],
+                metadata={
+                    "trace_label": trace_label
+                    or f"wiki_relation:{source_node.title or source_node.node_id}:{candidate.title}"
+                },
             )
         )
         try:
@@ -2111,12 +2205,49 @@ def _smoke_test() -> None:
     class MockModel:
         def generate(self, request: ModelRequest) -> ModelResponse:
             assert request.model == "mock_text"
+            system = request.messages[0].content if request.messages else ""
+            if "semantic relation between two Wikipedia text nodes" in system:
+                user = request.messages[-1].content if request.messages else ""
+                target_match = re.search(r"Target entity:\n([^\n]+)", str(user))
+                target = target_match.group(1).strip() if target_match else "target"
+                return ModelResponse(
+                    content=(
+                        "<relation>\n"
+                        "source: Kobe Bryant\n"
+                        f"target: {target}\n"
+                        f"relation: his relation to {target}\n"
+                        "direction: source_to_target\n"
+                        f"evidence: {target}\n"
+                        "</relation>"
+                    )
+                )
+            if "selecting useful neighboring Wikipedia entities" in system:
+                user = str(request.messages[-1].content if request.messages else "")
+                items = []
+                for match in re.finditer(r"\[(\d+)\]\nTitle: ([^\n]+)", user):
+                    index = match.group(1)
+                    title = match.group(2).strip()
+                    if title == "Dream Team (basketball)":
+                        items.append(
+                            f'<neighbor id="{index}" title="{title}" keep="no" score="1.0" '
+                            'relation="too_far" reason="Too indirect"/>'
+                        )
+                    else:
+                        items.append(
+                            f'<neighbor id="{index}" title="{title}" keep="yes" score="4.2" '
+                            f'relation="his relation to {title}" reason="Specific source-target relation"/>'
+                        )
+                return ModelResponse(content="".join(items))
             return ModelResponse(
                 content="<attr>occupation: basketball player</attr><attr>team: Los Angeles Lakers</attr>"
             )
 
     old_model = os.environ.get("TEXT_PROCESS_MODEL")
+    old_neighbor_model = os.environ.get("WIKI_NEIGHBOR_MODEL")
+    old_relation_model = os.environ.get("WIKI_RELATION_MODEL")
     os.environ["TEXT_PROCESS_MODEL"] = "mock_text"
+    os.environ["WIKI_NEIGHBOR_MODEL"] = "mock_text"
+    os.environ["WIKI_RELATION_MODEL"] = "mock_text"
     try:
         with tempfile.TemporaryDirectory() as tmpdir:
             store = JsonlGraphStore(tmpdir)
@@ -2137,8 +2268,11 @@ def _smoke_test() -> None:
             assert result.node.metadata["content_truncated"] is True
             titles = {link.title for link in result.linked_entities}
             assert "Los Angeles Lakers" in titles
-            assert "Dream Team (basketball)" in titles
+            assert "Dream Team (basketball)" not in titles
             assert all('"' not in link.url for link in result.linked_entities)
+            lakers_link = next(link for link in result.linked_entities if link.title == "Los Angeles Lakers")
+            assert lakers_link.relation == "his relation to Los Angeles Lakers"
+            assert lakers_link.relation_info["method"] == "llm_relation_extraction"
             parsed_neighbors = WikiTextBuilder._parse_neighbor_filter_response(
                 '<neighbor id="1" title="Los Angeles Lakers" keep="yes" score="4.2" relation="played_for" reason="Specific team"/>'
                 '<neighbor id="2" title="basketball" keep="no" score="1.0" relation="too_generic" reason="Broad class"/>'
@@ -2200,6 +2334,14 @@ def _smoke_test() -> None:
             os.environ.pop("TEXT_PROCESS_MODEL", None)
         else:
             os.environ["TEXT_PROCESS_MODEL"] = old_model
+        if old_neighbor_model is None:
+            os.environ.pop("WIKI_NEIGHBOR_MODEL", None)
+        else:
+            os.environ["WIKI_NEIGHBOR_MODEL"] = old_neighbor_model
+        if old_relation_model is None:
+            os.environ.pop("WIKI_RELATION_MODEL", None)
+        else:
+            os.environ["WIKI_RELATION_MODEL"] = old_relation_model
     print("wiki_text_builder smoke test passed")
 
 

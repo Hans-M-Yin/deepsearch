@@ -302,6 +302,7 @@ PROMPT_TEXT_TO_IMAGE_RELATION_REWRITE = """You are rewriting an image-search que
 Goal:
 - The original search query already identifies one unique image or visual scene.
 - Rewrite it into a short relation phrase that connects the source text node to that image node more naturally.
+- The relation should explain why this image is a meaningful visual neighbor of the source, not merely restate what the image shows.
 
 Requirements:
 1. Make only minimal edits to the original search query.
@@ -310,6 +311,9 @@ Requirements:
 4. Prefer replacing repeated mentions of the source title with a pronoun or possessive when this is natural and unambiguous.
 5. Do not broaden the query, drop key details, or add unsupported facts.
 6. Do not output a full sentence. Output a short phrase only.
+7. Avoid vague scaffolds such as "related to a photo", "related to an image", "associated with a picture", or "image that shows" when they do not explain the source-image connection.
+8. If the image is tied to the source through an intermediate work, product, label, organization, event, location, award, or other bridge entity, include that bridge explicitly instead of hiding it behind "related to".
+9. Pronouns and possessives such as "its", "his", or "her" are encouraged when they clearly refer to the source. For indirect source-image connections, do not let a pronoun hide the bridge; name the bridge explicitly with wording such as "through ..." or "via ...".
 
 Examples:
 Source title: Kobe Bryant
@@ -319,6 +323,22 @@ Relation: his photo of himself giving his farewell "Mamba Out" speech at center 
 Source title: Lionel Messi
 Original search query: Lionel Messi sleeping while hugging the World Cup trophy after the 2022 FIFA World Cup final
 Relation: his photo of himself sleeping while hugging the World Cup trophy after the 2022 FIFA World Cup final
+
+Source title: Warner Music Group
+Original search query: Fleetwood Mac 1977 Rumours album cover released by Warner Bros. Records
+Relation: the cover image of Rumours, the 1977 Fleetwood Mac album released through Warner Music Group's Warner Bros. Records label
+
+Source title: Warner Music Group
+Original search query: photo showing the cover of Fleetwood Mac's 1977 album Rumours released by Warner Bros. Records
+Relation: the cover of Rumours, the Fleetwood Mac album released through Warner Music Group's Warner Bros. Records label in 1977
+
+Source title: The United States Constitution
+Original search query: first handwritten page of the United States Constitution beginning with We the People
+Relation: image of its first handwritten page beginning with We the People
+
+Source title: Southern Methodist University
+Original search query: five U.S. presidents at the dedication ceremony for the George W. Bush Presidential Center on April 25, 2013
+Relation: image from the dedication ceremony for the George W. Bush Presidential Center on its campus on April 25, 2013
 
 Return valid JSON with exactly this field:
 {

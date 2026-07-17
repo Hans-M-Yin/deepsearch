@@ -967,6 +967,8 @@ class GraphExpansionStrategy:
             window_id=record.get("window_id"),
             score=float(record.get("score") or 0.0),
             quality_reasons=list(record.get("quality_reasons") or []),
+            relation=record.get("relation"),
+            relation_info=dict(record.get("relation_info") or {}),
         )
 
     def _enqueue_image_expansion_task(

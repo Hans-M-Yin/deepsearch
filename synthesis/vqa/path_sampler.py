@@ -6,6 +6,7 @@ import argparse
 from dataclasses import asdict, dataclass, field
 from hashlib import sha256
 import json
+import os
 from pathlib import Path
 import random
 import re
@@ -82,6 +83,83 @@ Return valid JSON with exactly this shape:
 Rank higher candidates first. Use higher score for better candidates. Use higher shortcut_risk when a candidate is more dangerous.
 Give priority to less well-known edges and their corresponding neighbor nodes that involve more niche knowledge.
 """
+
+
+PROMPT_HISTORY_EXPOSURE_JUDGE = """You are reviewing whether a candidate next TEXT node is already exposed by the current trajectory history in a multi-hop question-generation pipeline.
+
+Your job is NOT to judge whether the candidate is generally relevant.
+Your job is to decide whether selecting this candidate would create a shortcut, repeated entity, or answer leakage because the candidate has already been explicitly or semantically exposed by earlier trajectory text.
+
+A candidate should be BLOCKED if:
+- the candidate target is explicitly named in an earlier text-node title
+- the candidate target is explicitly named in an earlier edge relation
+- the candidate target is an alias, abbreviation, or equivalent name for something already exposed
+- the candidate target is strongly identified by a previous relation, even if the exact title string is not used
+- adding this candidate would make the chain look multi-hop while the answer was already revealed earlier
+
+A candidate should be ALLOWED if:
+- the candidate is only topically related but not already named or strongly identified
+- the previous history provides broad context but does not reveal the candidate
+- the candidate introduces genuinely new information needed for the next hop
+- the candidate is a reasonable continuation and cannot be answered from the history alone
+
+Important evaluation principles:
+1. Evaluate exposure from the trajectory history only. Do not use outside knowledge except to recognize obvious aliases or equivalent names.
+2. Be conservative about blocking common words, generic categories, and weak topical hints.
+3. Block exact mentions and strong aliases.
+4. Block cases where previous relation text already reveals the candidate as a named entity.
+5. Allow cases where the candidate is merely related, contrasted, or in the same domain but not revealed.
+6. The current candidate hop itself is not part of the history; do not block simply because the candidate title appears in the candidate hop.
+
+You will receive:
+- trajectory_exposure_history: text already exposed by previous trajectory nodes and relations
+- current_node: the node currently being expanded
+- candidate_edge: the edge under consideration
+- candidate_text_node: the target text node under consideration
+- hard_match_result: deterministic string-match evidence
+
+Return valid JSON with exactly this shape:
+{
+  "allow": true,
+  "decision": "allow",
+  "risk_type": "none",
+  "matched_history": "",
+  "matched_label": "",
+  "reason": "short explanation grounded in the provided history"
+}
+
+Use allow=false and decision="block" if the candidate is already exposed.
+Use allow=true and decision="allow" if the candidate is not already exposed.
+"""
+
+
+_GENERIC_EXPOSURE_LABELS = {
+    "album",
+    "band",
+    "book",
+    "city",
+    "country",
+    "episode",
+    "film",
+    "game",
+    "group",
+    "language",
+    "man",
+    "movie",
+    "music",
+    "novel",
+    "person",
+    "photo",
+    "picture",
+    "place",
+    "play",
+    "record",
+    "series",
+    "show",
+    "song",
+    "team",
+    "woman",
+}
 
 
 def _stable_hash(*parts: object, length: int = 16) -> str:
@@ -196,6 +274,8 @@ class RandomPathSampler(PathSampler):
     edge_usage_counts: dict[str, int] = field(default_factory=dict)
     model_client: ModelWorkerClient | None = None
     model: str | None = None
+    history_exposure_model_client: ModelWorkerClient | None = None
+    history_exposure_model: str | None = None
     llm_temperature: float = 0.0
     llm_max_tokens: int = 800
     _rng: random.Random = field(init=False, repr=False)
@@ -372,6 +452,11 @@ class RandomPathSampler(PathSampler):
             if self.config.require_simple_path:
                 neighbors = [edge for edge in neighbors if edge.get("dst_node_id") not in node_ids]
             neighbors = [edge for edge in neighbors if edge.get("edge_id") not in used_edge_ids]
+            neighbors = self._filter_candidate_neighbors(
+                neighbors,
+                node_ids=node_ids,
+                selection_trace=selection_trace,
+            )
             if not neighbors:
                 if len(edge_ids) < self.config.min_hops:
                     return None, "too_short"
@@ -445,6 +530,325 @@ class RandomPathSampler(PathSampler):
                 )
             ]
         return neighbors
+
+    def _filter_candidate_neighbors(
+        self,
+        neighbors: list[dict[str, Any]],
+        *,
+        node_ids: list[str],
+        selection_trace: list[dict[str, Any]] | None = None,
+    ) -> list[dict[str, Any]]:
+        if not neighbors:
+            return []
+        kept: list[dict[str, Any]] = []
+        rejected: list[dict[str, Any]] = []
+        exposure_parts: list[dict[str, Any]] | None = None
+        for edge in neighbors:
+            shortcut_reject = self._shortcut_reject_reason(edge=edge, node_ids=node_ids)
+            if shortcut_reject is not None:
+                rejected.append(shortcut_reject)
+                continue
+            if self.graph.node_type(str(edge.get("dst_node_id") or "")) == "text":
+                if exposure_parts is None:
+                    exposure_parts = self._history_exposure_parts(node_ids)
+                exposure_reject = self._history_exposure_reject_reason(
+                    edge=edge,
+                    node_ids=node_ids,
+                    exposure_parts=exposure_parts,
+                )
+                if exposure_reject is not None:
+                    rejected.append(exposure_reject)
+                    continue
+            kept.append(edge)
+        if rejected and selection_trace is not None:
+            selection_trace.append(
+                {
+                    "mode": "candidate_filter",
+                    "status": "filtered",
+                    "current_node_id": node_ids[-1] if node_ids else None,
+                    "input_edge_count": len(neighbors),
+                    "kept_edge_count": len(kept),
+                    "rejections": rejected,
+                }
+            )
+        return kept
+
+    def _shortcut_reject_reason(self, *, edge: dict[str, Any], node_ids: list[str]) -> dict[str, Any] | None:
+        dst_node_id = str(edge.get("dst_node_id") or "").strip()
+        if not dst_node_id or len(node_ids) <= 1:
+            return None
+        # The most recent node is the legitimate source of the candidate edge.
+        # Any direct edge between the candidate and an earlier node creates a
+        # structural shortcut in the sampled trajectory.
+        for history_node_id in node_ids[:-1]:
+            shortcut_edge = self._edge_between_nodes(history_node_id, dst_node_id)
+            if shortcut_edge is None:
+                continue
+            return {
+                "filter_reason": "shortcut_edge_to_history_node",
+                "edge_id": edge.get("edge_id"),
+                "dst_node_id": dst_node_id,
+                "history_node_id": history_node_id,
+                "shortcut_edge_id": shortcut_edge.get("edge_id"),
+                "shortcut_edge_type": shortcut_edge.get("edge_type"),
+                "shortcut_relation": shortcut_edge.get("relation") or "",
+            }
+        return None
+
+    def _edge_between_nodes(self, left_node_id: str, right_node_id: str) -> dict[str, Any] | None:
+        forward = self.graph.get_edge_id_between(left_node_id, right_node_id)
+        if forward is not None:
+            return forward
+        return self.graph.get_edge_id_between(right_node_id, left_node_id)
+
+    def _history_exposure_reject_reason(
+        self,
+        *,
+        edge: dict[str, Any],
+        node_ids: list[str],
+        exposure_parts: list[dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        dst_node_id = str(edge.get("dst_node_id") or "").strip()
+        dst_node = self.graph.get_node(dst_node_id) or {}
+        labels = self._candidate_text_exposure_labels(dst_node)
+        hard_match_result = self._hard_history_exposure_match(labels=labels, exposure_parts=exposure_parts)
+        if not bool(hard_match_result.get("allow", True)):
+            return {
+                "filter_reason": "history_exposure_hard_match",
+                "edge_id": edge.get("edge_id"),
+                "dst_node_id": dst_node_id,
+                "hard_match_result": hard_match_result,
+            }
+
+        llm_result = self._llm_history_exposure_judge(
+            edge=edge,
+            node_ids=node_ids,
+            exposure_parts=exposure_parts,
+            candidate_node=dst_node,
+            hard_match_result=hard_match_result,
+        )
+        if llm_result is not None and not bool(llm_result.get("allow", True)):
+            return {
+                "filter_reason": "history_exposure_llm_block",
+                "edge_id": edge.get("edge_id"),
+                "dst_node_id": dst_node_id,
+                "llm_result": llm_result,
+                "hard_match_result": hard_match_result,
+            }
+        return None
+
+    def _history_exposure_parts(self, node_ids: list[str]) -> list[dict[str, Any]]:
+        if not node_ids:
+            return []
+        parts: list[dict[str, Any]] = []
+        start_node = self.graph.get_node(node_ids[0]) or {}
+        if self.graph.node_type(node_ids[0]) == "text":
+            title = str(start_node.get("title") or "").strip()
+            if title:
+                parts.append(
+                    {
+                        "kind": "start_text_title",
+                        "node_id": node_ids[0],
+                        "text": title,
+                    }
+                )
+
+        for index in range(1, len(node_ids)):
+            src_node_id = node_ids[index - 1]
+            dst_node_id = node_ids[index]
+            edge = self.graph.get_edge_id_between(src_node_id, dst_node_id) or {}
+            relation = str(edge.get("relation") or edge.get("edge_type") or "").strip()
+            if relation:
+                parts.append(
+                    {
+                        "kind": "edge_relation",
+                        "edge_id": edge.get("edge_id"),
+                        "src_node_id": src_node_id,
+                        "dst_node_id": dst_node_id,
+                        "text": relation,
+                    }
+                )
+            if self.graph.node_type(dst_node_id) != "text":
+                continue
+            dst_node = self.graph.get_node(dst_node_id) or {}
+            title = str(dst_node.get("title") or "").strip()
+            if title:
+                parts.append(
+                    {
+                        "kind": "text_node_title",
+                        "node_id": dst_node_id,
+                        "text": title,
+                    }
+                )
+        return parts
+
+    def _candidate_text_exposure_labels(self, node: dict[str, Any]) -> list[str]:
+        labels: list[str] = []
+        title = str(node.get("title") or "").strip()
+        if title:
+            labels.append(title)
+        aliases = node.get("aliases") or []
+        if isinstance(aliases, list):
+            for alias in aliases:
+                alias_text = str(alias or "").strip()
+                if alias_text:
+                    labels.append(alias_text)
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for label in labels:
+            normalized = self._normalize_exposure_text(label)
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            deduped.append(label)
+        return deduped
+
+    def _hard_history_exposure_match(
+        self,
+        *,
+        labels: list[str],
+        exposure_parts: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        for label in labels:
+            normalized_label = self._normalize_exposure_text(label)
+            if not self._is_strong_exposure_label(normalized_label):
+                continue
+            needle = f" {normalized_label} "
+            for part in exposure_parts:
+                normalized_part = self._normalize_exposure_text(part.get("text") or "")
+                if not normalized_part:
+                    continue
+                if needle in f" {normalized_part} ":
+                    return {
+                        "allow": False,
+                        "matched_label": label,
+                        "matched_history_kind": part.get("kind"),
+                        "matched_history_text": part.get("text") or "",
+                        "matched_history_node_id": part.get("node_id"),
+                        "matched_history_edge_id": part.get("edge_id"),
+                        "reason": "candidate text label appears in trajectory exposure history",
+                    }
+        return {"allow": True, "reason": "no hard exposure match"}
+
+    @staticmethod
+    def _normalize_exposure_text(value: Any) -> str:
+        text = str(value or "").lower()
+        text = re.sub(r"[^a-z0-9]+", " ", text)
+        return re.sub(r"\s+", " ", text).strip()
+
+    @staticmethod
+    def _is_strong_exposure_label(normalized_label: str) -> bool:
+        if not normalized_label or normalized_label in _GENERIC_EXPOSURE_LABELS:
+            return False
+        tokens = normalized_label.split()
+        if len(tokens) >= 2:
+            return len(normalized_label) >= 5
+        return len(normalized_label) >= 5
+
+    def _llm_history_exposure_judge(
+        self,
+        *,
+        edge: dict[str, Any],
+        node_ids: list[str],
+        exposure_parts: list[dict[str, Any]],
+        candidate_node: dict[str, Any],
+        hard_match_result: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        model_client = self.history_exposure_model_client or self.model_client
+        model_alias = self.history_exposure_model or os.environ.get("VQA_HISTORY_EXPOSURE_MODEL")
+        if model_client is None or not model_alias:
+            return None
+        payload = self._history_exposure_payload(
+            edge=edge,
+            node_ids=node_ids,
+            exposure_parts=exposure_parts,
+            candidate_node=candidate_node,
+            hard_match_result=hard_match_result,
+        )
+        try:
+            parsed = self._generate_llm_json(
+                system=PROMPT_HISTORY_EXPOSURE_JUDGE,
+                user_payload=payload,
+                trace_label="sampler_history_exposure",
+                model_client=model_client,
+                model=model_alias,
+                temperature=0.0,
+            )
+        except Exception as exc:
+            return {
+                "allow": True,
+                "decision": "allow",
+                "risk_type": "judge_error",
+                "matched_history": "",
+                "matched_label": "",
+                "reason": f"history exposure judge failed open: {exc.__class__.__name__}: {exc}",
+                "error_type": exc.__class__.__name__,
+                "error": str(exc),
+                "model_alias": model_alias,
+            }
+        allow = self._coerce_optional_bool(parsed.get("allow"))
+        if allow is None:
+            allow = str(parsed.get("decision") or "").strip().lower() != "block"
+        decision = str(parsed.get("decision") or ("allow" if allow else "block")).strip().lower()
+        if decision == "block":
+            allow = False
+        return {
+            "allow": allow,
+            "decision": "allow" if allow else "block",
+            "risk_type": str(parsed.get("risk_type") or ("none" if allow else "exposed_target")).strip(),
+            "matched_history": str(parsed.get("matched_history") or "").strip(),
+            "matched_label": str(parsed.get("matched_label") or "").strip(),
+            "reason": str(parsed.get("reason") or "").strip(),
+            "model_alias": model_alias,
+            "raw": parsed,
+        }
+
+    @staticmethod
+    def _coerce_optional_bool(value: Any) -> bool | None:
+        if isinstance(value, bool):
+            return value
+        if value is None:
+            return None
+        if isinstance(value, (int, float)):
+            return bool(value)
+        text = str(value).strip().lower()
+        if text in {"true", "yes", "1", "allow", "allowed"}:
+            return True
+        if text in {"false", "no", "0", "block", "blocked"}:
+            return False
+        return None
+
+    def _history_exposure_payload(
+        self,
+        *,
+        edge: dict[str, Any],
+        node_ids: list[str],
+        exposure_parts: list[dict[str, Any]],
+        candidate_node: dict[str, Any],
+        hard_match_result: dict[str, Any],
+    ) -> dict[str, Any]:
+        current_node_id = node_ids[-1] if node_ids else ""
+        current_node = self.graph.get_node(current_node_id) or {}
+        return {
+            "trajectory_exposure_history": [
+                {
+                    key: value
+                    for key, value in part.items()
+                    if key in {"kind", "node_id", "edge_id", "src_node_id", "dst_node_id", "text"}
+                }
+                for part in exposure_parts
+            ],
+            "current_node": self._node_summary(current_node, include_details=False),
+            "candidate_edge": {
+                "edge_id": edge.get("edge_id"),
+                "edge_type": edge.get("edge_type"),
+                "relation": edge.get("relation") or edge.get("edge_type") or "",
+                "hop": self._format_candidate_hop(edge),
+            },
+            "candidate_text_node": self._node_summary(candidate_node, include_details=True),
+            "candidate_text_labels": self._candidate_text_exposure_labels(candidate_node),
+            "hard_match_result": hard_match_result,
+        }
 
     def _candidate_start_nodes(self) -> list[str]:
         node_ids = self.graph.list_node_ids()
@@ -623,13 +1027,20 @@ class RandomPathSampler(PathSampler):
         system: str,
         user_payload: dict[str, Any],
         trace_label: str,
+        model_client: ModelWorkerClient | None = None,
+        model: str | None = None,
+        temperature: float | None = None,
     ) -> dict[str, Any]:
-        if self.model_client is None:
+        request_client = model_client or self.model_client
+        request_model = model or self.model
+        if request_client is None:
             raise RuntimeError("model_client is required for LLM-guided sampling")
-        response = self.model_client.generate(
+        if not request_model:
+            raise RuntimeError("model alias is required for LLM-guided sampling")
+        response = request_client.generate(
             ModelRequest(
-                model=self.model,
-                temperature=self.llm_temperature,
+                model=request_model,
+                temperature=self.llm_temperature if temperature is None else temperature,
                 max_tokens=self.llm_max_tokens,
                 response_format={"type": "json_object"},
                 messages=[
@@ -862,6 +1273,11 @@ def _debug_main() -> None:
         default=None,
         help="Optional model alias registered in synthesis/models.json for next-hop ranking.",
     )
+    parser.add_argument(
+        "--history-exposure-model-alias",
+        default=None,
+        help="Optional model alias registered in synthesis/models.json for history-exposure filtering. Defaults to VQA_HISTORY_EXPOSURE_MODEL.",
+    )
     args = parser.parse_args()
 
     store = JsonlGraphStore(args.graph_dir)
@@ -883,6 +1299,8 @@ def _debug_main() -> None:
         ),
         model_client=LLM_WORKER if args.sampler_model_alias and args.neighbor_selection_strategy == "llm_guided" else None,
         model=args.sampler_model_alias,
+        history_exposure_model_client=LLM_WORKER if (args.history_exposure_model_alias or os.environ.get("VQA_HISTORY_EXPOSURE_MODEL")) else None,
+        history_exposure_model=args.history_exposure_model_alias or os.environ.get("VQA_HISTORY_EXPOSURE_MODEL"),
     )
     candidate = sampler.generate_one(start_node_id=args.start_node_id)
     print(f"graph_dir: {args.graph_dir}")

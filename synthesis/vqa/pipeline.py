@@ -46,11 +46,14 @@ class VqaGenerationPipeline:
         graph = GraphView(self.store, allowed_edge_types=set(self.config.allowed_edge_types))
         self.graph = graph
         sampler_model = os.environ.get("VQA_SAMPLER_MODEL")
+        history_exposure_model = os.environ.get("VQA_HISTORY_EXPOSURE_MODEL")
         self.sampler = self.sampler or RandomPathSampler(
             graph=graph,
             config=self.config,
             model_client=LLM_WORKER if sampler_model and self.config.neighbor_selection_strategy == "llm_guided" else None,
             model=sampler_model,
+            history_exposure_model_client=LLM_WORKER if history_exposure_model else None,
+            history_exposure_model=history_exposure_model,
         )
         self.sampler.graph = graph
         self.sampler.config = self.config
