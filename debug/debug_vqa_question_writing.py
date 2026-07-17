@@ -212,6 +212,47 @@ def _format_terminal_merge_section(sample: dict[str, Any], *, width: int) -> lis
     return lines
 
 
+def _format_target_ask_section(sample: dict[str, Any], *, width: int) -> list[str]:
+    raw_target_ask = sample.get("target_ask") or {}
+    question_target_ask = sample.get("question_target_ask") or {}
+    if not isinstance(raw_target_ask, dict):
+        raw_target_ask = {}
+    if not isinstance(question_target_ask, dict):
+        question_target_ask = {}
+
+    lines = ["Target Ask"]
+    if not raw_target_ask and not question_target_ask:
+        lines.append("  - No target ask record found.")
+        return lines
+
+    def append_target_ask(title: str, payload: dict[str, Any]) -> None:
+        lines.append(f"  {title}")
+        lines.extend(_format_field("ask_target", payload.get("ask_target"), width=width, indent=4))
+        lines.extend(_format_field("answer", payload.get("answer"), width=width, indent=4))
+        supporting_facts = payload.get("supporting_facts") or []
+        if supporting_facts:
+            lines.extend(
+                _format_field(
+                    "supporting_facts",
+                    " | ".join(str(item) for item in supporting_facts),
+                    width=width,
+                    indent=4,
+                )
+            )
+        if payload.get("reasoning"):
+            lines.extend(_format_field("reasoning", payload.get("reasoning"), width=width, indent=4))
+        if payload.get("support"):
+            lines.extend(_format_field("support", payload.get("support"), width=width, indent=4))
+        if payload.get("writer_warning"):
+            lines.extend(_format_field("writer_warning", payload.get("writer_warning"), width=width, indent=4))
+
+    if raw_target_ask:
+        append_target_ask("Raw target ask", raw_target_ask)
+    if question_target_ask and question_target_ask != raw_target_ask:
+        append_target_ask("Question-facing target ask", question_target_ask)
+    return lines
+
+
 def _format_questions_section(sample: dict[str, Any], *, width: int) -> list[str]:
     draft_question = _first_non_empty(_stage_question(sample, "draft"), sample.get("draft_question"))
     polished_question = _first_non_empty(_stage_question(sample, "polished"), sample.get("polished_question"))
@@ -257,6 +298,9 @@ def _format_sample(sample: dict[str, Any], *, ordinal: int, width: int) -> str:
 
     lines.append(SUB_SEPARATOR)
     lines.extend(_format_terminal_merge_section(sample, width=width))
+
+    lines.append(SUB_SEPARATOR)
+    lines.extend(_format_target_ask_section(sample, width=width))
 
     lines.append(SUB_SEPARATOR)
     lines.append("Question-Facing Hop Chain")
