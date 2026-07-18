@@ -235,13 +235,14 @@ def _build_fixture(tmp_path: Path) -> FixtureData:
             {"hop_index": 1, "edge_id": edge_mid_image.edge_id, "src_node_id": mid_node.node_id, "dst_node_id": relevant_image.node_id},
             {"hop_index": 2, "edge_id": edge_image_target.edge_id, "src_node_id": relevant_image.node_id, "dst_node_id": target_node.node_id},
         ],
-        "opening_package": {
-            "source_clue": "the source page clue",
-            "source_supporting_facts": ["Opening clue fact from the source page."],
-            "packaged_first_hop": "The source page clue points to Mid Topic.",
-            "first_hop_support": "The opening clue remains searchable.",
+        "entry_hop": {
+            "hop_index": 0,
+            "source": "-",
+            "target": "Source Page",
+            "statement": "The source page clue identifies Source Page.",
+            "supporting_facts": ["Opening clue fact from the source page."],
             "why_relevant": "The opening clue identifies the source without naming it.",
-            "forbidden_labels": ["Source Page"],
+            "entry_kind": "text",
         },
         "target_ask": {
             "ask_target": "Which entity is identified by the emblem?",
@@ -301,7 +302,7 @@ class RepositoryVerifierTests(unittest.TestCase):
         self.assertTrue(any((not item.is_relevant) and item.item_type == "image" for item in bundle.items))
         self.assertTrue(any(item.selection_reason == "sibling_image_distractor" for item in bundle.items if not item.is_relevant))
         self.assertTrue(any(item.selection_reason == "sibling_distractor_edge_quote" for item in bundle.items if not item.is_relevant and item.item_type == "doc"))
-        self.assertTrue(any(item.selection_reason == "writer_opening_source_supporting_fact" for item in bundle.items))
+        self.assertTrue(any(item.selection_reason == "writer_entry_supporting_fact" for item in bundle.items))
         self.assertTrue(any(item.selection_reason == "writer_target_ask_supporting_fact" for item in bundle.items))
         self.assertGreater(bundle.metadata.get("writer_stage_doc_count") or 0, 0)
 

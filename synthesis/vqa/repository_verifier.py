@@ -887,29 +887,30 @@ class RepositoryAssembler:
                 }
             )
 
-        opening_package = sample_record.get("opening_package") or {}
-        if isinstance(opening_package, dict):
-            for fact in self._string_list(opening_package.get("source_supporting_facts")):
+        entry_hop = sample_record.get("entry_hop") or {}
+        if isinstance(entry_hop, dict):
+            for fact in self._string_list(entry_hop.get("supporting_facts")):
                 add_doc(
                     text=fact,
-                    selection_reason="writer_opening_source_supporting_fact",
+                    selection_reason="writer_entry_supporting_fact",
                     metadata={
-                        "writer_stage": "opening_package",
-                        "source_clue": opening_package.get("source_clue"),
-                        "packaged_first_hop": opening_package.get("packaged_first_hop"),
+                        "writer_stage": "entry_hop",
+                        "entry_kind": entry_hop.get("entry_kind"),
+                        "target": entry_hop.get("target"),
+                        "statement": entry_hop.get("statement"),
                     },
                 )
             for field_name, reason in (
-                ("packaged_first_hop", "writer_opening_packaged_first_hop"),
-                ("why_relevant", "writer_opening_why_relevant"),
-                ("first_hop_support", "writer_opening_first_hop_support"),
+                ("statement", "writer_entry_statement"),
+                ("why_relevant", "writer_entry_why_relevant"),
             ):
                 add_doc(
-                    text=opening_package.get(field_name),
+                    text=entry_hop.get(field_name),
                     selection_reason=reason,
                     metadata={
-                        "writer_stage": "opening_package",
-                        "source_clue": opening_package.get("source_clue"),
+                        "writer_stage": "entry_hop",
+                        "entry_kind": entry_hop.get("entry_kind"),
+                        "target": entry_hop.get("target"),
                     },
                 )
 

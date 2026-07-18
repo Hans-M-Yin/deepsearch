@@ -5,7 +5,7 @@ separate evidence-builder stage. Internally it follows a seven-step process:
 
 1. compress each hop into a short statement
 2. normalize hidden image bridges when they are only evidence carriers
-3. derive an opening package for the first source + first hop
+3. build or normalize hop 0 as the entry hop
 4. select a raw askable target from the final node
 5. normalize a hidden final image terminal step when needed
 6. compose and polish the final multi-hop question
@@ -408,61 +408,49 @@ Return valid JSON with exactly these fields:
 """
 
 
-PROMPT_SELECT_OPENING_PACKAGE = """Next, the user will provide you with a declarative sentence describing the relationship between different objects; specifically, it describes the relationship between the source entity and the target entity. The user will then provide you with the Wikipedia page of the source entity. Please extract information about the source entity from the Wikipedia page and organize it into a phrase or short descriptive sentence to replace the source entity in the statement, so that the relationship between the source entity and the corresponding target entity can still be inferred from the revised sentence without causing ambiguity.
+PROMPT_BUILD_TEXT_OPENING_HOP = """You are creating the first hop of a multi-hop retrieval chain for a text-start path.
 
-Rules:
-You may extract any type of relevant information from the Wikipedia page, as long as it ensures that the final description can be used to identify the correct source entity through web search.
-The description must not be overly simple, overly generic, or based only on the most obvious and universally known characteristic of the source entity. Prefer a more detailed, less salient, and somewhat niche characteristic when it still ensures uniqueness. In particular, based on this description and the statement in which it is used, it should be possible to recover the source entity through web search without ambiguity.
-Use only information that is explicitly present in the provided Wikipedia page material.
-Do not output the source title, aliases, abbreviations, initials, canonical ids, or near-copy surface forms of the source name.
-The description should be a phrase or a short descriptive sentence, not a full biography.
+The first hop has no preceding entity. It must identify the supplied `target` from an evidence-supported description of that target.
 
-Input format:
-You will receive one JSON object with exactly these fields:
-{
-  "statement": "one declarative sentence describing the relationship between source and target",
-  "source": "source entity title",
-  "target": "target entity title or target description",
-  "forbidden_labels": ["source title and aliases that must not appear in the output"],
-  "wikipedia_page": {
-    "title": "source page title",
-    "aliases": ["source aliases"],
-    "summary": "short Wikipedia summary",
-    "description": "longer Wikipedia page content or introduction",
-    "attributes": {"optional": "structured attributes"}
-  }
-}
+You will receive:
+- `target`: the exact first entity that this opening hop must identify;
+- `source_description`: the source text node's description, which is the only factual evidence you may use for the identifying description;
+- `target_aliases`: names and aliases of the target;
+- `path_statements`: the later hop statements, provided only to show the topic and direction of the downstream reasoning chain;
+- `target_ask`: the final question, also provided only as downstream thematic context.
 
-Output format:
+Use `path_statements` to choose a source fact that connects naturally with the later path. Do not copy facts from `path_statements` into the opening description unless they are also explicitly supported by `source_description`. Do not reveal a later target or create a shortcut into a later hop.
+
+Write one complete declarative identification statement with this semantic form:
+
+[an evidence-supported description of the target] + [a natural identification relation] + [the exact target]
+
+Requirements:
+1. The output must be a complete statement, not only a noun phrase.
+2. The exact `target` must appear once as the entity being identified.
+3. The descriptive portion before the identification must not contain the target name, an alias, abbreviation, initialism, canonical id, or near-copy surface form.
+4. Prefer a specific but not trivially famous combination of facts that supports web retrieval and is semantically relevant to the downstream path.
+5. Use only facts from `source_description`.
+6. Do not mention that a profile, description, prompt, or source material was provided.
+7. Do not write a question.
+
+Good example:
+`A 20th-century Romanian sculptor who created a war memorial ensemble in Targu Jiu was Constantin Brâncuși.`
+
+Bad example:
+`A 20th-century Romanian sculptor who created a war memorial ensemble in Targu Jiu.`
+Reason: this is only a clue, not a complete identification hop.
+
+Bad example:
+`Constantin Brâncuși, a Romanian sculptor, created a war memorial ensemble in Targu Jiu.`
+Reason: the target is exposed before the identifying description and the sentence reads as biography rather than an identification hop.
+
 Return valid JSON with exactly these fields:
 {
-  "source_clue": "a phrase or short descriptive sentence replacing the source entity",
-  "rewritten_statement": "the original statement rewritten with source_clue replacing the source entity",
-  "source_supporting_facts": ["the exact source-page facts used to form source_clue"],
-  "why_relevant": "why the description is specific enough and still keeps the relationship inferable"
+  "opening_statement": "one complete identification statement ending in the exact target",
+  "supporting_facts": ["the exact facts from source_description used in the identifying description"],
+  "why_relevant": "why the selected description is recoverable and connects naturally to the downstream path"
 }
-
-Example:
-Input:
-{
-  "statement": "Lionel Messi’s first professional football club was Newell’s Old Boys of Argentina.",
-  "source": "Lionel Messi",
-  "target": "Newell’s Old Boys",
-  "forbidden_labels": ["Lionel Messi", "Messi"],
-  "wikipedia_page": {
-    "title": "Lionel Messi",
-    "aliases": ["Messi"],
-    "summary": "Wikipedia page content omitted.",
-    "description": "Wikipedia page content omitted.",
-    "attributes": {}
-  }
-}
-
-A suitable obfuscation would be:
-"the first-team captain of FC Barcelona in the 2018–19 season"
-
-Rewritten statement:
-"The first-team captain of FC Barcelona in the 2018–19 season first played for Argentina’s Newell’s Old Boys."
 """
 
 
@@ -684,367 +672,108 @@ Output:
 
 # Legacy compose prompt retained for comparison and rollback. Runtime question
 # composition uses the revised PROMPT_COMPOSE_QUESTION defined after this block.
-PROMPT_COMPOSE_QUESTION_LEGACY = """
-You are an expert at composing multi-hop search questions. Below, you will be given the specific structure of each hop in the data, and your task is to assemble these separated pieces into a continuous reasoning question that hides the intermediate steps and is meant for a user to answer.
+PROMPT_COMPOSE_QUESTION = """You are an expert at composing multi-hop retrieval questions. Below, I will provide you with the specific structure of each hop in the data, and your task is to merge these scattered pieces of information into a deep reasoning question. This question should hide the intermediate reasoning steps and be presented to the user for them to answer.
 
-Each hop contains at least three parts:
-- source: the starting point of this hop
-- target: the endpoint of this hop, which must be identified through search and reasoning from the known source based on the given relational statement
-- statement: a statement describing the relationship between the target and the source
+The input includes:
+1. each hop in the reasoning chain, including:
+   - `source`: the starting point of this hop;
+   - `target`: the target of this hop;
+   - `statement`: a statement describing the relationship between the source and the target;
+2. `target_ask`, a knowledge question about the final target.
 
-The source of each hop is the target of the previous hop, so you need to integrate all hops into one complete multi-hop question whose reasoning chain can be described as A -> B -> C ..., where A -> B is the first hop and the user must infer B from A, B -> C is the second hop, and so on.
+The first hop is a special entry hop whose `source` is `-`. For a text-start path, its statement identifies the first real entity from a textual description. For an image-start path, its statement identifies the first real entity from the attached image and may refer to `this image`.
 
-The entities in the intermediate process, including every hop's source and target, must not appear directly in the question. They must instead be recoverable only through clues, so that the user is forced to reason forward step by step.  NOTICE: if there is an image at the beginning, that means the image will serve as a part of the question, which will be provided along with the question.
+The `source` of each later hop is the `target` of the previous hop, so the whole hop sequence can be connected end-to-end into a complete multi-hop question, with the reasoning chain represented as A -> B -> C ...: A -> B is the first transition, where the user must infer B from A; B -> C is the next transition; and so on.
 
-For each hop's target, your question design must ensure that the user can infer it only on the premise that they have already inferred that hop's source from the previous step. There must be no shortcut clues or extra clues.
+For each hop's `target` (which is also the next hop's `source`), it must not appear directly in the question you write. Instead, given the known `source`, the user should have to infer what the `target` is by reasoning from the relationship expressed in that hop's `statement`.
 
-For the first hop's source, since there is no preceding entity, we additionally provide `first_clue` to describe that source. You must use this description in the question to refer to the first source, ensuring that the user must search and reason from this first clue to identify it.
+For the final hop's `target`, we additionally provide `target_ask`. After the user has inferred the final target entity step by step, they must then answer a knowledge question about that entity.
 
-For the final hop's target, we additionally provide `target_ask`. Once the user has inferred the final target entity step by step, they must answer a knowledge question about that entity.
+## Rules
 
-Rules:
-1. After composing the question, check that none of the source or target names appear in the question. However, if a source or target is an image, its textual description may appear, as long as it does not introduce a shortcut.
-2. The wording must be natural and references must be clear. The question may be very long, so make sure it is unambiguous, especially with pronouns, and avoid referential confusion.
-3. Do not list explicit reasoning steps, and do not use expressions such as "starting from...", "then...", "next...", or "based on this clue...".
-4. If the first source is an image, it will be shown to the user, so refer to it in the question as "this image".
-5. Check for redundant clues yourself and remove them to ensure there are no shortcuts.
-6. If any hop is ambiguous, you should flexibly add a restricting modifier. For example, if the true reasoning result is a certain player who once played for a certain club, and you ask who the first captain of that club was in 2023, the club might be ambiguous. In that case, the restriction should be derived from the true target in a way that still depends on the source. For instance, if the true target is FC Barcelona, a better phrasing would be: "the first international club this player played for." Do not use a restriction like "the club that won the 2011 UEFA Champions League," because that would allow the club to be inferred without depending on the previous source, which creates a shortcut.
+1. After writing the question, check whether any source or target names appear in the question.
 
-Example:
-Input:
-{
-  "opening_mode": "text_start",
-  "first_clue": "A 20th-century Romanian pioneering sculptor created a war memorial ensemble in Targu Jiu.",
-  "forbidden_labels": ["Constantin Brancusi", "Brancusi"],
-  "hop_facts": [
-    {
-      "hop_index": 0,
-      "source": "Constantin Brâncuși",
-      "target": "image of Constantin Brâncuși's studio in Paris in 1920",
-      "statement": "There is a famous photo of Constantin Brâncuși in his Paris studio photographed by Edward Steichen in 1920"
-    },
-    {
-      "hop_index": 1,
-      "source": "image of Constantin Brâncuși's studio in Paris in 1920",
-      "target": "Bird in Space",
-      "statement": "The slender sculpture positioned at the center of the room in the background is Bird in Space."
-    },
-    {
-      "hop_index": 2,
-      "source": "Bird in Space",
-      "target": "National Gallery of Art",
-      "statement": "National Gallery of Art houses the 1925 marble version and the 1927 bronze version of Bird in Space"
-    },
-    {
-      "hop_index": 3,
-      "source": "National Gallery of Art",
-      "target": "David E. Finley, Jr.",
-      "statement": "The director of the museum from 1938 to 1956 was David E. Finley, Jr."
-    }
-  ],
-  "target_ask": {
-    "ask_target": "Where did David E. Finley, Jr. earn his professional degree, and in what field was that degree?"
-  }
-}
+2. You need to use the information provided in the `statement` fields to bridge the source and target. Multiple statements may be compressed or merged to make the question more natural and concise.
 
-Output question: 
-"A 20th-century Romanian avant-garde sculptor was photographed by Edward Steichen in his Paris studio in 1920. The slender sculpture standing at the center of the studio background existed in multiple versions. Where did the director who served from 1938 to 1956 at the museum that holds its 1925 marble version and its 1927 bronze version receive their professional degree, and in what field was that degree?"
+3. Do not explicitly list the reasoning steps, and do not use expressions such as "starting from...", "then...", "next...", or "based on this clue...".
 
-Explanation: This question removes potentially redundant clues from the input, reveals none of the intermediate entities, and remains grammatically natural.
+4. You must check for and remove redundant clues yourself to ensure there are no shortcuts. For example, if the relationship referred to by a statement is too famous, you should make that relationship more implicit.
 
-Return valid JSON with exactly these fields:
-{
-  "question": "..."
-}
-"""
+5. If any hop is ambiguous, you should flexibly add a restricting modifier.
+For example, suppose the true reasoning result is a club that a certain player once played for, and you ask, "Who was the first captain of that club in 2023?" In that case, the club may be ambiguous. The restriction should be derived naturally from the true target while still depending on the source.
+For instance, if the true target is FC Barcelona, a better phrasing would be: "the first international club this player played for."
+Do not use a restriction such as "the club that won the 2011 UEFA Champions League," because that would allow the target to be inferred without depending on the previous source, creating a shortcut.
 
+## Tips
 
-PROMPT_COMPOSE_QUESTION = """
-You are an expert at composing multi-hop search questions. Below, you will be
-given the structure of each hop in a reasoning path. Transform these separated
-pieces into one coherent question that hides intermediate answers while still
-requiring the solver to follow the intended search path.
+1. Merge multiple statements so that the question is compact and natural.
 
-Each hop contains:
-- source: the starting point of the hop;
-- target: the endpoint that must be recovered from the source;
-- statement: a declarative sentence describing their relationship;
-- retrieval_query: optional retrieval context, especially for image hops.
+2. In addition to source and target not being allowed to appear directly, other widely known or obvious entities or relations appearing in the statements may also be blurred. When choosing such wording, aim for language that is neither too explicit nor too ambiguous; choose a relational expression that is connected to the previous source, or one that can still support smooth downstream reasoning once the previous source has been inferred.
 
-The source of each hop is the target of the previous hop. The path can therefore
-be represented as A -> B -> C ..., but this notation describes semantic
-dependency, not a sentence structure to copy.
-
-The input also provides:
-- `first_clue`: the question-facing description of the first source and,
-  sometimes, an already rewritten version of the first hop;
-- `forbidden_labels`: source names or aliases that must not be exposed;
-- `target_ask`: the final question to ask after the last entity or image has
-  been reached.
-
-Important: `first_clue` may already express the first item in `hop_facts`. If it
-does, use that information once and do not restate the same first hop.
-
-Composition principles:
-
-1. Compose globally instead of restating the path hop by hop.
-
-Read the complete path before writing. Determine the minimum role that each hop
-plays in identifying the next entity, then combine the necessary relationships
-using whatever structure is most natural: relative clauses, temporal clauses,
-appositives, participial phrases, or multiple sentences when they improve
-readability.
-
-Do not use a fixed template. Do not mechanically turn every hop statement into
-a separate sentence. Sentence boundaries should follow natural semantic units,
-not hop boundaries.
-
-2. Preserve semantic dependency and reasoning direction.
-
-The wording must preserve A -> B -> C: A provides the basis for identifying B,
-and B provides the basis for identifying C. Local reordering is allowed only
-when it improves grammar without breaking this dependency or making a later
-clue independently understandable without the preceding result.
-
-Every later entity must remain meaningfully connected to the entity recovered
-in the preceding hop.
-
-3. Apply minimum sufficient obfuscation, not maximum vagueness.
-
-Intermediate source and target labels are internal annotations and should not
-normally be exposed directly. However, do not blindly obscure every proper noun
-or concrete detail. For each reference, implicitly choose the least aggressive
-action that prevents leakage while preserving recoverability:
-
-- KEEP: retain a necessary entry anchor, disambiguating detail, or part of the
-  final ask when it does not independently reveal an intermediate answer.
-- RELATIONALIZE: replace an entity name with a description based on its
-  relationship to the entity recovered in the preceding hop.
-- GENERALIZE: replace an explicit name with a stable broader type, role, class,
-  or category when the exact name is unnecessarily revealing.
-- DELETE: remove a detail that does not identify the next entity, resolve a
-  genuine ambiguity, preserve an essential visual reference frame, or express
-  the final ask.
-
-A good replacement must pass both tests:
-- Without the preceding-hop result, it should not independently identify the
-  intermediate entity.
-- After the preceding-hop result is known, it should provide enough relational
-  or contextual information to recover the intended next entity.
-
-If a replacement identifies the entity without the previous hop, it is too
-revealing. If it remains unclear even after the previous hop is known, it is too
-vague.
-
-Do not obscure a clue merely because it is specific. Dates, visible clothing,
-event types, co-attendance, locations, and other concrete details should be
-retained when removing them would make the next event, image, or entity unstable
-or ambiguous. The goal is the minimum sufficient description, not the shortest
-possible question.
-
-4. Allow evidence-preserving abstraction, but do not expand the story.
-
-You may paraphrase, relationalize, or generalize information explicitly stated
-or directly entailed by `first_clue`, `hop_facts`, and `target_ask`.
-
-Examples of valid abstraction:
-- `Wellesley College` -> `a women's college`;
-- `the Presidential Medal of Freedom` -> `a major civilian honor`.
-
-Such abstractions preserve the supplied fact at a broader level. They are not
-permission to introduce outside knowledge.
-
-Do not add an unrelated event, achievement, office, famous anecdote,
-biographical fact, or identity clue merely because you know it. Do not replace
-a supplied relation with a different famous fact about the same entity. Avoid
-new highly searchable details that allow the solver to bypass the preceding
-hop.
-
-5. Retain functionally necessary information and remove only true redundancy.
-
-Every retained detail must serve at least one purpose:
-- identify the next entity through the preceding entity;
-- distinguish the intended event, image, or entity from plausible alternatives;
-- preserve an essential image or artifact reference frame;
-- express the final ask.
-
-When deciding whether to delete a detail, ask: after deletion, can the next hop
-still be recovered reliably and uniquely from the preceding result? If not,
-retain the detail.
-
-When several statements repeat the same person, event, image, or relationship,
-merge the repeated information instead of narrating it again.
-
-6. Handle images naturally.
-
-If the first source is an image, it will be shown with the question. Refer to it
-as `this image`; do not repeat a long title-like description unless a visible
-detail is necessary for the first transition.
-
-If a later image mainly records a real-world event or scene and the supplied hop
-has already been normalized into event-based wording, express the event
-naturally rather than instructing the solver to locate another image. If the
-image is itself the essential artifact or reference frame, such as a manuscript
-page, poster, artwork, cover, screenshot, map, diagram, or chart, preserve that
-framing.
-
-Avoid repeatedly saying `in this image`, `in that photo`, or `there is another
-image` unless the image itself is required as the reference frame.
-
-7. Keep the final question compact, connected, and natural.
-
-Do not add procedural introductions such as `Please look at`, `First identify`,
-`Starting from`, `Then`, `Next`, or `Based on this clue`. Do not explain the
-reasoning procedure.
-
-Avoid repeatedly reintroducing the same person, event, institution, or image.
-Maintain a continuous reference chain. Use pronouns only when they have one
-unambiguous referent. Multiple sentences are allowed, but use another sentence
-only when it improves comprehension rather than merely marking a new hop.
-
-8. Avoid shortcuts and unnecessary constraints.
-
-Do not identify a later entity through a newly added famous title, iconic event,
-unique achievement, unrelated date, nationality, or recognizable biographical
-fact. If a hop is genuinely ambiguous, add only a minimal restriction that
-still depends on the preceding entity.
-
-For example, `the first international club this player represented` still
-depends on identifying the player. By contrast, `the club that won the 2011
-UEFA Champions League` may identify the club independently and creates a
-shortcut.
-
-9. Preserve the final ask.
-
-The final question must retain the meaning of `target_ask`. Do not reveal its
-answer, replace it with a different question, or add an independent question
-that is not part of `target_ask`. The transition into the final ask should
-follow naturally from the entity or event established by the preceding clauses.
-
-10. Silently check the result before returning it.
-
-Verify that:
-- the path's semantic dependency and direction are preserved;
-- `first_clue` and the first hop are not repeated;
-- the output is not a one-sentence-per-hop narration;
-- intermediate names are hidden only where necessary;
-- necessary anchors and disambiguating details have not been over-obscured;
-- each later entity is recoverable after, but not independently of, the
-  preceding entity;
-- no outside background facts were introduced;
-- every retained detail performs a transition, disambiguation,
-  visual-reference, or final-ask function;
-- all references are clear;
-- the question is concise without sacrificing unique recoverability;
-- the final ask has the same meaning as the supplied `target_ask`.
-
-Few-shot example 1: image-start path with multiple visual transitions
+## Example 1
 
 Input:
 {
-  "opening_mode": "image_start",
-  "first_clue": "In this image showing President George H. W. Bush reviewing documents with Dick Cheney and Brent Scowcroft in April 1989, the man on the left is Brent Scowcroft.",
-  "forbidden_labels": ["Brent Scowcroft", "Scowcroft"],
   "hop_facts": [
     {
       "hop_index": 0,
-      "source": "image of George H. W. Bush reviewing documents with Dick Cheney and Brent Scowcroft in April 1989",
+      "source": "-",
       "target": "Brent Scowcroft",
-      "statement": "In this image showing President George H. W. Bush reviewing documents with Dick Cheney and Brent Scowcroft in April 1989, the man on the left is Brent Scowcroft.",
-      "retrieval_query": ""
+      "statement": "The man on the left in this image is Brent Scowcroft."
     },
     {
       "hop_index": 1,
       "source": "Brent Scowcroft",
-      "target": "image of Brent Scowcroft receiving the Presidential Medal of Freedom in 1991",
-      "statement": "Brent Scowcroft is associated with a photograph of President George H. W. Bush placing the Presidential Medal of Freedom around his neck at a White House ceremony in 1991.",
-      "retrieval_query": "Brent Scowcroft Presidential Medal of Freedom White House 1991"
-    },
-    {
-      "hop_index": 2,
-      "source": "image of Brent Scowcroft receiving the Presidential Medal of Freedom in 1991",
       "target": "Barbara Bush",
-      "statement": "In the photograph of the 1991 White House ceremony, the woman standing beside the recipient in a red-and-white polka-dot dress is Barbara Bush.",
-      "retrieval_query": ""
-    },
-    {
-      "hop_index": 3,
-      "source": "Barbara Bush",
-      "target": "image of Barbara Bush and another country's first lady at the Wellesley College commencement",
-      "statement": "Barbara Bush is associated with a photograph of her sitting beside another country's first lady at the Wellesley College commencement on June 1, 1990.",
-      "retrieval_query": "Barbara Bush Wellesley commencement June 1 1990"
+      "statement": "When he received the Presidential Medal of Freedom from President George H. W. Bush at the White House in 1991, the woman standing next to him in a red-and-white polka-dot dress was Barbara Bush."
     }
   ],
   "target_ask": {
-    "ask_target": "What type of necklace was Barbara Bush wearing at the commencement?"
+    "ask_target": "What type of necklace was Barbara Bush wearing when she attended the Wellesley College commencement with another country's first lady on June 1, 1990?"
   }
 }
 
 Bad output:
-"Please look at the man on the left in this image. In 1991, he received the
-Presidential Medal of Freedom from President George H. W. Bush at the White
-House. A woman in a red-and-white polka-dot dress was standing beside him. That
-woman later attended a famous commencement ceremony at Wellesley College. What
-type of necklace was she wearing?"
-
-Why it is bad:
-- It mechanically restates the hops as separate sentences.
-- It repeats the starting instruction.
-- It exposes exact names that can be safely abstracted.
-- It adds `famous`, which is unsupported and unnecessary.
-- Its references are fragmented instead of forming one dependency chain.
+"Please look at the man on the left in this image. In 1991, he received the Presidential Medal of Freedom from President George H. W. Bush at the White House. A woman in a red-and-white polka-dot dress was standing beside him. That woman later attended a famous commencement ceremony at Wellesley College. What type of necklace was she wearing?"
 
 Good output:
-"What type of necklace did the woman in the red-and-white polka-dot dress
-standing beside the man on the left of this image as he received a major
-civilian honor at a 1991 White House ceremony wear when, the previous year, she
-attended a women's-college commencement alongside another country's first
-lady?"
+"In the ceremony where the man on the left in this image received a certain civilian honor at the White House in 1991, the woman standing beside him in a red-and-white polka-dot dress attended a women's college commencement with a certain country's first lady the previous year. What type of necklace was she wearing?"
 
 Why it is good:
-- It preserves 1991 and the co-attendance clue because they distinguish the
-  intended ceremonies and image.
-- `another country's first lady` preserves the supplied relation without adding
-  a highly searchable nationality that could bypass the earlier transition.
-- It relationalizes the man and woman and generalizes the honor and college.
-- It uses the starting image once and preserves the complete dependency chain.
-- It does not add background facts or narrate one sentence per hop.
+It hides overly explicit information: it obscures the nationality of the other first lady, preventing the user from directly searching that first lady's schedule to infer the identity of the woman in the dress. At the same time, it preserves the fact that she was a first lady, so it is not made too vague to identify.
+It restates time information across clauses naturally: 1991 is kept at the start, and 1990 is later described as "the previous year," making the sentence more natural.
+It removes overly obvious clues: "Presidential Medal of Freedom" is blurred into "a certain civilian honor," and the detail that the award was presented by the sitting president is omitted. This ensures that the user must first infer Scowcroft and then search his biography to deduce that the award was the Presidential Medal of Freedom, and only then search for the award ceremony image. The degree of obfuscation matches the source appropriately.
+The sentence structure is compact and clean, rather than directly restating multiple isolated sentences.
+It does not introduce extra information or other shortcuts. The question is clean and non-redundant.
 
-Few-shot example 2: text-start path with a photographed artwork bridge
+## Example 2
 
 Input:
 {
-  "opening_mode": "text_start",
-  "first_clue": "A 20th-century Romanian sculptor created a war memorial ensemble in Targu Jiu.",
-  "forbidden_labels": ["Constantin Brancusi", "Constantin Brâncuși", "Brancusi", "Brâncuși"],
   "hop_facts": [
     {
       "hop_index": 0,
-      "source": "Constantin Brâncuși",
-      "target": "image of Constantin Brâncuși's studio in Paris in 1920",
-      "statement": "The sculptor was photographed in his Paris studio in 1920.",
-      "retrieval_query": "Constantin Brancusi Paris studio 1920"
+      "source": "-",
+      "target": "Constantin Brâncuși",
+      "statement": "A 20th-century Romanian sculptor who created a war memorial ensemble in Targu Jiu was Constantin Brâncuși."
     },
     {
       "hop_index": 1,
-      "source": "image of Constantin Brâncuși's studio in Paris in 1920",
+      "source": "Constantin Brâncuși",
       "target": "Bird in Space",
-      "statement": "The slender sculpture standing near the center of the studio is Bird in Space.",
-      "retrieval_query": ""
+      "statement": "In a photograph of Constantin Brâncuși's Paris studio taken by Edward Steichen in the 1920s, the slender sculpture at the center of the image is Bird in Space."
     },
     {
       "hop_index": 2,
       "source": "Bird in Space",
       "target": "National Gallery of Art",
-      "statement": "A museum holds both a marble version and a bronze version of the sculpture.",
-      "retrieval_query": ""
+      "statement": "The National Gallery of Art holds both a marble version and a bronze version of the sculpture Bird in Space."
     },
     {
       "hop_index": 3,
       "source": "National Gallery of Art",
       "target": "David E. Finley, Jr.",
-      "statement": "The museum's director from 1938 to 1956 was David E. Finley, Jr.",
-      "retrieval_query": ""
+      "statement": "The museum's director from 1938 to 1956 was David E. Finley, Jr."
     }
   ],
   "target_ask": {
@@ -1053,35 +782,18 @@ Input:
 }
 
 Bad output:
-"A 20th-century Romanian sculptor created a war memorial ensemble in Targu Jiu.
-He was photographed in his Paris studio in 1920. In the image, the sculpture in
-the center is Bird in Space. The National Gallery of Art holds two versions of
-the sculpture. Its director from 1938 to 1956 was David E. Finley, Jr. Where did
-he earn his professional degree, and in what field?"
-
-Why it is bad:
-- It assigns a separate sentence to nearly every hop.
-- It directly reveals the sculpture, museum, and director.
-- It reads like an explanation of the path rather than a natural question.
+"A 20th-century Romanian sculptor created a war memorial ensemble in Targu Jiu. He was photographed in his Paris studio in 1920. In the image, the sculpture in the center is Bird in Space. The National Gallery of Art holds two versions of the sculpture. Its director from 1938 to 1956 was David E. Finley, Jr. Where did he earn his professional degree, and in what field?"
 
 Good output:
-"A 20th-century Romanian sculptor who created a war memorial ensemble in Targu
-Jiu was photographed in his Paris studio in 1920. Where did the 1938-56 director
-of the museum that holds both marble and bronze versions of the slender
-sculpture at the center of that studio photograph earn his professional degree,
-and in what field?"
+"A 20th-century Romanian sculptor who created a war memorial ensemble in Targu Jiu was photographed in his Paris studio by Edward Steichen in the 1920s. Where did the 1938-56 director of the museum that holds both marble and bronze versions of the slender sculpture at the center of that studio photograph earn his professional degree, and in what field?"
 
 Why it is good:
-- It uses two sentences because they form natural semantic units, not because
-  the path contains multiple hops.
-- It preserves the path order while compressing the middle transitions.
-- It hides the sculpture, museum, and director names without losing the facts
-  needed to recover them.
-- It retains dates and material types because they perform useful identifying
-  functions.
+It uses two sentences because they form natural semantic units, not because the path contains multiple hops.
+It preserves the path order while compressing the middle transitions.
+It hides the sculpture, museum, and director names without losing the facts needed to recover them.
+It retains dates and material types because they perform useful identifying functions.
 
 Now compose the question for the provided input.
-
 Return valid JSON with exactly these fields:
 {
   "question": "..."
@@ -1544,94 +1256,119 @@ class QuestionWriter:
             "support": support,
         }
 
-    def select_opening_package(self, *, context: WriterContext, hop_summaries: list[dict[str, Any]]) -> dict[str, Any]:
-        if not context.hops:
+    def build_entry_hop(
+        self,
+        *,
+        path: PathCandidate,
+        context: WriterContext,
+        hop_summaries: list[dict[str, Any]],
+        target_ask: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Return the question-facing hop 0 for either a text or image entry."""
+        if not context.hops or not hop_summaries:
+            target = str(context.target_node.get("title") or context.target_node.get("node_id") or "the target").strip()
+            source_description = str(context.target_node.get("description") or context.target_node.get("summary") or "").strip()
+            clue = self._shorten_text(source_description, limit=180) or "the described starting subject"
             return {
-                "source_clue": "this subject",
-                "source_supporting_facts": [],
-                "packaged_first_hop": "",
-                "first_hop_support": "",
-                "why_relevant": "No hops available.",
-                "forbidden_labels": [],
+                "hop_index": 0,
+                "source": "-",
+                "target": target,
+                "statement": self._ensure_declarative_statement(f"{clue} was {target}"),
+                "relation": "is",
+                "retrieval_query": "",
+                "edge_id": "",
+                "src_node_id": None,
+                "dst_node_id": context.target_node.get("node_id"),
+                "entry_kind": "text",
+                "supporting_facts": [clue] if clue else [],
+                "why_relevant": "Fallback entry hop generated because no path hop was available.",
             }
 
         first_hop = context.hops[0]
-        source_node = first_hop.src_content
-        forbidden_labels = self._forbidden_source_labels(source_node)
-        first_hop_summary = hop_summaries[0] if hop_summaries else self._fallback_compress_hop(first_hop)
-        if first_hop.src_modality != "text":
-            packaged_first_hop = self._select_image_opening_first_hop(first_hop_summary)
+        first_summary = dict(hop_summaries[0])
+        if path.trajectory.starts_with_image:
+            statement = self._select_image_entry_statement(first_summary)
             return {
-                "source_clue": "",
-                "source_supporting_facts": [],
-                "packaged_first_hop": packaged_first_hop,
-                "first_hop_support": "Image-start trajectory; source-image references are normalized to deictic expressions such as 'this image'.",
-                "why_relevant": "Image-start trajectory; no text source anchor required.",
-                "forbidden_labels": forbidden_labels,
+                **first_summary,
+                "hop_index": 0,
+                "source": "-",
+                "statement": statement,
+                "entry_kind": "image",
             }
 
+        source_node = first_hop.src_content
+        target = str(source_node.get("title") or first_summary.get("source") or first_hop.src_node_id).strip()
+        target_aliases = self._forbidden_source_labels(source_node)
+        path_statements = [
+            {
+                "hop_index": item.get("hop_index"),
+                "statement": item.get("statement"),
+            }
+            for item in hop_summaries
+            if isinstance(item, dict) and item.get("statement")
+        ]
+        source_description = str(source_node.get("description") or source_node.get("summary") or "").strip()
+        payload = {
+            "target": target,
+            "source_description": source_description,
+            "target_aliases": target_aliases,
+            "path_statements": path_statements,
+            "target_ask": str(target_ask.get("ask_target") or "").strip(),
+        }
         if self.model_client is None:
-            return self._fallback_opening_package(
+            return self._fallback_text_entry_hop(
+                first_hop=first_hop,
+                target=target,
                 source_node=source_node,
-                first_hop_summary=first_hop_summary,
-                forbidden_labels=forbidden_labels,
+                target_aliases=target_aliases,
             )
-
         try:
             parsed = self._generate_json(
-                system=PROMPT_SELECT_OPENING_PACKAGE,
-                user_payload={
-                    "statement": first_hop_summary.get("statement") or "",
-                    "source": source_node.get("title") or first_hop_summary.get("source") or "",
-                    "target": first_hop_summary.get("target") or "",
-                    "forbidden_labels": forbidden_labels,
-                    "wikipedia_page": {
-                        "title": source_node.get("title"),
-                        "aliases": list(source_node.get("aliases") or []),
-                        "summary": source_node.get("summary"),
-                        "description": source_node.get("description"),
-                        "attributes": dict(source_node.get("attributes") or {}),
-                    },
-                },
-                trace_label="select_opening_package",
+                system=PROMPT_BUILD_TEXT_OPENING_HOP,
+                user_payload=payload,
+                trace_label="build_text_entry_hop",
             )
         except Exception as exc:
-            fallback = self._fallback_opening_package(
+            fallback = self._fallback_text_entry_hop(
+                first_hop=first_hop,
+                target=target,
                 source_node=source_node,
-                first_hop_summary=first_hop_summary,
-                forbidden_labels=forbidden_labels,
+                target_aliases=target_aliases,
             )
-            fallback["writer_warning"] = self._writer_warning_entry(stage="select_opening_package", error=exc)
+            fallback["writer_warning"] = self._writer_warning_entry(stage="build_text_entry_hop", error=exc)
             return fallback
-        clue = str(parsed.get("source_clue") or "").strip()
-        supporting_facts = parsed.get("source_supporting_facts") or []
+
+        statement = self._ensure_declarative_statement(str(parsed.get("opening_statement") or "").strip())
+        supporting_facts = parsed.get("supporting_facts") or []
         if not isinstance(supporting_facts, list):
             supporting_facts = []
         supporting_facts = [str(item).strip() for item in supporting_facts if str(item).strip()]
-        packaged_first_hop = str(parsed.get("rewritten_statement") or "").strip()
-        first_hop_support = str(parsed.get("why_relevant") or "").strip()
         why_relevant = str(parsed.get("why_relevant") or "").strip()
-        if not clue or self._contains_forbidden_label(clue, forbidden_labels):
-            clue = self._fallback_select_source(source_node, forbidden_labels=forbidden_labels)
-            if not supporting_facts and clue:
-                supporting_facts = [clue]
-            if not why_relevant:
-                why_relevant = "Fallback source clue generated because the model clue leaked the source name or was empty."
-        if not packaged_first_hop or self._contains_forbidden_label(packaged_first_hop, forbidden_labels):
-            packaged_first_hop = self._fallback_package_first_hop(
-                source_clue=clue,
-                first_hop_summary=first_hop_summary,
-                forbidden_labels=forbidden_labels,
+        if not self._valid_text_entry_statement(statement=statement, target=target, target_aliases=target_aliases):
+            fallback = self._fallback_text_entry_hop(
+                first_hop=first_hop,
+                target=target,
+                source_node=source_node,
+                target_aliases=target_aliases,
             )
-            if not first_hop_support:
-                first_hop_support = "Fallback first-hop packaging generated because the model output leaked the source name or was empty."
+            fallback["writer_warning"] = self._writer_warning_entry(
+                stage="build_text_entry_hop_validation",
+                error=ValueError("Opening statement did not identify the target exactly once after an alias-free clue."),
+            )
+            return fallback
         return {
-            "source_clue": clue,
-            "source_supporting_facts": supporting_facts,
-            "packaged_first_hop": packaged_first_hop,
-            "first_hop_support": first_hop_support,
+            "hop_index": 0,
+            "source": "-",
+            "target": target,
+            "statement": statement,
+            "relation": "is",
+            "retrieval_query": "",
+            "edge_id": "",
+            "src_node_id": None,
+            "dst_node_id": first_hop.src_node_id,
+            "entry_kind": "text",
+            "supporting_facts": supporting_facts,
             "why_relevant": why_relevant,
-            "forbidden_labels": forbidden_labels,
         }
 
     def compose_question(
@@ -1643,16 +1380,12 @@ class QuestionWriter:
     ) -> QuestionDraft:
         context = context or self.build_writer_context(path=path, graph=graph)
         raw_hop_summaries = self._compress_hops(context.hops)
-        opening_mode = "image_start" if path.trajectory.starts_with_image else "text_start"
         question_hop_summaries, image_bridge_normalization = self._normalize_question_hops(
             path=path,
             context=context,
             hop_summaries=raw_hop_summaries,
         )
-        opening_package = self.select_opening_package(
-            context=context,
-            hop_summaries=question_hop_summaries,
-        )
+        entry_context_hops = list(question_hop_summaries)
         raw_target_ask = self.select_target_ask(context=context)
         question_hop_summaries, question_target_ask, question_terminal_bridge, image_target_terminal_normalization = self._normalize_question_terminal_step(
             path=path,
@@ -1660,36 +1393,46 @@ class QuestionWriter:
             hop_summaries=question_hop_summaries,
             raw_target_ask=raw_target_ask,
         )
+        entry_hop = self.build_entry_hop(
+            path=path,
+            context=context,
+            hop_summaries=entry_context_hops,
+            target_ask=question_target_ask,
+        )
+        if path.trajectory.starts_with_image:
+            compose_hops = [entry_hop, *question_hop_summaries[1:]]
+        else:
+            compose_hops = [entry_hop, *question_hop_summaries]
+        compose_hops = self._renumber_question_hops(compose_hops)
         draft_warnings = self._collect_writer_warnings(
             raw_hop_summaries,
             question_hop_summaries,
             image_bridge_normalization,
-            opening_package,
+            entry_hop,
             raw_target_ask,
             image_target_terminal_normalization,
         )
         answer_type = self._default_answer_type(context.target_node)
         starting_image_url = self._starting_image_url(path=path, graph=graph)
         if self.model_client is None:
-            return self._draft_with_writer_warnings(self._fallback_compose_question(
-                path=path,
-                hop_summaries=question_hop_summaries,
-                opening_package=opening_package,
-                target_ask=question_target_ask,
-                opening_mode=opening_mode,
-                answer_type=answer_type,
-                raw_target_ask=raw_target_ask,
-                raw_hop_summaries=raw_hop_summaries,
-                image_bridge_normalization=image_bridge_normalization,
-                image_target_terminal_normalization=image_target_terminal_normalization,
-                question_terminal_bridge=question_terminal_bridge,
-                starting_image_url=starting_image_url,
-                writer_context=context.to_dict(),
-            ), warnings=draft_warnings)
-        compose_hops = question_hop_summaries
+            return self._draft_with_writer_warnings(
+                self._fallback_compose_question(
+                    path=path,
+                    hop_summaries=compose_hops,
+                    target_ask=question_target_ask,
+                    answer_type=answer_type,
+                    raw_target_ask=raw_target_ask,
+                    raw_hop_summaries=raw_hop_summaries,
+                    image_bridge_normalization=image_bridge_normalization,
+                    image_target_terminal_normalization=image_target_terminal_normalization,
+                    question_terminal_bridge=question_terminal_bridge,
+                    entry_hop=entry_hop,
+                    starting_image_url=starting_image_url,
+                    writer_context=context.to_dict(),
+                ),
+                warnings=draft_warnings,
+            )
         compose_payload = self._compose_question_payload(
-            opening_mode=opening_mode,
-            opening_package=opening_package,
             hop_summaries=compose_hops,
             target_ask=question_target_ask,
         )
@@ -1705,16 +1448,15 @@ class QuestionWriter:
             return self._draft_with_writer_warnings(
                 self._fallback_compose_question(
                     path=path,
-                    hop_summaries=question_hop_summaries,
-                    opening_package=opening_package,
+                    hop_summaries=compose_hops,
                     target_ask=question_target_ask,
-                    opening_mode=opening_mode,
                     answer_type=answer_type,
                     raw_target_ask=raw_target_ask,
                     raw_hop_summaries=raw_hop_summaries,
                     image_bridge_normalization=image_bridge_normalization,
                     image_target_terminal_normalization=image_target_terminal_normalization,
                     question_terminal_bridge=question_terminal_bridge,
+                    entry_hop=entry_hop,
                     starting_image_url=starting_image_url,
                     writer_context=context.to_dict(),
                 ),
@@ -1722,64 +1464,59 @@ class QuestionWriter:
             )
         question = self._clean_composed_question(str(parsed.get("question") or "").strip())
         answer = str(raw_target_ask.get("answer") or "").strip()
-        if (
-            not question
-            or not answer
-            or self._looks_like_chain_narration(question)
-            or self._contains_forbidden_label(question, opening_package.get("forbidden_labels") or [])
-        ):
+        if not question or not answer or self._looks_like_chain_narration(question):
             try:
                 rewritten = self._rewrite_chain_narration(
-                    opening_mode=opening_mode,
                     hop_summaries=compose_hops,
-                    opening_package=opening_package,
                     target_ask=question_target_ask,
+                    image_url=starting_image_url,
                 )
             except Exception as exc:
                 draft_warnings.append(self._writer_warning_entry(stage="rewrite_chain_narration", error=exc))
                 rewritten = None
             if rewritten is not None:
                 question = rewritten
-        if (
-            not question
-            or not answer
-            or self._contains_forbidden_label(question, opening_package.get("forbidden_labels") or [])
-        ):
-            return self._draft_with_writer_warnings(self._fallback_compose_question(
-                path=path,
-                hop_summaries=question_hop_summaries,
-                opening_package=opening_package,
-                target_ask=question_target_ask,
-                opening_mode=opening_mode,
+        if not question or not answer:
+            return self._draft_with_writer_warnings(
+                self._fallback_compose_question(
+                    path=path,
+                    hop_summaries=compose_hops,
+                    target_ask=question_target_ask,
+                    answer_type=answer_type,
+                    raw_target_ask=raw_target_ask,
+                    raw_hop_summaries=raw_hop_summaries,
+                    image_bridge_normalization=image_bridge_normalization,
+                    image_target_terminal_normalization=image_target_terminal_normalization,
+                    question_terminal_bridge=question_terminal_bridge,
+                    entry_hop=entry_hop,
+                    starting_image_url=starting_image_url,
+                    writer_context=context.to_dict(),
+                ),
+                warnings=draft_warnings,
+            )
+        return self._draft_with_writer_warnings(
+            QuestionDraft(
+                question=question,
+                answer=answer,
                 answer_type=answer_type,
-                raw_target_ask=raw_target_ask,
-                raw_hop_summaries=raw_hop_summaries,
-                image_bridge_normalization=image_bridge_normalization,
-                image_target_terminal_normalization=image_target_terminal_normalization,
-                question_terminal_bridge=question_terminal_bridge,
-                starting_image_url=starting_image_url,
-                writer_context=context.to_dict(),
-            ), warnings=draft_warnings)
-        return self._draft_with_writer_warnings(QuestionDraft(
-            question=question,
-            answer=answer,
-            answer_type=answer_type,
-            reasoning_steps=question_hop_summaries,
-            used_evidence_ids=[hop.edge_id for hop in context.hops],
-            metadata={
-                "path_id": path.path_id,
-                "opening_package": opening_package,
-                "compose_payload": compose_payload,
-                "raw_hop_summaries": raw_hop_summaries,
-                "image_bridge_normalization": image_bridge_normalization,
-                "starting_image_url": starting_image_url,
-                "target_ask": raw_target_ask,
-                "question_target_ask": question_target_ask,
-                "question_terminal_bridge": question_terminal_bridge,
-                "image_target_terminal_normalization": image_target_terminal_normalization,
-                "writer_context": context.to_dict(),
-            },
-        ), warnings=draft_warnings)
+                reasoning_steps=compose_hops,
+                used_evidence_ids=[hop.edge_id for hop in context.hops],
+                metadata={
+                    "path_id": path.path_id,
+                    "entry_hop": entry_hop,
+                    "compose_payload": compose_payload,
+                    "raw_hop_summaries": raw_hop_summaries,
+                    "image_bridge_normalization": image_bridge_normalization,
+                    "starting_image_url": starting_image_url,
+                    "target_ask": raw_target_ask,
+                    "question_target_ask": question_target_ask,
+                    "question_terminal_bridge": question_terminal_bridge,
+                    "image_target_terminal_normalization": image_target_terminal_normalization,
+                    "writer_context": context.to_dict(),
+                },
+            ),
+            warnings=draft_warnings,
+        )
 
     def draft(self, *, path: PathCandidate, graph: GraphView) -> QuestionDraft:
         return self.compose_question(path=path, graph=graph)
@@ -2969,27 +2706,16 @@ class QuestionWriter:
     @staticmethod
     def _compose_question_payload(
         *,
-        opening_mode: str,
-        opening_package: dict[str, Any],
         hop_summaries: list[dict[str, Any]],
         target_ask: dict[str, Any],
     ) -> dict[str, Any]:
-        first_clue = str(
-            opening_package.get("packaged_first_hop")
-            or opening_package.get("source_clue")
-            or ("this image" if opening_mode == "image_start" else "this subject")
-        ).strip()
         return {
-            "opening_mode": opening_mode,
-            "first_clue": first_clue,
-            "forbidden_labels": list(opening_package.get("forbidden_labels") or []),
             "hop_facts": [
                 {
                     "hop_index": item.get("hop_index"),
                     "source": item.get("source"),
                     "target": item.get("target"),
                     "statement": item.get("statement"),
-                    "retrieval_query": item.get("retrieval_query"),
                 }
                 for item in hop_summaries
             ],
@@ -3077,42 +2803,70 @@ class QuestionWriter:
                 return cleaned.rstrip(".")
         return "the starting subject"
 
-    @classmethod
-    def _fallback_package_first_hop(
-        cls,
+    def _fallback_text_entry_hop(
+        self,
         *,
-        source_clue: str,
-        first_hop_summary: dict[str, Any],
-        forbidden_labels: list[str],
-    ) -> str:
-        retrieval_query = str(first_hop_summary.get("retrieval_query") or "").strip()
-        statement = str(first_hop_summary.get("statement") or "").strip()
-        if retrieval_query:
-            cleaned_query = cls._remove_forbidden_labels(retrieval_query, forbidden_labels)
-            if cleaned_query:
-                return (
-                    f"An image associated with {source_clue} can be located using the clue "
-                    f"\"{cleaned_query}\"."
-                )
-        if not statement:
-            return f"{source_clue}."
-        packaged = cls._remove_forbidden_labels(statement, forbidden_labels, replacement=source_clue)
-        packaged = re.sub(r"\s+", " ", packaged).strip()
-        if not packaged:
-            packaged = source_clue
-        if not re.search(r"[.?!]$", packaged):
-            packaged = packaged.rstrip(" ,;:") + "."
-        return packaged
+        first_hop: HopContext,
+        target: str,
+        source_node: dict[str, Any],
+        target_aliases: list[str],
+    ) -> dict[str, Any]:
+        clue = self._fallback_select_source(source_node, forbidden_labels=target_aliases)
+        statement = self._ensure_declarative_statement(f"{clue} was {target}")
+        return {
+            "hop_index": 0,
+            "source": "-",
+            "target": target,
+            "statement": statement,
+            "relation": "is",
+            "retrieval_query": "",
+            "edge_id": "",
+            "src_node_id": None,
+            "dst_node_id": first_hop.src_node_id,
+            "entry_kind": "text",
+            "supporting_facts": [clue] if clue else [],
+            "why_relevant": "Fallback entry hop generated from the source node description.",
+        }
 
     @classmethod
-    def _fallback_package_image_first_hop(cls, first_hop_summary: dict[str, Any]) -> str:
+    def _valid_text_entry_statement(
+        cls,
+        *,
+        statement: str,
+        target: str,
+        target_aliases: list[str],
+    ) -> bool:
+        if not statement or not target:
+            return False
+        normalized_statement = cls._normalize_label(statement)
+        normalized_target = cls._normalize_label(target)
+        if not normalized_statement or not normalized_target:
+            return False
+        if len(re.findall(rf"(?<!\w){re.escape(normalized_target)}(?!\w)", normalized_statement)) != 1:
+            return False
+        target_start = normalized_statement.find(normalized_target)
+        clue_prefix = normalized_statement[:target_start].strip()
+        if not clue_prefix:
+            return False
+        for alias in target_aliases:
+            normalized_alias = cls._normalize_label(alias)
+            if normalized_alias and re.search(rf"(?<!\w){re.escape(normalized_alias)}(?!\w)", clue_prefix):
+                return False
+        return True
+
+    @staticmethod
+    def _renumber_question_hops(hops: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return [{**dict(hop), "hop_index": index} for index, hop in enumerate(hops)]
+
+    @classmethod
+    def _fallback_image_entry_statement(cls, first_hop_summary: dict[str, Any]) -> str:
         statement = str(first_hop_summary.get("statement") or "").strip()
         if not statement:
             return "This image provides the next clue."
-        packaged = cls._normalize_image_reference(statement)
-        if not re.search(r"[.?!]$", packaged):
-            packaged = packaged.rstrip(" ,;:") + "."
-        return packaged
+        entry_statement = cls._normalize_image_reference(statement)
+        if not re.search(r"[.?!]$", entry_statement):
+            entry_statement = entry_statement.rstrip(" ,;:") + "."
+        return entry_statement
 
     @staticmethod
     def _normalize_image_reference(text: str) -> str:
@@ -3125,30 +2879,8 @@ class QuestionWriter:
             rewritten = rewritten[0].upper() + rewritten[1:]
         return rewritten or "This image provides the next clue."
 
-    def _fallback_opening_package(
-        self,
-        *,
-        source_node: dict[str, Any],
-        first_hop_summary: dict[str, Any],
-        forbidden_labels: list[str],
-    ) -> dict[str, Any]:
-        clue = self._fallback_select_source(source_node, forbidden_labels=forbidden_labels)
-        packaged_first_hop = self._fallback_package_first_hop(
-            source_clue=clue,
-            first_hop_summary=first_hop_summary,
-            forbidden_labels=forbidden_labels,
-        )
-        return {
-            "source_clue": clue,
-            "source_supporting_facts": [clue] if clue else [],
-            "packaged_first_hop": packaged_first_hop,
-            "first_hop_support": "Fallback first-hop packaging generated from the first-hop summary.",
-            "why_relevant": "Fallback source clue generated from the source node summary/attributes.",
-            "forbidden_labels": forbidden_labels,
-        }
-
-    def _select_image_opening_first_hop(self, first_hop_summary: dict[str, Any]) -> str:
-        fallback = self._fallback_package_image_first_hop(first_hop_summary)
+    def _select_image_entry_statement(self, first_hop_summary: dict[str, Any]) -> str:
+        fallback = self._fallback_image_entry_statement(first_hop_summary)
         statement = str(first_hop_summary.get("statement") or "").strip()
         if self.model_client is None or not statement:
             return fallback
@@ -3277,42 +3009,26 @@ class QuestionWriter:
         *,
         path: PathCandidate,
         hop_summaries: list[dict[str, Any]],
-        opening_package: dict[str, Any],
         target_ask: dict[str, Any],
-        opening_mode: str,
         answer_type: str,
         raw_target_ask: dict[str, Any] | None = None,
         raw_hop_summaries: list[dict[str, Any]] | None = None,
         image_bridge_normalization: list[dict[str, Any]] | None = None,
         image_target_terminal_normalization: dict[str, Any] | None = None,
         question_terminal_bridge: dict[str, Any] | None = None,
+        entry_hop: dict[str, Any] | None = None,
         starting_image_url: str | None = None,
         writer_context: dict[str, Any] | None = None,
     ) -> QuestionDraft:
+        del path
         raw_target_ask = dict(raw_target_ask or target_ask)
         question_target_ask = dict(target_ask)
-        remaining_hops = hop_summaries[1:] if opening_package.get("packaged_first_hop") else hop_summaries
-        hop_text = " ".join(item.get("statement", "") for item in remaining_hops if item.get("statement"))
+        hop_text = " ".join(str(item.get("statement") or "").strip() for item in hop_summaries if item.get("statement"))
         ask_target = str(question_target_ask.get("ask_target") or "What is the final answer?")
         answer = str(raw_target_ask.get("answer") or question_target_ask.get("answer") or "unknown")
-        opening_bridge = str(opening_package.get("packaged_first_hop") or "").strip()
-        if opening_mode == "image_start":
-            question = (
-                f"{opening_bridge} {hop_text} {ask_target}"
-                if opening_bridge
-                else "Use the relevant visual and factual clues in the given image to identify the final subject. "
-                f"{hop_text} {ask_target}"
-            )
-        else:
-            forbidden = list(opening_package.get("forbidden_labels") or [])
-            if not opening_bridge:
-                source_clue = str(opening_package.get("source_clue") or "this subject").strip()
-                opening_bridge = source_clue.rstrip(".") + "."
-            masked_hop_text = QuestionWriter._remove_forbidden_labels(hop_text, forbidden)
-            question = f"{opening_bridge} {masked_hop_text} {ask_target}"
-        question = QuestionWriter._clean_composed_question(question)
+        question = QuestionWriter._clean_composed_question(f"{hop_text} {ask_target}")
         metadata: dict[str, Any] = {
-            "opening_package": opening_package,
+            "entry_hop": dict(entry_hop or {}),
             "target_ask": raw_target_ask,
             "question_target_ask": question_target_ask,
         }
@@ -3360,44 +3076,33 @@ class QuestionWriter:
     def _rewrite_chain_narration(
         self,
         *,
-        opening_mode: str,
         hop_summaries: list[dict[str, Any]],
-        opening_package: dict[str, Any],
         target_ask: dict[str, Any],
+        image_url: str | None = None,
     ) -> str | None:
         if self.model_client is None:
             return None
         parsed = self._generate_json(
             system=(
                 "You are rewriting a bad multi-hop question draft.\n\n"
-                "The previous draft explicitly narrated the reasoning chain or was too hard to read.\n"
-                "Rewrite it into ONE natural search question.\n"
-                "Do not narrate the chain. Do not use phrases like 'starting with', "
-                "'then', 'following that clue', or 'using that clue'.\n"
-                "Keep the latent reasoning structure, but hide the step-by-step derivation.\n"
-                "Make the question easy to read, with a clear final ask.\n"
-                "Prefer one main question with layered constraints, not a loose string of facts.\n\n"
-                "Use first_clue to refer to the first source instead of naming it directly.\n"
-                "If forbidden_labels is provided, never output those labels.\n\n"
-                "Return valid JSON with exactly these fields:\n"
-                "{\n"
-                '  "question": "..."\n'
-                "}\n"
+                "Rewrite the supplied hop facts and target ask into one natural search question.\n"
+                "Do not narrate the chain or use phrases like 'starting with', 'then', "
+                "'following that clue', or 'using that clue'.\n"
+                "Hop 0 has source '-' and establishes the entry entity from either a textual description "
+                "or the attached image. Hide every intermediate target name in the final wording.\n"
+                "Keep the latent dependency structure and produce a clear final ask.\n\n"
+                "Return valid JSON with exactly this field:\n"
+                '{"question": "..."}'
             ),
             user_payload=self._compose_question_payload(
-                opening_mode=opening_mode,
-                opening_package=opening_package,
                 hop_summaries=hop_summaries,
                 target_ask=target_ask,
             ),
             trace_label="rewrite_chain_narration",
+            image_url=image_url,
         )
         question = self._clean_composed_question(str(parsed.get("question") or "").strip())
-        if (
-            not question
-            or self._looks_like_chain_narration(question)
-            or self._contains_forbidden_label(question, opening_package.get("forbidden_labels") or [])
-        ):
+        if not question or self._looks_like_chain_narration(question):
             return None
         return question
 
@@ -3533,7 +3238,6 @@ def _debug_main() -> None:
         }
         for item in normalized_hop_summaries
     ]
-    opening_package = writer.select_opening_package(context=context, hop_summaries=normalized_hop_summaries)
     draft = writer.compose_question(path=path, graph=graph, context=context)
     raw_target_ask = draft.metadata.get("target_ask") if isinstance(draft.metadata, dict) else None
     question_target_ask = draft.metadata.get("question_target_ask") if isinstance(draft.metadata, dict) else None
@@ -3574,10 +3278,10 @@ def _debug_main() -> None:
     print(json.dumps(debug_normalized_hop_summaries, ensure_ascii=False, indent=2))
     print("question_hop_summaries:")
     print(json.dumps(debug_question_hop_summaries, ensure_ascii=False, indent=2))
+    print("entry_hop:")
+    print(json.dumps((draft.metadata or {}).get("entry_hop") or {}, ensure_ascii=False, indent=2))
     print("image_bridge_normalization:")
     print(json.dumps(image_bridge_normalization, ensure_ascii=False, indent=2))
-    print("opening_package:")
-    print(json.dumps(opening_package, ensure_ascii=False, indent=2))
     print("raw_target_ask:")
     print(json.dumps(raw_target_ask or {}, ensure_ascii=False, indent=2))
     print("question_target_ask:")

@@ -253,41 +253,31 @@ def _format_target_ask_section(sample: dict[str, Any], *, width: int) -> list[st
     return lines
 
 
-def _format_opening_package_section(sample: dict[str, Any], *, width: int) -> list[str]:
-    package = sample.get("opening_package") or {}
-    lines = ["Opening Package"]
-    if not isinstance(package, dict) or not package:
-        lines.append("  - No opening package record found.")
+def _format_entry_hop_section(sample: dict[str, Any], *, width: int) -> list[str]:
+    entry_hop = sample.get("entry_hop") or {}
+    lines = ["Entry Hop"]
+    if not isinstance(entry_hop, dict) or not entry_hop:
+        lines.append("  - No entry hop record found.")
         return lines
 
-    lines.extend(_format_field("source_clue", package.get("source_clue"), width=width, indent=2))
-    lines.extend(_format_field("packaged_first_hop", package.get("packaged_first_hop"), width=width, indent=2))
-    source_facts = package.get("source_supporting_facts") or []
-    if source_facts:
+    lines.extend(_format_field("entry_kind", entry_hop.get("entry_kind"), width=width, indent=2))
+    lines.extend(_format_field("source", entry_hop.get("source"), width=width, indent=2))
+    lines.extend(_format_field("target", entry_hop.get("target"), width=width, indent=2))
+    lines.extend(_format_field("statement", entry_hop.get("statement"), width=width, indent=2))
+    supporting_facts = entry_hop.get("supporting_facts") or []
+    if supporting_facts:
         lines.extend(
             _format_field(
-                "source_supporting_facts",
-                " | ".join(str(item) for item in source_facts),
+                "supporting_facts",
+                " | ".join(str(item) for item in supporting_facts),
                 width=width,
                 indent=2,
             )
         )
-    lines.extend(_format_field("first_hop_support", package.get("first_hop_support"), width=width, indent=2))
-    lines.extend(_format_field("why_relevant", package.get("why_relevant"), width=width, indent=2))
-    forbidden_labels = package.get("forbidden_labels") or []
-    if forbidden_labels:
-        lines.extend(
-            _format_field(
-                "forbidden_labels",
-                ", ".join(str(item) for item in forbidden_labels),
-                width=width,
-                indent=2,
-            )
-        )
-    if package.get("writer_warning"):
-        lines.extend(_format_field("writer_warning", package.get("writer_warning"), width=width, indent=2))
+    lines.extend(_format_field("why_relevant", entry_hop.get("why_relevant"), width=width, indent=2))
+    if entry_hop.get("writer_warning"):
+        lines.extend(_format_field("writer_warning", entry_hop.get("writer_warning"), width=width, indent=2))
     return lines
-
 
 def _json_text(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True)
@@ -390,10 +380,10 @@ def _format_sample(sample: dict[str, Any], *, ordinal: int, width: int) -> str:
     lines.extend(_format_terminal_merge_section(sample, width=width))
 
     lines.append(SUB_SEPARATOR)
-    lines.extend(_format_target_ask_section(sample, width=width))
+    lines.extend(_format_entry_hop_section(sample, width=width))
 
     lines.append(SUB_SEPARATOR)
-    lines.extend(_format_opening_package_section(sample, width=width))
+    lines.extend(_format_target_ask_section(sample, width=width))
 
     lines.append(SUB_SEPARATOR)
     lines.extend(_format_polish_section(sample, width=width))

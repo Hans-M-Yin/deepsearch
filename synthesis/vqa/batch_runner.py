@@ -804,9 +804,9 @@ class VqaBatchRunner:
                 "polished": VqaBatchRunner._compact_writer_stage(sample.get("polished") or {}),
                 "obfuscated": VqaBatchRunner._compact_writer_stage(sample.get("obfuscated") or {}),
             },
-            "opening_package": VqaBatchRunner._extract_stage_metadata_value(
+            "entry_hop": VqaBatchRunner._extract_stage_metadata_value(
                 sample,
-                field_name="opening_package",
+                field_name="entry_hop",
             ),
             "target_ask": VqaBatchRunner._extract_stage_metadata_value(
                 sample,
