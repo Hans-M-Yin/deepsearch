@@ -88,40 +88,80 @@ Give priority to less well-known edges and their corresponding neighbor nodes th
 
 PROMPT_HISTORY_EXPOSURE_JUDGE = """You are reviewing whether a candidate next TEXT node is already exposed by the current trajectory history in a multi-hop question-generation pipeline.
 
-Your job is NOT to judge whether the candidate is generally relevant.
-Your job is to decide whether selecting this candidate would create a shortcut, repeated entity, or answer leakage because the candidate has already been explicitly or semantically exposed by earlier trajectory text.
+Your job is narrow: decide whether the history has already identified the SAME entity as the candidate, so that adding the candidate would be only a repeated name, alias expansion, or trivial type expansion. You are NOT judging whether the candidate is easy to infer, strongly related, topically similar, or naturally suggested by the history. A useful clue toward a new entity is valid multi-hop reasoning and should be allowed.
 
-A candidate should be BLOCKED if:
-- the candidate target is explicitly named in an earlier text-node title
-- the candidate target is explicitly named in an earlier edge relation
-- the candidate target is an alias, abbreviation, or equivalent name for something already exposed
-- a distinctive named component of the candidate target was already exposed, even if the full candidate title is longer or adds a type qualifier; for example, block `Astor Court (Metropolitan Museum of Art)` if `Astor Court` already appeared
-- the candidate is a group, organization, team, institution, work, event, or object whose defining named anchor was already supplied by an earlier relation; for example, block `New Zealand national rugby union team` when the immediately preceding image description already says `New Zealand captain` and the proposed hop merely reads a New Zealand logo from that image
-- the candidate target is strongly identified by a previous relation, even if the exact title string is not used
-- adding this candidate would make the chain look multi-hop while the answer was already revealed earlier
-- the candidate adds only a redundant subtype or category around an entity already named in the history, rather than requiring a genuinely new inference
+BLOCK only when at least one of the following is true:
+- the exact candidate entity is explicitly named in an earlier text-node title or edge relation;
+- an obvious alias, abbreviation, common name, formal name, spelling variant, or parenthetical/disambiguated form of the same entity was already exposed;
+- the candidate is only a trivial name expansion or type wrapper around the same exposed entity, such as a common event name becoming its formal event title;
+- an earlier image/relation already states the defining named anchor and the candidate merely converts that same anchor into an obvious label visible in the image, without adding a genuinely new entity. Example: an image description already says `New Zealand captain`, and the candidate is `New Zealand national rugby union team` obtained only by reading the New Zealand logo in that same image;
+- selecting the candidate would create a pseudo-hop whose only work is renaming or reifying information already given verbatim.
 
-A candidate should be ALLOWED if:
-- the candidate is only topically related but not already named or strongly identified
-- the previous history provides broad context but does not reveal the candidate
-- the candidate introduces genuinely new information needed for the next hop
-- the candidate is a reasonable continuation and cannot be answered from the history alone
+ALLOW when any of the following is true:
+- the history merely provides a clue from which the candidate can be inferred through a real new relation;
+- the candidate is associated with, located in, derived from, operated by, spoken in, inhabited by, or otherwise related to something named in history, but is not the same entity;
+- the candidate and history share a geographic, linguistic, organizational, cultural, or lexical root, but refer to different entity types;
+- the candidate is strongly suggested by the history but still requires a genuine inference or lookup;
+- the overlap is a generic word, broad topic, demonym, language/country relationship, franchise/operator relationship, work/character relationship, or other non-equivalence relation.
+
+Critical distinction:
+- `already identified` means the candidate is the same referent under another name or a trivial label expansion -> BLOCK.
+- `inferable from a clue` means the candidate is a different referent connected by a meaningful relation -> ALLOW.
+
+Do not block merely because the history makes the candidate easy, likely, or searchable. Multi-hop questions are supposed to provide clues. Only block when the proposed hop adds no substantive entity transition.
+
+Be especially careful with these non-equivalences:
+- a language name is not automatically the same entity as its country or ethnic group;
+- a demonym is not automatically the same entity as a country;
+- a franchise, route, service, brand, and operating company are not automatically the same entity;
+- a venue, institution, courtyard, exhibition space, and event held there are not automatically the same entity;
+- a work, character, adaptation, performance, and venue are not automatically the same entity.
+
+Examples:
+
+BLOCK:
+1. History: `Crockett Cup (1986)`
+   Candidate: `Jim Crockett Sr. Memorial Cup Tag Team Tournament`
+   Reason: common name and formal title of the same tournament.
+
+2. History: `Astor Court`
+   Candidate: `Astor Court (Metropolitan Museum of Art)`
+   Reason: same place with a parenthetical disambiguator.
+
+3. History: `the photo of New Zealand captain David Kirk lifting the trophy`
+   Candidate: `New Zealand national rugby union team`, where the candidate hop only reads the New Zealand logo from that same photo.
+   Reason: the named national anchor is already supplied and the image hop merely reifies the same label.
+
+ALLOW:
+1. History: `Daco-Romanian`, `Aromanian`, `Megleno-Romanian`, and `Istro-Romanian`
+   Candidate: `Romania`
+   Reason: a language variety and a country are related but not the same entity.
+
+2. History: `Daco-Romanian`
+   Candidate: `Romanians`
+   Reason: a language variety and an ethnic group are related but not aliases or equivalent entities.
+
+3. History: `InterCity East Coast`
+   Candidate: `East Coast (train operating company)`
+   Reason: a franchise/service context and a specific operating company may be linked, but they are not automatically the same referent; allow unless the provided history explicitly establishes them as aliases.
+
+4. History: `The Peony Pavilion`
+   Candidate: `Du Liniang`
+   Reason: a work and its protagonist are distinct entities connected by a meaningful relation.
 
 Important evaluation principles:
-1. Evaluate exposure from the trajectory history only. Do not use outside knowledge except to recognize obvious aliases or equivalent names.
-2. Be conservative about blocking common words, generic categories, and weak topical hints.
-3. Block exact mentions and strong aliases.
-4. Block cases where previous relation text already reveals the candidate as a named entity.
-5. Block named-anchor redundancy: if the earlier history already gives the proper-name anchor that defines the candidate and the current hop only turns that anchor into an obvious organization/team/place subtype, the hop is redundant.
-6. Allow cases where the candidate is merely related, contrasted, or in the same domain but not revealed. Do not block generic topic overlap alone.
-7. The current candidate hop itself is not part of the history; do not block simply because the candidate title appears in the candidate hop.
+1. Evaluate only the supplied trajectory history and candidate information. Use outside knowledge only to recognize unmistakable aliases or exact entity equivalence, not to invent semantic equivalences.
+2. The burden of proof is on BLOCK. If equivalence is uncertain, choose ALLOW.
+3. A shared word or proper-name fragment is evidence to inspect, not sufficient proof of equivalence.
+4. The current candidate hop itself is not part of the history; do not block simply because the candidate title appears in the candidate hop.
+5. `hard_match_result` is advisory evidence. Independently check whether its match represents the same entity or only a related entity.
 
 You will receive:
-- trajectory_exposure_history: text already exposed by previous trajectory nodes and relations
-- current_node: the node currently being expanded
-- candidate_edge: the edge under consideration
-- candidate_text_node: the target text node under consideration
-- hard_match_result: deterministic string-match evidence
+- trajectory_exposure_history: text already exposed by previous trajectory nodes and relations;
+- current_node: the node currently being expanded;
+- candidate_edge: the edge under consideration;
+- candidate_text_node: the target text node under consideration;
+- hard_match_result: deterministic string-match evidence.
 
 Return valid JSON with exactly this shape:
 {
@@ -130,13 +170,11 @@ Return valid JSON with exactly this shape:
   "risk_type": "none",
   "matched_history": "",
   "matched_label": "",
-  "reason": "short explanation grounded in the provided history"
+  "reason": "short explanation distinguishing same-entity exposure from a valid relational clue"
 }
 
-Use allow=false and decision="block" if the candidate is already exposed.
-Use allow=true and decision="allow" if the candidate is not already exposed.
+Use allow=false and decision="block" only when the candidate is already exposed as the same entity or a trivial renaming/type expansion. Otherwise use allow=true and decision="allow".
 """
-
 
 _GENERIC_EXPOSURE_LABELS = {
     "album",
