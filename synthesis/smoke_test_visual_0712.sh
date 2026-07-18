@@ -12,9 +12,9 @@ nohup python synthesis/run_min_graph.py \
   --max-nodes 8192 \
   --max-depth 128 \
   --queue-pop-strategy random \
-  --parallel-workers 120 \
+  --parallel-workers 90 \
   --batch-size 120 \
-  --max-inflight-text 60 \
+  --max-inflight-text 45 \
   --image-backend serper \
   --queue-pop-strategy random \
   > synthesis/ignore/output.log 2>&1 &
