@@ -34,7 +34,7 @@ from synthesis.model_worker import LLM_WORKER
 from synthesis.store import JsonlGraphStore
 
 from .graph_view import GraphView
-from .path_sampler import RandomPathSampler, SamplerConfiguration
+from .path_sampler import DEFAULT_HISTORY_EXPOSURE_MODEL, RandomPathSampler, SamplerConfiguration
 from .schemas import PathCandidate, QuestionDraft
 
 
@@ -704,6 +704,8 @@ For example, suppose the true reasoning result is a club that a certain player o
 For instance, if the true target is FC Barcelona, a better phrasing would be: "the first international club this player played for."
 Do not use a restriction such as "the club that won the 2011 UEFA Champions League," because that would allow the target to be inferred without depending on the previous source, creating a shortcut.
 
+6. Please ensure that the reasoning order in the question follows the order of the hops.
+
 ## Tips
 
 1. Merge multiple statements so that the question is compact and natural.
@@ -792,6 +794,46 @@ It uses two sentences because they form natural semantic units, not because the 
 It preserves the path order while compressing the middle transitions.
 It hides the sculpture, museum, and director names without losing the facts needed to recover them.
 It retains dates and material types because they perform useful identifying functions.
+
+## Example 3
+
+Input:
+{
+  "hop_facts": [
+    {
+      "hop_index": 0,
+      "source": "-",
+      "target": "Du Liniang",
+      "statement": "The female protagonist of the play The Peony Pavilion who dies from lovesickness after dreaming of a lover and is later resurrected is Du Liniang."
+    },
+    {
+      "hop_index": 1,
+      "source": "Du Liniang",
+      "target": "Metropolitan Museum of Art",
+      "statement": "The venue where a 2012 outdoor production of The Peony Pavilion featuring Du Liniang's story was performed in the Astor Court is the Metropolitan Museum of Art."
+    },
+    {
+      "hop_index": 2,
+      "source": "Metropolitan Museum of Art",
+      "target": "Astor Court (Metropolitan Museum of Art)",
+      "statement": "The Ming Dynasty-style garden courtyard with a pavilion and rock formations in the Asian Art wing of the Metropolitan Museum of Art is the Astor Court."
+    }
+  ],
+  "target_ask": {
+    "ask_target": "The Metropolitan Museum of Art's Astor Court was built using traditional Chinese materials. What rare tree species was felled under special permission for its wooden columns, and what three ingredients made up the hand-mixed adhesive used to secure its terracotta floor tiles?"
+  }
+}
+
+Bad output:
+"A 2012 outdoor production of The Peony Pavilion was performed in a Ming Dynasty-style garden courtyard; the play's heroine dies of lovesickness and is later resurrected. What rare tree species was felled under special permission for the courtyard's wooden columns, and what three ingredients made up the hand-mixed adhesive used to secure its terracotta floor tiles?"
+
+Good output:
+"At the venue of a 2012 performance adapted from the story of the Peony Pavilion heroine who dies from lovesickness after dreaming of a lover and is later resurrected, what rare tree species was felled under special permission for the wooden columns of the Ming Dynasty-style garden courtyard in its Asian Art wing, and what three ingredients made up the hand-mixed adhesive used to secure the terracotta floor tiles?"
+
+Why it is good:
+It retains The Peony Pavilion as the opening clue while hiding all intermediate source and target names.
+It removes the premature mention of Astor Court from hop 1, so the courtyard must be inferred only after the venue has been identified.
+It is compact and preserves the same dependency and reasoning order as the hop chain.
 
 Now compose the question for the provided input.
 Return valid JSON with exactly these fields:
@@ -3144,8 +3186,8 @@ def _debug_main() -> None:
     )
     parser.add_argument(
         "--history-exposure-model-alias",
-        default=None,
-        help="Optional model alias registered in synthesis/models.json for sampler history-exposure filtering.",
+        default=os.environ.get("VQA_HISTORY_EXPOSURE_MODEL") or DEFAULT_HISTORY_EXPOSURE_MODEL,
+        help="Model alias for sampler history-exposure filtering. Defaults to VQA_HISTORY_EXPOSURE_MODEL or multimodal_process.",
     )
     parser.add_argument(
         "--compress-hop-model-alias",
@@ -3194,7 +3236,7 @@ def _debug_main() -> None:
         config=config,
         model_client=LLM_WORKER if args.sampler_model_alias and args.neighbor_selection_strategy == "llm_guided" else None,
         model=args.sampler_model_alias,
-        history_exposure_model_client=LLM_WORKER if args.history_exposure_model_alias else None,
+        history_exposure_model_client=LLM_WORKER,
         history_exposure_model=args.history_exposure_model_alias,
     )
     path = sampler.generate_one()

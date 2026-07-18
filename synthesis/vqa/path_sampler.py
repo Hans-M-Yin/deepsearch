@@ -26,6 +26,7 @@ from .schemas import PathCandidate, TrajectoryStats
 
 
 SAMPLER_STATE_VERSION = 1
+DEFAULT_HISTORY_EXPOSURE_MODEL = "multimodal_process"
 
 
 PROMPT_LLM_NEXT_HOP_SELECTION = """You are reviewing candidate next hops for graph trajectory sampling in a multi-hop question-generation pipeline.
@@ -94,8 +95,11 @@ A candidate should be BLOCKED if:
 - the candidate target is explicitly named in an earlier text-node title
 - the candidate target is explicitly named in an earlier edge relation
 - the candidate target is an alias, abbreviation, or equivalent name for something already exposed
+- a distinctive named component of the candidate target was already exposed, even if the full candidate title is longer or adds a type qualifier; for example, block `Astor Court (Metropolitan Museum of Art)` if `Astor Court` already appeared
+- the candidate is a group, organization, team, institution, work, event, or object whose defining named anchor was already supplied by an earlier relation; for example, block `New Zealand national rugby union team` when the immediately preceding image description already says `New Zealand captain` and the proposed hop merely reads a New Zealand logo from that image
 - the candidate target is strongly identified by a previous relation, even if the exact title string is not used
 - adding this candidate would make the chain look multi-hop while the answer was already revealed earlier
+- the candidate adds only a redundant subtype or category around an entity already named in the history, rather than requiring a genuinely new inference
 
 A candidate should be ALLOWED if:
 - the candidate is only topically related but not already named or strongly identified
@@ -108,8 +112,9 @@ Important evaluation principles:
 2. Be conservative about blocking common words, generic categories, and weak topical hints.
 3. Block exact mentions and strong aliases.
 4. Block cases where previous relation text already reveals the candidate as a named entity.
-5. Allow cases where the candidate is merely related, contrasted, or in the same domain but not revealed.
-6. The current candidate hop itself is not part of the history; do not block simply because the candidate title appears in the candidate hop.
+5. Block named-anchor redundancy: if the earlier history already gives the proper-name anchor that defines the candidate and the current hop only turns that anchor into an obvious organization/team/place subtype, the hop is redundant.
+6. Allow cases where the candidate is merely related, contrasted, or in the same domain but not revealed. Do not block generic topic overlap alone.
+7. The current candidate hop itself is not part of the history; do not block simply because the candidate title appears in the candidate hop.
 
 You will receive:
 - trajectory_exposure_history: text already exposed by previous trajectory nodes and relations
@@ -745,12 +750,14 @@ class RandomPathSampler(PathSampler):
         title = str(node.get("title") or "").strip()
         if title:
             labels.append(title)
+            labels.extend(self._exposure_label_variants(title))
         aliases = node.get("aliases") or []
         if isinstance(aliases, list):
             for alias in aliases:
                 alias_text = str(alias or "").strip()
                 if alias_text:
                     labels.append(alias_text)
+                    labels.extend(self._exposure_label_variants(alias_text))
         deduped: list[str] = []
         seen: set[str] = set()
         for label in labels:
@@ -761,19 +768,43 @@ class RandomPathSampler(PathSampler):
             deduped.append(label)
         return deduped
 
+    @classmethod
+    def _exposure_label_variants(cls, label: str) -> list[str]:
+        """Return conservative entity-name variants useful for exposure checks."""
+        variants: list[str] = []
+        without_parenthetical = re.sub(r"\s*[\(\[\{][^\)\]\}]*[\)\]\}]\s*$", "", label).strip()
+        if without_parenthetical and without_parenthetical != label:
+            variants.append(without_parenthetical)
+        without_disambiguator = re.sub(
+            r"\s+(?:national\s+)?(?:men'?s\s+|women'?s\s+)?(?:rugby\s+union|football|basketball|cricket|hockey|baseball)?\s*"
+            r"(?:team|club|association|federation|organization|organisation|university|college|museum|court|stadium|airport|station)$",
+            "",
+            without_parenthetical or label,
+            flags=re.IGNORECASE,
+        ).strip()
+        if (
+            len(without_disambiguator.split()) >= 2
+            and without_disambiguator not in {label, without_parenthetical}
+        ):
+            variants.append(without_disambiguator)
+        return variants
+
     def _hard_history_exposure_match(
         self,
         *,
         labels: list[str],
         exposure_parts: list[dict[str, Any]],
     ) -> dict[str, Any]:
+        normalized_history_parts = [
+            (part, self._normalize_exposure_text(part.get("text") or ""))
+            for part in exposure_parts
+        ]
         for label in labels:
             normalized_label = self._normalize_exposure_text(label)
             if not self._is_strong_exposure_label(normalized_label):
                 continue
             needle = f" {normalized_label} "
-            for part in exposure_parts:
-                normalized_part = self._normalize_exposure_text(part.get("text") or "")
+            for part, normalized_part in normalized_history_parts:
                 if not normalized_part:
                     continue
                 if needle in f" {normalized_part} ":
@@ -786,7 +817,64 @@ class RandomPathSampler(PathSampler):
                         "matched_history_edge_id": part.get("edge_id"),
                         "reason": "candidate text label appears in trajectory exposure history",
                     }
+        anchor_result = self._hard_named_anchor_exposure_match(
+            labels=labels,
+            normalized_history_parts=normalized_history_parts,
+        )
+        if anchor_result is not None:
+            return anchor_result
         return {"allow": True, "reason": "no hard exposure match"}
+
+    def _hard_named_anchor_exposure_match(
+        self,
+        *,
+        labels: list[str],
+        normalized_history_parts: list[tuple[dict[str, Any], str]],
+    ) -> dict[str, Any] | None:
+        for label in labels:
+            normalized_label = self._normalize_exposure_text(label)
+            tokens = normalized_label.split()
+            if len(tokens) < 3:
+                continue
+            anchors = self._candidate_named_anchors(tokens)
+            for anchor in anchors:
+                needle = f" {anchor} "
+                for part, normalized_part in normalized_history_parts:
+                    if needle not in f" {normalized_part} ":
+                        continue
+                    return {
+                        "allow": False,
+                        "matched_label": label,
+                        "matched_anchor": anchor,
+                        "matched_history_kind": part.get("kind"),
+                        "matched_history_text": part.get("text") or "",
+                        "matched_history_node_id": part.get("node_id"),
+                        "matched_history_edge_id": part.get("edge_id"),
+                        "reason": "a distinctive named anchor of the candidate already appears in trajectory history",
+                    }
+        return None
+
+    @staticmethod
+    def _candidate_named_anchors(tokens: list[str]) -> list[str]:
+        generic_tail_tokens = {
+            "association", "club", "college", "court", "federation", "museum",
+            "organization", "organisation", "stadium", "team", "union", "university",
+        }
+        anchors: list[str] = []
+        trimmed = list(tokens)
+        while trimmed and trimmed[-1] in generic_tail_tokens:
+            trimmed.pop()
+        if len(trimmed) >= 2:
+            anchors.append(" ".join(trimmed))
+        # Country/region plus a generic national-team suffix is a common pseudo-hop:
+        # the image query already names the country, then the next hop reads its logo.
+        team_markers = {"national", "rugby", "football", "basketball", "cricket", "hockey", "baseball"}
+        first_marker = next((index for index, token in enumerate(tokens) if token in team_markers), None)
+        if first_marker is not None and first_marker >= 1:
+            geographic_anchor = " ".join(tokens[:first_marker])
+            if len(geographic_anchor) >= 5:
+                anchors.append(geographic_anchor)
+        return list(dict.fromkeys(anchor for anchor in anchors if anchor))
 
     @staticmethod
     def _normalize_exposure_text(value: Any) -> str:
@@ -813,7 +901,11 @@ class RandomPathSampler(PathSampler):
         hard_match_result: dict[str, Any],
     ) -> dict[str, Any] | None:
         model_client = self.history_exposure_model_client or self.model_client
-        model_alias = self.history_exposure_model or os.environ.get("VQA_HISTORY_EXPOSURE_MODEL")
+        model_alias = (
+            self.history_exposure_model
+            or os.environ.get("VQA_HISTORY_EXPOSURE_MODEL")
+            or DEFAULT_HISTORY_EXPOSURE_MODEL
+        )
         if model_client is None or not model_alias:
             return None
         payload = self._history_exposure_payload(
@@ -1333,8 +1425,8 @@ def _debug_main() -> None:
     )
     parser.add_argument(
         "--history-exposure-model-alias",
-        default=None,
-        help="Optional model alias registered in synthesis/models.json for history-exposure filtering. Defaults to VQA_HISTORY_EXPOSURE_MODEL.",
+        default=os.environ.get("VQA_HISTORY_EXPOSURE_MODEL") or DEFAULT_HISTORY_EXPOSURE_MODEL,
+        help="Model alias for history-exposure filtering. Defaults to VQA_HISTORY_EXPOSURE_MODEL or multimodal_process.",
     )
     args = parser.parse_args()
 
@@ -1357,8 +1449,8 @@ def _debug_main() -> None:
         ),
         model_client=LLM_WORKER if args.sampler_model_alias and args.neighbor_selection_strategy == "llm_guided" else None,
         model=args.sampler_model_alias,
-        history_exposure_model_client=LLM_WORKER if (args.history_exposure_model_alias or os.environ.get("VQA_HISTORY_EXPOSURE_MODEL")) else None,
-        history_exposure_model=args.history_exposure_model_alias or os.environ.get("VQA_HISTORY_EXPOSURE_MODEL"),
+        history_exposure_model_client=LLM_WORKER,
+        history_exposure_model=args.history_exposure_model_alias,
     )
     candidate = sampler.generate_one(start_node_id=args.start_node_id)
     print(f"graph_dir: {args.graph_dir}")

@@ -11,7 +11,7 @@ from synthesis.model_worker import LLM_WORKER
 from synthesis.store import JsonlGraphStore
 
 from .graph_view import GraphView
-from .path_sampler import RandomPathSampler, SamplerConfiguration
+from .path_sampler import DEFAULT_HISTORY_EXPOSURE_MODEL, RandomPathSampler, SamplerConfiguration
 from .question_writer import QuestionWriter
 from .schemas import EvidenceBundle, PathCandidate, SampleProgress, SampleStatus, VqaSample
 from .verifier import SampleVerifier
@@ -46,13 +46,13 @@ class VqaGenerationPipeline:
         graph = GraphView(self.store, allowed_edge_types=set(self.config.allowed_edge_types))
         self.graph = graph
         sampler_model = os.environ.get("VQA_SAMPLER_MODEL")
-        history_exposure_model = os.environ.get("VQA_HISTORY_EXPOSURE_MODEL")
+        history_exposure_model = os.environ.get("VQA_HISTORY_EXPOSURE_MODEL") or DEFAULT_HISTORY_EXPOSURE_MODEL
         self.sampler = self.sampler or RandomPathSampler(
             graph=graph,
             config=self.config,
             model_client=LLM_WORKER if sampler_model and self.config.neighbor_selection_strategy == "llm_guided" else None,
             model=sampler_model,
-            history_exposure_model_client=LLM_WORKER if history_exposure_model else None,
+            history_exposure_model_client=LLM_WORKER,
             history_exposure_model=history_exposure_model,
         )
         self.sampler.graph = graph
