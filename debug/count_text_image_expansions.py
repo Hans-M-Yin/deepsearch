@@ -8,6 +8,11 @@ Examples:
     --graph-dir runs/my_graph_run \
     --json \
     --include-zero
+
+The graph directory may also contain visual_plans.jsonl. It is used to recover
+the source text node for older wiki-inline image records that kept their
+``image_variants[].source = wikipedia_inline`` marker but lost
+``metadata.source_text_node_id`` during persistence.
 """
 
 from __future__ import annotations
@@ -110,22 +115,89 @@ def image_variant_sources(node: dict[str, Any]) -> list[str]:
 
 
 def image_origin(node: dict[str, Any]) -> str:
+    """Classify image origin using the same precedence as visualize_graph.py."""
     metadata = node.get("metadata") or {}
     source = node.get("source") or {}
     source_type = str(source.get("source_type") or "").strip().lower() if isinstance(source, dict) else ""
     origin = str(metadata.get("image_origin") or "").strip().lower()
     variant_sources = image_variant_sources(node)
-    if source_type == "wikipedia_inline_image" or origin == "wikipedia_inline":
+    if source_type == "wikipedia_inline_image" or origin == "wikipedia_inline" or "wikipedia_inline" in variant_sources:
         return "wiki_inline"
-    if "wikipedia_inline" in variant_sources:
-        return "wiki_inline"
-    if origin == "visual_plan":
-        return "visual_plan"
     if source_type in {"image_search_bundle", "image_search"}:
         return "visual_plan"
     if source_type:
         return f"other:{source_type}"
     return "other:unknown"
+
+
+def image_urls(node: dict[str, Any]) -> set[str]:
+    urls: set[str] = set()
+    for key in ("image_url", "oss_uri", "thumb_oss_uri"):
+        value = str(node.get(key) or "").strip()
+        if value:
+            urls.add(value)
+    for variant in node.get("image_variants") or []:
+        if not isinstance(variant, dict):
+            continue
+        for key in ("image_url", "thumbnail_url"):
+            value = str(variant.get(key) or "").strip()
+            if value:
+                urls.add(value)
+    return urls
+
+
+def wiki_inline_plan_sources(visual_plans: list[dict[str, Any]]) -> dict[str, set[str]]:
+    """Index persisted wiki-inline plans by their original/thumbnail URLs."""
+    sources_by_url: dict[str, set[str]] = defaultdict(set)
+    for plan in visual_plans:
+        metadata = plan.get("metadata") or {}
+        planner = str(plan.get("planner") or "").strip().lower()
+        plan_source = str(metadata.get("plan_source") or "").strip().lower() if isinstance(metadata, dict) else ""
+        if planner != "wikipedia_inline_image_planner" and plan_source != "wikipedia_inline_image":
+            continue
+        source_text_node_id = str(plan.get("node_id") or "").strip()
+        if not source_text_node_id:
+            continue
+        candidate_urls: set[str] = set()
+        if isinstance(metadata, dict):
+            for key in ("image_url", "thumbnail_url"):
+                value = str(metadata.get(key) or "").strip()
+                if value:
+                    candidate_urls.add(value)
+        target = plan.get("target") or {}
+        if isinstance(target, dict):
+            value = str(target.get("url") or "").strip()
+            if value:
+                candidate_urls.add(value)
+            target_metadata = target.get("metadata") or {}
+            if isinstance(target_metadata, dict):
+                for key in ("image_url", "thumbnail_url"):
+                    value = str(target_metadata.get(key) or "").strip()
+                    if value:
+                        candidate_urls.add(value)
+        for query_spec in plan.get("query_specs") or []:
+            if not isinstance(query_spec, dict):
+                continue
+            query_metadata = query_spec.get("metadata") or {}
+            if not isinstance(query_metadata, dict):
+                continue
+            for key in ("image_url", "thumbnail_url"):
+                value = str(query_metadata.get(key) or "").strip()
+                if value:
+                    candidate_urls.add(value)
+        for url in candidate_urls:
+            sources_by_url[url].add(source_text_node_id)
+    return sources_by_url
+
+
+def matched_wiki_inline_plan_sources(
+    node: dict[str, Any],
+    plan_sources_by_url: dict[str, set[str]],
+) -> set[str]:
+    matched_source_ids: set[str] = set()
+    for url in image_urls(node):
+        matched_source_ids.update(plan_sources_by_url.get(url, set()))
+    return matched_source_ids
 
 
 def node_title(node: dict[str, Any]) -> str:
@@ -140,9 +212,11 @@ def collect_visual_plan_pairs(
     *,
     edges: list[dict[str, Any]],
     nodes_by_id: dict[str, dict[str, Any]],
-) -> tuple[dict[str, set[str]], int]:
+    plan_sources_by_url: dict[str, set[str]],
+) -> tuple[dict[str, set[str]], int, int]:
     pairs: dict[str, set[str]] = defaultdict(set)
     skipped_edges = 0
+    excluded_wiki_inline_edges = 0
     for edge in edges:
         if str(edge.get("edge_type") or "").strip().lower() != SEARCH_RETRIEVED_EDGE_TYPE:
             continue
@@ -171,25 +245,40 @@ def collect_visual_plan_pairs(
         if src_node.get("node_type") != TEXT_NODE_TYPE or dst_node.get("node_type") != IMAGE_NODE_TYPE:
             skipped_edges += 1
             continue
+        # Match visualize_graph.py: node-level wiki-inline signals take precedence
+        # over the generic image_search/image_search_bundle source type.
+        if image_origin(dst_node) == "wiki_inline" or matched_wiki_inline_plan_sources(dst_node, plan_sources_by_url):
+            excluded_wiki_inline_edges += 1
+            continue
         pairs[src_node_id].add(dst_node_id)
-    return pairs, skipped_edges
+    return pairs, skipped_edges, excluded_wiki_inline_edges
 
 
 def collect_wiki_inline_pairs(
     *,
     nodes: list[dict[str, Any]],
     nodes_by_id: dict[str, dict[str, Any]],
-) -> tuple[dict[str, set[str]], int]:
+    plan_sources_by_url: dict[str, set[str]],
+) -> tuple[dict[str, set[str]], int, int, int]:
     pairs: dict[str, set[str]] = defaultdict(set)
     skipped_nodes = 0
+    recovered_from_plans = 0
+    ambiguous_plan_matches = 0
     for node in nodes:
         if node.get("node_type") != IMAGE_NODE_TYPE:
             continue
-        if image_origin(node) != "wiki_inline":
+        matched_source_ids = matched_wiki_inline_plan_sources(node, plan_sources_by_url)
+        if image_origin(node) != "wiki_inline" and not matched_source_ids:
             continue
         metadata = node.get("metadata") or {}
         source_text_node_id = str(metadata.get("source_text_node_id") or "").strip()
         image_node_id = str(node.get("node_id") or "").strip()
+        if not source_text_node_id:
+            if len(matched_source_ids) == 1:
+                source_text_node_id = next(iter(matched_source_ids))
+                recovered_from_plans += 1
+            elif len(matched_source_ids) > 1:
+                ambiguous_plan_matches += 1
         if not source_text_node_id or not image_node_id:
             skipped_nodes += 1
             continue
@@ -198,7 +287,7 @@ def collect_wiki_inline_pairs(
             skipped_nodes += 1
             continue
         pairs[source_text_node_id].add(image_node_id)
-    return pairs, skipped_nodes
+    return pairs, skipped_nodes, recovered_from_plans, ambiguous_plan_matches
 
 
 def build_rows(
@@ -280,6 +369,7 @@ def main() -> int:
     graph_dir = Path(args.graph_dir)
     nodes = load_jsonl(graph_dir / "nodes.jsonl")
     edges = load_jsonl(graph_dir / "edges.jsonl")
+    visual_plans = load_jsonl(graph_dir / "visual_plans.jsonl")
 
     if args.active_only:
         nodes = [node for node in nodes if is_active(node)]
@@ -293,13 +383,21 @@ def main() -> int:
     text_nodes = [node for node in nodes if node.get("node_type") == TEXT_NODE_TYPE]
     image_nodes = [node for node in nodes if node.get("node_type") == IMAGE_NODE_TYPE]
 
-    visual_plan_pairs, skipped_visual_edges = collect_visual_plan_pairs(
+    plan_sources_by_url = wiki_inline_plan_sources(visual_plans)
+    visual_plan_pairs, skipped_visual_edges, excluded_wiki_inline_edges = collect_visual_plan_pairs(
         edges=edges,
         nodes_by_id=nodes_by_id,
+        plan_sources_by_url=plan_sources_by_url,
     )
-    wiki_inline_pairs, skipped_wiki_inline_nodes = collect_wiki_inline_pairs(
+    (
+        wiki_inline_pairs,
+        skipped_wiki_inline_nodes,
+        wiki_inline_nodes_recovered_from_plans,
+        ambiguous_wiki_inline_plan_matches,
+    ) = collect_wiki_inline_pairs(
         nodes=image_nodes,
         nodes_by_id=nodes_by_id,
+        plan_sources_by_url=plan_sources_by_url,
     )
 
     rows = build_rows(
@@ -323,7 +421,10 @@ def main() -> int:
         "visual_plan_source_image_pairs": sum(len(image_ids) for image_ids in visual_plan_pairs.values()),
         "wiki_inline_source_image_pairs": sum(len(image_ids) for image_ids in wiki_inline_pairs.values()),
         "skipped_visual_plan_edges": skipped_visual_edges,
+        "excluded_wiki_inline_edges_from_visual_plan": excluded_wiki_inline_edges,
         "skipped_wiki_inline_image_nodes": skipped_wiki_inline_nodes,
+        "wiki_inline_image_nodes_recovered_from_visual_plans": wiki_inline_nodes_recovered_from_plans,
+        "ambiguous_wiki_inline_visual_plan_matches": ambiguous_wiki_inline_plan_matches,
         "active_only": bool(args.active_only),
     }
 
@@ -350,7 +451,10 @@ def main() -> int:
         f"visual_pairs={summary['visual_plan_source_image_pairs']} "
         f"wiki_inline_pairs={summary['wiki_inline_source_image_pairs']} "
         f"skipped_visual_edges={summary['skipped_visual_plan_edges']} "
-        f"skipped_wiki_inline_nodes={summary['skipped_wiki_inline_image_nodes']}"
+        f"excluded_wiki_edges={summary['excluded_wiki_inline_edges_from_visual_plan']} "
+        f"recovered_wiki_nodes={summary['wiki_inline_image_nodes_recovered_from_visual_plans']} "
+        f"skipped_wiki_inline_nodes={summary['skipped_wiki_inline_image_nodes']} "
+        f"ambiguous_wiki_matches={summary['ambiguous_wiki_inline_visual_plan_matches']}"
     )
     print(render_table(rows))
     return 0

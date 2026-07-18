@@ -6,7 +6,8 @@ nohup python synthesis/run_min_graph.py \
   --store-dir runs/0712_multi_seed_visual_test_8192_4 \
   --reader-base-url http://localhost:8004 \
   --skip-attributes \
-  --max-neighbors 4 \
+  --max-neighbors 10 \
+  --max-llm-neighbor-candidates 80 \
   --max-steps 12345678 \
   --max-nodes 8192 \
   --max-depth 128 \
