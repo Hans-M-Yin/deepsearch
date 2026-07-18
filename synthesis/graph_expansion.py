@@ -219,7 +219,7 @@ class GraphExpansionConfig:
     attribute_errors_fatal: bool = False
     enable_image_expansion: bool = True
     persist: bool = True
-    max_wiki_inline_images_per_page: int = 2
+    max_wiki_inline_images_per_page: int = 3
     wiki_inline_random_seed: str = "wiki_inline_page_cap_v1"
 
 

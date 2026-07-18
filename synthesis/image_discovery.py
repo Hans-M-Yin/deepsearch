@@ -318,23 +318,19 @@ Requirements:
 Examples:
 Source title: Kobe Bryant
 Original search query: Kobe Bryant giving his farewell "Mamba Out" speech at center court after his final NBA game on April 13, 2016
-Relation: his photo of himself giving his farewell "Mamba Out" speech at center court after his final NBA game on April 13, 2016
+Relation: photo of Kobe Bryant giving his farewell "Mamba Out" speech at center court after his final NBA game on April 13, 2016
 
 Source title: Lionel Messi
 Original search query: Lionel Messi sleeping while hugging the World Cup trophy after the 2022 FIFA World Cup final
-Relation: his photo of himself sleeping while hugging the World Cup trophy after the 2022 FIFA World Cup final
+Relation: photo of Lionel Messi sleeping while hugging the World Cup trophy after the 2022 FIFA World Cup final
 
 Source title: Warner Music Group
 Original search query: Fleetwood Mac 1977 Rumours album cover released by Warner Bros. Records
 Relation: the cover image of Rumours, the 1977 Fleetwood Mac album released through Warner Music Group's Warner Bros. Records label
 
-Source title: Warner Music Group
-Original search query: photo showing the cover of Fleetwood Mac's 1977 album Rumours released by Warner Bros. Records
-Relation: the cover of Rumours, the Fleetwood Mac album released through Warner Music Group's Warner Bros. Records label in 1977
-
 Source title: The United States Constitution
 Original search query: first handwritten page of the United States Constitution beginning with We the People
-Relation: image of its first handwritten page beginning with We the People
+Relation: image of the United States Constitution's first handwritten page beginning with We the People
 
 Source title: Southern Methodist University
 Original search query: five U.S. presidents at the dedication ceremony for the George W. Bush Presidential Center on April 25, 2013
