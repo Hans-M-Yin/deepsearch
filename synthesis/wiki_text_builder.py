@@ -13,6 +13,7 @@ import sys
 import time
 from typing import Any, Protocol
 from urllib.parse import quote, unquote, urlparse
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 if __package__ in (None, ""):
@@ -395,8 +396,20 @@ class EnhancedReaderClient:
             f"{self.base_url}/{target}",
             headers={"Accept": "application/json"},
         )
-        with urlopen(request, timeout=self.timeout_s) as response:
-            payload = response.read().decode("utf-8")
+        try:
+            with urlopen(request, timeout=self.timeout_s) as response:
+                payload = response.read().decode("utf-8")
+        except HTTPError as exc:
+            if exc.code != 502:
+                raise
+            _trace_timing(f"[reader] phase=retry_502 target={target!r} sleep_s=15")
+            time.sleep(15)
+            request = Request(
+                f"{self.base_url}/{target}",
+                headers={"Accept": "application/json"},
+            )
+            with urlopen(request, timeout=self.timeout_s) as response:
+                payload = response.read().decode("utf-8")
         elapsed_s = time.perf_counter() - started_at
         _trace_timing(f"[reader] phase=done target={target!r} elapsed_s={elapsed_s:.3f}")
         data = json.loads(payload)
