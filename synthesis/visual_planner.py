@@ -132,8 +132,6 @@ PROMPT_VISUAL_PLAN_UNIQUENESS_JUDGE = """You are judging whether an image-search
 
 The query will be sent to an image search engine. Keep it only if several correct search results are likely to show the same main visual content, or the same canonical visual object. A real event name, a year, or a location alone does not make a query unique.
 
-The query must also be a meaningful visual neighbor of the source entity. Reject it if the query is unrelated to the source, only appears as a loose background fact, or mainly describes a third-party entity without explaining a clear source-to-image connection. A query may be connected through an intermediate work, product, label, organization, event, location, award, or document, but the planner reason must make that bridge clear enough to justify the visual hop from the source.
-
 For an event photograph, check whether the query identifies all of the following when needed:
 - one particular time, edition, or moment;
 - the particular people or main subject;
@@ -164,16 +162,6 @@ Reason: It identifies one parade year but not one sub-scene. Many different mome
 Query: cover of Justin Bieber's album Changes
 Answer: TRUE
 Reason: It identifies one canonical album artwork. Different copies preserve the same main visual content.
-
-Entity: Warner Music Group
-Query: cover of Fleetwood Mac's album Rumours released by Warner Bros. Records in 1977
-Answer: TRUE
-Reason: The query points to one canonical album cover, and the bridge to the source is clear through Warner Music Group's Warner Bros. Records label.
-
-Entity: Watermark (Enya album)
-Query: Rob Dickins meeting Enya and the Ryan family at an Irish Recorded Music Association awards event
-Answer: FALSE
-Reason: The query describes a third-party career-history event involving Rob Dickins and Enya, not a clear visual target directly tied to the Watermark album as the source entity.
 
 Query: Queen Elizabeth II presented the Venus Rosewater Dish to Virginia Wade after the 1977 Wimbledon women’s singles final.
 Answer: TRUE
