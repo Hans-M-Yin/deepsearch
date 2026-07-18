@@ -1275,7 +1275,7 @@ class WikiTextBuilder:
                 if debug_records_by_url is not None:
                     debug_records_by_url[candidate.url] = evaluation
                 correct_count = int(evaluation.get("correct_count") or 0)
-                penalty = 0.5 * float(correct_count)
+                penalty = {1: 0.1, 2: 0.3, 3: 0.5}.get(correct_count, 0.0)
                 if penalty <= 0:
                     continue
                 candidate.score = max(0.0, candidate.score - penalty)
