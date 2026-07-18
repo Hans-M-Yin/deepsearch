@@ -9,7 +9,7 @@ nohup python synthesis/run_min_graph.py \
   --max-neighbors 10 \
   --max-llm-neighbor-candidates 80 \
   --max-steps 12345678 \
-  --max-nodes 128 \
+  --max-nodes 8192 \
   --max-depth 128 \
   --parallel-workers 120 \
   --batch-size 120 \
