@@ -9,6 +9,7 @@ Run from the repository root, for example:
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import sys
@@ -29,6 +30,27 @@ from synthesis.wiki_text_builder import (
     WIKI_PAGE_PREFIXES_TO_SKIP,
     WikiTextBuilder,
 )
+
+
+PROMPT_JUDGE_TEXT_RELATION = """You are judging whether a graph relation is a valid source-to-target statement.
+
+You will be given a source Wikipedia node, a candidate target Wikipedia node,
+the proposed relation, the hyperlink anchor, and local context from the source
+page.
+
+Return whether the relation is a valid directed statement from the source to the
+target. A valid relation should describe the target from the source side, be
+supported by the local context, and not mainly describe a third-party person,
+event, or background fact. Penalize relations that are standalone target clues,
+too broad, unrelated, or require multiple implicit hops from source to target.
+
+Return valid JSON exactly with these fields:
+{
+  "valid": true,
+  "directness": "direct|indirect|unrelated|too_broad|unsupported",
+  "reason": "short reason"
+}
+"""
 
 
 def _truncate(text: str | None, limit: int) -> str:
@@ -53,9 +75,63 @@ def _print_candidates(
             f"title={candidate.title!r} anchor={candidate.anchor_text!r}"
         )
         print(f"    url={candidate.url}")
+        print(f"    relation={candidate.relation or '-'}")
+        if candidate.relation_info:
+            method = candidate.relation_info.get("method") or "-"
+            evidence = _truncate(candidate.relation_info.get("evidence"), context_chars)
+            print(f"    relation_method={method}")
+            if evidence:
+                print(f"    relation_evidence={evidence}")
         print(f"    reasons={reasons}")
         if context_chars > 0:
             print(f"    context={_truncate(candidate.context, context_chars)}")
+
+
+def _build_rule_candidates(
+    builder: WikiTextBuilder,
+    *,
+    page_url: str,
+    link_markdown: str,
+) -> list[WikiLinkCandidate]:
+    rule_candidates: list[WikiLinkCandidate] = []
+    seen_urls: set[str] = set()
+    for rank, (anchor_text, href, start, end) in enumerate(builder._iter_markdown_links(link_markdown), start=1):
+        url = builder._wiki_url_from_href(href, source_url=page_url)
+        if not url or url in seen_urls:
+            continue
+        title = builder._title_from_url(url)
+        if not title or title.startswith(WIKI_PAGE_PREFIXES_TO_SKIP):
+            continue
+        context = builder._context(link_markdown, start, end)
+        score, reasons = builder._score_link_candidate(
+            title=title,
+            anchor_text=anchor_text,
+            context=context,
+            rank=rank,
+        )
+        if score <= 0:
+            continue
+        seen_urls.add(url)
+        rule_candidates.append(
+            WikiLinkCandidate(
+                title=title,
+                url=url,
+                anchor_text=anchor_text.strip(),
+                source_url=page_url,
+                context=context,
+                rank=rank,
+                start_char=start,
+                end_char=end,
+                window_id=builder._window_id(start),
+                score=score,
+                quality_reasons=reasons,
+            )
+        )
+    rule_candidates = builder._uniformly_sample_candidates(rule_candidates, builder.max_raw_links)
+    return builder._attach_relations_to_candidates(
+        source_title=builder._title_from_url(page_url) or page_url,
+        candidates=rule_candidates,
+    )
 
 
 def _run_llm_filter_debug(
@@ -101,6 +177,8 @@ def _run_llm_filter_debug(
         )
         elapsed_s = time.perf_counter() - started_at
         decisions = builder._parse_neighbor_filter_response(response.content)
+        if not decisions:
+            raise ValueError("empty_neighbor_filter_decisions")
     except Exception as exc:
         return {
             "enabled": True,
@@ -174,7 +252,7 @@ def _print_llm_debug(result: dict[str, Any], *, context_chars: int) -> None:
         f"kept={len(result['kept'])} elapsed_s={result.get('elapsed_s', 0.0):.2f}"
     )
     if result.get("fallback") == "llm_kept_none":
-        print("LLM kept no candidates; pipeline would fall back to the rule-ranked list.")
+        print("LLM kept no candidates; pipeline returns no LLM-kept neighbors.")
 
     system_prompt = result.get("system_prompt")
     prompt_input = result.get("prompt_input")
@@ -289,6 +367,120 @@ def _run_qa_penalty_debug(
     }
 
 
+def _judge_relation(
+    builder: WikiTextBuilder,
+    *,
+    source_title: str,
+    candidate: WikiLinkCandidate,
+    model_alias: str | None,
+) -> dict[str, Any]:
+    relation = candidate.relation or candidate.anchor_text or ""
+    if not model_alias:
+        return {
+            "enabled": False,
+            "valid": None,
+            "directness": "not_judged",
+            "reason": "missing_judge_model",
+        }
+    payload = (
+        f"Source node: {source_title}\n"
+        f"Target node: {candidate.title}\n"
+        f"Proposed relation: {relation}\n"
+        f"Anchor text: {candidate.anchor_text}\n"
+        f"Local context:\n{candidate.context or ''}\n"
+    )
+    try:
+        response = builder.model_client.generate(
+            ModelRequest(
+                model=model_alias,
+                response_format={"type": "json_object"},
+                messages=[
+                    ModelMessage(role="system", content=PROMPT_JUDGE_TEXT_RELATION),
+                    ModelMessage(role="user", content=payload),
+                ],
+                max_tokens=512,
+                metadata={"trace_label": f"text_relation_judge:{source_title}:{candidate.title}"},
+            )
+        )
+        parsed = json.loads(response.content)
+    except Exception as exc:
+        return {
+            "enabled": True,
+            "valid": None,
+            "directness": "judge_error",
+            "reason": f"{exc.__class__.__name__}: {exc}",
+        }
+    return {
+        "enabled": True,
+        "valid": bool(parsed.get("valid")),
+        "directness": str(parsed.get("directness") or "").strip() or "unknown",
+        "reason": str(parsed.get("reason") or "").strip(),
+        "raw": parsed,
+    }
+
+
+def _relations_by_url_from_candidates(candidates: list[WikiLinkCandidate]) -> dict[str, str]:
+    return {
+        candidate.url: (candidate.relation or candidate.anchor_text or "").strip()
+        for candidate in candidates
+    }
+
+
+def _select_final_input(llm_result: dict[str, Any], rule_candidates: list[WikiLinkCandidate]) -> list[WikiLinkCandidate]:
+    if not llm_result.get("enabled") or llm_result.get("error"):
+        return rule_candidates
+    return list(llm_result.get("kept") or [])
+
+
+def _process_url(
+    builder: WikiTextBuilder,
+    reader: EnhancedReaderClient,
+    *,
+    url: str,
+    judge_model: str | None,
+) -> dict[str, Any]:
+    document = reader.read(url)
+    page_url = builder._normalize_wikipedia_url(document.url or url)
+    page_title = document.title or builder._title_from_url(page_url) or page_url
+    builder._validate_article_page(page_url=page_url, page_title=page_title, content=document.content)
+    link_markdown = builder._safe_truncate_markdown(
+        document.raw_markdown or document.content,
+        builder.max_link_markdown_chars,
+    )
+    rule_candidates = _build_rule_candidates(builder, page_url=page_url, link_markdown=link_markdown)
+    ranked_candidates = sorted(rule_candidates, key=lambda item: (-item.score, item.rank or 10**9))
+    llm_result = _run_llm_filter_debug(builder, source_url=page_url, candidates=rule_candidates)
+    final_input = _select_final_input(llm_result, rule_candidates)
+    relations_by_url = _relations_by_url_from_candidates(final_input)
+    qa_result = _run_qa_penalty_debug(
+        builder,
+        source_url=page_url,
+        candidates=final_input,
+        relations_by_url=relations_by_url,
+    )
+    final_candidates = builder._select_position_diverse_links(final_input)
+    judge_rows = []
+    for candidate in final_candidates:
+        judge = _judge_relation(
+            builder,
+            source_title=page_title,
+            candidate=candidate,
+            model_alias=judge_model,
+        )
+        judge_rows.append({"candidate": candidate, "judge": judge})
+    return {
+        "url": page_url,
+        "title": page_title,
+        "raw_markdown_chars": len(document.raw_markdown or document.content),
+        "rule_candidates": rule_candidates,
+        "ranked_candidates": ranked_candidates,
+        "llm_result": llm_result,
+        "qa_result": qa_result,
+        "final_candidates": final_candidates,
+        "judge_rows": judge_rows,
+    }
+
+
 def _print_qa_debug(result: dict[str, Any], *, context_chars: int) -> None:
     print("\n=== QA Penalty ===")
     if not result["enabled"]:
@@ -324,7 +516,8 @@ def _print_qa_debug(result: dict[str, Any], *, context_chars: int) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Debug text-neighbor ranking and LLM filtering for one Wikipedia URL.")
-    parser.add_argument("--url", required=True, help="Wikipedia page URL to inspect.")
+    parser.add_argument("--url", action="append", default=[], help="Wikipedia page URL to inspect. Repeat for batch mode.")
+    parser.add_argument("--urls-file", default="", help="Optional text file with one Wikipedia URL per line for batch mode.")
     parser.add_argument("--env-file", default=str(DEFAULT_ENV_PATH), help="Optional env file with model/reader settings.")
     parser.add_argument("--override-env", action="store_true", help="Override existing environment variables from the env file.")
     parser.add_argument("--reader-base-url", default="http://127.0.0.1:8004", help="Enhanced Reader base URL.")
@@ -337,16 +530,35 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--show-rule-top", type=int, default=60, help="How many rule-ranked candidates to print.")
     parser.add_argument("--show-final-top", type=int, default=30, help="How many final candidates to print.")
     parser.add_argument("--context-chars", type=int, default=180, help="Characters of local context shown per candidate.")
+    parser.add_argument(
+        "--judge-model",
+        default=None,
+        help="Optional model alias for relation validity judging. Defaults to WIKI_RELATION_JUDGE_MODEL, then WIKI_NEIGHBOR_MODEL.",
+    )
+    parser.add_argument("--no-judge", action="store_true", help="Disable relation validity judging.")
+    parser.add_argument("--show-invalid-limit", type=int, default=50, help="Maximum invalid judged relations to print in batch mode.")
     args = parser.parse_args(argv)
 
     env_path = Path(args.env_file).expanduser()
     if env_path.exists():
         load_env_file(env_path, override=args.override_env)
 
+    urls = list(args.url or [])
+    if args.urls_file:
+        urls_path = Path(args.urls_file).expanduser()
+        for raw_line in urls_path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            urls.append(line)
+    urls = list(dict.fromkeys(urls))
+    if not urls:
+        parser.error("provide at least one --url or --urls-file")
+
     if not args.skip_reader_check:
         ok, message = check_reader_service(
             args.reader_base_url,
-            test_url=args.url,
+            test_url=urls[0],
             timeout_s=args.reader_check_timeout,
         )
         if not ok:
@@ -363,71 +575,81 @@ def main(argv: list[str] | None = None) -> int:
         max_llm_neighbor_candidates=args.max_llm_candidates,
         max_qa_neighbor_candidates=args.max_qa_candidates,
     )
+    judge_model = None if args.no_judge else (args.judge_model or os.environ.get("WIKI_RELATION_JUDGE_MODEL") or os.environ.get("WIKI_NEIGHBOR_MODEL"))
 
-    document = reader.read(args.url)
-    page_url = builder._normalize_wikipedia_url(document.url or args.url)
-    page_title = document.title or builder._title_from_url(page_url) or page_url
-    builder._validate_article_page(page_url=page_url, page_title=page_title, content=document.content)
-    link_markdown = builder._safe_truncate_markdown(
-        document.raw_markdown or document.content,
-        builder.max_link_markdown_chars,
-    )
+    results: list[dict[str, Any]] = []
+    errors: list[dict[str, str]] = []
+    for url in urls:
+        try:
+            results.append(_process_url(builder, reader, url=url, judge_model=judge_model))
+        except Exception as exc:
+            errors.append({"url": url, "error": f"{exc.__class__.__name__}: {exc}"})
 
-    rule_candidates: list[WikiLinkCandidate] = []
-    seen_urls: set[str] = set()
-    for rank, (anchor_text, href, start, end) in enumerate(builder._iter_markdown_links(link_markdown), start=1):
-        url = builder._wiki_url_from_href(href, source_url=page_url)
-        if not url or url in seen_urls:
-            continue
-        title = builder._title_from_url(url)
-        if not title or title.startswith(WIKI_PAGE_PREFIXES_TO_SKIP):
-            continue
-        context = builder._context(link_markdown, start, end)
-        score, reasons = builder._score_link_candidate(
-            title=title,
-            anchor_text=anchor_text,
-            context=context,
-            rank=rank,
-        )
-        if score <= 0:
-            continue
-        seen_urls.add(url)
-        rule_candidates.append(
-            WikiLinkCandidate(
-                title=title,
-                url=url,
-                anchor_text=anchor_text.strip(),
-                source_url=page_url,
-                context=context,
-                rank=rank,
-                start_char=start,
-                end_char=end,
-                window_id=builder._window_id(start),
-                score=score,
-                quality_reasons=reasons,
+    if len(urls) > 1:
+        total_final = sum(len(item["final_candidates"]) for item in results)
+        invalid_cases: list[dict[str, Any]] = []
+        judged_count = 0
+        for item in results:
+            for row in item["judge_rows"]:
+                judge = row["judge"]
+                if judge.get("enabled"):
+                    judged_count += 1
+                if judge.get("valid") is False:
+                    invalid_cases.append({"source": item, "candidate": row["candidate"], "judge": judge})
+        print("=== batch text neighbor debug ===")
+        print(f"input_url_count: {len(urls)}")
+        print(f"processed_url_count: {len(results)}")
+        print(f"error_count: {len(errors)}")
+        print(f"total_expanded_text_nodes: {total_final}")
+        print(f"judge_model: {judge_model or '<disabled>'}")
+        print(f"judged_relation_count: {judged_count}")
+        print(f"invalid_relation_count: {len(invalid_cases)}")
+        print("\n=== per source summary ===")
+        for item in results:
+            invalid_for_source = sum(1 for row in item["judge_rows"] if row["judge"].get("valid") is False)
+            print(
+                f"- {item['title']} | final={len(item['final_candidates'])} "
+                f"rule={len(item['rule_candidates'])} invalid={invalid_for_source} url={item['url']}"
             )
-        )
-    rule_candidates = builder._uniformly_sample_candidates(rule_candidates, builder.max_raw_links)
+        if errors:
+            print("\n=== errors ===")
+            for item in errors:
+                print(f"- {item['url']}: {item['error']}")
+        print("\n=== invalid relation cases ===")
+        if not invalid_cases:
+            print("(none)")
+        for index, case in enumerate(invalid_cases[: max(0, args.show_invalid_limit)], start=1):
+            source = case["source"]
+            candidate = case["candidate"]
+            judge = case["judge"]
+            print(f"{index}. source={source['title']!r}")
+            print(f"   source_url={source['url']}")
+            print(f"   target={candidate.title!r}")
+            print(f"   target_url={candidate.url}")
+            print(f"   relation={candidate.relation or '-'}")
+            print(f"   directness={judge.get('directness') or '-'}")
+            print(f"   judge_reason={judge.get('reason') or '-'}")
+            print(f"   anchor={candidate.anchor_text or '-'}")
+            print(f"   context={_truncate(candidate.context, args.context_chars)}")
+        return 0 if not errors else 1
 
-    ranked_candidates = sorted(rule_candidates, key=lambda item: (-item.score, item.rank or 10**9))
-    llm_result = _run_llm_filter_debug(builder, source_url=page_url, candidates=rule_candidates)
-    final_input = llm_result["kept"] if llm_result.get("kept") else rule_candidates
-    relations_by_url = {
-        row["url"]: row["relation"]
-        for row in llm_result.get("rows", [])
-        if row.get("url")
-    }
-    qa_result = _run_qa_penalty_debug(
-        builder,
-        source_url=page_url,
-        candidates=final_input,
-        relations_by_url=relations_by_url,
-    )
-    final_candidates = builder._select_position_diverse_links(final_input)
+    if not results:
+        for item in errors:
+            print(f"{item['url']}: {item['error']}", file=sys.stderr)
+        return 1
+
+    result = results[0]
+    page_url = result["url"]
+    page_title = result["title"]
+    rule_candidates = result["rule_candidates"]
+    ranked_candidates = result["ranked_candidates"]
+    llm_result = result["llm_result"]
+    qa_result = result["qa_result"]
+    final_candidates = result["final_candidates"]
 
     print(f"URL: {page_url}")
     print(f"Title: {page_title}")
-    print(f"raw_markdown_chars: {len(document.raw_markdown or document.content)}")
+    print(f"raw_markdown_chars: {result['raw_markdown_chars']}")
     print(f"rule_candidates: {len(rule_candidates)}")
     print(f"llm_enabled: {'yes' if llm_result['enabled'] else 'no'}")
     print(f"qa_enabled: {'yes' if qa_result['enabled'] else 'no'}")
@@ -447,6 +669,19 @@ def main(argv: list[str] | None = None) -> int:
         limit=args.show_final_top,
         context_chars=args.context_chars,
     )
+    print("\n=== Relation Judge ===")
+    if args.no_judge or not judge_model:
+        print("disabled")
+    else:
+        for index, row in enumerate(result["judge_rows"], start=1):
+            candidate = row["candidate"]
+            judge = row["judge"]
+            print(
+                f"{index:>2}. valid={judge.get('valid')} directness={judge.get('directness') or '-'} "
+                f"title={candidate.title!r}"
+            )
+            print(f"    relation={candidate.relation or '-'}")
+            print(f"    reason={judge.get('reason') or '-'}")
     return 0
 
 

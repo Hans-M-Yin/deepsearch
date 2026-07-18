@@ -613,12 +613,16 @@ class RandomPathSampler(PathSampler):
         labels = self._candidate_text_exposure_labels(dst_node)
         hard_match_result = self._hard_history_exposure_match(labels=labels, exposure_parts=exposure_parts)
         if not bool(hard_match_result.get("allow", True)):
-            return {
+            reject = {
                 "filter_reason": "history_exposure_hard_match",
                 "edge_id": edge.get("edge_id"),
                 "dst_node_id": dst_node_id,
+                "candidate_node": self._debug_candidate_node(dst_node),
+                "history_string": self._history_exposure_debug_string(exposure_parts),
                 "hard_match_result": hard_match_result,
             }
+            self._emit_history_exposure_debug(reject)
+            return reject
 
         llm_result = self._llm_history_exposure_judge(
             edge=edge,
@@ -628,14 +632,68 @@ class RandomPathSampler(PathSampler):
             hard_match_result=hard_match_result,
         )
         if llm_result is not None and not bool(llm_result.get("allow", True)):
-            return {
+            reject = {
                 "filter_reason": "history_exposure_llm_block",
                 "edge_id": edge.get("edge_id"),
                 "dst_node_id": dst_node_id,
+                "candidate_node": self._debug_candidate_node(dst_node),
+                "history_string": self._history_exposure_debug_string(exposure_parts),
                 "llm_result": llm_result,
                 "hard_match_result": hard_match_result,
             }
+            self._emit_history_exposure_debug(reject)
+            return reject
         return None
+
+    def _emit_history_exposure_debug(self, reject: dict[str, Any]) -> None:
+        if os.environ.get("VQA_HISTORY_EXPOSURE_DEBUG", "1") == "0":
+            return
+        payload = {
+            "filter_reason": reject.get("filter_reason"),
+            "edge_id": reject.get("edge_id"),
+            "dst_node_id": reject.get("dst_node_id"),
+            "candidate_node": reject.get("candidate_node"),
+            "history_string": reject.get("history_string"),
+        }
+        hard_match = reject.get("hard_match_result")
+        if isinstance(hard_match, dict) and not bool(hard_match.get("allow", True)):
+            payload["hard_match"] = {
+                "matched_label": hard_match.get("matched_label"),
+                "matched_history_kind": hard_match.get("matched_history_kind"),
+                "matched_history_text": hard_match.get("matched_history_text"),
+            }
+        llm_result = reject.get("llm_result")
+        if isinstance(llm_result, dict):
+            payload["llm_result"] = {
+                "decision": llm_result.get("decision"),
+                "risk_type": llm_result.get("risk_type"),
+                "matched_label": llm_result.get("matched_label"),
+                "matched_history": llm_result.get("matched_history"),
+                "reason": llm_result.get("reason"),
+                "model_alias": llm_result.get("model_alias"),
+            }
+        print(
+            "[vqa-history-exposure-filter] " + json.dumps(payload, ensure_ascii=False),
+            file=sys.stderr,
+            flush=True,
+        )
+
+    @staticmethod
+    def _history_exposure_debug_string(exposure_parts: list[dict[str, Any]]) -> str:
+        return " | ".join(
+            str(part.get("text") or "").strip()
+            for part in exposure_parts
+            if str(part.get("text") or "").strip()
+        )
+
+    @staticmethod
+    def _debug_candidate_node(node: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "node_id": node.get("node_id"),
+            "node_type": node.get("node_type"),
+            "title": node.get("title"),
+            "aliases": list(node.get("aliases") or [])[:5] if isinstance(node.get("aliases"), list) else [],
+        }
 
     def _history_exposure_parts(self, node_ids: list[str]) -> list[dict[str, Any]]:
         if not node_ids:
