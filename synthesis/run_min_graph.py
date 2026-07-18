@@ -348,6 +348,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="When image tasks are queued, cap concurrently running text-expansion tasks so workers are left for images. <=0 disables the cap.",
     )
     parser.add_argument("--max-depth", type=int, default=1, help="Maximum text-neighbor BFS depth.")
+    parser.add_argument(
+        "--queue-pop-strategy",
+        choices=("fifo", "random"),
+        default="fifo",
+        help="How to select the next eligible expansion task from the queue.",
+    )
+    parser.add_argument(
+        "--queue-pop-random-seed",
+        default="graph_expansion_queue_v1",
+        help="Stable seed used when --queue-pop-strategy=random.",
+    )
     parser.add_argument("--max-neighbors", type=int, default=5, help="Text neighbors queued per text node.")
     parser.add_argument("--max-links", type=int, default=60, help="Wiki links extracted per page before queue slicing.")
     parser.add_argument("--link-window-size", type=int, default=1200, help="Character window size for wiki-link diversity.")
@@ -532,6 +543,8 @@ def main(argv: list[str] | None = None) -> int:
         config=GraphExpansionConfig(
             max_depth=args.max_depth,
             max_new_text_neighbors=args.max_neighbors,
+            queue_pop_strategy=args.queue_pop_strategy,
+            queue_pop_random_seed=args.queue_pop_random_seed,
             extract_attributes=not args.skip_attributes,
             attribute_errors_fatal=args.fatal_attribute_errors,
             enable_image_expansion=not args.no_images,

@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import asdict, dataclass, field
 from enum import Enum
+from hashlib import sha256
 import os
 from pathlib import Path
 import random
@@ -221,6 +222,8 @@ class GraphExpansionConfig:
     persist: bool = True
     max_wiki_inline_images_per_page: int = 3
     wiki_inline_random_seed: str = "wiki_inline_page_cap_v1"
+    queue_pop_strategy: str = "fifo"
+    queue_pop_random_seed: str = "graph_expansion_queue_v1"
 
 
 class GraphExpansionStrategy:
@@ -303,6 +306,7 @@ class GraphExpansionStrategy:
                 return None
             if allowed_task_types is None:
                 allowed_task_types = {ExpansionTaskType.TEXT_EXPAND, ExpansionTaskType.IMAGE_EXPAND}
+            eligible_indices: list[int] = []
             for index, task in enumerate(self._queue):
                 if task.task_type in allowed_task_types:
                     metadata = task.metadata or {}
@@ -313,9 +317,13 @@ class GraphExpansionStrategy:
                     if exclude_text_task_origin is not None:
                         if task.task_type == ExpansionTaskType.TEXT_EXPAND and task_origin == exclude_text_task_origin:
                             continue
-                    del self._queue[index]
-                    return task
-            return None
+                    eligible_indices.append(index)
+            if not eligible_indices:
+                return None
+            selected_index = self._select_queue_index(eligible_indices)
+            task = self._queue[selected_index]
+            del self._queue[selected_index]
+            return task
 
     def pop_next_batch(
         self,
@@ -328,7 +336,13 @@ class GraphExpansionStrategy:
             limit = max(1, int(batch_size))
             if allowed_task_types is None:
                 while self._queue and len(tasks) < limit:
-                    tasks.append(self._queue.popleft())
+                    if self.config.queue_pop_strategy == "random":
+                        selected_index = self._select_queue_index(list(range(len(self._queue))))
+                        task = self._queue[selected_index]
+                        del self._queue[selected_index]
+                        tasks.append(task)
+                    else:
+                        tasks.append(self._queue.popleft())
                 return tasks
             index = 0
             while index < len(self._queue) and len(tasks) < limit:
@@ -339,6 +353,20 @@ class GraphExpansionStrategy:
                     continue
                 index += 1
             return tasks
+
+    def _select_queue_index(self, eligible_indices: list[int]) -> int:
+        if (self.config.queue_pop_strategy or "fifo").lower() != "random":
+            return eligible_indices[0]
+        seed = str(self.config.queue_pop_random_seed or "graph_expansion_queue_v1")
+        best_index = eligible_indices[0]
+        best_key: str | None = None
+        for index in eligible_indices:
+            task = self._queue[index]
+            digest = sha256(f"{seed}||{task.dedupe_key()}||{index}".encode("utf-8")).hexdigest()
+            if best_key is None or digest < best_key:
+                best_key = digest
+                best_index = index
+        return best_index
 
     def queue_records(self) -> list[dict[str, Any]]:
         with self._lock:
