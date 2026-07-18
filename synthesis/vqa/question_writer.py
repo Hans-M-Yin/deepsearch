@@ -682,7 +682,9 @@ Output:
 """
 
 
-PROMPT_COMPOSE_QUESTION = """
+# Legacy compose prompt retained for comparison and rollback. Runtime question
+# composition uses the revised PROMPT_COMPOSE_QUESTION defined after this block.
+PROMPT_COMPOSE_QUESTION_LEGACY = """
 You are an expert at composing multi-hop search questions. Below, you will be given the specific structure of each hop in the data, and your task is to assemble these separated pieces into a continuous reasoning question that hides the intermediate steps and is meant for a user to answer.
 
 Each hop contains at least three parts:
@@ -755,6 +757,337 @@ Return valid JSON with exactly these fields:
   "question": "..."
 }
 """
+
+
+PROMPT_COMPOSE_QUESTION = """
+You are an expert at composing multi-hop search questions. Below, you will be
+given the structure of each hop in a reasoning path. Transform these separated
+pieces into one coherent question that hides intermediate answers while still
+requiring the solver to follow the intended search path.
+
+Each hop contains:
+- source: the starting point of the hop;
+- target: the endpoint that must be recovered from the source;
+- statement: a declarative sentence describing their relationship;
+- retrieval_query: optional retrieval context, especially for image hops.
+
+The source of each hop is the target of the previous hop. The path can therefore
+be represented as A -> B -> C ..., but this notation describes semantic
+dependency, not a sentence structure to copy.
+
+The input also provides:
+- `first_clue`: the question-facing description of the first source and,
+  sometimes, an already rewritten version of the first hop;
+- `forbidden_labels`: source names or aliases that must not be exposed;
+- `target_ask`: the final question to ask after the last entity or image has
+  been reached.
+
+Important: `first_clue` may already express the first item in `hop_facts`. If it
+does, use that information once and do not restate the same first hop.
+
+Composition principles:
+
+1. Compose globally instead of restating the path hop by hop.
+
+Read the complete path before writing. Determine the minimum role that each hop
+plays in identifying the next entity, then combine the necessary relationships
+using whatever structure is most natural: relative clauses, temporal clauses,
+appositives, participial phrases, or multiple sentences when they improve
+readability.
+
+Do not use a fixed template. Do not mechanically turn every hop statement into
+a separate sentence. Sentence boundaries should follow natural semantic units,
+not hop boundaries.
+
+2. Preserve semantic dependency and reasoning direction.
+
+The wording must preserve A -> B -> C: A provides the basis for identifying B,
+and B provides the basis for identifying C. Local reordering is allowed only
+when it improves grammar without breaking this dependency or making a later
+clue independently understandable without the preceding result.
+
+Every later entity must remain meaningfully connected to the entity recovered
+in the preceding hop.
+
+3. Apply minimum sufficient obfuscation, not maximum vagueness.
+
+Intermediate source and target labels are internal annotations and should not
+normally be exposed directly. However, do not blindly obscure every proper noun
+or concrete detail. For each reference, implicitly choose the least aggressive
+action that prevents leakage while preserving recoverability:
+
+- KEEP: retain a necessary entry anchor, disambiguating detail, or part of the
+  final ask when it does not independently reveal an intermediate answer.
+- RELATIONALIZE: replace an entity name with a description based on its
+  relationship to the entity recovered in the preceding hop.
+- GENERALIZE: replace an explicit name with a stable broader type, role, class,
+  or category when the exact name is unnecessarily revealing.
+- DELETE: remove a detail that does not identify the next entity, resolve a
+  genuine ambiguity, preserve an essential visual reference frame, or express
+  the final ask.
+
+A good replacement must pass both tests:
+- Without the preceding-hop result, it should not independently identify the
+  intermediate entity.
+- After the preceding-hop result is known, it should provide enough relational
+  or contextual information to recover the intended next entity.
+
+If a replacement identifies the entity without the previous hop, it is too
+revealing. If it remains unclear even after the previous hop is known, it is too
+vague.
+
+Do not obscure a clue merely because it is specific. Dates, visible clothing,
+event types, co-attendance, locations, and other concrete details should be
+retained when removing them would make the next event, image, or entity unstable
+or ambiguous. The goal is the minimum sufficient description, not the shortest
+possible question.
+
+4. Allow evidence-preserving abstraction, but do not expand the story.
+
+You may paraphrase, relationalize, or generalize information explicitly stated
+or directly entailed by `first_clue`, `hop_facts`, and `target_ask`.
+
+Examples of valid abstraction:
+- `Wellesley College` -> `a women's college`;
+- `the Presidential Medal of Freedom` -> `a major civilian honor`.
+
+Such abstractions preserve the supplied fact at a broader level. They are not
+permission to introduce outside knowledge.
+
+Do not add an unrelated event, achievement, office, famous anecdote,
+biographical fact, or identity clue merely because you know it. Do not replace
+a supplied relation with a different famous fact about the same entity. Avoid
+new highly searchable details that allow the solver to bypass the preceding
+hop.
+
+5. Retain functionally necessary information and remove only true redundancy.
+
+Every retained detail must serve at least one purpose:
+- identify the next entity through the preceding entity;
+- distinguish the intended event, image, or entity from plausible alternatives;
+- preserve an essential image or artifact reference frame;
+- express the final ask.
+
+When deciding whether to delete a detail, ask: after deletion, can the next hop
+still be recovered reliably and uniquely from the preceding result? If not,
+retain the detail.
+
+When several statements repeat the same person, event, image, or relationship,
+merge the repeated information instead of narrating it again.
+
+6. Handle images naturally.
+
+If the first source is an image, it will be shown with the question. Refer to it
+as `this image`; do not repeat a long title-like description unless a visible
+detail is necessary for the first transition.
+
+If a later image mainly records a real-world event or scene and the supplied hop
+has already been normalized into event-based wording, express the event
+naturally rather than instructing the solver to locate another image. If the
+image is itself the essential artifact or reference frame, such as a manuscript
+page, poster, artwork, cover, screenshot, map, diagram, or chart, preserve that
+framing.
+
+Avoid repeatedly saying `in this image`, `in that photo`, or `there is another
+image` unless the image itself is required as the reference frame.
+
+7. Keep the final question compact, connected, and natural.
+
+Do not add procedural introductions such as `Please look at`, `First identify`,
+`Starting from`, `Then`, `Next`, or `Based on this clue`. Do not explain the
+reasoning procedure.
+
+Avoid repeatedly reintroducing the same person, event, institution, or image.
+Maintain a continuous reference chain. Use pronouns only when they have one
+unambiguous referent. Multiple sentences are allowed, but use another sentence
+only when it improves comprehension rather than merely marking a new hop.
+
+8. Avoid shortcuts and unnecessary constraints.
+
+Do not identify a later entity through a newly added famous title, iconic event,
+unique achievement, unrelated date, nationality, or recognizable biographical
+fact. If a hop is genuinely ambiguous, add only a minimal restriction that
+still depends on the preceding entity.
+
+For example, `the first international club this player represented` still
+depends on identifying the player. By contrast, `the club that won the 2011
+UEFA Champions League` may identify the club independently and creates a
+shortcut.
+
+9. Preserve the final ask.
+
+The final question must retain the meaning of `target_ask`. Do not reveal its
+answer, replace it with a different question, or add an independent question
+that is not part of `target_ask`. The transition into the final ask should
+follow naturally from the entity or event established by the preceding clauses.
+
+10. Silently check the result before returning it.
+
+Verify that:
+- the path's semantic dependency and direction are preserved;
+- `first_clue` and the first hop are not repeated;
+- the output is not a one-sentence-per-hop narration;
+- intermediate names are hidden only where necessary;
+- necessary anchors and disambiguating details have not been over-obscured;
+- each later entity is recoverable after, but not independently of, the
+  preceding entity;
+- no outside background facts were introduced;
+- every retained detail performs a transition, disambiguation,
+  visual-reference, or final-ask function;
+- all references are clear;
+- the question is concise without sacrificing unique recoverability;
+- the final ask has the same meaning as the supplied `target_ask`.
+
+Few-shot example 1: image-start path with multiple visual transitions
+
+Input:
+{
+  "opening_mode": "image_start",
+  "first_clue": "In this image showing President George H. W. Bush reviewing documents with Dick Cheney and Brent Scowcroft in April 1989, the man on the left is Brent Scowcroft.",
+  "forbidden_labels": ["Brent Scowcroft", "Scowcroft"],
+  "hop_facts": [
+    {
+      "hop_index": 0,
+      "source": "image of George H. W. Bush reviewing documents with Dick Cheney and Brent Scowcroft in April 1989",
+      "target": "Brent Scowcroft",
+      "statement": "In this image showing President George H. W. Bush reviewing documents with Dick Cheney and Brent Scowcroft in April 1989, the man on the left is Brent Scowcroft.",
+      "retrieval_query": ""
+    },
+    {
+      "hop_index": 1,
+      "source": "Brent Scowcroft",
+      "target": "image of Brent Scowcroft receiving the Presidential Medal of Freedom in 1991",
+      "statement": "Brent Scowcroft is associated with a photograph of President George H. W. Bush placing the Presidential Medal of Freedom around his neck at a White House ceremony in 1991.",
+      "retrieval_query": "Brent Scowcroft Presidential Medal of Freedom White House 1991"
+    },
+    {
+      "hop_index": 2,
+      "source": "image of Brent Scowcroft receiving the Presidential Medal of Freedom in 1991",
+      "target": "Barbara Bush",
+      "statement": "In the photograph of the 1991 White House ceremony, the woman standing beside the recipient in a red-and-white polka-dot dress is Barbara Bush.",
+      "retrieval_query": ""
+    },
+    {
+      "hop_index": 3,
+      "source": "Barbara Bush",
+      "target": "image of Barbara Bush and another country's first lady at the Wellesley College commencement",
+      "statement": "Barbara Bush is associated with a photograph of her sitting beside another country's first lady at the Wellesley College commencement on June 1, 1990.",
+      "retrieval_query": "Barbara Bush Wellesley commencement June 1 1990"
+    }
+  ],
+  "target_ask": {
+    "ask_target": "What type of necklace was Barbara Bush wearing at the commencement?"
+  }
+}
+
+Bad output:
+"Please look at the man on the left in this image. In 1991, he received the
+Presidential Medal of Freedom from President George H. W. Bush at the White
+House. A woman in a red-and-white polka-dot dress was standing beside him. That
+woman later attended a famous commencement ceremony at Wellesley College. What
+type of necklace was she wearing?"
+
+Why it is bad:
+- It mechanically restates the hops as separate sentences.
+- It repeats the starting instruction.
+- It exposes exact names that can be safely abstracted.
+- It adds `famous`, which is unsupported and unnecessary.
+- Its references are fragmented instead of forming one dependency chain.
+
+Good output:
+"What type of necklace did the woman in the red-and-white polka-dot dress
+standing beside the man on the left of this image as he received a major
+civilian honor at a 1991 White House ceremony wear when, the previous year, she
+attended a women's-college commencement alongside another country's first
+lady?"
+
+Why it is good:
+- It preserves 1991 and the co-attendance clue because they distinguish the
+  intended ceremonies and image.
+- `another country's first lady` preserves the supplied relation without adding
+  a highly searchable nationality that could bypass the earlier transition.
+- It relationalizes the man and woman and generalizes the honor and college.
+- It uses the starting image once and preserves the complete dependency chain.
+- It does not add background facts or narrate one sentence per hop.
+
+Few-shot example 2: text-start path with a photographed artwork bridge
+
+Input:
+{
+  "opening_mode": "text_start",
+  "first_clue": "A 20th-century Romanian sculptor created a war memorial ensemble in Targu Jiu.",
+  "forbidden_labels": ["Constantin Brancusi", "Constantin Brâncuși", "Brancusi", "Brâncuși"],
+  "hop_facts": [
+    {
+      "hop_index": 0,
+      "source": "Constantin Brâncuși",
+      "target": "image of Constantin Brâncuși's studio in Paris in 1920",
+      "statement": "The sculptor was photographed in his Paris studio in 1920.",
+      "retrieval_query": "Constantin Brancusi Paris studio 1920"
+    },
+    {
+      "hop_index": 1,
+      "source": "image of Constantin Brâncuși's studio in Paris in 1920",
+      "target": "Bird in Space",
+      "statement": "The slender sculpture standing near the center of the studio is Bird in Space.",
+      "retrieval_query": ""
+    },
+    {
+      "hop_index": 2,
+      "source": "Bird in Space",
+      "target": "National Gallery of Art",
+      "statement": "A museum holds both a marble version and a bronze version of the sculpture.",
+      "retrieval_query": ""
+    },
+    {
+      "hop_index": 3,
+      "source": "National Gallery of Art",
+      "target": "David E. Finley, Jr.",
+      "statement": "The museum's director from 1938 to 1956 was David E. Finley, Jr.",
+      "retrieval_query": ""
+    }
+  ],
+  "target_ask": {
+    "ask_target": "Where did David E. Finley, Jr. earn his professional degree, and in what field was that degree?"
+  }
+}
+
+Bad output:
+"A 20th-century Romanian sculptor created a war memorial ensemble in Targu Jiu.
+He was photographed in his Paris studio in 1920. In the image, the sculpture in
+the center is Bird in Space. The National Gallery of Art holds two versions of
+the sculpture. Its director from 1938 to 1956 was David E. Finley, Jr. Where did
+he earn his professional degree, and in what field?"
+
+Why it is bad:
+- It assigns a separate sentence to nearly every hop.
+- It directly reveals the sculpture, museum, and director.
+- It reads like an explanation of the path rather than a natural question.
+
+Good output:
+"A 20th-century Romanian sculptor who created a war memorial ensemble in Targu
+Jiu was photographed in his Paris studio in 1920. Where did the 1938-56 director
+of the museum that holds both marble and bronze versions of the slender
+sculpture at the center of that studio photograph earn his professional degree,
+and in what field?"
+
+Why it is good:
+- It uses two sentences because they form natural semantic units, not because
+  the path contains multiple hops.
+- It preserves the path order while compressing the middle transitions.
+- It hides the sculpture, museum, and director names without losing the facts
+  needed to recover them.
+- It retains dates and material types because they perform useful identifying
+  functions.
+
+Now compose the question for the provided input.
+
+Return valid JSON with exactly these fields:
+{
+  "question": "..."
+}
+"""
+
 
 PROMPT_POLISH_ENTITY_OBFUSCATION = """
 You are auditing a multi-hop reasoning question for which the intended reasoning chain has already been provided. In this chain, the source of each hop statement is an intermediate answer. An ideal multi-hop reasoning question must require the solver to infer each intermediate result step by step from the beginning, so intermediate answers must not be exposed in advance. It must also ensure that an intermediate answer cannot be inferred without first obtaining the result of the previous step; in other words, shortcuts must be avoided, so that a solver cannot infer an intermediate answer without relying on the earlier part of the question.
