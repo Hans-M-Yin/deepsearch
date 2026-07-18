@@ -51,6 +51,7 @@ class GraphRunnerConfig:
     state_file_name: str = "graph_runner_state.json"
     parallel_workers: int = 1
     batch_size: int | None = None
+    max_inflight_text: int | None = None
     show_progress: bool = True
     persist_visual_plans: bool = True
     visual_plans_file_name: str = "visual_plans.jsonl"
@@ -340,10 +341,18 @@ class GraphRunner:
         remaining_text_slots = self._remaining_text_slots(
             in_flight_text_count=in_flight_text_count,
         )
+        queue_breakdown = self._queue_breakdown()
+        text_inflight_cap = self.config.max_inflight_text
+        limit_text_for_images = (
+            text_inflight_cap is not None
+            and int(text_inflight_cap) > 0
+            and queue_breakdown["image_queue"] > 0
+            and in_flight_text_count >= int(text_inflight_cap)
+        )
         if remaining_text_slots is None or remaining_text_slots > 0:
-            queue_breakdown = self._queue_breakdown()
             if (
-                queue_breakdown["image_entity_queue"] > 0
+                not limit_text_for_images
+                and queue_breakdown["image_entity_queue"] > 0
                 and self._text_dispatch_since_image_entity >= 3
             ):
                 task = self.strategy.pop_next_task(
@@ -354,7 +363,7 @@ class GraphRunner:
                     self._text_dispatch_since_image_entity = 0
                     return task
         allowed_types = {ExpansionTaskType.IMAGE_EXPAND}
-        if remaining_text_slots is None or remaining_text_slots > 0:
+        if (remaining_text_slots is None or remaining_text_slots > 0) and not limit_text_for_images:
             allowed_types.add(ExpansionTaskType.TEXT_EXPAND)
         task = self.strategy.pop_next_task(allowed_task_types=allowed_types)
         if task is not None and task.task_type == ExpansionTaskType.TEXT_EXPAND:
@@ -919,6 +928,48 @@ def _smoke_test() -> None:
         assert strategy.queue_size(ExpansionTaskType.TEXT_EXPAND) == 2
         assert strategy.queue_size(ExpansionTaskType.IMAGE_EXPAND) == 0
         assert runner._text_node_count() == 2
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = JsonlGraphStore(tmpdir)
+        strategy = MockSchedulingStrategy(store)
+        runner = GraphRunner(
+            strategy=strategy,
+            store=store,
+            config=GraphRunnerConfig(
+                max_steps=3,
+                max_nodes=10,
+                parallel_workers=4,
+                batch_size=4,
+                max_inflight_text=1,
+                show_progress=False,
+            ),
+            run_id="run_max_inflight_text_smoke",
+            resume=False,
+        )
+        for index in range(3):
+            strategy.enqueue(
+                ExpansionTask(
+                    url=f"https://en.wikipedia.org/wiki/Capped_Text_{index}",
+                    title=f"Capped Text {index}",
+                )
+            )
+        for index in range(2):
+            strategy.enqueue(
+                ExpansionTask.from_image_expansion(
+                    url=f"https://en.wikipedia.org/wiki/Capped_Image_{index}",
+                    title=f"Capped Image {index}",
+                    depth=0,
+                    source_text_node_id=f"capped_text_source_{index}",
+                    source_evidence_id=f"capped_evidence_{index}",
+                )
+            )
+        processed_count, _ = runner._run_parallel_batch(last_error=None)
+        assert processed_count == 3
+        assert strategy.executed_task_types == [
+            ExpansionTaskType.TEXT_EXPAND,
+            ExpansionTaskType.IMAGE_EXPAND,
+            ExpansionTaskType.IMAGE_EXPAND,
+        ]
     print("graph_runner smoke test passed")
 
 

@@ -341,6 +341,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Number of workers shared by text and image expansion tasks.",
     )
     parser.add_argument("--batch-size", type=int, default=None, help="Tasks popped from the queue per parallel expansion round.")
+    parser.add_argument(
+        "--max-inflight-text",
+        type=int,
+        default=None,
+        help="When image tasks are queued, cap concurrently running text-expansion tasks so workers are left for images. <=0 disables the cap.",
+    )
     parser.add_argument("--max-depth", type=int, default=1, help="Maximum text-neighbor BFS depth.")
     parser.add_argument("--max-neighbors", type=int, default=5, help="Text neighbors queued per text node.")
     parser.add_argument("--max-links", type=int, default=60, help="Wiki links extracted per page before queue slicing.")
@@ -542,6 +548,7 @@ def main(argv: list[str] | None = None) -> int:
             stop_on_error=False,
             parallel_workers=args.parallel_workers,
             batch_size=args.batch_size,
+            max_inflight_text=args.max_inflight_text if args.max_inflight_text and args.max_inflight_text > 0 else None,
         ),
         run_id=args.run_id,
         resume=not args.fresh,
