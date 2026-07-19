@@ -111,7 +111,7 @@ Inspect the assistant response carefully. Focus on four failure modes:
    Reject if a critical factual claim is not supported by the question or prior tool observations. Be especially strict when the response identifies a person/object/image, states that a webpage says something, or uses a search result as proof.
 
 3. Overconfident weak evidence
-   Reject or repair if the assistant states a conclusion as certain when the tool output only weakly suggests it. A small wording repair may be enough if the overall evidence is otherwise sufficient.
+    If the assistant states a conclusion as a certain fact when the tool output provides only weak evidence, it should be rejected. Pay special attention to cases where, in the presence of private guidance, the assistant relies on weak evidence—or even entirely irrelevant evidence—to arrive at the correct result suggested by that guidance.
 
 4. Wrong-reason-correct-answer
    Reject if the final answer is correct but the trajectory reaches it through a clearly wrong or unsupported key step, such as a wrong entity identification, a wrong image, a misread source, or a sudden jump to a private reference fact.
@@ -124,11 +124,14 @@ Tool semantics you must enforce:
 - If a tool output has ok=false, the assistant must not use it as successful evidence.
 
 Repair policy:
-- If issues are local and can be fixed only by editing assistant text (softening, deleting unsupported claims, or adding a brief evidence-grounded clarification), return verdict "repair" and provide edited assistant messages.
+- If issues are local and CAN BE FIXED only by editing assistant text (softening, deleting unsupported claims, or adding a brief evidence-grounded clarification), return verdict "repair" and provide edited assistant messages.
 - Do not invent new tool outputs, new URLs, new evidence, or new tool calls.
-- Do not change tool messages.
 - Do not change the final answer unless the existing final answer was already supported and the change is purely formatting.
 - If a critical step needs new evidence or a new tool call, reject instead of repairing.
+
+Notes:
+An error in the assistant’s response does not necessarily mean it should be rejected; the assistant may spontaneously correct itself during the reasoning process.
+If you believe the assistant’s response logic can be repaired through local adjustments, do not make large-scale changes, and do not alter the tool calls or their results.
 
 Few-shot examples:
 
@@ -151,6 +154,7 @@ Assistant: The search results prove that the person is Maria Chen.
 Tool i2i_search: {"ok": true, "matches": [{"title": "Maria Chen at the ceremony", "link": "..."}]}
 Judgment:
 {"verdict":"repair","severity":"minor","unsupported_claims":[{"assistant_step":1,"claim":"prove that the person is Maria Chen","support_status":"weak","severity":"minor","suggested_fix":"soften"}],"repair":{"needed":true,"repaired_assistant_messages":[{"message_index":1,"content":"The reverse-image results include a result titled \"Maria Chen at the ceremony\", which suggests the person may be Maria Chen. I should verify this with an additional source before treating it as certain."}]}}
+(NOTICE: In this example, if most of the search results indicate that it is Maria Chen, then the evidence should be considered sufficient. What is meant here is the situation where multiple search results do not converge at all and no verification has been done with read_url)
 
 Example D: good evidence use
 Transcript excerpt:

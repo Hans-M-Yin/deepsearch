@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
 import json
 import os
 from pathlib import Path
@@ -365,14 +366,107 @@ def _print_generation_stats(stats: dict[str, Counter[str]]) -> None:
             print(f"  {name}: {count}")
 
 
-def _build_source_metadata(record: dict[str, Any], *, vqa_dir: str | None) -> dict[str, Any]:
-    return {
+def _select_fields(source: dict[str, Any], field_names: tuple[str, ...]) -> dict[str, Any]:
+    return {field_name: source.get(field_name) for field_name in field_names if source.get(field_name) is not None}
+
+
+def _compact_path_record(path: dict[str, Any]) -> dict[str, Any]:
+    return _select_fields(
+        path,
+        (
+            "path_id",
+            "start_node_id",
+            "target_node_id",
+            "node_ids",
+            "edge_ids",
+            "node_types",
+            "edge_types",
+            "relations",
+            "trajectory",
+            "exact_signature",
+            "skeleton_signature",
+            "core_signature",
+        ),
+    )
+
+
+def _compact_question_record(question_record: dict[str, Any]) -> dict[str, Any]:
+    return _select_fields(
+        question_record,
+        (
+            "question_id",
+            "sample_id",
+            "path_id",
+            "status",
+            "question",
+            "draft_question",
+            "polished_question",
+            "final_question",
+            "answer",
+            "image_url",
+            "input_image_url",
+        ),
+    )
+
+
+def _compact_sample_record(sample_record: dict[str, Any]) -> dict[str, Any]:
+    compact = _select_fields(
+        sample_record,
+        (
+            "sample_id",
+            "status",
+            "hop_chain",
+            "question_hop_chain",
+            "entry_hop",
+            "target_ask",
+            "question_target_ask",
+            "question_terminal_bridge",
+            "image_bridge_normalization",
+            "image_target_terminal_normalization",
+            "input_image_url",
+            "created_at",
+            "updated_at",
+        ),
+    )
+    path = sample_record.get("path") or {}
+    if isinstance(path, dict):
+        compact["path"] = _compact_path_record(path)
+    metadata = sample_record.get("metadata") or {}
+    if isinstance(metadata, dict):
+        compact_metadata = _select_fields(metadata, ("input_image_url", "writer_warnings", "timings"))
+        if compact_metadata:
+            compact["metadata"] = compact_metadata
+    return compact
+
+
+def _build_source_metadata(
+    record: dict[str, Any],
+    *,
+    vqa_dir: str | None,
+    mode: str,
+) -> dict[str, Any]:
+    base = {
+        "mode": mode,
         "vqa_dir": vqa_dir,
         "question_id": record.get("question_id"),
         "sample_id": record.get("sample_id"),
         "path_id": record.get("path_id"),
-        "question_record": record.get("question_record") or {},
-        "sample_record": record.get("sample_record") or {},
+    }
+    if mode == "ref":
+        return base
+
+    question_record = record.get("question_record") or {}
+    sample_record = record.get("sample_record") or {}
+    if mode == "compact":
+        return {
+            **base,
+            "question_record": _compact_question_record(question_record) if isinstance(question_record, dict) else {},
+            "sample_record": _compact_sample_record(sample_record) if isinstance(sample_record, dict) else {},
+        }
+    return {
+        **base,
+        "question_record": question_record,
+        "sample_record": sample_record,
     }
 
 
@@ -386,6 +480,7 @@ def _build_raw_trajectory_record(
     generation_summary: dict[str, Any],
     hop_chain_coverage: dict[str, Any] | None,
     vqa_dir: str | None,
+    source_metadata_mode: str,
 ) -> dict[str, Any]:
     return {
         "question_id": record.get("question_id"),
@@ -394,7 +489,7 @@ def _build_raw_trajectory_record(
         "question": record.get("question"),
         "gold_answer": record.get("gold_answer"),
         "input_images": input_images,
-        "source_metadata": _build_source_metadata(record, vqa_dir=vqa_dir),
+        "source_metadata": _build_source_metadata(record, vqa_dir=vqa_dir, mode=source_metadata_mode),
         "raw_messages": messages,
         "extracted_answer": extracted_answer,
         "answer_judge": answer_judge,
@@ -420,6 +515,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--raw-trajectories-jsonl",
         help="Optional path to save raw formatted trajectories.",
+    )
+    parser.add_argument(
+        "--source-metadata-mode",
+        choices=("full", "compact", "ref"),
+        default=os.environ.get("SFT_SOURCE_METADATA_MODE") or "compact",
+        help=(
+            "How much original VQA source metadata to store in each SFT JSONL record. "
+            "full stores full question/sample records; compact stores only verifier/export-relevant fields; "
+            "ref stores only ids and vqa_dir. Defaults to compact."
+        ),
     )
     parser.add_argument(
         "--repair-model",
@@ -591,6 +696,7 @@ def _process_record(
     expert_config: Any,
     workdir: str,
     vqa_dir: str | None,
+    source_metadata_mode: str,
 ) -> dict[str, Any]:
     context = build_runtime_context(
         working_dir=os.path.join(workdir, f"debug_{index:04d}_{record.get('question_id') or 'question'}"),
@@ -666,6 +772,7 @@ def _process_record(
         generation_summary=generation_summary,
         hop_chain_coverage=hop_chain_coverage,
         vqa_dir=vqa_dir,
+        source_metadata_mode=source_metadata_mode,
     )
     is_correct = bool((answer_judge or {}).get("is_correct"))
     return {
@@ -748,11 +855,15 @@ def main(argv: list[str] | None = None) -> int:
         raw_output_path = Path(args.raw_trajectories_jsonl)
     elif args.output_jsonl:
         raw_output_path = Path(args.output_jsonl)
+    elif args.vqa_dir:
+        timestamp = datetime.now().strftime("%m%d_%H%M%S")
+        raw_output_path = Path(args.vqa_dir) / f"sft_{timestamp}.jsonl"
 
     raw_output_handle = None
     if raw_output_path is not None:
         raw_output_path.parent.mkdir(parents=True, exist_ok=True)
         raw_output_handle = raw_output_path.open("w", encoding="utf-8")
+        print(f"raw_trajectories_jsonl: {raw_output_path}")
     total_count = 0
     correct_count = 0
     incorrect_count = 0
@@ -779,6 +890,7 @@ def main(argv: list[str] | None = None) -> int:
                     expert_config=expert_config,
                     workdir=args.workdir,
                     vqa_dir=resolved_vqa_dir,
+                    source_metadata_mode=args.source_metadata_mode,
                 ): {
                     "index": index,
                     "record": record,
