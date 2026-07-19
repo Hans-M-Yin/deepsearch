@@ -525,11 +525,6 @@ class RandomPathSampler(PathSampler):
         trajectory = self._trajectory_stats(node_types)
         if trajectory.modality_switch_count < self.config.min_modality_switches:
             return None, "modality_switch"
-        # Temporary debug guard: keep only trajectories with at least one
-        # intermediate image, for example text->image->text. Remove this once
-        # the image-focused debugging run is complete.
-        if not trajectory.has_mid_image:
-            return None, "image_position_requirement"
         if not self._valid_end_type(node_types[-1]):
             return None, "end_type"
         exact_signature = "|".join(node_ids)

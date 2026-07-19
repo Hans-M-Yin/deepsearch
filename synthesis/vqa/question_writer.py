@@ -705,7 +705,7 @@ For example, suppose the true reasoning result is a club that a certain player o
 For instance, if the true target is FC Barcelona, a better phrasing would be: "the first international club this player played for."
 Do not use a restriction such as "the club that won the 2011 UEFA Champions League," because that would allow the target to be inferred without depending on the previous source, creating a shortcut.
 
-	6. If a statement in a given hop refers to a specific scene or image, that hop will be marked as `"image"`. In the rewritten question, preserve the description of that scene or image—especially the visual details—and only apply slight obfuscation to the entities within it.
+6. If a statement in a given hop refers to a specific scene or image, that hop will be marked as `"image"`. In the rewritten question, preserve the description of that scene or image—especially the visual details—and only apply slight obfuscation to the entities within it.
 
 7. Please ensure that the reasoning order in the question follows the order of the hops.
 
@@ -1037,14 +1037,14 @@ Goal: The purpose is not to make the question longer, nor to blindly make all cl
 
 1. Do not change the core question, and do not change the final answer.
 2. Reduce the salience of intermediate entities according to the reasoning process of the question. Make sure that after revision, each intermediate entity can only be inferred after reasoning through the previous one. This means you must choose an appropriate degree of obfuscation and avoid any shortcut that allows the solver to skip earlier reasoning steps. For example:
-3. In Jacques-Louis David’s painting of the Tennis Court Oath at Versailles (the previous target) on June 20, 1789, the man standing on a table at the center of the crowd with his arm raised is Jean Sylvain Bailly.
+Example: In Jacques-Louis David’s painting of the Tennis Court Oath at Versailles (the previous target) on June 20, 1789, the man standing on a table at the center of the crowd with his arm raised is Jean Sylvain Bailly.
     Good revision: In Jacques-Louis David’s painting of the event that took place there, the man standing on a table at the center of the crowd with his arm raised is Jean Sylvain Bailly.
     Bad revision: In a painting by a famous artist of an event that took place there, the man standing on a table at the center of the crowd with his arm raised is Jean Sylvain Bailly.
     Reason: The former removes the date and the specific content of the painting, preventing the solver from inferring the painting directly from the date and event without first identifying Versailles; but once Versailles is inferred, the painter’s name and the location still allow the painting to be identified smoothly. The latter removes both the painter and the date entirely, making the clue too vague: even after inferring the location, multiple painters could have depicted events there, so the question becomes ambiguous.
-4. A replacement expression must satisfy this condition: on its own, it should not directly identify the target entity, but within the full question context, it should still help uniquely constrain the correct path.
-5. The question may include an image, so you need to preserve the connection between the question and the image content. In addition, descriptions of the image or scene should only be appropriately blurred, not deleted outright.
-6. Do not fabricate any extra information.
-7. Retain some explicit clues that may appear at the beginning of the reasoning chain so that the question still has an entry point. Note: this refers to the beginning of the reasoning chain, not necessarily the beginning of the surface wording of the question.
+3. A replacement expression must satisfy this condition: on its own, it should not directly identify the target entity, but within the full question context, it should still help uniquely constrain the correct path.
+4. The question may include an image, so you need to preserve the connection between the question and the image content. In addition, descriptions of the image or scene should only be appropriately blurred, not deleted outright.
+5. Do not fabricate any extra information.
+6. Retain some explicit clues that may appear at the beginning of the reasoning chain so that the question still has an entry point. Note: this refers to the beginning of the reasoning chain, not necessarily the beginning of the surface wording of the question.
 
 Output format:
 {
