@@ -116,6 +116,31 @@ def _hop_index_map(hops: list[dict[str, Any]]) -> dict[int, dict[str, Any]]:
     return result
 
 
+def _find_merged_question_hop(
+    question_hops: list[dict[str, Any]],
+    *,
+    incoming_index: int | None,
+    incoming_hop: dict[str, Any] | None,
+    outgoing_hop: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    incoming_edge_id = str((incoming_hop or {}).get("edge_id") or "").strip()
+    outgoing_edge_id = str((outgoing_hop or {}).get("edge_id") or "").strip()
+    merged_edge_id = "|".join(item for item in (incoming_edge_id, outgoing_edge_id) if item)
+    if merged_edge_id:
+        for hop in question_hops:
+            if str(hop.get("edge_id") or "").strip() == merged_edge_id:
+                return hop
+
+    # Fallback for older records that do not preserve the merged edge id. Be
+    # aware that question_hop_chain may contain a synthetic entry hop inserted
+    # before the raw graph hops, so hop_index can be shifted; prefer edge_id
+    # matching above whenever possible.
+    if isinstance(incoming_index, int):
+        by_index = _hop_index_map(question_hops)
+        return by_index.get(incoming_index)
+    return None
+
+
 def _format_hop(hop: dict[str, Any], *, width: int, title: str) -> list[str]:
     lines = [f"  {title}"]
     lines.extend(_format_field("source", hop.get("source"), width=width, indent=4))
@@ -146,7 +171,6 @@ def _format_image_bridge_section(sample: dict[str, Any], *, width: int) -> list[
     raw_hops = list(sample.get("hop_chain") or [])
     question_hops = list(sample.get("question_hop_chain") or [])
     raw_by_index = _hop_index_map(raw_hops)
-    question_by_index = _hop_index_map(question_hops)
     diagnostics = list(sample.get("image_bridge_normalization") or [])
 
     lines = ["Text -> Image -> Text Merge"]
@@ -172,7 +196,12 @@ def _format_image_bridge_section(sample: dict[str, Any], *, width: int) -> list[
             lines.extend(_format_hop(outgoing_hop, width=width, title=f"Before Hop {outgoing_index}"))
 
         if diag.get("applied"):
-            merged_hop = question_by_index.get(incoming_index) if isinstance(incoming_index, int) else None
+            merged_hop = _find_merged_question_hop(
+                question_hops,
+                incoming_index=incoming_index if isinstance(incoming_index, int) else None,
+                incoming_hop=incoming_hop,
+                outgoing_hop=outgoing_hop,
+            )
             if merged_hop:
                 lines.extend(_format_hop(merged_hop, width=width, title="After Merged Hop"))
             else:
