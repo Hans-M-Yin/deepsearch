@@ -680,6 +680,8 @@ class RepositoryVerifierTests(unittest.TestCase):
         self.assertIn("Question-only:", printed)
         self.assertIn("  correct: 1", printed)
         self.assertIn("  cannot_answer_or_question_issue: 1", printed)
+        self.assertIn("Question-Only Cannot-Answer Reasons (sampled 1, max 10)", printed)
+        self.assertIn("No shortcut.", printed)
 
     def test_debug_repository_verifier_redacts_inline_image_data_urls(self):
         from synthesis.vqa.debug.debug_repository_verifier import _dump_stdout_safe_json

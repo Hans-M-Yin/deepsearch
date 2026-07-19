@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import os
 from pathlib import Path
+import re
 import traceback
 from typing import Any
 
@@ -17,7 +19,7 @@ from .pipeline import (
     extract_answer,
     format_messages,
     judge,
-    run_agent_loop,
+    run_agent_session,
 )
 
 
@@ -152,6 +154,21 @@ def _print_record_result(result: dict[str, Any]) -> None:
     if result.get("input_images"):
         print("input_images:")
         print(json.dumps(result.get("input_images") or [], ensure_ascii=False, indent=2))
+    if result.get("generation_summary"):
+        summary = result.get("generation_summary") or {}
+        print(
+            "generation: "
+            f"status={summary.get('generation_status')} "
+            f"complete={summary.get('generation_complete')} "
+            f"stop_reason={summary.get('stop_reason')} "
+            f"turns={summary.get('turn_count')} "
+            f"tools={summary.get('tool_call_count')}"
+        )
+        if summary.get("failure_reasons"):
+            print(f"generation_failure_reasons: {summary.get('failure_reasons')}")
+        if summary.get("tool_error_counts"):
+            print("tool_error_counts:")
+            print(json.dumps(summary.get("tool_error_counts") or {}, ensure_ascii=False, indent=2))
     print(f"extracted_answer: {result.get('extracted_answer')}")
     print("answer_judge:")
     print(json.dumps(result.get("answer_judge") or {}, ensure_ascii=False, indent=2))
@@ -185,6 +202,169 @@ def _message_text_for_transcript(message: dict[str, Any]) -> str:
     return content
 
 
+def _try_parse_json_object(text: Any) -> dict[str, Any] | None:
+    if isinstance(text, dict):
+        return text
+    if not isinstance(text, str):
+        return None
+    candidate = text.strip()
+    if not candidate:
+        return None
+    try:
+        parsed = json.loads(candidate)
+        return parsed if isinstance(parsed, dict) else None
+    except json.JSONDecodeError:
+        start = candidate.find("{")
+        end = candidate.rfind("}")
+        if start < 0 or end <= start:
+            return None
+        try:
+            parsed = json.loads(candidate[start : end + 1])
+            return parsed if isinstance(parsed, dict) else None
+        except json.JSONDecodeError:
+            return None
+
+
+def _normalize_error_reason(text: str) -> str:
+    reason = str(text or "").strip()
+    if not reason:
+        return "unknown_error"
+    lowered = reason.lower()
+    if "max react turns" in lowered or "max tool-calling turns" in lowered:
+        return "max_turns_reached"
+    if "query is required" in lowered:
+        return "missing_query"
+    if "url is required" in lowered:
+        return "missing_url"
+    if "no image is available" in lowered:
+        return "i2i_no_image_available"
+    if "cropped region was created" in lowered and "public url" in lowered:
+        return "i2i_crop_upload_failed"
+    if "requires a publicly reachable image url" in lowered:
+        return "image_upload_failed"
+    if "http_403" in lowered or "403" in lowered or "forbidden" in lowered:
+        return "http_403"
+    if "http_404" in lowered or "404" in lowered or "not found" in lowered:
+        return "http_404"
+    if "http_429" in lowered or "429" in lowered or "too many requests" in lowered:
+        return "http_429"
+    if "timeout" in lowered:
+        return "timeout"
+    if "decode_error" in lowered:
+        return "image_decode_error"
+    if "non_image_content_type" in lowered:
+        return "non_image_content_type"
+    if "read_url failed" in lowered:
+        return "read_url_failed"
+    if "i2i_search failed" in lowered:
+        return "i2i_search_failed"
+    normalized = re.sub(r"https?://\S+", "<url>", reason)
+    normalized = re.sub(r"\s+", " ", normalized).strip().lower()
+    normalized = re.sub(r"[^a-z0-9_ .:-]+", "", normalized)
+    return normalized[:120] or "unknown_error"
+
+
+def _summarize_generation(
+    *,
+    messages: list[dict[str, Any]],
+    generation_metadata: dict[str, Any] | None,
+    extracted_answer: str,
+) -> dict[str, Any]:
+    metadata = dict(generation_metadata or {})
+    status = str(metadata.get("generation_status") or "unknown")
+    stop_reason = str(metadata.get("stop_reason") or "unknown")
+    tool_error_counts: Counter[str] = Counter()
+    tool_success_counts: Counter[str] = Counter()
+    tool_error_reasons: Counter[str] = Counter()
+    tool_call_count = 0
+    assistant_turn_count = 0
+    tool_turn_count = 0
+    total_content_chars = 0
+
+    for message in messages:
+        role = str(message.get("role") or "")
+        content_text = _message_content_to_text(message.get("content"))
+        total_content_chars += len(content_text)
+        if role == "assistant":
+            assistant_turn_count += 1
+        if role != "tool":
+            continue
+        tool_turn_count += 1
+        tool_call_count += 1
+        tool_name = str(message.get("name") or "unknown_tool").strip() or "unknown_tool"
+        parsed = _try_parse_json_object(message.get("content"))
+        ok_value = parsed.get("ok") if isinstance(parsed, dict) else None
+        if ok_value is False:
+            error_text = str((parsed or {}).get("error") or "tool_returned_ok_false")
+            reason = _normalize_error_reason(error_text)
+            tool_error_counts[tool_name] += 1
+            tool_error_reasons[f"{tool_name}:{reason}"] += 1
+        else:
+            tool_success_counts[tool_name] += 1
+
+    complete = bool(metadata.get("generation_complete"))
+    if status == "finished":
+        complete = True
+    if status == "max_turns_reached":
+        complete = False
+    failure_reasons: list[str] = []
+    if status == "max_turns_reached":
+        failure_reasons.append("max_turns_reached")
+    if status == "parse_error_finalized":
+        failure_reasons.append("manual_react_parse_error")
+    if not str(extracted_answer or "").strip():
+        failure_reasons.append("empty_extracted_answer")
+
+    return {
+        "generation_status": status,
+        "generation_complete": complete,
+        "stop_reason": stop_reason,
+        "failure_reasons": failure_reasons,
+        "max_turns": metadata.get("max_turns"),
+        "turn_count": metadata.get("turn_count"),
+        "assistant_turn_count": assistant_turn_count,
+        "tool_turn_count": tool_turn_count,
+        "tool_call_count": metadata.get("tool_call_count", tool_call_count),
+        "total_content_chars": total_content_chars,
+        "tool_success_counts": dict(sorted(tool_success_counts.items())),
+        "tool_error_counts": dict(sorted(tool_error_counts.items())),
+        "tool_error_reasons": dict(sorted(tool_error_reasons.items())),
+    }
+
+
+def _merge_generation_stats(stats: dict[str, Counter[str]], generation_summary: dict[str, Any]) -> None:
+    status = str(generation_summary.get("generation_status") or "unknown")
+    stats["generation_status"][status] += 1
+    if not bool(generation_summary.get("generation_complete")):
+        stats["incomplete"][status] += 1
+    for reason in generation_summary.get("failure_reasons") or []:
+        stats["failure_reasons"][str(reason)] += 1
+    for tool_name, count in (generation_summary.get("tool_success_counts") or {}).items():
+        stats["tool_success_counts"][str(tool_name)] += int(count)
+    for tool_name, count in (generation_summary.get("tool_error_counts") or {}).items():
+        stats["tool_error_counts"][str(tool_name)] += int(count)
+    for reason, count in (generation_summary.get("tool_error_reasons") or {}).items():
+        stats["tool_error_reasons"][str(reason)] += int(count)
+
+
+def _print_generation_stats(stats: dict[str, Counter[str]]) -> None:
+    print("\n--- SFT Generation Stats ---")
+    for title, key in (
+        ("generation_status", "generation_status"),
+        ("incomplete", "incomplete"),
+        ("failure_reasons", "failure_reasons"),
+        ("tool_success_counts", "tool_success_counts"),
+        ("tool_error_counts", "tool_error_counts"),
+        ("tool_error_reasons", "tool_error_reasons"),
+    ):
+        counter = stats[key]
+        if not counter:
+            continue
+        print(f"{title}:")
+        for name, count in counter.most_common():
+            print(f"  {name}: {count}")
+
+
 def _build_source_metadata(record: dict[str, Any], *, vqa_dir: str | None) -> dict[str, Any]:
     return {
         "vqa_dir": vqa_dir,
@@ -203,6 +383,7 @@ def _build_raw_trajectory_record(
     messages: list[dict[str, Any]],
     extracted_answer: str,
     answer_judge: dict[str, Any],
+    generation_summary: dict[str, Any],
     hop_chain_coverage: dict[str, Any] | None,
     vqa_dir: str | None,
 ) -> dict[str, Any]:
@@ -217,6 +398,7 @@ def _build_raw_trajectory_record(
         "raw_messages": messages,
         "extracted_answer": extracted_answer,
         "answer_judge": answer_judge,
+        "generation_summary": generation_summary,
         "hop_chain": list(record.get("hop_chain") or []),
         "hop_chain_coverage": hop_chain_coverage,
     }
@@ -434,13 +616,19 @@ def _process_record(
             input_images.append({"image_url": normalized_url})
 
     input_messages = _build_user_messages(record)
-    messages = run_agent_loop(
+    agent_result = run_agent_session(
         prompt=None if input_messages is not None else _build_user_prompt_text(record),
         messages=input_messages,
         config=agent_config,
         context=context,
     )
+    messages = agent_result.messages
     extracted_answer = extract_answer(messages)
+    generation_summary = _summarize_generation(
+        messages=messages,
+        generation_metadata=agent_result.metadata,
+        extracted_answer=extracted_answer,
+    )
     answer_judge = judge(
         question=str(record.get("question") or ""),
         answer=str(record.get("gold_answer") or ""),
@@ -461,6 +649,7 @@ def _process_record(
         "question": record.get("question"),
         "gold_answer": record.get("gold_answer"),
         "input_images": input_images,
+        "generation_summary": generation_summary,
         "extracted_answer": extracted_answer,
         "answer_judge": answer_judge,
         "hop_chain": hop_chain,
@@ -474,6 +663,7 @@ def _process_record(
         messages=messages,
         extracted_answer=extracted_answer,
         answer_judge=answer_judge,
+        generation_summary=generation_summary,
         hop_chain_coverage=hop_chain_coverage,
         vqa_dir=vqa_dir,
     )
@@ -483,6 +673,7 @@ def _process_record(
         "result_record": result_record,
         "raw_record": raw_record,
         "is_correct": is_correct,
+        "generation_summary": generation_summary,
     }
 
 
@@ -566,6 +757,15 @@ def main(argv: list[str] | None = None) -> int:
     correct_count = 0
     incorrect_count = 0
     failed_count = 0
+    generation_stats: dict[str, Counter[str]] = {
+        "generation_status": Counter(),
+        "incomplete": Counter(),
+        "failure_reasons": Counter(),
+        "tool_success_counts": Counter(),
+        "tool_error_counts": Counter(),
+        "tool_error_reasons": Counter(),
+        "record_exceptions": Counter(),
+    }
 
     try:
         resolved_vqa_dir = str(Path(args.vqa_dir).resolve()) if args.vqa_dir else None
@@ -593,6 +793,7 @@ def main(argv: list[str] | None = None) -> int:
                 except Exception as exc:
                     failed_count += 1
                     total_count += 1
+                    generation_stats["record_exceptions"][exc.__class__.__name__] += 1
                     print("\n" + "=" * 100)
                     print(f"question_id: {record.get('question_id')}")
                     if record.get("sample_id") is not None:
@@ -603,11 +804,14 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"error: {exc.__class__.__name__}: {exc}")
                     print("traceback:")
                     print("".join(traceback.format_exception(exc)).rstrip())
+                    _print_generation_stats(generation_stats)
                     continue
 
                 result_record = payload["result_record"]
                 raw_record = payload["raw_record"]
                 is_correct = bool(payload["is_correct"])
+                generation_summary = payload.get("generation_summary") or {}
+                _merge_generation_stats(generation_stats, generation_summary)
                 _print_record_result(result_record)
                 if raw_output_handle is not None:
                     _write_jsonl_record(raw_output_handle, raw_record)
@@ -617,6 +821,7 @@ def main(argv: list[str] | None = None) -> int:
                     correct_count += 1
                 else:
                     incorrect_count += 1
+                _print_generation_stats(generation_stats)
     finally:
         if raw_output_handle is not None:
             raw_output_handle.close()
@@ -627,6 +832,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"correct: {correct_count}")
     print(f"incorrect: {incorrect_count}")
     print(f"failed: {failed_count}")
+    _print_generation_stats(generation_stats)
 
     return 0
 

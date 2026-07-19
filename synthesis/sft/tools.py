@@ -50,6 +50,7 @@ PDF_CONTENT_TYPES = {
     "application/pdf",
     "application/x-pdf",
 }
+T2T_BLOCKED_SEARCH_DOMAINS: tuple[str, ...] = ()
 T2I_BLOCKED_IMAGE_SEARCH_DOMAINS = (
     # TikTok image-search results are often video-thumbnail endpoints or signed
     # CDN URLs. The source pages are video posts and direct image URLs frequently
@@ -58,6 +59,7 @@ T2I_BLOCKED_IMAGE_SEARCH_DOMAINS = (
     "tiktokcdn.com",
     "tiktokcdn-us.com",
 )
+I2I_BLOCKED_IMAGE_SEARCH_DOMAINS: tuple[str, ...] = ()
 _SFT_FIXED_REQUEST_ID = "3200636808"
 
 
@@ -539,9 +541,13 @@ def _request_with_retry(
     raise last_error
 
 
-def _url_matches_blocked_domain(url: str) -> bool:
+def _search_fetch_limit(top_k: int) -> int:
+    return max(1, int(top_k) * 3)
+
+
+def _url_matches_blocked_domain(url: str, blocked_domains: tuple[str, ...]) -> bool:
     normalized_url = str(url or "").strip()
-    if not normalized_url:
+    if not normalized_url or not blocked_domains:
         return False
     try:
         hostname = (urlparse(normalized_url).hostname or "").lower()
@@ -551,7 +557,7 @@ def _url_matches_blocked_domain(url: str) -> bool:
         return False
     return any(
         hostname == blocked_domain or hostname.endswith(f".{blocked_domain}")
-        for blocked_domain in T2I_BLOCKED_IMAGE_SEARCH_DOMAINS
+        for blocked_domain in blocked_domains
     )
 
 
@@ -857,9 +863,12 @@ def t2t_search(query: str, lang: str = "en", top_k: int = DEFAULT_SEARCH_TOP_K) 
     """Search text pages and return search results only."""
     try:
         top_k = max(1, min(int(top_k), MAX_SEARCH_RESULTS))
-        response = _serper_client().search_text(query, limit=top_k, hl=lang)
+        fetch_limit = _search_fetch_limit(top_k)
+        response = _serper_client().search_text(query, limit=fetch_limit, hl=lang)
         results: list[dict[str, Any]] = []
-        for item in response.results[:top_k]:
+        for item in response.results:
+            if _url_matches_blocked_domain(item.url or "", T2T_BLOCKED_SEARCH_DOMAINS):
+                continue
             results.append(
                 {
                     "title": item.title or "",
@@ -868,6 +877,8 @@ def t2t_search(query: str, lang: str = "en", top_k: int = DEFAULT_SEARCH_TOP_K) 
                     "rank": item.rank,
                 }
             )
+            if len(results) >= top_k:
+                break
         _record_search_tool_call("t2t_search", success=True, result_count=len(results))
         return {
             "ok": True,
@@ -883,14 +894,14 @@ def t2i_search(query: str, lang: str = "en", top_k: int = DEFAULT_SEARCH_TOP_K) 
     """Search images from a text query."""
     try:
         top_k = max(1, min(int(top_k), MAX_SEARCH_RESULTS))
-        fetch_limit = min(max(top_k * 3, top_k), 20)
+        fetch_limit = _search_fetch_limit(top_k)
         effective_query = _sanitize_t2i_query(query)
         response = _serper_client().search_image(effective_query, limit=fetch_limit, hl=lang)
         results: list[dict[str, Any]] = []
         for item in response.results:
-            if _url_matches_blocked_domain(item.image_url or ""):
+            if _url_matches_blocked_domain(item.image_url or "", T2I_BLOCKED_IMAGE_SEARCH_DOMAINS):
                 continue
-            if _url_matches_blocked_domain(item.source_page_url or ""):
+            if _url_matches_blocked_domain(item.source_page_url or "", T2I_BLOCKED_IMAGE_SEARCH_DOMAINS):
                 continue
             results.append(
                 {
@@ -916,6 +927,7 @@ def t2i_search(query: str, lang: str = "en", top_k: int = DEFAULT_SEARCH_TOP_K) 
 
 def _image_search_via_serper(image_url: str, top_k: int = MAX_SEARCH_RESULTS) -> object:
     serper_api_key, _ = acquire_serper_api_key()
+    fetch_limit = _search_fetch_limit(max(1, min(int(top_k), MAX_SEARCH_RESULTS)))
 
     response = requests.post(
         os.environ.get("SERPER_LENS_URL") or "https://google.serper.dev/lens",
@@ -933,8 +945,7 @@ def _image_search_via_serper(image_url: str, top_k: int = MAX_SEARCH_RESULTS) ->
         return data
 
     results = []
-    top_k = max(1, min(int(top_k), MAX_SEARCH_RESULTS))
-    for item in organic[:top_k]:
+    for item in organic[:fetch_limit]:
         results.append(
             {
                 "title": item.get("title", ""),
@@ -978,6 +989,17 @@ def i2i_search(
             if isinstance(result, dict) and "error" in result:
                 raise RuntimeError(str(result["error"]))
             matches = summarize_image_search(result)
+            if isinstance(matches, list):
+                matches = [
+                    item
+                    for item in matches
+                    if not (
+                        _url_matches_blocked_domain(item.get("source") or "", I2I_BLOCKED_IMAGE_SEARCH_DOMAINS)
+                        or _url_matches_blocked_domain(item.get("link") or "", I2I_BLOCKED_IMAGE_SEARCH_DOMAINS)
+                        or _url_matches_blocked_domain(item.get("imageUrl") or "", I2I_BLOCKED_IMAGE_SEARCH_DOMAINS)
+                        or _url_matches_blocked_domain(item.get("thumbnailUrl") or "", I2I_BLOCKED_IMAGE_SEARCH_DOMAINS)
+                    )
+                ]
             result_count = len(matches) if isinstance(matches, list) else (1 if matches else 0)
             _record_search_tool_call("i2i_search", success=True, result_count=result_count)
             return {

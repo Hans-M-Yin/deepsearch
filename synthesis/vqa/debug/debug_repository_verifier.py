@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import textwrap
 from pathlib import Path
 import sys
 from typing import Any
@@ -182,6 +183,63 @@ def _format_io_summary(summary: dict[str, dict[str, int]]) -> str:
     return "\n".join(lines)
 
 
+def _question_only_issue_sample(
+    *,
+    record: dict[str, Any],
+    question_record: dict[str, Any],
+    sample_record: dict[str, Any],
+) -> dict[str, str] | None:
+    solver_result = record.get("question_only_solver_result") or {}
+    if str(solver_result.get("status") or "").strip().lower() != "cannot_answer":
+        return None
+    reason = str(solver_result.get("cannot_answer_reason") or "").strip()
+    if not reason:
+        reason = "missing_reason"
+    return {
+        "question_id": str(question_record.get("question_id") or ""),
+        "sample_id": str(question_record.get("sample_id") or sample_record.get("sample_id") or ""),
+        "reason": reason,
+        "raw_output": _raw_solver_output_text(solver_result),
+    }
+
+
+def _format_question_only_issue_samples(samples: list[dict[str, str]], *, width: int) -> str:
+    lines = [SEPARATOR, f"Question-Only Cannot-Answer Reasons (sampled {len(samples)}, max 10)"]
+    if not samples:
+        lines.append("  - No cannot_answer_or_question_issue samples.")
+        lines.append(SEPARATOR)
+        return "\n".join(lines)
+    for index, sample in enumerate(samples, start=1):
+        lines.append(
+            f"  {index}. question_id={sample.get('question_id') or '-'} "
+            f"sample_id={sample.get('sample_id') or '-'}"
+        )
+        reason_prefix = "    reason: "
+        lines.extend(
+            textwrap.wrap(
+                str(sample.get("reason") or ""),
+                width=max(20, width),
+                initial_indent=reason_prefix,
+                subsequent_indent=" " * len(reason_prefix),
+            )
+            or [reason_prefix.rstrip()]
+        )
+        raw_output = str(sample.get("raw_output") or "").strip()
+        if raw_output and raw_output != str(sample.get("reason") or "").strip():
+            output_prefix = "    model_output: "
+            lines.extend(
+                textwrap.wrap(
+                    raw_output,
+                    width=max(20, width),
+                    initial_indent=output_prefix,
+                    subsequent_indent=" " * len(output_prefix),
+                )
+                or [output_prefix.rstrip()]
+            )
+    lines.append(SEPARATOR)
+    return "\n".join(lines)
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--vqa-dir", required=True, help="Directory containing questions.jsonl and samples.jsonl.")
@@ -295,6 +353,7 @@ def main(argv: list[str] | None = None) -> int:
 
     outputs: list[str] = []
     io_summary = _empty_io_summary()
+    question_only_issue_samples: list[dict[str, str]] = []
     for index, (question_record, sample_record) in enumerate(selected, start=1):
         bundle = assembler.build_bundle(question_record=question_record, sample_record=sample_record)
         outputs.append(SEPARATOR)
@@ -372,9 +431,17 @@ def main(argv: list[str] | None = None) -> int:
                 solver_result=record.get("question_only_solver_result") or {},
                 answer_judgment=((checks.get("question_only_shortcut") or {}).get("answer_judgment") or {}),
             )
+            issue_sample = _question_only_issue_sample(
+                record=record,
+                question_record=question_record,
+                sample_record=sample_record,
+            )
+            if issue_sample is not None and len(question_only_issue_samples) < 10:
+                question_only_issue_samples.append(issue_sample)
     outputs.append(SEPARATOR)
     if verifier is not None:
         outputs.append(_format_io_summary(io_summary))
+        outputs.append(_format_question_only_issue_samples(question_only_issue_samples, width=args.width))
     print("\n\n".join(outputs))
     return 0
 

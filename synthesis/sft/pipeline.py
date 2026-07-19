@@ -8,6 +8,7 @@ import re
 from typing import Any
 
 from .api_tools import DEFAULT_SYSTEM_PROMPT
+from .api_tools import AgentRunResult
 from .api_tools import OpenAIToolAgent
 from .api_tools import OpenAIToolAgentConfig
 from .api_tools import ToolRuntimeContext
@@ -352,16 +353,34 @@ def run_agent_loop(
     - every tool output
     """
 
+    return run_agent_session(
+        prompt=prompt,
+        messages=messages,
+        config=config,
+        context=context,
+        system_prompt=system_prompt,
+    ).messages
+
+
+def run_agent_session(
+    *,
+    prompt: str | None = None,
+    messages: list[Message] | None = None,
+    config: OpenAIToolAgentConfig | None = None,
+    context: ToolRuntimeContext | None = None,
+    system_prompt: str | None = None,
+) -> AgentRunResult:
+    """Run the multi-turn agent loop and return messages plus generation metadata."""
+
     agent_config = config or build_agent_config(system_prompt=system_prompt)
     runtime_context = context or build_runtime_context()
     agent = OpenAIToolAgent(agent_config)
-    result = agent.run(
+    return agent.run(
         prompt=prompt,
         messages=messages,
         context=runtime_context,
         system_prompt=system_prompt,
     )
-    return result.messages
 
 
 def format_messages(messages: list[Message]) -> dict[str, Any]:

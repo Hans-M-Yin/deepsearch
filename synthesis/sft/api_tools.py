@@ -361,6 +361,7 @@ class AgentRunResult:
     messages: list[dict[str, Any]]
     tool_results: list[ToolExecutionResult]
     raw_responses: list[dict[str, Any]]
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -1636,6 +1637,8 @@ class OpenAIToolAgent:
         tool_results: list[ToolExecutionResult] = []
         raw_responses: list[dict[str, Any]] = []
         final_text = ""
+        generation_status = "unknown"
+        stop_reason = "unknown"
         print(
             f"[manual_react backend] llm_worker alias={self._worker_model_alias}",
             file=sys.stderr,
@@ -1672,6 +1675,8 @@ class OpenAIToolAgent:
                 conversation_messages.append({"role": "assistant", "content": assistant_text})
                 logger.warning("Failed to parse manual ReAct step; treating the latest assistant text as final output.")
                 final_text = assistant_text
+                generation_status = "parse_error_finalized"
+                stop_reason = "manual_react_parse_error"
                 break
             repaired_step_text = step.raw_text
             execution_action_input = step.action_input
@@ -1694,6 +1699,8 @@ class OpenAIToolAgent:
             conversation_messages.append({"role": "assistant", "content": repaired_step_text})
             if step.action == "finish":
                 final_text = str(step.action_input.get("answer") or step.raw_text).strip()
+                generation_status = "finished"
+                stop_reason = "finish_action"
                 break
 
             result = execute_tool_call(
@@ -1716,6 +1723,8 @@ class OpenAIToolAgent:
             )
         else:
             final_text = "Max ReAct turns reached before the model produced a final answer."
+            generation_status = "max_turns_reached"
+            stop_reason = "max_react_turns"
 
         if request_messages:
             effective_system_prompt = str(request_messages[0].get("content") or "")
@@ -1729,6 +1738,15 @@ class OpenAIToolAgent:
             messages=conversation_messages,
             tool_results=tool_results,
             raw_responses=raw_responses,
+            metadata={
+                "api_mode": "manual_react",
+                "generation_status": generation_status,
+                "generation_complete": generation_status == "finished",
+                "stop_reason": stop_reason,
+                "max_turns": self.config.max_turns,
+                "turn_count": len(raw_responses),
+                "tool_call_count": len(tool_results),
+            },
         )
 
     def _run_chat_completions(
@@ -1750,6 +1768,8 @@ class OpenAIToolAgent:
         tool_results: list[ToolExecutionResult] = []
         raw_responses: list[dict[str, Any]] = []
         final_text = ""
+        generation_status = "unknown"
+        stop_reason = "unknown"
 
         for turn_index in range(self.config.max_turns):
             kwargs: dict[str, Any] = {
@@ -1776,6 +1796,8 @@ class OpenAIToolAgent:
             if not tool_calls:
                 final_text = assistant_message.content or ""
                 conversation_messages.append({"role": "assistant", "content": final_text})
+                generation_status = "finished"
+                stop_reason = "no_tool_calls"
                 break
             assistant_content = assistant_message.content or ""
             followup_tool_calls: list[dict[str, Any]] = []
@@ -1835,12 +1857,23 @@ class OpenAIToolAgent:
                 )
         else:
             final_text = "Max tool-calling turns reached before the model produced a final answer."
+            generation_status = "max_turns_reached"
+            stop_reason = "max_tool_calling_turns"
 
         return AgentRunResult(
             final_text=final_text,
             messages=conversation_messages,
             tool_results=tool_results,
             raw_responses=raw_responses,
+            metadata={
+                "api_mode": "chat_completions",
+                "generation_status": generation_status,
+                "generation_complete": generation_status == "finished",
+                "stop_reason": stop_reason,
+                "max_turns": self.config.max_turns,
+                "turn_count": len(raw_responses),
+                "tool_call_count": len(tool_results),
+            },
         )
 
     def _run_responses(
@@ -1862,6 +1895,8 @@ class OpenAIToolAgent:
         tool_results: list[ToolExecutionResult] = []
         raw_responses: list[dict[str, Any]] = []
         final_text = ""
+        generation_status = "unknown"
+        stop_reason = "unknown"
         current_input = _messages_to_responses_input(conversation_messages)
         previous_response_id: str | None = None
         use_previous_response_id = True
@@ -1913,6 +1948,8 @@ class OpenAIToolAgent:
             if not assistant_tool_calls:
                 final_text = assistant_content
                 conversation_messages.append({"role": "assistant", "content": final_text})
+                generation_status = "finished"
+                stop_reason = "no_tool_calls"
                 break
 
             followup_tool_calls: list[dict[str, Any]] = []
@@ -1980,12 +2017,23 @@ class OpenAIToolAgent:
                 current_input = _conversation_messages_to_responses_input(conversation_messages)
         else:
             final_text = "Max tool-calling turns reached before the model produced a final answer."
+            generation_status = "max_turns_reached"
+            stop_reason = "max_tool_calling_turns"
 
         return AgentRunResult(
             final_text=final_text,
             messages=conversation_messages,
             tool_results=tool_results,
             raw_responses=raw_responses,
+            metadata={
+                "api_mode": "responses",
+                "generation_status": generation_status,
+                "generation_complete": generation_status == "finished",
+                "stop_reason": stop_reason,
+                "max_turns": self.config.max_turns,
+                "turn_count": len(raw_responses),
+                "tool_call_count": len(tool_results),
+            },
         )
 
 
