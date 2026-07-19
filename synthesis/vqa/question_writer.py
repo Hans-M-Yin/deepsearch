@@ -1042,7 +1042,7 @@ Example: In Jacques-Louis David’s painting of the Tennis Court Oath at Versail
     Bad revision: In a painting by a famous artist of an event that took place there, the man standing on a table at the center of the crowd with his arm raised is Jean Sylvain Bailly.
     Reason: The former removes the date and the specific content of the painting, preventing the solver from inferring the painting directly from the date and event without first identifying Versailles; but once Versailles is inferred, the painter’s name and the location still allow the painting to be identified smoothly. The latter removes both the painter and the date entirely, making the clue too vague: even after inferring the location, multiple painters could have depicted events there, so the question becomes ambiguous.
 3. A replacement expression must satisfy this condition: on its own, it should not directly identify the target entity, but within the full question context, it should still help uniquely constrain the correct path.
-4. The question may include an image, so you need to preserve the connection between the question and the image content. In addition, descriptions of the image or scene should only be appropriately blurred, not deleted outright.
+4. The question may include an image, so you need to preserve the connection between the question and the image content. In addition, descriptions of the image or scene should only be appropriately blurred, not deleted outright. If a statement in a given reasoning_chain item refers to a specific scene or image, that item will be marked as `"image"`. In the rewritten question, preserve the description of that scene or image—especially the visual details—and only apply slight obfuscation to the entities within it.
 5. Do not fabricate any extra information.
 6. Retain some explicit clues that may appear at the beginning of the reasoning chain so that the question still has an entry point. Note: this refers to the beginning of the reasoning chain, not necessarily the beginning of the surface wording of the question.
 
@@ -2822,6 +2822,7 @@ class QuestionWriter:
                     "statement": item.get("statement"),
                     "relation": item.get("relation"),
                     "retrieval_query": item.get("retrieval_query"),
+                    "mark": item.get("mark"),
                 }
                 for item in hops
             ],
