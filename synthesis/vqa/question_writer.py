@@ -1027,69 +1027,61 @@ Please return valid JSON with exactly the following field:
 }
 """
 
-PROMPT_DIFFICULTY_ENHANCEMENT = """
-You are a difficulty enhancement editor for multi-hop search questions. Rewrite the question so that it becomes harder for strong models to immediately identify the intermediate entities, while keeping the original answer, factual relations, and core reasoning chain unchanged. The rewritten question must remain uniquely solvable and verifiable.
+PROMPT_DIFFICULTY_ENHANCEMENT = """You are a difficulty-enhancement editor for multi-hop retrieval questions. You will be given a multi-hop question together with its underlying reasoning chain. Your task is to lightly revise the question so that the descriptions of intermediate entities or clues become subtler and less directly recognizable to strong models, while keeping the original answer, factual relations, and core reasoning chain unchanged. The rewritten question must still have the same answer, remain uniquely solvable, and be verifiable.
+Goal: The purpose is not to make the question longer, nor to blindly make all clues vaguer. Instead, based on the provided `reasoning_chain`, you should analyze which intermediate entities and clues need to be obfuscated, and to what extent. You should reduce the direct exposure of intermediate entities, remove strong clues or redundant clues that would let someone jump to the answer through common sense without following the reasoning path, and at the same time keep the whole question fluent, natural, and benchmark-like.
 
-Your goal is NOT to make the question longer, more literary, or more confusing. Instead, you should:
-1. reduce direct exposure of intermediate entities;
-2. remove strong clues that allow common-sense shortcutting;
-3. replace those strong clues with weaker, vaguer expressions that still preserve contextual identification function;
-4. keep the entire question fluent, natural, and benchmark-like.
+##Requirements:
 
-Strict requirements:
-1. Do not change the core question or the final answer.
-2. Do not merely perform synonym substitution; you must genuinely reduce the salience of intermediate entities.
-3. A replacement expression must satisfy this condition: by itself it should not directly identify the target entity, but within the full question context it should still help uniquely constrain the correct path.
-4. While reducing salience, you must preserve or introduce enough non-shortcut constraints to keep the question uniquely solvable. Recommendation: retain the name of one or two objects mentioned at the beginning of the original question to provide an entry point for identification and reasoning if there's no images attached to the questions. Apply stronger obfuscation to widely known entities, and weaker obfuscation to less familiar entities—or leave some unobfuscated in certain questions—to ensure the questions remain solvable and the difficulty stays balanced.
-5. If the original question is artificially tied to a specific source framing (“according to profile X,” “in source Y’s description,” etc.) but the answer is really a real-world fact rather than a document-specific wording question, remove or naturalize that framing instead of keeping it mechanically.
-6. Note that there might be an image attached to the question, keep the connection between the question and the image content
-7. Do not fabricate any information, and do not make any changes unless you are explicitly certain about them.
+1. Do not change the core question, and do not change the final answer.
+2. Reduce the salience of intermediate entities according to the reasoning process of the question. Make sure that after revision, each intermediate entity can only be inferred after reasoning through the previous one. This means you must choose an appropriate degree of obfuscation and avoid any shortcut that allows the solver to skip earlier reasoning steps. For example:
+3. In Jacques-Louis David’s painting of the Tennis Court Oath at Versailles (the previous target) on June 20, 1789, the man standing on a table at the center of the crowd with his arm raised is Jean Sylvain Bailly.
+    Good revision: In Jacques-Louis David’s painting of the event that took place there, the man standing on a table at the center of the crowd with his arm raised is Jean Sylvain Bailly.
+    Bad revision: In a painting by a famous artist of an event that took place there, the man standing on a table at the center of the crowd with his arm raised is Jean Sylvain Bailly.
+    Reason: The former removes the date and the specific content of the painting, preventing the solver from inferring the painting directly from the date and event without first identifying Versailles; but once Versailles is inferred, the painter’s name and the location still allow the painting to be identified smoothly. The latter removes both the painter and the date entirely, making the clue too vague: even after inferring the location, multiple painters could have depicted events there, so the question becomes ambiguous.
+4. A replacement expression must satisfy this condition: on its own, it should not directly identify the target entity, but within the full question context, it should still help uniquely constrain the correct path.
+5. The question may include an image, so you need to preserve the connection between the question and the image content. In addition, descriptions of the image or scene should only be appropriately blurred, not deleted outright.
+6. Do not fabricate any extra information.
+7. Retain some explicit clues that may appear at the beginning of the reasoning chain so that the question still has an entry point. Note: this refers to the beginning of the reasoning chain, not necessarily the beginning of the surface wording of the question.
 
-Preferred rewriting strategies:
-1. Use relational, structural, or contextual constraints instead of highly distinctive signals including famous titles, people names, signature works, unique achievements, strong year markers, or iconic paper titles.
-2. Remove features that directly expose intermediate entities, but replace them with weaker contextual descriptions rather than simply deleting them.
-3. If obfuscation introduces ambiguity, add non-shortcut constraints to eliminate wrong candidates.
-4. Keep the question natural, concise, and benchmark-like rather than turning it into a pile of hints.
+Output format:
+{
+  "analysis": "analysis of the original question and the revision plan",
+  "question": "the improved question"
+}
 
-Below are examples. Learn the rewriting style from them.
+##Techniques:
+
+1. Prefer relational, structural, or contextual constraints rather than highly salient signals such as famous titles, person names, signature works, unique achievements, explicit year markers, or iconic paper titles.
+2. If obfuscation introduces ambiguity, add a context-appropriate modifier or qualifier for the target object to rule out wrong candidates. For example: Messi -> FC Barcelona.
+    Overly vague relation: The team Messi played for was FCB. (ambiguous)
+    Appropriate relation: The club Messi played for at age 20 was FCB.
+3. Keep the question natural, concise, compact, and benchmark-like, rather than turning it into a pile of stitched-together hints.
+
+##Examples
 
 Example 1:
 question: The man shown in this image later became nationally prominent for his handling of the devastating 1927 flood, a development that helped lead to his 1928 presidential nomination by the political party that narrowly carried three long-Democratic “blue wall” states in 2016. Which three states were they, and what broader effect did that victory have on that party?
-Output:
 {
   "analysis": "This question has problems of redundant reasoning steps, overly strong shortcut cues, and imprecise phrasing. First, based on the input hop chain, the question should first identify the man in the image and then proceed along the path “man -> the party that nominated him -> the ‘blue wall’ states in 2016.” Therefore, the clause about the flood can in fact be removed. Second, the question includes shortcut cues such as “Democratic Party” and “blue wall,” which can function as hints without requiring the earlier reasoning steps. These can be blurred into a phrase like “the opposing party” in light of the surrounding context, so that the reader must first infer the party that nominated the man before determining the identity of the “opposing party.” In addition, several short clauses can be merged to make the sentence more compact and fluent.",
   "question": "The political party that nominated the man shown in this image as its 1928 presidential candidate narrowly carried three states that had long supported its rival party in 2016. Which three states were they, and what broader effect did that victory have on that party?"
 }
-
 Example 2:
-question: This image shows a work on the Moon’s motion. That subject also appears in a geometrical diagram in Newton’s landmark 1687 mathematical treatise on natural philosophy. Before the final three-book structure of the Principia was settled, what was the planned title of the surviving fair-copy draft of its second volume, about when was that draft completed, and which later part of the finished work did it largely correspond to in purpose?
-Output:
-{
-  "analysis": "The original question is too easy because it exposes the bridge entities too directly and presents the clues in almost the same order as the hop chain, allowing a strong model to identify the target work and its composition history during question reading. First, the phrase “Moon’s motion” is not a proper name, but when combined with the later Newton cue it sharply narrows the search space, so it should be replaced with the weaker expression “The topic treated in the work shown here,” which preserves the semantic link to the pictured text without repeating an overly revealing subject label. Second, “Newton’s landmark 1687 mathematical treatise on natural philosophy” is an especially strong identifying bundle: it gives the author, the year, the genre, and a canonical-status cue, which together almost amount to naming the Principia outright. This should therefore be weakened to “a late seventeenth-century mathematical work on natural philosophy,” which keeps the period, disciplinary context, and textual type while removing the most direct author- and year-based shortcuts. Third, the phrase “Before the final three-book structure of the Principia was settled” not only names the work again but also points the solver straight to the specific composition-history page about its evolving structure. The revision replaces this with “was not yet fixed in its eventual three-book arrangement when one surviving fair-copy draft was prepared,” which preserves the same manuscript-history constraint while no longer directly naming the Principia or making the search path so explicit. Fourth, “the surviving fair-copy draft of its second volume” is actually a valuable non-shortcut constraint and should be retained rather than removed, because it is part of what keeps the question uniquely solvable. In the revision, it becomes “the draft corresponding to what was then planned as its second volume,” which preserves the same functional role while making the transition slightly less template-like. Fifth, the original question follows a highly mechanical sequence: pictured topic -> Newton’s treatise -> Principia composition history -> second-volume fair-copy -> title/date/correspondence. The revision improves this by folding the pictured topic and the geometric treatment into a single sentence and by centering the question more on the unstable early structural state of the work, so the solver must reconstruct the composition history instead of simply following a rigid scaffold. Overall, these changes are justified because they remove or weaken highly distinctive cues such as the author name, exact year, work title, and canonical-status framing, while preserving enough non-shortcut constraints—late seventeenth-century natural-philosophical mathematics, eventual three-book structure, surviving fair-copy, planned second volume, and title/date/later-book correspondence—to keep the question uniquely solvable and faithful to the original answer chain.",
-  "question": "TThe topic treated in the work shown in this image appears in geometrical form in a late seventeenth-century mathematical work on natural philosophy; at the time one surviving fair-copy draft was prepared, the work’s final three-book structure had not yet been fixed. What was the intended title of the draft that was then planned as the second volume, approximately when was it completed, and which later part of the finished work did it roughly correspond to in purpose?"
-}
-
-Example 3:
 question: The 2015 Copa Libertadores champion was an Argentine giant whose home ground is the Estadio Monumental. In River Plate’s 2024–25 squad list, the player wearing number 29 took the final penalty in the 2022 World Cup final. The provided photo shows Montiel taking that last penalty. Which side of the goal did he send the ball to?
-Output:
 {
-  "analysis": "The question contains multiple overly revealing clues, as well as some redundancy. First, to ensure that the question remains solvable, we keep the Copa Libertadores as the entry point. Since the 2015 Copa Libertadores champion is already sufficient to identify the team as Argentina’s River Plate, the clue \"Estadio Monumental\" is redundant and makes the question easier. In addition, the team’s name is explicitly exposed in the second hop and should be removed. The description of the World Cup year can also be made vaguer; even after doing so, the relevant World Cup can still be identified through Montiel and the penalty he took. In the final sentence, Montiel is named directly, and because the image does not appear at the beginning of the question—that is, it is not actually provided to the user and must instead be located online by the user—this image cue should be hidden. The question should not explicitly mention the image, while still requiring the visual information from that specific image in order to answer correctly. In addition, the order of the clues can be adjusted and compressed to some extent."
+  "analysis": "The question contains multiple overly revealing clues, as well as some redundancy. First, to ensure that the question remains solvable, we keep the Copa Libertadores as the entry point. Since the 2015 Copa Libertadores champion is already sufficient to identify the team as Argentina’s River Plate, the clue \"Estadio Monumental\" is redundant and makes the question easier. In addition, the team’s name is explicitly exposed in the second hop and should be removed. The description of the World Cup year can also be made vaguer; even after doing so, the relevant World Cup can still be identified through Montiel and the penalty he took. In the final sentence, Montiel is named directly, and because the image does not appear at the beginning of the question—that is, it is not actually provided to the user and must instead be located online by the user—this image cue should be hidden. The question should not explicitly mention the image, while still requiring the visual information from that specific image in order to answer correctly. In addition, the order of the clues can be adjusted and compressed to some extent.",
   "question": "The number 29 player who was with the 2015 Copa Libertadores-winning club in 2024–25 once took the final penalty in a World Cup final. Which side of the goal did he aim at for that kick?"
 }
-
-Example 4:
-quesiton: A 20th-century Romanian sculptor who created a war memorial ensemble in Targu Jiu was photographed in his Paris studio by Edward Steichen in the 1920s. Where did the 1938-56 director of the museum that holds both marble and bronze versions of the slender sculpture at the center of that studio photograph earn his professional degree, and in what field?
-Output:
+Example 3:
+question: A 20th-century Romanian sculptor who created a war memorial ensemble in Targu Jiu was photographed in his Paris studio by Edward Steichen in the 1920s. Where did the 1938-56 director of the museum that holds both marble and bronze versions of the slender sculpture at the center of that studio photograph earn his professional degree, and in what field?
 {
-  "analysis": "This question first points, through a vague description, to Constantin Brâncuşi and the photograph of his studio. It then moves through consecutive hops to the slender sculpture in the photograph and to the director of the museum that holds it. In this question, although a specific personal name and place name appear, that name, the phrase “Paris studio,” and the description of the photograph still do not explicitly expose Constantin Brâncuşi, who is the main entity in the reasoning chain, so these bridging statements can be retained. The sentence structure is fairly compact, the hop logic follows the order of the hop chain, and there is no obvious shortcut. Therefore, this is a high-quality question and does not need to be revised."
+  "analysis": "This question first points, through a vague description, to Constantin Brâncuşi and the photograph of his studio. It then moves through consecutive hops to the slender sculpture in the photograph and to the director of the museum that holds it. In this question, although a specific personal name and place name appear, that name, the phrase “Paris studio,” and the description of the photograph still do not explicitly expose Constantin Brâncuşi, who is the main entity in the reasoning chain, so these bridging statements can be retained. The sentence structure is fairly compact, the hop logic follows the order of the hop chain, and there is no obvious shortcut. Therefore, this is a high-quality question and does not need to be revised.",
   "question": "A 20th-century Romanian sculptor who created a war memorial ensemble in Targu Jiu was photographed in his Paris studio by Edward Steichen in the 1920s. Where did the 1938-56 director of the museum that holds both marble and bronze versions of the slender sculpture at the center of that studio photograph earn his professional degree, and in what field?"
 }
-Now perform the same style of difficulty enhancement on the following question.
-
-Return valid JSON with exactly these fields:
+Example 4:
+question: In Jacques-Louis David’s painting of the Tennis Court Oath, the man standing on a table at the center of the crowd with his arm raised later wrote a eulogy for an astronomer; that oath took place in the city that hosted the 8th summit of an intergovernmental forum in 1982. While conducting an arc measurement at the Cape of Good Hope, that astronomer incorrectly concluded that the Earth was prolate. Decades later, who first proposed that this error was caused by the gravitational pull of nearby mountains, and who later confirmed the theory through new measurements?
 {
-  "analysis": "brief analysis of why the original question is too easy or too linear, and what was changed",
-  "question": "the revised harder question"
+  "analysis": "This question has a clear reasoning chain. However, the opening description of the painting is too explicit, and the later clue that ‘the astronomer conducted measurements at the Cape of Good Hope and concluded that the Earth was prolate’ makes it easy to jump directly to Jean Sylvain Bailly, which creates an obvious shortcut. So the question should keep the beginning of the reasoning chain—namely, the description involving the Group of Seven—while moderately obfuscating the intermediate entities.",
+  "question": "In Jacques-Louis David’s painting of an event that took place in the city that hosted the 8th summit of an intergovernmental forum in 1982, the man standing on a table at the center of the crowd with his arm raised later wrote a eulogy for an astronomer, who reached an incorrect conclusion about the Earth’s shape during an arc measurement carried out somewhere. Decades later, who first proposed that the error in shape was caused by nearby mountains, and who later confirmed the theory through new measurements?"
 }
 """
 
@@ -1780,6 +1772,7 @@ class QuestionWriter:
     ) -> QuestionDraft:
         payload = self._difficulty_enhancement_payload(
             question=draft.question,
+            answer=draft.answer,
             hops=draft.reasoning_steps,
         )
         try:
@@ -2809,10 +2802,11 @@ class QuestionWriter:
         }
 
     @staticmethod
-    def _difficulty_enhancement_payload(*, question: str, hops: list[dict[str, Any]]) -> dict[str, Any]:
+    def _difficulty_enhancement_payload(*, question: str, answer: str, hops: list[dict[str, Any]]) -> dict[str, Any]:
         return {
             "question": question,
-            "hops": [
+            "answer": answer,
+            "reasoning_chain": [
                 {
                     "hop_index": item.get("hop_index"),
                     "source": item.get("source"),
