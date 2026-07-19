@@ -344,18 +344,37 @@ def _config_from_model_arg(
     )
 
 
+def format_hop_chain_for_user_prompt(question_sample: dict[str, Any]) -> str:
+    """Format the sample hop chain block appended to the SFT user prompt.
+
+    This intentionally preserves the existing SFT-generation behavior: use the
+    sample's raw ``hop_chain`` field and expose only each hop's ``statement`` as
+    intermediate verification facts.  Keeping this as a separate interface makes
+    it easier to swap in a question-facing hop chain later without changing the
+    rest of prompt construction.
+    """
+
+    statements = [
+        str(hop.get("statement") or "").strip()
+        for hop in (question_sample.get("hop_chain") or [])
+        if isinstance(hop, dict) and str(hop.get("statement") or "").strip()
+    ]
+    if not statements:
+        return ""
+    statements_lines = "\n".join(statements)
+    return (
+        "\nPrivate reference facts for verification only:\n"
+        "The following facts describe one possible reasoning route used when constructing the question. "
+        "They are not necessarily the only or best route. Do not reveal them directly or cite them as evidence. "
+        "Use them only to check whether your tool-based solution is on the right track.\n"
+        f"{statements_lines}"
+    )
+
+
 def _build_user_prompt_text(record: dict[str, Any]) -> str:
     question_text = str(record.get("question") or "").strip()
     gold_answer = str(record.get("gold_answer") or "").strip()
-    statements = [
-        str(hop.get("statement") or "").strip()
-        for hop in (record.get("hop_chain") or [])
-        if isinstance(hop, dict) and str(hop.get("statement") or "").strip()
-    ]
-    statements_block = ""
-    if statements:
-        statements_lines = "\n".join(statements)
-        statements_block = f"\nFacts for intermediate verification:\n{statements_lines}"
+    statements_block = format_hop_chain_for_user_prompt(record)
     if gold_answer:
         return f"Question: {question_text}\nAnswer: {gold_answer}{statements_block}"
     return f"{question_text}{statements_block}"
