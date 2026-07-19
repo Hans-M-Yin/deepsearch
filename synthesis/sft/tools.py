@@ -51,10 +51,12 @@ PDF_CONTENT_TYPES = {
     "application/x-pdf",
 }
 T2I_BLOCKED_IMAGE_SEARCH_DOMAINS = (
-    "facebook.com",
-    "m.facebook.com",
-    "lookaside.fbsbx.com",
-    "fbsbx.com",
+    # TikTok image-search results are often video-thumbnail endpoints or signed
+    # CDN URLs. The source pages are video posts and direct image URLs frequently
+    # return 403, so they are poor static image evidence for SFT trajectories.
+    "tiktok.com",
+    "tiktokcdn.com",
+    "tiktokcdn-us.com",
 )
 _SFT_FIXED_REQUEST_ID = "3200636808"
 
