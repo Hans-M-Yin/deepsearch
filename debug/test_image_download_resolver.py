@@ -70,6 +70,68 @@ DEFAULT_CASES: tuple[TestCase, ...] = (
         query="site:x.com NASA photo OR site:twitter.com NASA photo",
         domains=("x.com", "www.x.com", "twitter.com", "www.twitter.com", "pbs.twimg.com", "twimg.com"),
     ),
+    TestCase(
+        name="linkedin",
+        query="site:linkedin.com company logo photo",
+        domains=("linkedin.com", "www.linkedin.com", "licdn.com", "media.licdn.com"),
+    ),
+    TestCase(
+        name="youtube_thumbnail",
+        query="site:youtube.com official video thumbnail",
+        domains=("youtube.com", "www.youtube.com", "youtu.be", "ytimg.com", "i.ytimg.com"),
+    ),
+    TestCase(
+        name="bilibili_thumbnail",
+        query="site:bilibili.com official video thumbnail",
+        domains=("bilibili.com", "www.bilibili.com", "hdslb.com", "i0.hdslb.com", "i1.hdslb.com", "i2.hdslb.com"),
+    ),
+    TestCase(
+        name="deviantart",
+        query="site:deviantart.com digital artwork image",
+        domains=("deviantart.com", "www.deviantart.com", "wixmp.com", "images-wixmp-ed30a86b8c4ca887773594c2.wixmp.com"),
+    ),
+    TestCase(
+        name="flickr",
+        query="site:flickr.com historic building photo",
+        domains=("flickr.com", "www.flickr.com", "staticflickr.com", "live.staticflickr.com"),
+    ),
+    TestCase(
+        name="ecommerce_amazon",
+        query="site:amazon.com product image",
+        domains=("amazon.com", "www.amazon.com", "media-amazon.com", "ssl-images-amazon.com", "images-na.ssl-images-amazon.com"),
+    ),
+    TestCase(
+        name="ecommerce_etsy_shopify",
+        query="site:etsy.com handmade product image OR site:myshopify.com product image",
+        domains=("etsy.com", "www.etsy.com", "etsystatic.com", "shopifycdn.net", "myshopify.com"),
+    ),
+    TestCase(
+        name="stock_getty",
+        query="site:gettyimages.com news photo",
+        domains=("gettyimages.com", "www.gettyimages.com", "media.gettyimages.com"),
+    ),
+    TestCase(
+        name="stock_alamy",
+        query="site:alamy.com historical photo",
+        domains=("alamy.com", "www.alamy.com", "c8.alamy.com", "c7.alamy.com"),
+    ),
+    TestCase(
+        name="stock_shutterstock",
+        query="site:shutterstock.com editorial photo",
+        domains=("shutterstock.com", "www.shutterstock.com", "image.shutterstock.com", "www.shutterstock.com"),
+    ),
+    TestCase(
+        name="google_thumbnail_cache",
+        query="official poster image",
+        domains=(
+            "encrypted-tbn0.gstatic.com",
+            "encrypted-tbn1.gstatic.com",
+            "encrypted-tbn2.gstatic.com",
+            "encrypted-tbn3.gstatic.com",
+            "gstatic.com",
+            "googleusercontent.com",
+        ),
+    ),
 )
 
 
