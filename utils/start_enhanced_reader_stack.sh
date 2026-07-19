@@ -28,6 +28,7 @@ READERLM_MODEL_NAME="${READERLM_MODEL_NAME:-${READERLM_SERVED_MODEL_NAME}}"
 READERLM_MAX_HTML_CHARS="${READERLM_MAX_HTML_CHARS:-120000}"
 READERLM_MAX_TOKENS="${READERLM_MAX_TOKENS:-8192}"
 ENHANCED_READER_TIMEOUT="${ENHANCED_READER_TIMEOUT:-180}"
+READER_NODE_MAX_OLD_SPACE_MB="${READER_NODE_MAX_OLD_SPACE_MB:-32768}"
 
 require_dir() {
   local path="$1"
@@ -53,7 +54,11 @@ start_reader() {
   echo "Starting Jina Reader from ${READER_DIR} ..."
   (
     cd "${READER_DIR}"
-    nohup env PORT="${READER_PORT}" npm run start > "${READER_LOG}" 2>&1 &
+    nohup env \
+      PORT="${READER_PORT}" \
+      NODE_OPTIONS="--max-old-space-size=${READER_NODE_MAX_OLD_SPACE_MB}" \
+      npm run start \
+      > "${READER_LOG}" 2>&1 &
     echo $! > "${READER_DIR}/reader.pid"
   )
   echo "Reader log: ${READER_LOG}"
@@ -121,6 +126,7 @@ Startup commands have been issued.
 
 Endpoints:
   Raw Reader HTML endpoint: ${RAW_READER_URL}
+  Raw Reader Node heap:     ${READER_NODE_MAX_OLD_SPACE_MB} MB
   ReaderLM API endpoint:    ${READERLM_API_BASE}
   Enhanced Reader endpoint: http://127.0.0.1:${ENHANCED_READER_PORT}
   Enhanced Reader workers:  ${ENHANCED_READER_WORKERS}
