@@ -675,11 +675,12 @@ Output:
 PROMPT_COMPOSE_QUESTION = """You are an expert at composing multi-hop retrieval questions. Below, I will provide you with the specific structure of each hop in the data, and your task is to merge these scattered pieces of information into a deep reasoning question. This question should hide the intermediate reasoning steps and be presented to the user for them to answer.
 
 The input includes:
-1. each hop in the reasoning chain, including:
-   - `source`: the starting point of this hop;
-   - `target`: the target of this hop;
-   - `statement`: a statement describing the relationship between the source and the target;
-2. `target_ask`, a knowledge question about the final target.
+	1. each hop in the reasoning chain, including:
+	   - `source`: the starting point of this hop;
+	   - `target`: the target of this hop;
+	   - `statement`: a statement describing the relationship between the source and the target;
+	   - `mark`: optional metadata; `"image"` means the hop depends on a specific image or scene.
+	2. `target_ask`, a knowledge question about the final target.
 
 The first hop is a special entry hop whose `source` is `-`. For a text-start path, its statement identifies the first real entity from a textual description. For an image-start path, its statement identifies the first real entity from the attached image and may refer to `this image`.
 
@@ -704,7 +705,9 @@ For example, suppose the true reasoning result is a club that a certain player o
 For instance, if the true target is FC Barcelona, a better phrasing would be: "the first international club this player played for."
 Do not use a restriction such as "the club that won the 2011 UEFA Champions League," because that would allow the target to be inferred without depending on the previous source, creating a shortcut.
 
-6. Please ensure that the reasoning order in the question follows the order of the hops.
+	6. If a statement in a given hop refers to a specific scene or image, that hop will be marked as `"image"`. In the rewritten question, preserve the description of that scene or image—especially the visual details—and only apply slight obfuscation to the entities within it.
+
+7. Please ensure that the reasoning order in the question follows the order of the hops.
 
 ## Tips
 
@@ -2120,6 +2123,7 @@ class QuestionWriter:
             "image_bridge_hidden": decision == "hide_image",
             "image_bridge_decision": decision,
             "bridge_image_node_id": incoming_hop.dst_node_id,
+            "mark": "image",
         }
         if decision == "hide_image":
             synthetic_summary["hidden_image_node_id"] = incoming_hop.dst_node_id
@@ -2308,6 +2312,7 @@ class QuestionWriter:
             return question_target_ask, None, diagnostic
 
         question_target_ask["ask_target"] = rewritten_ask_target
+        question_target_ask["mark"] = "image"
         question_terminal_bridge = self._build_final_image_target_terminal_bridge(
             final_hop=final_hop,
             final_hop_summary=final_hop_summary,
@@ -2336,6 +2341,7 @@ class QuestionWriter:
             "terminal_bridge_decision": decision,
             "terminal_image_node_id": final_hop.dst_node_id,
             "replaces_terminal_text_to_image_hop": True,
+            "mark": "image",
             "source": final_hop_summary.get("source"),
             "target_image": final_hop_summary.get("target"),
             "answer": target_value or str(raw_target_ask.get("answer") or "").strip(),
@@ -2757,11 +2763,13 @@ class QuestionWriter:
                     "source": item.get("source"),
                     "target": item.get("target"),
                     "statement": item.get("statement"),
+                    "mark": item.get("mark"),
                 }
                 for item in hop_summaries
             ],
             "target_ask": {
                 "ask_target": target_ask.get("ask_target"),
+                "mark": target_ask.get("mark"),
             },
         }
 
