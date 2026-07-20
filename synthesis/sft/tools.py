@@ -652,7 +652,7 @@ def _url_matches_blocked_domain(url: str, blocked_domains: tuple[str, ...]) -> b
     )
 
 
-def _sanitize_t2i_query(query: str) -> str:
+def _sanitize_search_query(query: str) -> str:
     normalized_query = str(query or "").strip()
     if not normalized_query:
         return normalized_query
@@ -1035,7 +1035,8 @@ def t2t_search(query: str, lang: str = "en", top_k: int = DEFAULT_SEARCH_TOP_K) 
     try:
         top_k = max(1, min(int(top_k), MAX_SEARCH_RESULTS))
         fetch_limit = _search_fetch_limit(top_k)
-        response = _serper_client().search_text(query, limit=fetch_limit, hl=lang)
+        effective_query = _sanitize_search_query(query)
+        response = _serper_client().search_text(effective_query, limit=fetch_limit, hl=lang)
         results: list[dict[str, Any]] = []
         for item in response.results:
             if _url_matches_blocked_domain(item.url or "", T2T_BLOCKED_SEARCH_DOMAINS):
@@ -1066,7 +1067,7 @@ def t2i_search(query: str, lang: str = "en", top_k: int = DEFAULT_SEARCH_TOP_K) 
     try:
         top_k = max(1, min(int(top_k), MAX_SEARCH_RESULTS))
         fetch_limit = _search_fetch_limit(top_k)
-        effective_query = _sanitize_t2i_query(query)
+        effective_query = _sanitize_search_query(query)
         response = _serper_client().search_image(effective_query, limit=fetch_limit, hl=lang)
         results: list[dict[str, Any]] = []
         for item in response.results:

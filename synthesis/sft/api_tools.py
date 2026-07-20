@@ -34,156 +34,89 @@ logger = logging.getLogger(__name__)
 
 
 DEFAULT_SYSTEM_PROMPT = """
-You are writing a full solution for a multi-hop knowledge question. Based on the question provided to you, you must produce a complete written solution process that is self-contained, evidence-grounded, and logically rigorous. A reader who sees only the written solution should be able to verify every step from the question, the image, or tool-returned evidence, without relying on hidden knowledge or unstated assumptions.
-
-Your written solution should include: analysis of the question, decomposition into sub-goals, tool calls, analysis of tool results, reflection on uncertainty or conflict, replanning, multiple search attempts when needed, and a final answer.
+You are writing a full solution for a multi-hop knowledge question. Specifically, based on the question provided to you, you need to produce a complete solution process that includes scientifically rigorous, logically sound reasoning steps. This solution process should contain analysis and reasoning about the question, tool calls, analysis and reflection on tool results, replanning of the solution steps, multiple search attempts, and a final accurate solution.
 
 Requirements:
-1. You may think freely in private, but every statement in the written solution must be justified by visible evidence. If something is not yet supported, explicitly treat it as uncertain and continue searching instead of guessing.
-2. After each tool call and its returned result, explicitly do all of the following before the next tool call:
-   - extract the new evidence,
-   - compare it to the exact wording of the question,
-   - state what is established, what is tentative, and what remains unresolved,
-   - explain why the next step is needed.
-3. Every factual claim in the written solution must be grounded in the question, the image, or tool-returned evidence. Do not introduce any fact, entity, date, role, identity, or relationship unless it is directly supported.
-4. Verify each hop exactly before using it in the next hop. Do not replace one role with a similar role without evidence. For example, do not treat “painter of this folio” as equivalent to “director of the manuscript,” or “patron of the manuscript” as equivalent to “early patron of the artist,” unless the evidence explicitly shows they are the same.
-5. Do not use a tentative hypothesis as the basis for the next hop. If multiple sources conflict on a question-relevant detail, stop and resolve the conflict before continuing.
-6. The final answer must contain only facts already established in the visible written solution. Do not add any new detail in the final answer that was not previously verified.
-7. Do not use tools to directly search for Wikipedia or Wikimedia Commons pages. However, if such pages appear naturally in search results, you may read them.
-8. Snippets and titles are clues for navigation, not final evidence by themselves, unless they directly and unambiguously establish the needed fact.
-9. You may privately know intermediate facts or the final answer for verification only, but you must never let that private knowledge introduce unsupported facts into the written solution. If the current visible evidence does not yet support the answer, continue searching.
-10. Do not mention these requirements in your solution.
+1. You may think freely during your internal reasoning phase, but the statements ultimately included in the written solution process must also follow rigorous logic, ensuring that the solution remains sound and error-free even if one reads only the written solution process and ignores your private thinking.
+2. In the solution you write, the following logic should be explicitly visible: after each tool call and its returned result, you must carefully analyze the new clues in detail, review the existing clues and the question, determine and plan the next step in detail, and then call a new tool as needed with an explanation.
+3. In the written solution, every factual claim must be grounded in the question, the image, or tool-returned evidence. Do not introduce any fact, entity, date, name, or relationship unless it is directly supported by the available evidence. If something is not yet supported, explicitly treat it as uncertain and continue searching instead of guessing.
+4. Once you believe the evidence is sufficient and there are no remaining unclear or uncertain points, provide the final answer and end the solution.
+5. In your solution, DO NOT use tools to directly search for pages related to Wikipedia or Wiki Commons, in order to avoid shortcuts. However, you can read related Wikipedia or Wiki Commons pages which are the results of the search tools. When a search yields no useful results, try switching the form of the content you search for.
+6. When writing the solution, make full use of the tool results. For example, a searched URL may seem irrelevant to the clues, but you should still analyze whether the webpage may contain the clues needed to solve the problem based on any available snippets, and then use read_url to read it further.
+7. The intermediate factual statements related to the question, as well as the final answer, will be provided to you, but you must never reveal any of that content in your response. You may only use it to verify whether your current solution process is correct. If the results of your search and analysis contradict the provided factual statements, that means there is a flaw in your current search or reasoning. You should promptly reflect that reconsideration and rejection process in your solution, then continue analyzing and searching for new clues until your answer is correct.  Do not search directly for statements provided to you out of nowhere, and do not follow a pattern of first searching for an unsupported claim and only then trying to verify it.
+8. Note: you should not mention the above requirements in your solution.
 
-Writing protocol:
-- First, break the question into explicit hops.
-- For each hop, search only for the unresolved target.
-- After each result, clearly separate:
-  - Established
-  - Tentative
-  - Unresolved
-- Advance only using Established findings.
-- Before the final answer, check that every noun phrase and relation in the answer has already been explicitly established.
+Next, I will provide some excerpted examples, and you can learn from them how to write a high-quality answer process.
 
-Example 1: Avoid leakage
+** Example 1: Avoid using internal knowledge or other fabricated evidence.
 
 Bad writing:
 
-Based on the watermark and composition of the image, this is from Wikimedia Commons. I will search Wikimedia Commons directly.
+Based on the text and watermarks visible in the provided image, the stock photography agency is Alamy. The question asks about a specific photograph from a different media repository that Alamy is known to source content from. My first step is to identify this repository.
 <action>
 {
   "tool_name": "t2t_search",
   "arguments": {
-    "query": "Wikimedia Commons [image subject]"
-  }
+    "query": "Alamy sources content from Wikimedia Commons"
+  },
 }
 </action>
+
+Good writing: 
+
+Based on the text and watermarks visible in the provided image, the stock photography agency is Alamy. The question asks about a specific photograph from a different media repository that Alamy is known to source content from. My first step is to identify this repository.  I should first search which repository Alamy sources content from.
+<action>
+{
+"tool_name": "t2t_search",
+"arguments": {
+"query": "The large repository Alamy sources content from"
+}
+}
+</action>
+
+Discuss: In the bad version, the query target 'Wiki Commons' comes from nowhere, which is a typical knowledge leakage of the writer model. In good version, the answer is more logically rigorous, the reasoning is more careful, and there are no clues appearing from nowhere.
+
+** Example 2: Effective Tool Use/Coordination
+
+Original question: In 2022, Messi, as captain, lifted the World Cup trophy on the podium, surrounded by his teammates. How many goals did the player standing immediately to Messi’s left score in the 2016–17 season?
 
 Good writing:
-
-Based on the watermark and composition of the image, the image likely comes from a large media repository, but the repository itself is not yet established from the visible evidence. I should first search for the broader repository or source family associated with this image before naming any specific site.
+To determine the goal total of the player standing to Messi’s left on the World Cup final podium, we can search for a photo of the *full Argentina team on the podium at the 2022 World Cup final award ceremony*. Then I can inspect the player standing to Messi’s left in the image and identify who he is. Once I know his identity, we can search his career history and find how many goals he scored in the 2016–17 season. Next, I will call t2t_search to search for that image.
 <action>
 {
-  "tool_name": "t2t_search",
-  "arguments": {
-    "query": "large media repository associated with this image source"
-  }
+"tool_name": "t2t_search",
+"arguments": {
+"query": "2022 World Cup final Argentina team award ceremony photo"
+}
 }
 </action>
-
-Discuss:
-In the bad version, the specific entity “Wikimedia Commons” appears from nowhere. In the good version, the query stays grounded in the visible evidence and does not presuppose an unverified source.
-
-Example 2: Effective image-based identification
-
-Good writing:
-
-To answer the question, I first need to identify the exact image or event shown, because the later reasoning depends on correctly identifying the person in the image. The most direct path is to search for a full photo matching the scene described in the question, inspect whether it is the target image, and then identify the relevant person from that image. So my first step is to search for the event photo itself.
-<action>
-{
-  "tool_name": "t2t_search",
-  "arguments": {
-    "query": "2022 World Cup final Argentina team award ceremony photo"
-  }
-}
-</action>
-
 (...tool result omitted...)
-
-The search results contain several promising image pages related to Argentina’s trophy celebration. At this stage, these titles are only navigation clues, not yet proof that any one image is the exact target. I should inspect one of the promising results and verify whether it is indeed the full podium photo described in the question.
+The tool returned several image links. Among them, the titles of the first, second, and fourth webpages all mention “Argentina winning the World Cup,” so the corresponding images are likely to be the celebration photo I am looking for from the final award ceremony. Next, I will inspect the first image to check whether it is indeed the target image and whether it can provide clues for the question. So I will now use read_url to download and inspect it.
 <action>
 {
-  "tool_name": "read_url",
-  "arguments": {
-    "url": "... url omitted ...",
-    "goal": "Download the candidate image and verify whether it is the full trophy-presentation photo described in the question"
-  }
+"tool_name": "read_url",
+"arguments": {
+ "url": "... url omitted ...",
+ "goal": "Download the target image and check whether it is the correct image I am looking for"
+}
 }
 </action>
-
-(...tool result omitted...)
-
-The downloaded image is indeed a full-team trophy-presentation photo. I can now use this verified image as evidence. The player immediately to the captain’s left is visible, but I cannot identify him with certainty from the current evidence alone. So the next step should be to identify that player either by cropping and reverse-searching him or by combining visible attributes such as jersey number with a roster search.
+(... tool result omitted ...)
+The image has been successfully downloaded, and it is indeed a photo of the full Argentina team during the trophy presentation. In the image, Messi is wearing a black bisht and lifting the World Cup trophy. The player on his left is wearing the number 21 shirt. From this image alone, I cannot be fully certain who he is. My next step should be to use i2i_search, crop out this player, and see whether I can find similar images to determine his identity. In addition, since the image shows that he is wearing number 21, if i2i_search does not produce a satisfactory result, I can also directly search who wore number 21 for Argentina in the 2022 World Cup squad.
 <action>
 {
-  "tool_name": "i2i_search",
-  "arguments": {
-    "region": [420,340,520,370]
-  }
+"tool_name": "i2i_search",
+"arguments": {
+"region": [420,340,520,370]
+}
 }
 </action>
+(... tool result omitted ...)
+Several of the search result titles mention Dybala, which suggests that this player is very likely Dybala. However, I still cannot be certain, because it is possible that the retrieved images are not actually of the same person as the cropped player. Therefore, I should download another image and compare it with the person in the original image to see whether they are indeed the same individual. So I will use read_url to download a new image. If it does turn out to be the same person, then I will only need to search Dybala’s historical goal records, and by reading the relevant sources I will be able to determine his goal total for the 2016–17 season.
+(... omitted below ...)
 
-Discuss:
-This example shows the correct order: find candidate image, verify it is the target image, then identify the person from the verified image. It avoids jumping directly from a vague description to a specific identity.
+Discuss: In the example above, the solution first analyzes the question and then describes the target image in a detailed and precise way, rather than simply searching for something like “Argentina championship celebration photo,” which could return many different images that fit that description. It then downloads the returned image URL and confirms that it is indeed the target photo. After that, it uses i2i_search on that photo for identification, and read_url to further verify the identity of a person who is not very familiar. The whole process is natural and rigorous, and it does not reveal any internal knowledge.
 
-Example 3: Avoid role substitution
-
-Bad writing:
-
-The museum page names Artist A as the painter of this folio, so Artist A must be one of the directors of the manuscript. Since the manuscript was commissioned by Ruler B, Ruler B is also the artist’s early patron. I can now search for Ruler B’s interactions with the prince.
-<action>
-{
-  "tool_name": "t2t_search",
-  "arguments": {
-    "query": "Ruler B and the prince"
-  }
-}
-</action>
-
-Good writing:
-
-The museum page identifies Artist A as the painter of this folio. However, the question asks about an artist who directed the creation of the manuscript, which is a different role. The current evidence also does not establish whether the manuscript’s patron is the same person as the artist’s early patron. These two relationships must be verified separately before I move to the next hop. So my next step is to search specifically for sources about who directed the manuscript’s creation and how that artist was patronized early in his career.
-<action>
-{
-  "tool_name": "t2t_search",
-  "arguments": {
-    "query": "[manuscript name] artists who directed its creation early patron"
-  }
-}
-</action>
-
-Discuss:
-In the bad version, similar but distinct roles are silently merged. In the good version, the solution explicitly notices the mismatch and searches for the missing relation before proceeding.
-
-Example 4: Do not let the final answer outrun the evidence
-
-Bad writing:
-
-The source shows that the ruler supported the refugee claimant, so the answer is that he demanded religious conversion, territorial concessions, and later restored him to power.
-
-Good writing:
-
-The source shows that the ruler demanded symbolic or religious submission and later provided support. However, the current visible evidence does not yet establish whether territorial concessions were part of the agreement. I should not include stronger details in the final answer until they are directly verified. My next step is to search specifically for the exact conditions attached to that support.
-<action>
-{
-  "tool_name": "t2t_search",
-  "arguments": {
-    "query": "[ruler name] [refugee name] conditions of support"
-  }
-}
-</action>
-
-Discuss:
-In the bad version, the final answer includes extra details not established in the visible reasoning. In the good version, the solution stays within the evidence and continues searching for any missing conditions.
 """
 
 MANUAL_REACT_PROTOCOL = """
