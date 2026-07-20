@@ -35,6 +35,7 @@ from synthesis.search_client import acquire_serper_api_key
 
 
 logger = logging.getLogger(__name__)
+T2T_BLOCKED_SEARCH_DOMAINS = ("wikipedia.org",)
 
 
 def _build_serper_client():
@@ -52,6 +53,20 @@ def _build_serper_client():
 
 def _format_search_results(results: list[dict[str, Any]]) -> str:
     return json.dumps(results, ensure_ascii=False, indent=2)
+
+
+def _url_matches_blocked_domain(url: str, blocked_domains: tuple[str, ...]) -> bool:
+    normalized_url = str(url or "").strip()
+    if not normalized_url or not blocked_domains:
+        return False
+    try:
+        hostname = (urlparse(normalized_url).hostname or "").lower()
+    except Exception:
+        return False
+    return any(
+        hostname == domain or hostname.endswith(f".{domain}")
+        for domain in blocked_domains
+    )
 
 
 def _guess_image_from_url(url: str) -> bool:
@@ -502,7 +517,8 @@ def t2t_search(query: str, lang: str = "en", top_k: int = 5) -> str:
     """Search text pages via synthesis' Serper backend, then read/summarize."""
 
     try:
-        response = _build_serper_client().search_text(query, limit=top_k, hl=lang)
+        fetch_limit = max(1, min(int(top_k) * 3, 100))
+        response = _build_serper_client().search_text(query, limit=fetch_limit, hl=lang)
     except Exception as exc:
         return f"Tool execution error:\nText search failed: {exc}"
 
@@ -510,7 +526,9 @@ def t2t_search(query: str, lang: str = "en", top_k: int = 5) -> str:
         return "Tool execution result:\nNo relevant web pages found for the query."
 
     formatted: list[str] = []
-    for idx, item in enumerate(response.results[:top_k], start=1):
+    for item in response.results:
+        if _url_matches_blocked_domain(item.url or "", T2T_BLOCKED_SEARCH_DOMAINS):
+            continue
         title = item.title or ""
         url = item.url or ""
         snippet = item.snippet or ""
@@ -522,11 +540,16 @@ def t2t_search(query: str, lang: str = "en", top_k: int = 5) -> str:
             elif read_result.get("error"):
                 logger.debug("read_url failed during t2t_search for %s: %s", url, read_result["error"])
         formatted.append(
-            f"[Passage {idx}]\n"
+            f"[Passage {len(formatted) + 1}]\n"
             f"Title: {title}\n"
             f"URL: {url}\n"
             f"Summary:\n{summary}"
         )
+        if len(formatted) >= top_k:
+            break
+
+    if not formatted:
+        return "Tool execution result:\nNo relevant non-Wikipedia web pages found for the query."
 
     body = ("\n\n" + "=" * 60 + "\n\n").join(formatted)
     return f"Tool execution result:\n{body}"

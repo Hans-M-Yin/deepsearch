@@ -50,7 +50,11 @@ PDF_CONTENT_TYPES = {
     "application/pdf",
     "application/x-pdf",
 }
-T2T_BLOCKED_SEARCH_DOMAINS: tuple[str, ...] = ()
+T2T_BLOCKED_SEARCH_DOMAINS = (
+    # Filter Wikipedia after retrieval instead of sending `-site:wikipedia.org`,
+    # which is rejected by Serper free accounts.
+    "wikipedia.org",
+)
 T2I_BLOCKED_IMAGE_SEARCH_DOMAINS = (
     # TikTok image-search results are often video-thumbnail endpoints or signed
     # CDN URLs. The source pages are video posts and direct image URLs frequently
