@@ -10,6 +10,7 @@ import logging
 import os
 import re
 import uuid
+import urllib.parse
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -275,6 +276,7 @@ class ToolRuntimeContext:
     working_dir: str
     session_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
     image_registry: dict[str, Any] = field(default_factory=dict)
+    url_registry: dict[str, tools.UrlResource] = field(default_factory=dict)
     filename_prefix: str = "sft"
     case_id: str = "sft_session"
     visual_lookup: Callable[..., object] | None = None
@@ -319,6 +321,79 @@ class ToolRuntimeContext:
         for image_id, payload in self.image_registry.items():
             lines.append(f"- {image_id}: {str(payload)[:120]}")
         return "\n".join(lines)
+
+    @staticmethod
+    def _normalize_resource_url(value: Any) -> str:
+        raw = str(value or "").strip()
+        if not raw:
+            return ""
+        try:
+            parsed = urllib.parse.urlsplit(raw)
+        except Exception:
+            return raw
+        if parsed.scheme not in {"http", "https"}:
+            return raw
+        hostname = (parsed.hostname or "").lower()
+        port = parsed.port
+        netloc = hostname
+        if port and not ((parsed.scheme == "http" and port == 80) or (parsed.scheme == "https" and port == 443)):
+            netloc = f"{hostname}:{port}"
+        return urllib.parse.urlunsplit((parsed.scheme.lower(), netloc, parsed.path or "/", parsed.query, ""))
+
+    def register_url_resource(self, resource: tools.UrlResource) -> None:
+        for candidate in (
+            resource.primary_url,
+            resource.image_url,
+            resource.thumbnail_url,
+            resource.source_page_url,
+        ):
+            key = self._normalize_resource_url(candidate)
+            if key:
+                self.url_registry[key] = resource
+
+    def resolve_url_resource(self, url: str) -> tools.UrlResource | None:
+        return self.url_registry.get(self._normalize_resource_url(url))
+
+    def register_search_output(self, tool_name: str, output: dict[str, Any]) -> None:
+        query = str(output.get("query") or "").strip() or None
+        raw_results = output.get("results") if tool_name in {"t2t_search", "t2i_search"} else output.get("matches")
+        if not isinstance(raw_results, list):
+            return
+        for raw in raw_results:
+            if not isinstance(raw, dict):
+                continue
+            image_url = str(raw.get("image_url") or raw.get("imageUrl") or "").strip() or None
+            thumbnail_url = str(raw.get("thumbnail_url") or raw.get("thumbnailUrl") or "").strip() or None
+            source_page_url = str(
+                raw.get("source_page_url") or raw.get("link") or raw.get("url") or raw.get("source") or ""
+            ).strip() or None
+            if tool_name == "t2t_search":
+                primary_url = source_page_url
+                kind = "text"
+            else:
+                primary_url = image_url or thumbnail_url or source_page_url
+                kind = "image"
+            if not primary_url:
+                continue
+            rank_value = raw.get("rank")
+            try:
+                rank = int(rank_value) if rank_value is not None else None
+            except (TypeError, ValueError):
+                rank = None
+            self.register_url_resource(
+                tools.UrlResource(
+                    primary_url=primary_url,
+                    kind=kind,
+                    title=str(raw.get("title") or "").strip() or None,
+                    snippet=str(raw.get("snippet") or "").strip() or None,
+                    image_url=image_url,
+                    thumbnail_url=thumbnail_url,
+                    source_page_url=source_page_url,
+                    search_tool=tool_name,
+                    search_query=query,
+                    rank=rank,
+                )
+            )
 
 
 @dataclass(slots=True)
@@ -1412,6 +1487,8 @@ def execute_tool_call(
                 lang=params.get("lang") or params.get("hl") or "en",
                 top_k=int(params.get("top_k", tools.DEFAULT_SEARCH_TOP_K)),
             )
+        if isinstance(output, dict) and output.get("ok"):
+            context.register_search_output("t2t_search", output)
         return ToolExecutionResult(name=name, arguments=params, output=output, output_text=_json_text(output))
 
     if name == "t2i_search":
@@ -1424,6 +1501,8 @@ def execute_tool_call(
                 lang=params.get("lang") or params.get("hl") or "en",
                 top_k=int(params.get("top_k", tools.DEFAULT_SEARCH_TOP_K)),
             )
+        if isinstance(output, dict) and output.get("ok"):
+            context.register_search_output("t2i_search", output)
         return ToolExecutionResult(name=name, arguments=params, output=output, output_text=_json_text(output))
 
     if name == "read_url":
@@ -1436,6 +1515,7 @@ def execute_tool_call(
             url=url,
             goal=effective_goal,
             assistant_output=assistant_text,
+            resource=context.resolve_url_resource(url),
         )
         new_images: dict[str, Any] = {}
         if output.get("ok") and output.get("local_path"):
@@ -1488,6 +1568,8 @@ def execute_tool_call(
             )
             output = dict(output)
             output["cropped_image_url"] = uploaded_url
+            if output.get("ok"):
+                context.register_search_output("i2i_search", output)
             return ToolExecutionResult(name=name, arguments=params, output=output, output_text=_json_text(output), new_images=new_images)
 
         remote_url, err = _materialize_remote_image_url(image_source, context, "i2i_search")
@@ -1499,6 +1581,8 @@ def execute_tool_call(
             visual_lookup=context.visual_lookup,
             top_k=int(params.get("top_k", tools.DEFAULT_SEARCH_TOP_K)),
         )
+        if isinstance(output, dict) and output.get("ok"):
+            context.register_search_output("i2i_search", output)
         return ToolExecutionResult(name=name, arguments=params, output=output, output_text=_json_text(output))
 
     output = {"ok": False, "error": f"Unknown tool: {name}"}

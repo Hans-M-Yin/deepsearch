@@ -264,6 +264,7 @@ def process_single_case(
     image_paths_dict, initial_parts = _bootstrap_images(
         row, case_id, case_idx, filename_prefix, image_urls_dict
     )
+    url_registry: dict[str, Any] = {}
 
     tools_schema = tools.get_tools_definition()
     system_prompt = build_system_prompt(tools_schema)
@@ -339,6 +340,7 @@ def process_single_case(
             intermediate_dir,
             filename_prefix=filename_prefix,
             visual_lookup=visual_lookup,
+            url_registry=url_registry,
         )
         observation_text = f"<tool_response>\n{tool_message}\n</tool_response>"
         turn_record["tool_output"] = observation_text

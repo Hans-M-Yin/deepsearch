@@ -6,11 +6,13 @@ import json
 import logging
 import mimetypes
 import os
+import random
 import re
 import sys
 import tempfile
 import threading
 import time
+from dataclasses import asdict, dataclass
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Callable
@@ -65,6 +67,25 @@ T2I_BLOCKED_IMAGE_SEARCH_DOMAINS = (
 )
 I2I_BLOCKED_IMAGE_SEARCH_DOMAINS: tuple[str, ...] = ()
 _SFT_FIXED_REQUEST_ID = "3200636808"
+
+
+@dataclass(slots=True)
+class UrlResource:
+    """Search-result provenance used internally by read_url fallbacks."""
+
+    primary_url: str
+    kind: str = "unknown"
+    title: str | None = None
+    snippet: str | None = None
+    image_url: str | None = None
+    thumbnail_url: str | None = None
+    source_page_url: str | None = None
+    search_tool: str | None = None
+    search_query: str | None = None
+    rank: int | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
 
 
 def _jsonify(value: Any) -> Any:
@@ -188,6 +209,62 @@ def _web_request_headers(*, referer_url: str | None = None) -> dict[str, str]:
     if referer_url:
         headers["Referer"] = referer_url
     return headers
+
+
+def _resource_candidate_urls(resource: UrlResource | None, requested_url: str) -> list[tuple[str, str, str | None]]:
+    """Return ordered binary download candidates as (kind, url, referer)."""
+    candidates: list[tuple[str, str, str | None]] = []
+    seen: set[str] = set()
+
+    def add(kind: str, url: str | None, referer: str | None = None) -> None:
+        normalized = str(url or "").strip()
+        if not normalized or normalized in seen:
+            return
+        seen.add(normalized)
+        candidates.append((kind, normalized, str(referer or "").strip() or None))
+
+    if resource is None:
+        add("requested", requested_url)
+        return candidates
+    referer = resource.source_page_url
+    add("requested", requested_url, referer)
+    add("image_url", resource.image_url, referer)
+    add("primary_url", resource.primary_url, referer)
+    add("thumbnail_url", resource.thumbnail_url, referer)
+    return candidates
+
+
+def _source_page_image_candidates(resource: UrlResource | None) -> list[str]:
+    """Best-effort og:image/twitter:image extraction from a result page."""
+    if resource is None or not resource.source_page_url:
+        return []
+    try:
+        response = _request_with_retry(
+            "GET",
+            resource.source_page_url,
+            timeout=30,
+            allow_redirects=True,
+            headers=_web_request_headers(referer_url=resource.source_page_url),
+            max_retries=2,
+            retry_sleep_s=5,
+        )
+        html = response.text
+        response.close()
+    except Exception:
+        return []
+    candidates: list[str] = []
+    patterns = (
+        r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)',
+        r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image["\']',
+        r'<meta[^>]+name=["\']twitter:image(?::src)?["\'][^>]+content=["\']([^"\']+)',
+        r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+name=["\']twitter:image(?::src)?["\']',
+    )
+    for pattern in patterns:
+        for match in re.finditer(pattern, html, flags=re.IGNORECASE):
+            resolved = requests.compat.urljoin(resource.source_page_url, match.group(1).strip())
+            if resolved and resolved not in candidates:
+                candidates.append(resolved)
+    return candidates[:4]
 
 
 def get_tool_definitions() -> list[dict[str, Any]]:
@@ -511,8 +588,13 @@ def _request_with_retry(
         try:
             response = requests.request(method, url, timeout=timeout, **kwargs)
             if _should_retry_http_status(response.status_code) and attempt < attempts:
+                retry_after = response.headers.get("Retry-After")
+                try:
+                    wait_s = max(float(retry_after), 0.0) if retry_after else retry_sleep_s * attempt
+                except (TypeError, ValueError):
+                    wait_s = retry_sleep_s * attempt
                 response.close()
-                time.sleep(retry_sleep_s)
+                time.sleep(wait_s + random.uniform(0.0, 1.0))
                 continue
             response.raise_for_status()
             return response
@@ -521,7 +603,7 @@ def _request_with_retry(
             if response is not None:
                 response.close()
             if attempt < attempts:
-                time.sleep(retry_sleep_s)
+                time.sleep(retry_sleep_s * attempt + random.uniform(0.0, 1.0))
                 continue
             raise
         except requests.HTTPError as exc:
@@ -533,7 +615,12 @@ def _request_with_retry(
                 and _should_retry_http_status(exc.response.status_code)
                 and attempt < attempts
             ):
-                time.sleep(retry_sleep_s)
+                retry_after = exc.response.headers.get("Retry-After") if exc.response is not None else None
+                try:
+                    wait_s = max(float(retry_after), 0.0) if retry_after else retry_sleep_s * attempt
+                except (TypeError, ValueError):
+                    wait_s = retry_sleep_s * attempt
+                time.sleep(wait_s + random.uniform(0.0, 1.0))
                 continue
             raise
         except Exception as exc:
@@ -624,12 +711,17 @@ def _probe_content_type(url: str) -> str:
     return guessed_image_type or "text/html"
 
 
-def _download_binary(url: str, *, timeout: int = 60) -> tuple[bytes, str]:
+def _download_binary(
+    url: str,
+    *,
+    timeout: int = 60,
+    referer_url: str | None = None,
+) -> tuple[bytes, str]:
     response = _request_with_retry(
         "GET",
         url,
         timeout=timeout,
-        headers=_web_request_headers(referer_url=url),
+        headers=_web_request_headers(referer_url=referer_url or url),
     )
     content_type = response.headers.get("Content-Type", "")
     normalized = content_type.split(";", 1)[0].strip().lower() if content_type else ""
@@ -757,6 +849,7 @@ def read_url(
     url: str,
     goal: str = "",
     assistant_output: str = "",
+    resource: UrlResource | None = None,
 ) -> dict[str, Any]:
     """Read a URL as either text content or a downloadable image."""
 
@@ -768,34 +861,76 @@ def read_url(
 
     content_type = _probe_content_type(normalized_url)
     if content_type.startswith("image/"):
-        try:
-            temp_dir = tempfile.mkdtemp(prefix="synthesis_sft_read_url_")
-            filename = os.path.basename(urlparse(normalized_url).path) or "downloaded_image"
-            response_content, _ = _download_binary(normalized_url, timeout=60)
-            image_bytes, resolved_content_type = _maybe_resize_downloaded_image(
-                response_content,
-                content_type=content_type,
-            )
-            extension = mimetypes.guess_extension(resolved_content_type) or os.path.splitext(filename)[1] or ".png"
-            stem = os.path.splitext(filename)[0] or "downloaded_image"
-            filename = f"{stem}{extension}"
-            save_path = os.path.join(temp_dir, filename)
-            with open(save_path, "wb") as handle:
-                handle.write(image_bytes)
-            _record_read_url_call(branch="image", success=True)
-            return {
-                "ok": True,
-                "url": normalized_url,
-                "content_type": resolved_content_type,
-                "local_path": save_path,
-            }
-        except Exception as exc:  # pragma: no cover - network bound
-            _record_read_url_call(
-                branch="image",
-                success=False,
-                image_http_status=_extract_http_status_code(exc),
-            )
-            return {"ok": False, "error": f"read_url failed for {normalized_url}: {exc}"}
+        failures: list[str] = []
+        candidates = _resource_candidate_urls(resource, normalized_url)
+        source_page_checked = False
+        candidate_index = 0
+        while candidate_index < len(candidates):
+            candidate_kind, candidate_url, referer_url = candidates[candidate_index]
+            candidate_index += 1
+            try:
+                temp_dir = tempfile.mkdtemp(prefix="synthesis_sft_read_url_")
+                filename = os.path.basename(urlparse(candidate_url).path) or "downloaded_image"
+                response_content, downloaded_type = _download_binary(
+                    candidate_url,
+                    timeout=60,
+                    referer_url=referer_url,
+                )
+                candidate_content_type = (
+                    downloaded_type
+                    or _sniff_image_content_type(response_content)
+                    or _guess_image_content_type(candidate_url)
+                    or content_type
+                )
+                if not candidate_content_type.startswith("image/"):
+                    raise ValueError(f"downloaded fallback is not an image: {candidate_content_type or 'unknown'}")
+                image_bytes, resolved_content_type = _maybe_resize_downloaded_image(
+                    response_content,
+                    content_type=candidate_content_type,
+                )
+                extension = mimetypes.guess_extension(resolved_content_type) or os.path.splitext(filename)[1] or ".png"
+                stem = os.path.splitext(filename)[0] or "downloaded_image"
+                filename = f"{stem}{extension}"
+                save_path = os.path.join(temp_dir, filename)
+                with open(save_path, "wb") as handle:
+                    handle.write(image_bytes)
+                _record_read_url_call(branch="image", success=True)
+                return {
+                    "ok": True,
+                    "url": normalized_url,
+                    "resolved_url": candidate_url,
+                    "resolved_via": candidate_kind,
+                    "content_type": resolved_content_type,
+                    "local_path": save_path,
+                }
+            except Exception as exc:  # pragma: no cover - network bound
+                failures.append(f"{candidate_kind}:{candidate_url}: {exc}")
+                if not source_page_checked and candidate_index >= len(candidates):
+                    source_page_checked = True
+                    seen_urls = {url for _, url, _ in candidates}
+                    for page_image_url in _source_page_image_candidates(resource):
+                        if page_image_url in seen_urls:
+                            continue
+                        seen_urls.add(page_image_url)
+                        candidates.append(
+                            (
+                                "source_page_image",
+                                page_image_url,
+                                resource.source_page_url if resource is not None else None,
+                            )
+                        )
+                continue
+        final_error = failures[-1] if failures else "no download candidates"
+        _record_read_url_call(
+            branch="image",
+            success=False,
+            image_http_status=None,
+        )
+        return {
+            "ok": False,
+            "error": f"read_url failed for {normalized_url}: {final_error}",
+            "fallback_errors": failures,
+        }
 
     if content_type in PDF_CONTENT_TYPES:
         try:
@@ -804,7 +939,11 @@ def read_url(
             if not filename.lower().endswith(".pdf"):
                 filename = f"{os.path.splitext(filename)[0] or 'downloaded'}.pdf"
             save_path = os.path.join(temp_dir, filename)
-            pdf_bytes, _ = _download_binary(normalized_url, timeout=60)
+            pdf_bytes, _ = _download_binary(
+                normalized_url,
+                timeout=int(os.environ.get("SFT_PDF_DOWNLOAD_TIMEOUT_S", "120")),
+                referer_url=resource.source_page_url if resource is not None else None,
+            )
             with open(save_path, "wb") as handle:
                 handle.write(pdf_bytes)
             content, title = _extract_pdf_text(save_path)
@@ -833,6 +972,34 @@ def read_url(
                 "content_type": "application/pdf",
             }
         except Exception as exc:  # pragma: no cover - network bound
+            # A browser-visible PDF may still be unreachable from the inference
+            # host. Fall back to the configured reader, which may use a
+            # different network path and can return extracted text directly.
+            try:
+                document = _read_document(normalized_url)
+                content = str(document.get("content") or "").strip()
+                if content:
+                    summarized_content = (
+                        summarize_with_qwen(
+                            content=content,
+                            goal=goal,
+                            assistant_output=assistant_output,
+                        )
+                        if goal or assistant_output
+                        else content[:500]
+                    )
+                    _record_read_url_call(branch="pdf", success=True)
+                    return {
+                        "ok": True,
+                        "kind": "text",
+                        "url": normalized_url,
+                        "title": str(document.get("title") or os.path.basename(urlparse(normalized_url).path)),
+                        "content": summarized_content,
+                        "content_type": "application/pdf",
+                        "resolved_via": "reader_fallback",
+                    }
+            except Exception:
+                pass
             _record_read_url_call(branch="pdf", success=False)
             return {"ok": False, "error": f"read_url failed for {normalized_url}: {exc}"}
 
@@ -911,6 +1078,7 @@ def t2i_search(query: str, lang: str = "en", top_k: int = DEFAULT_SEARCH_TOP_K) 
                 {
                     "title": item.title,
                     "image_url": item.image_url,
+                    "thumbnail_url": item.thumbnail_url,
                     "source_page_url": item.source_page_url,
                     "snippet": item.snippet,
                     "rank": item.rank,

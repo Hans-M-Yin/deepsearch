@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import re
+import urllib.parse
 from typing import Callable, Dict, List, Optional, Tuple
 
 from PIL import Image
@@ -155,6 +156,70 @@ def has_response_tag(text: str) -> bool:
 
 
 ToolResult = Tuple[str, Dict[str, str]]
+
+
+def _normalize_resource_url(value: object) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    try:
+        parsed = urllib.parse.urlsplit(raw)
+    except Exception:
+        return raw
+    if parsed.scheme not in {"http", "https"}:
+        return raw
+    hostname = (parsed.hostname or "").lower()
+    port = parsed.port
+    netloc = hostname
+    if port and not ((parsed.scheme == "http" and port == 80) or (parsed.scheme == "https" and port == 443)):
+        netloc = f"{hostname}:{port}"
+    return urllib.parse.urlunsplit(
+        (parsed.scheme.lower(), netloc, parsed.path or "/", parsed.query, "")
+    )
+
+
+def _register_search_resources(
+    registry: dict[str, sft_tools.UrlResource],
+    *,
+    tool_name: str,
+    output: dict,
+) -> None:
+    query = str(output.get("query") or "").strip() or None
+    raw_results = output.get("results") if tool_name in {"t2t_search", "t2i_search"} else output.get("matches")
+    if not isinstance(raw_results, list):
+        return
+    for raw in raw_results:
+        if not isinstance(raw, dict):
+            continue
+        image_url = str(raw.get("image_url") or raw.get("imageUrl") or "").strip() or None
+        thumbnail_url = str(raw.get("thumbnail_url") or raw.get("thumbnailUrl") or "").strip() or None
+        source_page_url = str(
+            raw.get("source_page_url") or raw.get("link") or raw.get("url") or raw.get("source") or ""
+        ).strip() or None
+        primary_url = source_page_url if tool_name == "t2t_search" else (image_url or thumbnail_url or source_page_url)
+        if not primary_url:
+            continue
+        rank_value = raw.get("rank")
+        try:
+            rank = int(rank_value) if rank_value is not None else None
+        except (TypeError, ValueError):
+            rank = None
+        resource = sft_tools.UrlResource(
+            primary_url=primary_url,
+            kind="text" if tool_name == "t2t_search" else "image",
+            title=str(raw.get("title") or "").strip() or None,
+            snippet=str(raw.get("snippet") or "").strip() or None,
+            image_url=image_url,
+            thumbnail_url=thumbnail_url,
+            source_page_url=source_page_url,
+            search_tool=tool_name,
+            search_query=query,
+            rank=rank,
+        )
+        for candidate in (primary_url, image_url, thumbnail_url, source_page_url):
+            key = _normalize_resource_url(candidate)
+            if key:
+                registry[key] = resource
 
 
 def _resolve_image_for_search(
@@ -371,6 +436,7 @@ def execute_tool(
     intermediate_dir: str,
     filename_prefix: str = "fvqa_train",
     visual_lookup: Optional[Callable[..., object]] = None,
+    url_registry: Optional[dict[str, sft_tools.UrlResource]] = None,
 ) -> ToolResult:
     """Dispatch a parsed tool call. Returns ``(message, new_images)``."""
 
@@ -385,6 +451,7 @@ def execute_tool(
 
     name = call.get("name", "")
     params = call.get("parameters", {}) or {}
+    resource_registry = url_registry if url_registry is not None else {}
 
     if name == "t2t_search":
         query = params.get("query") or ""
@@ -395,6 +462,8 @@ def execute_tool(
             lang=params.get("lang", "en"),
             top_k=int(params.get("top_k", sft_tools.DEFAULT_SEARCH_TOP_K)),
         )
+        if isinstance(result, dict) and result.get("ok"):
+            _register_search_resources(resource_registry, tool_name="t2t_search", output=result)
         return json.dumps(result, ensure_ascii=False, indent=2), {}
 
     if name == "t2i_search":
@@ -406,6 +475,8 @@ def execute_tool(
             lang=params.get("lang", "en"),
             top_k=int(params.get("top_k", sft_tools.DEFAULT_SEARCH_TOP_K)),
         )
+        if isinstance(result, dict) and result.get("ok"):
+            _register_search_resources(resource_registry, tool_name="t2i_search", output=result)
         return json.dumps(result, ensure_ascii=False, indent=2), {}
 
     if name == "i2i_search":
@@ -446,6 +517,8 @@ def execute_tool(
             visual_lookup=visual_lookup,
             top_k=int(params.get("top_k", sft_tools.DEFAULT_SEARCH_TOP_K)),
         )
+        if isinstance(result, dict) and result.get("ok"):
+            _register_search_resources(resource_registry, tool_name="i2i_search", output=result)
         return json.dumps(result, ensure_ascii=False, indent=2), new_images
 
     if name == "read_url":
@@ -455,6 +528,7 @@ def execute_tool(
         result = sft_tools.read_url(
             url=url,
             goal=str(params.get("goal") or "").strip(),
+            resource=resource_registry.get(_normalize_resource_url(url)),
         )
         if not result.get("ok", False):
             return f"Tool execution error:\n{result.get('error', 'Unknown read_url error')}", {}
