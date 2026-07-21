@@ -52,11 +52,7 @@ PDF_CONTENT_TYPES = {
     "application/pdf",
     "application/x-pdf",
 }
-T2T_BLOCKED_SEARCH_DOMAINS = (
-    # Filter Wikipedia after retrieval instead of sending `-site:wikipedia.org`,
-    # which is rejected by Serper free accounts.
-    "wikipedia.org",
-)
+T2T_BLOCKED_SEARCH_DOMAINS: tuple[str, ...] = ()
 T2I_BLOCKED_IMAGE_SEARCH_DOMAINS = (
     # TikTok image-search results are often video-thumbnail endpoints or signed
     # CDN URLs. The source pages are video posts and direct image URLs frequently
@@ -715,12 +711,12 @@ def _request_with_retry(
 def _search_fetch_multiplier(tool_name: str | None = None) -> int:
     """Return over-fetch multiplier for search tools.
 
-    Defaults preserve the existing behavior (3x).  Set
+    Defaults preserve the existing behavior (2x).  Set
     SFT_SEARCH_FETCH_MULTIPLIER for all search tools, or a tool-specific env var
     such as SFT_I2I_SEARCH_FETCH_MULTIPLIER to override only one backend.
     """
 
-    default_multiplier = max(1, _env_int("SFT_SEARCH_FETCH_MULTIPLIER", 3))
+    default_multiplier = max(1, _env_int("SFT_SEARCH_FETCH_MULTIPLIER", 2))
     normalized = str(tool_name or "").strip().lower()
     if normalized == "t2t_search":
         return max(1, _env_int("SFT_T2T_SEARCH_FETCH_MULTIPLIER", default_multiplier))
