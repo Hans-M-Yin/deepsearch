@@ -123,6 +123,8 @@ def _is_wikipedia_url(url: str | None) -> bool:
 def _iter_candidate_edges(store: JsonlGraphStore, image_node_id: str | None = None) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
     for edge in store.list_edges():
+        if edge.get("edge_type") != "image_depicts":
+            continue
         if image_node_id and edge.get("src_node_id") != image_node_id:
             continue
         src_node = store.get_node(str(edge.get("src_node_id") or ""))
@@ -138,6 +140,42 @@ def _iter_candidate_edges(store: JsonlGraphStore, image_node_id: str | None = No
             continue
         results.append(edge)
     return results
+
+
+def _image_node_debug_stats(store: JsonlGraphStore, image_node_id: str) -> dict[str, Any]:
+    node = store.get_node(image_node_id)
+    out_edges = store.edges_from(image_node_id)
+    edge_type_counts: dict[str, int] = {}
+    source_type_counts: dict[str, int] = {}
+    sample_edges: list[dict[str, Any]] = []
+    for edge in out_edges:
+        edge_type = str(edge.get("edge_type") or "<missing>")
+        edge_type_counts[edge_type] = edge_type_counts.get(edge_type, 0) + 1
+        source = edge.get("source") or {}
+        source_type = str((source or {}).get("source_type") or "<missing>")
+        source_type_counts[source_type] = source_type_counts.get(source_type, 0) + 1
+        if len(sample_edges) < 10:
+            sample_edges.append(
+                {
+                    "edge_id": edge.get("edge_id"),
+                    "edge_type": edge.get("edge_type"),
+                    "relation": edge.get("relation"),
+                    "dst_node_id": edge.get("dst_node_id"),
+                    "source_type": (source or {}).get("source_type"),
+                }
+            )
+    metadata = (node or {}).get("metadata") or {}
+    return {
+        "image_node_exists": node is not None,
+        "image_node_type": (node or {}).get("node_type"),
+        "out_edge_count": len(out_edges),
+        "out_edge_type_counts": edge_type_counts,
+        "out_edge_source_type_counts": source_type_counts,
+        "grounded_entity_count": len(metadata.get("grounded_entities") or []),
+        "unresolved_grounded_entity_count": len(metadata.get("unresolved_grounded_entities") or []),
+        "query_overlap_grounded_entity_count": len(metadata.get("query_overlap_grounded_entities") or []),
+        "sample_out_edges": sample_edges,
+    }
 
 
 def _find_grounded_entity(image_node: dict[str, Any], text_node: dict[str, Any], edge: dict[str, Any]) -> dict[str, Any] | None:
@@ -436,6 +474,8 @@ def main() -> int:
         "planned_removals": planned_removals,
         "results": results,
     }
+    if args.image_node_id and not results:
+        payload["empty_result_debug"] = _image_node_debug_stats(store, args.image_node_id)
     print(json.dumps(payload, ensure_ascii=False, indent=2 if args.pretty else None))
     if args.dry_run and planned_removals:
         print("\n[verify_image_text_edges][dry-run] planned removals:", file=sys.stderr)
