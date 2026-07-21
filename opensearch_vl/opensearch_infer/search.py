@@ -126,6 +126,7 @@ def _read_document(url: str) -> dict[str, Any]:
             "raw_markdown": content,
             "raw": {"reader": "jina_direct"},
         }
+    print(f"########## DEBUG: {url}")
     return _enhanced_reader_read(url)
 
 

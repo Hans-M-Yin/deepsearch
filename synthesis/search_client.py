@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import re
+import socket
 import sys
 import tempfile
 import time
@@ -13,8 +14,8 @@ from dataclasses import asdict, dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Any, Protocol
-from urllib.parse import urlencode
-from urllib.error import HTTPError
+from urllib.parse import urlencode, urlparse
+from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 try:
@@ -129,6 +130,52 @@ def _log_serper_request(*, url: str, body: dict[str, Any]) -> None:
     """Log an outbound Serper request before network I/O begins."""
     del url, body
     return
+
+
+def _serper_debug_enabled() -> bool:
+    raw = os.environ.get("SFT_SERPER_DEBUG") or os.environ.get("SERPER_DEBUG")
+    return str(raw or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _serper_debug(event: str, **kwargs: Any) -> None:
+    if not _serper_debug_enabled():
+        return
+    details = " ".join(f"{key}={value!r}" for key, value in kwargs.items())
+    suffix = f" {details}" if details else ""
+    print(f"[serper-debug] {event}{suffix}", file=sys.stderr, flush=True)
+
+
+def _serper_dns_debug(url: str) -> dict[str, Any] | None:
+    if str(os.environ.get("SFT_SERPER_DEBUG_DNS") or "").strip().lower() not in {"1", "true", "yes", "on"}:
+        return None
+    parsed = urlparse(url)
+    host = parsed.hostname or ""
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    if not host:
+        return {"host": host, "error": "missing_host"}
+    started = time.perf_counter()
+    try:
+        infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except Exception as exc:  # noqa: BLE001 - debug path only
+        return {
+            "host": host,
+            "port": port,
+            "elapsed_s": round(time.perf_counter() - started, 3),
+            "error_type": exc.__class__.__name__,
+            "error": str(exc),
+        }
+    addresses = []
+    for info in infos[:5]:
+        sockaddr = info[4]
+        if sockaddr:
+            addresses.append(str(sockaddr[0]))
+    return {
+        "host": host,
+        "port": port,
+        "elapsed_s": round(time.perf_counter() - started, 3),
+        "addresses": addresses,
+        "count": len(infos),
+    }
 
 
 def _log_serper_raw_response(*, url: str, status_code: int, raw: dict[str, Any]) -> None:
@@ -688,6 +735,16 @@ class SerperSearchClient:
 
         _log_serper_key(url=url, api_key=api_key, metadata=pool_metadata)
         _log_serper_request(url=url, body=body)
+        parsed_url = urlparse(url)
+        _serper_debug(
+            "request_start",
+            url=url,
+            host=parsed_url.hostname,
+            timeout_s=self.timeout_s,
+            body=body,
+            key_pool=pool_metadata if pool_metadata else None,
+            dns=_serper_dns_debug(url),
+        )
         payload = json.dumps(body).encode("utf-8")
         request = Request(
             url,
@@ -699,16 +756,33 @@ class SerperSearchClient:
             },
             method="POST",
         )
+        started_at = time.perf_counter()
         try:
             with urlopen(request, timeout=self.timeout_s) as response:
                 response_payload = response.read().decode("utf-8")
                 status_code = response.getcode()
+            _serper_debug(
+                "request_done",
+                url=url,
+                status_code=status_code,
+                elapsed_s=round(time.perf_counter() - started_at, 3),
+                response_chars=len(response_payload),
+            )
         except HTTPError as exc:
+            elapsed_s = round(time.perf_counter() - started_at, 3)
             error_payload = ""
             try:
                 error_payload = exc.read().decode("utf-8", errors="replace")
             except Exception:
                 error_payload = ""
+            _serper_debug(
+                "http_error",
+                url=url,
+                status_code=exc.code,
+                elapsed_s=elapsed_s,
+                body=body,
+                response_preview=error_payload[:500],
+            )
             message = (
                 f"Serper request failed with HTTP {exc.code} for {url}. "
                 f"Request body: {json.dumps(body, ensure_ascii=False)}"
@@ -716,6 +790,26 @@ class SerperSearchClient:
             if error_payload:
                 message += f" Response body: {error_payload}"
             raise RuntimeError(message) from exc
+        except URLError as exc:
+            elapsed_s = round(time.perf_counter() - started_at, 3)
+            reason = getattr(exc, "reason", exc)
+            _serper_debug(
+                "url_error",
+                url=url,
+                host=parsed_url.hostname,
+                elapsed_s=elapsed_s,
+                timeout_s=self.timeout_s,
+                reason_type=reason.__class__.__name__,
+                reason=str(reason),
+                body=body,
+                key_pool=pool_metadata if pool_metadata else None,
+            )
+            raise RuntimeError(
+                "Serper request failed before receiving an HTTP response "
+                f"for {url}. host={parsed_url.hostname!r} timeout_s={self.timeout_s} "
+                f"elapsed_s={elapsed_s} reason={reason.__class__.__name__}: {reason}. "
+                f"Request body: {json.dumps(body, ensure_ascii=False)}"
+            ) from exc
         raw = json.loads(response_payload)
         _log_serper_raw_response(url=url, status_code=status_code, raw=raw)
         self._log_raw_response(url=url, body=body, status_code=status_code, raw=raw)
