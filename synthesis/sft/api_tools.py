@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import argparse
 import base64
+# #### START Response 0720 ####
+from copy import deepcopy
+# #### END Response 0720 ####
 import io
 import json
 import logging
@@ -27,6 +30,9 @@ if __package__ in (None, ""):
 from synthesis.model_worker import LLM_WORKER
 from synthesis.model_worker import ModelMessage
 from synthesis.model_worker import ModelRequest
+# #### START Response 0720 ####
+from synthesis.model_worker import ResponsesModelRequest
+# #### END Response 0720 ####
 from . import tools
 import sys
 
@@ -147,6 +153,39 @@ Rules:
 
 """
 
+# #### START Response 0720 ####
+RESPONSES_PUBLIC_REASONING_PROMPT = """
+You are using native function tools through the Responses API. Do not write
+manual <action> blocks and do not imitate the manual-ReAct examples elsewhere in
+the base prompt.
+
+Before each function call, emit a concise but substantive public progress update
+as an assistant message. The update should:
+1. analyze what the latest tool observation actually establishes;
+2. state what remains uncertain or unresolved;
+3. explain why the selected function and its arguments are the appropriate next
+   step;
+4. avoid claiming that search-result metadata proves webpage or image content;
+5. never mention or cite the private answer, reference facts, verification
+   guidance, hidden hints, or construction-time information.
+
+The public update is an evidence-grounded explanation for a reader, not hidden
+chain-of-thought. Keep it focused and avoid repeating the entire question every
+turn. Use native function calls for tools. When the evidence is sufficient,
+return a final answer as an assistant message and do not call another tool.
+
+For i2i_search, region coordinates are x-first normalized coordinates on a
+0-1000 scale in the order [x1, y1, x2, y2]. x increases left-to-right and y
+increases top-to-bottom. Use [0, 0, 1000, 1000] for the full image.
+""".strip()
+
+
+def _build_responses_instructions(base_system_prompt: str) -> str:
+    return "\n\n".join(
+        part for part in (base_system_prompt.strip(), RESPONSES_PUBLIC_REASONING_PROMPT) if part
+    ).strip()
+# #### END Response 0720 ####
+
 _MANUAL_REACT_ACTIONS = {"t2t_search", "t2i_search", "i2i_search", "read_url", "finish"}
 _MANUAL_REACT_ACTION_RE = re.compile(r"<action>\s*(?P<json>\{.*?\})\s*</action>", re.DOTALL | re.IGNORECASE)
 _I2I_WRAPPER_DEFAULT_MODEL_ALIAS = "multimodal_process"
@@ -172,6 +211,25 @@ def _sft_worker_metadata(
     if extra_body:
         metadata["extra_body"] = extra_body
     return metadata
+
+
+# #### START Response 0720 ####
+def _sft_request_extra_headers() -> dict[str, str]:
+    """Return per-request cache/session headers for direct OpenAI SDK calls."""
+
+    return {
+        "extra": json.dumps(
+            {
+                "session_id": _SFT_FIXED_REQUEST_ID,
+                "prompt_cache_key": _SFT_FIXED_REQUEST_ID,
+                "user_id": _SFT_FIXED_REQUEST_ID,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ),
+        "X-TT-LOGID": _SFT_FIXED_REQUEST_ID,
+    }
+# #### END Response 0720 ####
 
 PROMPT_I2I_REWRITE_ASSISTANT = """
 I will give you an image and a passage containing analysis and tool-call process text for a certain question. This passage is missing context. Your goal is to determine, based only on this single passage, which object in the image the passage is focusing on. Then, summarize that object as a noun phrase (possibly with a descriptive referring expression). Finally, polish the parts of the passage that are related to tool calling so that the logic becomes tighter and more coherent.
@@ -209,6 +267,7 @@ Your output:
 </action></refined>
 """
 
+# #### START Response 0720 ####
 PROMPT_I2I_GROUND_OBJECT = """
 You need to localize a target object in an image for reverse image search.
 Please return one bounding box for the target object using normalized coordinates on a 0-1000 scale:
@@ -218,9 +277,10 @@ If most of the image consists of the target object, or if the target is not a cl
 Please return strict JSON:
 {
 "label": "...",
-"bbox": [x1, y1, x1, y1]
+"bbox": [x1, y1, x2, y2]
 }
 """
+# #### END Response 0720 ####
 _NORMALIZED_COORD_SCALE = 1000.0
 
 
@@ -231,7 +291,12 @@ def _env_flag(name: str, default: bool = False) -> bool:
     return raw_value.strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _prepare_region_for_crop(region: object, image_size: tuple[int, int]) -> object:
+def _prepare_region_for_crop(
+    region: object,
+    image_size: tuple[int, int],
+    *,
+    coordinate_order: str | None = None,
+) -> object:
     """Convert model-style normalized coordinates into absolute crop coordinates."""
 
     if not isinstance(region, (list, tuple)) or len(region) != 4:
@@ -242,8 +307,13 @@ def _prepare_region_for_crop(region: object, image_size: tuple[int, int]) -> obj
     except (TypeError, ValueError):
         return region
 
-    if _env_flag("REVERSE_IMAGE_CROP_COORDS"):
+    # #### START Response 0720 ####
+    effective_order = (coordinate_order or "").strip().lower()
+    if not effective_order:
+        effective_order = "yxyx" if _env_flag("REVERSE_IMAGE_CROP_COORDS") else "xyxy"
+    if effective_order == "yxyx":
         coords = [coords[1], coords[0], coords[3], coords[2]]
+    # #### END Response 0720 ####
 
     image_width, image_height = image_size
     x1 = int(round(coords[0] / _NORMALIZED_COORD_SCALE * image_width))
@@ -426,6 +496,16 @@ class OpenAIToolAgentConfig:
     extra_body: dict[str, Any] | None = None
     max_turns: int = 8
     print_rounds: bool = True
+    # #### START Response 0720 ####
+    responses_reasoning_effort: str | None = None
+    responses_reasoning_summary: str | None = "auto"
+    responses_reasoning_mode: str | None = None
+    responses_reasoning_context: str | None = "all_turns"
+    responses_parallel_tool_calls: bool = False
+    responses_store: bool | None = None
+    responses_prompt_public_reasoning: bool = True
+    responses_i2i_wrapper_enabled: bool = False
+    # #### END Response 0720 ####
 
 
 @dataclass(slots=True)
@@ -1202,11 +1282,18 @@ def _assistant_message_for_followup_from_dict(
     *,
     content: str,
     tool_calls: list[dict[str, Any]],
+    # #### START Response 0720 ####
+    phase: str | None = None,
+    # #### END Response 0720 ####
 ) -> dict[str, Any]:
     assistant_message: dict[str, Any] = {
         "role": "assistant",
         "tool_calls": tool_calls,
     }
+    # #### START Response 0720 ####
+    if phase:
+        assistant_message["phase"] = phase
+    # #### END Response 0720 ####
     if content:
         assistant_message["content"] = content
     return assistant_message
@@ -1379,10 +1466,13 @@ def _messages_to_responses_input(messages: list[dict[str, Any]]) -> list[dict[st
         if role == "tool":
             continue
         items.append(
+            # #### START Response 0720 ####
             {
                 "role": role,
                 "content": _message_content_to_responses_content(message.get("content")),
             }
+            | ({"phase": message.get("phase")} if role == "assistant" and message.get("phase") else {})
+            # #### END Response 0720 ####
         )
     return items
 
@@ -1397,12 +1487,15 @@ def _conversation_messages_to_responses_input(messages: list[dict[str, Any]]) ->
             content = message.get("content")
             has_textual_content = bool(content not in (None, "", []))
             if has_textual_content:
-                items.append(
-                    {
-                        "role": role,
-                        "content": _message_content_to_responses_content(content),
-                    }
-                )
+                    # #### START Response 0720 ####
+                    input_item = {
+                            "role": role,
+                            "content": _message_content_to_responses_content(content),
+                        }
+                    if role == "assistant" and message.get("phase"):
+                        input_item["phase"] = message.get("phase")
+                    items.append(input_item)
+                    # #### END Response 0720 ####
             if role == "assistant":
                 for tool_call in message.get("tool_calls") or []:
                     if not isinstance(tool_call, dict):
@@ -1458,6 +1551,87 @@ def _extract_responses_content_and_tool_calls(raw_response: dict[str, Any]) -> t
             )
 
     return "\n".join(part for part in text_parts if part).strip(), tool_calls
+
+
+# #### START Response 0720 ####
+def _responses_reasoning_summaries(raw_response: dict[str, Any]) -> list[str]:
+    summaries: list[str] = []
+    for item in raw_response.get("output") or []:
+        if not isinstance(item, dict) or item.get("type") != "reasoning":
+            continue
+        for summary_item in item.get("summary") or []:
+            if not isinstance(summary_item, dict):
+                continue
+            text = summary_item.get("text") or summary_item.get("summary_text")
+            if text:
+                summaries.append(str(text).strip())
+    return [item for item in summaries if item]
+
+
+def _responses_turn_trace(
+    *,
+    turn_index: int,
+    raw_response: dict[str, Any],
+    assistant_content: str,
+    assistant_tool_calls: list[dict[str, Any]],
+) -> dict[str, Any]:
+    output_items = raw_response.get("output") or []
+    return {
+        "turn_index": turn_index + 1,
+        "response_id": raw_response.get("id"),
+        "status": raw_response.get("status"),
+        "incomplete_details": raw_response.get("incomplete_details"),
+        "assistant_phase": next(
+            (
+                item.get("phase")
+                for item in output_items
+                if isinstance(item, dict) and item.get("type") == "message" and item.get("phase")
+            ),
+            None,
+        ),
+        "visible_text": assistant_content,
+        "visible_text_chars": len(assistant_content),
+        "visible_rationale_present": bool(assistant_content.strip()) and bool(assistant_tool_calls),
+        "reasoning_summaries": _responses_reasoning_summaries(raw_response),
+        "function_calls": deepcopy(assistant_tool_calls),
+        "output_item_types": [
+            str(item.get("type") or "") for item in output_items if isinstance(item, dict)
+        ],
+    }
+
+
+def _responses_rationale_summary(turn_traces: list[dict[str, Any]]) -> dict[str, Any]:
+    tool_turns = [item for item in turn_traces if item.get("function_calls")]
+    with_visible = [item for item in tool_turns if item.get("visible_rationale_present")]
+    total_chars = sum(int(item.get("visible_text_chars") or 0) for item in with_visible)
+    return {
+        "tool_call_turn_count": len(tool_turns),
+        "tool_call_turns_with_visible_rationale": len(with_visible),
+        "tool_call_turns_without_visible_rationale": len(tool_turns) - len(with_visible),
+        "visible_rationale_coverage": (
+            len(with_visible) / len(tool_turns) if tool_turns else None
+        ),
+        "average_visible_rationale_chars": (
+            total_chars / len(with_visible) if with_visible else 0.0
+        ),
+        "reasoning_summary_turn_count": sum(
+            1 for item in turn_traces if item.get("reasoning_summaries")
+        ),
+    }
+
+
+def _responses_reasoning_payload(config: OpenAIToolAgentConfig) -> dict[str, Any] | None:
+    payload: dict[str, Any] = {}
+    if config.responses_reasoning_effort:
+        payload["effort"] = config.responses_reasoning_effort
+    if config.responses_reasoning_summary:
+        payload["summary"] = config.responses_reasoning_summary
+    if config.responses_reasoning_mode:
+        payload["mode"] = config.responses_reasoning_mode
+    if config.responses_reasoning_context:
+        payload["context"] = config.responses_reasoning_context
+    return payload or None
+# #### END Response 0720 ####
 
 
 def _is_previous_response_not_found_error(exc: Exception) -> bool:
@@ -1538,7 +1712,13 @@ def execute_tool_call(
         new_images: dict[str, Any] = {}
         if region not in (None, ""):
             image = _load_pil_image(image_source, context)
-            region = _prepare_region_for_crop(region, image.size)
+            # #### START Response 0720 ####
+            region = _prepare_region_for_crop(
+                region,
+                image.size,
+                coordinate_order=str((context.metadata or {}).get("bbox_coordinate_order") or ""),
+            )
+            # #### END Response 0720 ####
             bbox, err = _normalize_region_bbox(region)
             if err:
                 output = {"ok": False, "error": err}
@@ -1605,6 +1785,14 @@ class OpenAIToolAgent:
                 )
             self._worker_model_alias = config.model
             return
+
+        # #### START Response 0720 ####
+        if config.api_mode == "responses":
+            # Responses API calls are routed through LLM_WORKER.responses_generate
+            # so model aliases, cache/session headers, retries, and endpoint
+            # configuration stay centralized in synthesis/model_worker.py.
+            return
+        # #### END Response 0720 ####
 
         try:
             from openai import AzureOpenAI, OpenAI
@@ -1862,6 +2050,9 @@ class OpenAIToolAgent:
                 "tools": tools.get_tool_definitions(),
                 "max_tokens": self.config.max_tokens,
                 "stream": False,
+                # #### START Response 0720 ####
+                "extra_headers": _sft_request_extra_headers(),
+                # #### END Response 0720 ####
             }
             if self.config.temperature is not None:
                 kwargs["temperature"] = self.config.temperature
@@ -1981,26 +2172,48 @@ class OpenAIToolAgent:
         final_text = ""
         generation_status = "unknown"
         stop_reason = "unknown"
-        current_input = _messages_to_responses_input(conversation_messages)
+        # #### START Response 0720 ####
+        responses_turn_traces: list[dict[str, Any]] = []
+        base_system_prompt = system_prompt or self.config.system_prompt
+        responses_instructions = (
+            _build_responses_instructions(base_system_prompt)
+            if self.config.responses_prompt_public_reasoning
+            else base_system_prompt
+        )
+        # Responses receives system behavior through instructions. Remove the
+        # system message from input to avoid duplicating the base prompt.
+        response_input_messages = [
+            message for message in conversation_messages if message.get("role") != "system"
+        ]
+        # #### END Response 0720 ####
+        current_input = _messages_to_responses_input(response_input_messages)
         previous_response_id: str | None = None
         use_previous_response_id = True
 
         for turn_index in range(self.config.max_turns):
-            kwargs: dict[str, Any] = {
-                "model": self.config.model,
-                "input": current_input,
-                "tools": tools.get_responses_tool_definitions(),
-            }
-            if self.config.max_tokens is not None:
-                kwargs["max_output_tokens"] = self.config.max_tokens
-            if self.config.extra_body:
-                kwargs["extra_body"] = self.config.extra_body
-            if previous_response_id and use_previous_response_id:
-                kwargs["previous_response_id"] = previous_response_id
+            reasoning_payload = _responses_reasoning_payload(self.config)
+            previous_id_for_request = previous_response_id if use_previous_response_id else None
 
             try:
-                response = self.client.responses.create(**kwargs)
-                raw_response = response.model_dump() if hasattr(response, "model_dump") else {"repr": repr(response)}
+                worker_response = LLM_WORKER.responses_generate(
+                    ResponsesModelRequest(
+                        model=self.config.model,
+                        input=current_input,
+                        tools=tools.get_responses_tool_definitions(),
+                        instructions=responses_instructions,
+                        previous_response_id=previous_id_for_request,
+                        max_output_tokens=self.config.max_tokens,
+                        reasoning=reasoning_payload,
+                        parallel_tool_calls=self.config.responses_parallel_tool_calls,
+                        store=self.config.responses_store,
+                        temperature=self.config.temperature,
+                        metadata=_sft_worker_metadata(
+                            f"responses_turn_{turn_index + 1}",
+                            extra_body=self.config.extra_body,
+                        ),
+                    )
+                )
+                raw_response = worker_response.raw_response
             except Exception as exc:
                 if previous_response_id and use_previous_response_id and _is_previous_response_not_found_error(exc):
                     logger.warning(
@@ -2008,20 +2221,45 @@ class OpenAIToolAgent:
                         "falling back to full-context replay."
                     )
                     use_previous_response_id = False
-                    kwargs.pop("previous_response_id", None)
-                    kwargs["input"] = _conversation_messages_to_responses_input(conversation_messages)
-                    response = self.client.responses.create(**kwargs)
-                    raw_response = response.model_dump() if hasattr(response, "model_dump") else {"repr": repr(response)}
+                    current_input = _conversation_messages_to_responses_input(conversation_messages)
+                    worker_response = LLM_WORKER.responses_generate(
+                        ResponsesModelRequest(
+                            model=self.config.model,
+                            input=current_input,
+                            tools=tools.get_responses_tool_definitions(),
+                            instructions=responses_instructions,
+                            max_output_tokens=self.config.max_tokens,
+                            reasoning=reasoning_payload,
+                            parallel_tool_calls=self.config.responses_parallel_tool_calls,
+                            store=self.config.responses_store,
+                            temperature=self.config.temperature,
+                            metadata=_sft_worker_metadata(
+                                f"responses_turn_{turn_index + 1}:full_replay",
+                                extra_body=self.config.extra_body,
+                            ),
+                        )
+                    )
+                    raw_response = worker_response.raw_response
                 else:
                     raise
             raw_responses.append(raw_response)
             if use_previous_response_id:
-                previous_response_id = raw_response.get("id") or getattr(response, "id", None)
+                previous_response_id = raw_response.get("id")
             else:
                 previous_response_id = None
 
             assistant_content, assistant_tool_calls = _extract_responses_content_and_tool_calls(raw_response)
             assistant_tool_calls = _truncate_tool_calls(assistant_tool_calls, source="responses")
+            # #### START Response 0720 ####
+            responses_turn_traces.append(
+                _responses_turn_trace(
+                    turn_index=turn_index,
+                    raw_response=raw_response,
+                    assistant_content=assistant_content,
+                    assistant_tool_calls=assistant_tool_calls,
+                )
+            )
+            # #### END Response 0720 ####
             if self.config.print_rounds:
                 _print_round_output_from_responses(
                     turn_index,
@@ -2031,7 +2269,9 @@ class OpenAIToolAgent:
 
             if not assistant_tool_calls:
                 final_text = assistant_content
-                conversation_messages.append({"role": "assistant", "content": final_text})
+                # #### START Response 0720 ####
+                conversation_messages.append({"role": "assistant", "content": final_text, "phase": "final_answer"})
+                # #### END Response 0720 ####
                 generation_status = "finished"
                 stop_reason = "no_tool_calls"
                 break
@@ -2043,7 +2283,11 @@ class OpenAIToolAgent:
                 parsed_args = json.loads(tool_call["function"]["arguments"] or "{}")
                 display_args = parsed_args
                 execution_args = parsed_args
-                if tool_call["function"]["name"] == "i2i_search":
+                if (
+                    tool_call["function"]["name"] == "i2i_search"
+                    and self.config.responses_i2i_wrapper_enabled
+                ):
+                    # #### START Response 0720 ####
                     repaired = _maybe_repair_i2i_tool_call(
                         assistant_text=assistant_content,
                         tool_name=tool_call["function"]["name"],
@@ -2055,6 +2299,7 @@ class OpenAIToolAgent:
                         assistant_content = repaired.assistant_text
                         display_args = repaired.display_arguments
                         execution_args = repaired.execution_arguments
+                    # #### END Response 0720 ####
                 followup_tool_calls.append(
                     {
                         "id": tool_call["id"],
@@ -2070,6 +2315,9 @@ class OpenAIToolAgent:
                 _assistant_message_for_followup_from_dict(
                     content=assistant_content,
                     tool_calls=followup_tool_calls,
+                    # #### START Response 0720 ####
+                    phase="commentary",
+                    # #### END Response 0720 ####
                 )
             )
             for tool_name, execution_args, tool_call_id in execution_payloads:
@@ -2117,6 +2365,13 @@ class OpenAIToolAgent:
                 "max_turns": self.config.max_turns,
                 "turn_count": len(raw_responses),
                 "tool_call_count": len(tool_results),
+                # #### START Response 0720 ####
+                "responses_public_reasoning_prompted": self.config.responses_prompt_public_reasoning,
+                "responses_i2i_wrapper_enabled": self.config.responses_i2i_wrapper_enabled,
+                "responses_turn_traces": responses_turn_traces,
+                "responses_rationale_summary": _responses_rationale_summary(responses_turn_traces),
+                "responses_raw_response_count": len(raw_responses),
+                # #### END Response 0720 ####
             },
         )
 
@@ -2162,8 +2417,29 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--prompt", help="Simple user prompt sent to the model.")
     parser.add_argument("--messages-json", help="Full messages list as a JSON array.")
     parser.add_argument("--messages-file", help="Path to a JSON file containing a full messages list.")
-    parser.add_argument("--model", default=os.environ.get("SFT_OPENAI_MODEL") or os.environ.get("OPENAI_MODEL") or "")
+    # #### START Response 0720 ####
+    parser.add_argument(
+        "--model-alias",
+        "--model",
+        dest="model_alias",
+        default=os.environ.get("SFT_OPENAI_MODEL") or os.environ.get("OPENAI_MODEL") or "",
+        help="Registered synthesis/models.json alias for the answer model.",
+    )
+    # #### END Response 0720 ####
     parser.add_argument("--api-key", default=os.environ.get("OPENAI_API_KEY"))
+    # #### START Response 0720 ####
+    parser.add_argument(
+        "--client-type",
+        choices=("azure_openai", "openai"),
+        default=os.environ.get("SFT_OPENAI_CLIENT_TYPE") or "azure_openai",
+        help="OpenAI SDK client type. Use openai for standard/base_url Responses endpoints.",
+    )
+    parser.add_argument(
+        "--base-url",
+        default=os.environ.get("SFT_OPENAI_BASE_URL") or os.environ.get("OPENAI_BASE_URL"),
+        help="Optional base URL for --client-type openai.",
+    )
+    # #### END Response 0720 ####
     parser.add_argument(
         "--api-mode",
         choices=("manual_react", "chat_completions", "responses"),
@@ -2192,6 +2468,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--system-prompt", default=DEFAULT_SYSTEM_PROMPT)
     parser.add_argument("--headers-json", default=os.environ.get("SFT_OPENAI_HEADERS_JSON"))
     parser.add_argument("--extra-body-json", default=os.environ.get("SFT_OPENAI_EXTRA_BODY_JSON"))
+    # #### START Response 0720 ####
+    parser.add_argument("--responses-reasoning-effort", default=os.environ.get("SFT_RESPONSES_REASONING_EFFORT"))
+    parser.add_argument("--responses-reasoning-summary", default=os.environ.get("SFT_RESPONSES_REASONING_SUMMARY", "auto"))
+    parser.add_argument("--responses-reasoning-mode", default=os.environ.get("SFT_RESPONSES_REASONING_MODE"))
+    parser.add_argument("--responses-reasoning-context", default=os.environ.get("SFT_RESPONSES_REASONING_CONTEXT", "all_turns"))
+    parser.add_argument("--responses-store", choices=("true", "false"), default=os.environ.get("SFT_RESPONSES_STORE"))
+    parser.add_argument("--no-responses-public-reasoning", action="store_true", help="Do not append the Responses public-reasoning prompt.")
+    parser.add_argument("--responses-parallel-tool-calls", action="store_true", help="Allow parallel Responses tool calls. Defaults to false.")
+    parser.add_argument("--responses-i2i-wrapper", action="store_true", help="Enable the legacy i2i wrapper rewrite in Responses mode.")
+    # #### END Response 0720 ####
     parser.add_argument("--workdir", default=os.path.join(os.getcwd(), "synthesis_sft_runs"))
     parser.add_argument("--filename-prefix", default="sft")
     parser.add_argument("--case-id", default="sft_session")
@@ -2216,8 +2502,8 @@ def main(argv: list[str] | None = None) -> int:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
-    if not args.model:
-        parser.error("--model is required (or set SFT_OPENAI_MODEL / OPENAI_MODEL).")
+    if not args.model_alias:
+        parser.error("--model-alias is required (or set SFT_OPENAI_MODEL / OPENAI_MODEL).")
     if not any([args.prompt, args.messages_json, args.messages_file]):
         parser.error("One of --prompt, --messages-json, or --messages-file is required.")
     if sum(1 for item in [args.prompt, args.messages_json, args.messages_file] if item) > 1:
@@ -2227,20 +2513,32 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.gpt54:
         args.api_mode = "manual_react"
-        args.model = os.environ.get("SFT_GPT54_MODEL") or "gpt-5.4-2026-03-05"
+        # #### START Response 0720 ####
+        args.client_type = os.environ.get("SFT_GPT54_CLIENT_TYPE") or args.client_type
+        args.base_url = os.environ.get("SFT_GPT54_BASE_URL") or args.base_url
+        # #### END Response 0720 ####
+        args.model_alias = os.environ.get("SFT_GPT54_MODEL") or "gpt-5.4-2026-03-05"
         args.api_key = os.environ.get("SFT_GPT54_API_KEY") or args.api_key
         args.azure_endpoint = os.environ.get("SFT_GPT54_AZURE_ENDPOINT") or args.azure_endpoint
         args.api_version = os.environ.get("SFT_GPT54_API_VERSION") or args.api_version
     elif args.gemini35_flash:
         args.api_mode = "manual_react"
-        args.model = os.environ.get("SFT_GEMINI35_FLASH_MODEL") or "gemini-3.5-flash"
+        # #### START Response 0720 ####
+        args.client_type = os.environ.get("SFT_GEMINI35_FLASH_CLIENT_TYPE") or args.client_type
+        args.base_url = os.environ.get("SFT_GEMINI35_FLASH_BASE_URL") or args.base_url
+        # #### END Response 0720 ####
+        args.model_alias = os.environ.get("SFT_GEMINI35_FLASH_MODEL") or "gemini-3.5-flash"
         args.api_key = os.environ.get("SFT_GEMINI35_FLASH_API_KEY") or args.api_key
         args.azure_endpoint = os.environ.get("SFT_GEMINI35_FLASH_AZURE_ENDPOINT") or args.azure_endpoint
         args.api_version = os.environ.get("SFT_GEMINI35_FLASH_API_VERSION") or args.api_version
 
     config = OpenAIToolAgentConfig(
-        model=args.model,
+        model=args.model_alias,
         api_key=args.api_key,
+        # #### START Response 0720 ####
+        client_type=args.client_type,
+        base_url=args.base_url,
+        # #### END Response 0720 ####
         azure_endpoint=args.azure_endpoint,
         api_version=args.api_version,
         api_mode=args.api_mode,
@@ -2251,6 +2549,16 @@ def main(argv: list[str] | None = None) -> int:
         default_headers=_parse_json_flag(args.headers_json),
         extra_body=_parse_json_flag(args.extra_body_json),
         max_turns=args.max_turns,
+        # #### START Response 0720 ####
+        responses_reasoning_effort=args.responses_reasoning_effort,
+        responses_reasoning_summary=args.responses_reasoning_summary,
+        responses_reasoning_mode=args.responses_reasoning_mode,
+        responses_reasoning_context=args.responses_reasoning_context,
+        responses_store=(None if args.responses_store is None else args.responses_store == "true"),
+        responses_prompt_public_reasoning=not args.no_responses_public_reasoning,
+        responses_parallel_tool_calls=args.responses_parallel_tool_calls,
+        responses_i2i_wrapper_enabled=args.responses_i2i_wrapper,
+        # #### END Response 0720 ####
     )
     context = _build_context_from_args(args)
     agent = OpenAIToolAgent(config)

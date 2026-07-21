@@ -20,7 +20,9 @@ import time
 from typing import Any, Protocol
 
 
-VALID_REASONING_EFFORTS = {"low", "medium", "high", "xhigh"}
+# #### START Response 0720 ####
+VALID_REASONING_EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh", "max"}
+# #### END Response 0720 ####
 FIXED_TT_LOGID = "3200636808"
 
 
@@ -66,6 +68,42 @@ class ModelResponse:
 
     def to_dict(self) -> dict[str, Any]:
         return _jsonify(asdict(self))
+
+
+# #### START Response 0720 ####
+@dataclass(slots=True)
+class ResponsesModelRequest:
+    input: list[dict[str, Any]]
+    tools: list[dict[str, Any]] = field(default_factory=list)
+    model: str | None = None
+    instructions: str | None = None
+    previous_response_id: str | None = None
+    max_output_tokens: int | None = None
+    reasoning: dict[str, Any] | None = None
+    parallel_tool_calls: bool | None = None
+    store: bool | None = None
+    temperature: float | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return _jsonify(asdict(self))
+
+
+@dataclass(slots=True)
+class ResponsesModelResponse:
+    raw_response: dict[str, Any]
+    content: str = ""
+    function_calls: list[dict[str, Any]] = field(default_factory=list)
+    reasoning_summaries: list[str] = field(default_factory=list)
+    response_id: str | None = None
+    status: str | None = None
+    model: str | None = None
+    usage: dict[str, Any] | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return _jsonify(asdict(self))
+# #### END Response 0720 ####
 
 
 class ModelWorkerClient(Protocol):
@@ -126,6 +164,23 @@ def _usage_int(value: Any) -> int:
         return 0
 
 
+# #### START Response 0720 ####
+def _coerce_optional_bool(value: Any) -> bool | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if not text:
+        return None
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"0", "false", "no", "off"}:
+        return False
+    return bool(value)
+# #### END Response 0720 ####
+
+
 def _normalize_extra_body(extra_body: Any) -> dict[str, Any] | None:
     if not isinstance(extra_body, dict):
         base: dict[str, Any] = {}
@@ -153,6 +208,107 @@ def _request_extra_headers(metadata: dict[str, Any] | None) -> dict[str, str] | 
     if logid_text:
         headers["X-TT-LOGID"] = logid_text
     return headers or None
+
+
+# #### START Response 0720 ####
+def _extract_responses_content_and_function_calls(raw_response: dict[str, Any]) -> tuple[str, list[dict[str, Any]]]:
+    text_parts: list[str] = []
+    function_calls: list[dict[str, Any]] = []
+    for item in raw_response.get("output") or []:
+        if not isinstance(item, dict):
+            continue
+        item_type = item.get("type")
+        if item_type == "message":
+            for content_item in item.get("content") or []:
+                if not isinstance(content_item, dict):
+                    continue
+                if content_item.get("type") in {"output_text", "text"}:
+                    text = content_item.get("text")
+                    if text:
+                        text_parts.append(str(text))
+        elif item_type == "function_call":
+            call_id = item.get("call_id") or item.get("id") or ""
+            function_calls.append(
+                {
+                    "id": call_id,
+                    "type": "function",
+                    "function": {
+                        "name": item.get("name", ""),
+                        "arguments": item.get("arguments", "{}"),
+                    },
+                }
+            )
+    return "\n".join(part for part in text_parts if part).strip(), function_calls
+
+
+def _extract_responses_reasoning_summaries(raw_response: dict[str, Any]) -> list[str]:
+    summaries: list[str] = []
+    for item in raw_response.get("output") or []:
+        if not isinstance(item, dict) or item.get("type") != "reasoning":
+            continue
+        for summary_item in item.get("summary") or []:
+            if not isinstance(summary_item, dict):
+                continue
+            text = summary_item.get("text") or summary_item.get("summary_text")
+            if text:
+                summaries.append(str(text).strip())
+    return [item for item in summaries if item]
+
+
+def _responses_create_kwargs(request: ResponsesModelRequest, *, default_model: str) -> dict[str, Any]:
+    kwargs: dict[str, Any] = {
+        "model": request.model or default_model,
+        "input": request.input,
+    }
+    if request.tools:
+        kwargs["tools"] = request.tools
+    if request.instructions:
+        kwargs["instructions"] = request.instructions
+    if request.previous_response_id:
+        kwargs["previous_response_id"] = request.previous_response_id
+    if request.max_output_tokens is not None:
+        kwargs["max_output_tokens"] = request.max_output_tokens
+    if request.reasoning:
+        kwargs["reasoning"] = request.reasoning
+    if request.parallel_tool_calls is not None:
+        kwargs["parallel_tool_calls"] = request.parallel_tool_calls
+    if request.store is not None:
+        kwargs["store"] = request.store
+    if request.temperature is not None:
+        kwargs["temperature"] = request.temperature
+    extra_body = _normalize_extra_body(request.metadata.get("extra_body"))
+    if isinstance(extra_body, dict) and extra_body:
+        kwargs["extra_body"] = extra_body
+    extra_headers = _request_extra_headers(request.metadata)
+    if extra_headers:
+        kwargs["extra_headers"] = extra_headers
+    return kwargs
+
+
+def _responses_model_response_from_raw(
+    raw_response: dict[str, Any],
+    *,
+    default_model: str,
+    base_url: str | None,
+    api_version: str | None = None,
+) -> ResponsesModelResponse:
+    content, function_calls = _extract_responses_content_and_function_calls(raw_response)
+    usage = raw_response.get("usage") if isinstance(raw_response, dict) else None
+    metadata = {"base_url": base_url}
+    if api_version:
+        metadata["api_version"] = api_version
+    return ResponsesModelResponse(
+        raw_response=raw_response,
+        content=content,
+        function_calls=function_calls,
+        reasoning_summaries=_extract_responses_reasoning_summaries(raw_response),
+        response_id=raw_response.get("id"),
+        status=raw_response.get("status"),
+        model=raw_response.get("model") or default_model,
+        usage=usage,
+        metadata=metadata,
+    )
+# #### END Response 0720 ####
 
 
 def _get_usage_value(payload: Any, *path: str) -> Any:
@@ -276,6 +432,34 @@ class OpenAIModelWorkerClient:
             raise ValueError("Model JSON response must be an object.")
         return parsed
 
+    # #### START Response 0720 ####
+    def responses_generate(self, request: ResponsesModelRequest) -> ResponsesModelResponse:
+        label = str(request.metadata.get("trace_label") or request.model or self.model)
+        _trace_model_call(
+            phase="start",
+            label=label,
+            model=request.model or self.model,
+            base_url=self.base_url,
+            message_count=len(request.input),
+            max_tokens=request.max_output_tokens,
+        )
+        started_at = time.perf_counter()
+        kwargs = _responses_create_kwargs(request, default_model=self.model)
+        response = self.client.responses.create(**kwargs)
+        elapsed_s = time.perf_counter() - started_at
+        raw_response = response.model_dump() if hasattr(response, "model_dump") else {"repr": repr(response)}
+        _trace_model_call(
+            phase="done",
+            label=label,
+            model=raw_response.get("model") or kwargs["model"],
+            base_url=self.base_url,
+            elapsed_s=elapsed_s,
+            message_count=len(request.input),
+            max_tokens=request.max_output_tokens,
+        )
+        return _responses_model_response_from_raw(raw_response, default_model=kwargs["model"], base_url=self.base_url)
+    # #### END Response 0720 ####
+
 
 class AzureOpenAIModelWorkerClient:
     """Azure OpenAI-compatible model worker.
@@ -395,6 +579,41 @@ class AzureOpenAIModelWorkerClient:
                 "api_version": self.api_version,
             },
         )
+
+    # #### START Response 0720 ####
+    def responses_generate(self, request: ResponsesModelRequest) -> ResponsesModelResponse:
+        label = str(request.metadata.get("trace_label") or request.model or self.model)
+        _trace_model_call(
+            phase="start",
+            label=label,
+            model=request.model or self.model,
+            base_url=self.azure_endpoint,
+            message_count=len(request.input),
+            max_tokens=request.max_output_tokens,
+        )
+        started_at = time.perf_counter()
+        if self.generate_tt_logid:
+            self.client = self._build_client()
+        kwargs = _responses_create_kwargs(request, default_model=self.model)
+        response = self.client.responses.create(**kwargs)
+        elapsed_s = time.perf_counter() - started_at
+        raw_response = response.model_dump() if hasattr(response, "model_dump") else {"repr": repr(response)}
+        _trace_model_call(
+            phase="done",
+            label=label,
+            model=raw_response.get("model") or kwargs["model"],
+            base_url=self.azure_endpoint,
+            elapsed_s=elapsed_s,
+            message_count=len(request.input),
+            max_tokens=request.max_output_tokens,
+        )
+        return _responses_model_response_from_raw(
+            raw_response,
+            default_model=kwargs["model"],
+            base_url=self.azure_endpoint,
+            api_version=self.api_version,
+        )
+    # #### END Response 0720 ####
 
 
 class ModelRouterWorkerClient:
@@ -572,6 +791,87 @@ class ModelRouterWorkerClient:
             raise ValueError("Model JSON response must be an object.")
         return parsed
 
+    # #### START Response 0720 ####
+    def responses_generate(self, request: ResponsesModelRequest) -> ResponsesModelResponse:
+        alias = request.model
+        if not alias:
+            if len(self._configs) == 1:
+                alias = next(iter(self._configs))
+            else:
+                raise ValueError("ResponsesModelRequest.model must be a registered alias.")
+
+        config = self._configs.get(alias)
+        if config is None:
+            raise KeyError(f"Model alias is not registered: {alias}")
+
+        client = self._client_for(alias, config)
+        sampling_params = dict(config.get("sampling_params") or {})
+        extra_body = dict(request.metadata.get("extra_body") or {})
+
+        routed_reasoning = dict(sampling_params.pop("reasoning", {}) or {})
+        if request.reasoning:
+            routed_reasoning.update(request.reasoning)
+        reasoning_effort = sampling_params.pop("reasoning_effort", None)
+        if reasoning_effort is not None and "effort" not in routed_reasoning:
+            routed_reasoning["effort"] = _normalize_reasoning_effort(reasoning_effort)
+
+        routed_max_output_tokens = request.max_output_tokens
+        if routed_max_output_tokens is None:
+            for key in ("max_output_tokens", "out_seq_length", "max_tokens"):
+                value = sampling_params.pop(key, None)
+                if value is not None:
+                    routed_max_output_tokens = int(value)
+                    break
+
+        routed_temperature = sampling_params.pop("temperature", request.temperature)
+        routed_parallel_tool_calls = request.parallel_tool_calls
+        if routed_parallel_tool_calls is None and "parallel_tool_calls" in sampling_params:
+            # #### START Response 0720 ####
+            routed_parallel_tool_calls = _coerce_optional_bool(sampling_params.pop("parallel_tool_calls"))
+            # #### END Response 0720 ####
+        routed_store = request.store
+        if routed_store is None and "store" in sampling_params:
+            # #### START Response 0720 ####
+            routed_store = _coerce_optional_bool(sampling_params.pop("store"))
+            # #### END Response 0720 ####
+
+        extra_body = {**sampling_params, **extra_body} if sampling_params or extra_body else {}
+        routed_metadata = dict(request.metadata or {})
+        if extra_body:
+            routed_metadata["extra_body"] = extra_body
+
+        routed_request = ResponsesModelRequest(
+            model=config["served_model"],
+            input=request.input,
+            tools=request.tools,
+            instructions=request.instructions,
+            previous_response_id=request.previous_response_id,
+            max_output_tokens=routed_max_output_tokens,
+            reasoning=routed_reasoning or None,
+            parallel_tool_calls=routed_parallel_tool_calls,
+            store=routed_store,
+            temperature=routed_temperature,
+            metadata=routed_metadata,
+        )
+        response = self._responses_generate_with_retry(
+            alias=alias,
+            config=config,
+            client=client,
+            request=routed_request,
+        )
+        response.metadata.update(
+            {
+                "model_alias": alias,
+                "served_model": config["served_model"],
+                "base_url": config.get("base_url") or config.get("azure_endpoint"),
+                "sampling_params": config.get("sampling_params"),
+                "qpm": config.get("qpm"),
+            }
+        )
+        self._update_and_print_token_totals(alias=alias, response=response)
+        return response
+    # #### END Response 0720 ####
+
     def _client_for(self, alias: str, config: dict[str, Any]) -> Any:
         client = self._clients.get(alias)
         if client is None:
@@ -632,6 +932,43 @@ class ModelRouterWorkerClient:
             raise RuntimeError(f"Model request failed without a captured exception for alias={alias!r}")
         raise last_error
 
+    # #### START Response 0720 ####
+    def _responses_generate_with_retry(
+        self,
+        *,
+        alias: str,
+        config: dict[str, Any],
+        client: Any,
+        request: ResponsesModelRequest,
+    ) -> ResponsesModelResponse:
+        served_model = str(config.get("served_model") or request.model or alias)
+        last_error: Exception | None = None
+        for attempt_index in range(2):
+            self._wait_for_qpm_slot(alias=alias, config=config, served_model=served_model)
+            try:
+                return client.responses_generate(request)
+            except Exception as exc:
+                last_error = exc
+                if attempt_index >= 1:
+                    break
+                print(
+                    "[llm-retry]"
+                    f" alias={alias}"
+                    f" served_model={served_model}"
+                    f" api_mode=responses"
+                    f" attempt={attempt_index + 1}"
+                    f" error_type={exc.__class__.__name__}"
+                    f" error={str(exc)!r}"
+                    " sleep_seconds=30",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                time.sleep(30)
+        if last_error is None:
+            raise RuntimeError(f"Responses request failed without a captured exception for alias={alias!r}")
+        raise last_error
+    # #### END Response 0720 ####
+
     def _wait_for_qpm_slot(self, *, alias: str, config: dict[str, Any], served_model: str) -> None:
         qpm = config.get("qpm")
         if qpm is None:
@@ -662,13 +999,19 @@ class ModelRouterWorkerClient:
 
     def _update_and_print_token_totals(self, *, alias: str, response: ModelResponse) -> None:
         usage = dict(response.usage or {})
-        prompt_tokens = _usage_int(usage.get("prompt_tokens"))
-        completion_tokens = _usage_int(usage.get("completion_tokens"))
+        # #### START Response 0720 ####
+        prompt_tokens = _usage_int(usage.get("prompt_tokens") or usage.get("input_tokens"))
+        completion_tokens = _usage_int(usage.get("completion_tokens") or usage.get("output_tokens"))
         total_tokens = _usage_int(usage.get("total_tokens"))
-        reasoning_tokens = _usage_int(_get_usage_value({"usage": usage}, "usage", "reasoning_tokens"))
+        reasoning_tokens = _usage_int(
+            _get_usage_value({"usage": usage}, "usage", "reasoning_tokens")
+            or _get_usage_value({"usage": usage}, "usage", "output_tokens_details", "reasoning_tokens")
+        )
         cached_tokens = _usage_int(
             _get_usage_value({"usage": usage}, "usage", "prompt_tokens_details", "cached_tokens")
+            or _get_usage_value({"usage": usage}, "usage", "input_tokens_details", "cached_tokens")
         )
+        # #### END Response 0720 ####
         if total_tokens <= 0:
             total_tokens = prompt_tokens + completion_tokens
         with self._token_totals_lock:

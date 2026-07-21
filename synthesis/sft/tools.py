@@ -324,8 +324,13 @@ def get_tool_definitions() -> list[dict[str, Any]]:
                         "region": {
                             "type": "array",
                             "description": (
-                                "Optional bounding box on the current image to crop before search. The relative coordinates between 0~1000 of the region containing an unfamiliar/task-related person, logo, object, or other entity are recommended. If this parameter is not provided, the entire image will be searched."
-                                "Preferred format: [x1, y1, x2, y2]."
+                                # #### START Response 0720 ####
+                                "Optional x-first bounding box on the current image to crop before search. "
+                                "Use normalized coordinates from 0 to 1000 in exactly this order: "
+                                "[x1, y1, x2, y2], where x increases left-to-right and y increases top-to-bottom. "
+                                "Use [0, 0, 1000, 1000] for the full image. If this parameter is omitted, "
+                                "the entire image will be searched."
+                                # #### END Response 0720 ####
                             ),
                             "items": {"type": "number"},
                             "minItems": 4,
@@ -371,6 +376,7 @@ def get_tool_definitions() -> list[dict[str, Any]]:
 def get_responses_tool_definitions() -> list[dict[str, Any]]:
     """Return Responses-API-compatible function tool definitions."""
 
+    # #### START Response 0720 ####
     definitions: list[dict[str, Any]] = []
     for item in get_tool_definitions():
         function_block = dict(item["function"])
@@ -378,10 +384,15 @@ def get_responses_tool_definitions() -> list[dict[str, Any]]:
             {
                 "type": "function",
                 "name": function_block["name"],
-                "function": function_block,
+                "description": function_block.get("description", ""),
+                "parameters": function_block.get("parameters") or {"type": "object", "properties": {}},
+                # Keep best-effort mode for now because several existing schemas
+                # contain optional properties and are not strict-mode compatible.
+                "strict": False,
             }
         )
     return definitions
+    # #### END Response 0720 ####
 
 
 def get_tool_definitions_json() -> str:

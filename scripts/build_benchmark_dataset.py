@@ -681,8 +681,16 @@ def _build_browsecomp_v3_row(record: dict[str, Any], adapter: BenchmarkAdapter) 
     row["category"] = str(record.get("category") or row.get("category") or "unknown")
     row["sub_category"] = record.get("sub_category")
     row["images"] = _browsecomp_v3_images(record)
-    row["metadata"] = _maybe_parse_json_string(record.get("metadata"))
-    row["sub_goals"] = _maybe_parse_json_string(record.get("sub_goals"))
+    # Keep nested benchmark annotations as JSON strings so pyarrow does not
+    # have to infer mixed list/dict scalar types across rows.
+    row["metadata"] = json.dumps(
+        _json_safe(_maybe_parse_json_string(record.get("metadata"))),
+        ensure_ascii=False,
+    )
+    row["sub_goals"] = json.dumps(
+        _json_safe(_maybe_parse_json_string(record.get("sub_goals"))),
+        ensure_ascii=False,
+    )
     row["source_metadata"] = json.dumps(_json_safe(record), ensure_ascii=False)
     return row
 

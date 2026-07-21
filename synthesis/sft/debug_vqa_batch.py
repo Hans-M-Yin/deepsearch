@@ -316,7 +316,7 @@ def _summarize_generation(
     if not str(extracted_answer or "").strip():
         failure_reasons.append("empty_extracted_answer")
 
-    return {
+    summary = {
         "generation_status": status,
         "generation_complete": complete,
         "stop_reason": stop_reason,
@@ -331,6 +331,18 @@ def _summarize_generation(
         "tool_error_counts": dict(sorted(tool_error_counts.items())),
         "tool_error_reasons": dict(sorted(tool_error_reasons.items())),
     }
+    # #### START Response 0720 ####
+    for key in (
+        "responses_public_reasoning_prompted",
+        "responses_i2i_wrapper_enabled",
+        "responses_rationale_summary",
+        "responses_turn_traces",
+        "responses_raw_response_count",
+    ):
+        if key in metadata:
+            summary[key] = metadata[key]
+    # #### END Response 0720 ####
+    return summary
 
 
 def _merge_generation_stats(stats: dict[str, Counter[str]], generation_summary: dict[str, Any]) -> None:
@@ -539,11 +551,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--verbose", action="store_true")
 
+    # #### START Response 0720 ####
     parser.add_argument(
+        "--model-alias",
         "--model",
+        dest="model_alias",
         default=os.environ.get("SFT_OPENAI_MODEL") or os.environ.get("OPENAI_MODEL") or "",
-        help="Primary answer model. Prefer a registered alias from synthesis/models.json.",
+        help="Primary answer model alias from synthesis/models.json.",
     )
+    # #### END Response 0720 ####
     parser.add_argument("--api-key", default=os.environ.get("OPENAI_API_KEY"))
     parser.add_argument(
         "--api-mode",
@@ -551,6 +567,27 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=os.environ.get("SFT_OPENAI_API_MODE") or "manual_react",
         help="Primary trajectory collection mode. Defaults to manual_react.",
     )
+    # #### START Response 0720 ####
+    parser.add_argument(
+        "--client-type",
+        choices=("azure_openai", "openai"),
+        default=os.environ.get("SFT_OPENAI_CLIENT_TYPE") or "azure_openai",
+        help="OpenAI SDK client type. Use openai for standard/base_url Responses endpoints.",
+    )
+    parser.add_argument(
+        "--base-url",
+        default=os.environ.get("SFT_OPENAI_BASE_URL") or os.environ.get("OPENAI_BASE_URL"),
+        help="Optional base URL for --client-type openai.",
+    )
+    parser.add_argument("--responses-reasoning-effort", default=os.environ.get("SFT_RESPONSES_REASONING_EFFORT"))
+    parser.add_argument("--responses-reasoning-summary", default=os.environ.get("SFT_RESPONSES_REASONING_SUMMARY", "auto"))
+    parser.add_argument("--responses-reasoning-mode", default=os.environ.get("SFT_RESPONSES_REASONING_MODE"))
+    parser.add_argument("--responses-reasoning-context", default=os.environ.get("SFT_RESPONSES_REASONING_CONTEXT", "all_turns"))
+    parser.add_argument("--responses-store", choices=("true", "false"), default=os.environ.get("SFT_RESPONSES_STORE"))
+    parser.add_argument("--no-responses-public-reasoning", action="store_true", help="Do not append the Responses public-reasoning prompt.")
+    parser.add_argument("--responses-parallel-tool-calls", action="store_true", help="Allow parallel Responses tool calls. Defaults to false.")
+    parser.add_argument("--responses-i2i-wrapper", action="store_true", help="Enable the legacy i2i wrapper rewrite in Responses mode.")
+    # #### END Response 0720 ####
     parser.add_argument(
         "--azure-endpoint",
         default=(
@@ -601,8 +638,10 @@ def _config_from_model_arg(
     *,
     model_arg: str | None,
     api_key: str | None,
+    client_type: str,
     api_mode: str,
     azure_endpoint: str | None,
+    base_url: str | None,
     api_version: str | None,
     max_tokens: int | None,
     temperature: float | None,
@@ -612,12 +651,23 @@ def _config_from_model_arg(
     extra_body_json: str | None,
     max_turns: int,
     print_rounds: bool,
+    # #### START Response 0720 ####
+    responses_reasoning_effort: str | None = None,
+    responses_reasoning_summary: str | None = None,
+    responses_reasoning_mode: str | None = None,
+    responses_reasoning_context: str | None = None,
+    responses_store: str | None = None,
+    responses_prompt_public_reasoning: bool = True,
+    responses_parallel_tool_calls: bool = False,
+    responses_i2i_wrapper_enabled: bool = False,
+    # #### END Response 0720 ####
 ) -> Any:
     return build_agent_config(
         model=model_arg,
         api_key=api_key,
-        client_type="azure_openai",
+        client_type=client_type,
         azure_endpoint=azure_endpoint,
+        base_url=base_url,
         api_version=api_version,
         api_mode=api_mode,
         max_tokens=max_tokens,
@@ -628,6 +678,16 @@ def _config_from_model_arg(
         extra_body=_parse_json_flag(extra_body_json),
         max_turns=max_turns,
         print_rounds=print_rounds,
+        # #### START Response 0720 ####
+        responses_reasoning_effort=responses_reasoning_effort,
+        responses_reasoning_summary=responses_reasoning_summary,
+        responses_reasoning_mode=responses_reasoning_mode,
+        responses_reasoning_context=responses_reasoning_context,
+        responses_store=(None if responses_store is None else responses_store == "true"),
+        responses_prompt_public_reasoning=responses_prompt_public_reasoning,
+        responses_parallel_tool_calls=responses_parallel_tool_calls,
+        responses_i2i_wrapper_enabled=responses_i2i_wrapper_enabled,
+        # #### END Response 0720 ####
     )
 
 
@@ -790,10 +850,10 @@ def main(argv: list[str] | None = None) -> int:
 
     if bool(args.vqa_dir) == bool(args.question):
         parser.error("Use exactly one of --vqa-dir or --question.")
-    if args.question and not args.model:
-        parser.error("--model is required in single-question mode unless SFT_OPENAI_MODEL / OPENAI_MODEL is set.")
-    if args.vqa_dir and not args.model:
-        parser.error("--model is required in batch mode unless SFT_OPENAI_MODEL / OPENAI_MODEL is set.")
+    if args.question and not args.model_alias:
+        parser.error("--model-alias is required in single-question mode unless SFT_OPENAI_MODEL / OPENAI_MODEL is set.")
+    if args.vqa_dir and not args.model_alias:
+        parser.error("--model-alias is required in batch mode unless SFT_OPENAI_MODEL / OPENAI_MODEL is set.")
     if args.workers <= 0:
         parser.error("--workers must be positive.")
 
@@ -815,10 +875,16 @@ def main(argv: list[str] | None = None) -> int:
             record["image_urls"] = list(args.image_url or [])
 
     agent_config = _config_from_model_arg(
-        model_arg=args.model,
+        model_arg=args.model_alias,
         api_key=args.api_key,
+        # #### START Response 0720 ####
+        client_type=args.client_type,
+        # #### END Response 0720 ####
         api_mode=args.api_mode,
         azure_endpoint=args.azure_endpoint,
+        # #### START Response 0720 ####
+        base_url=args.base_url,
+        # #### END Response 0720 ####
         api_version=args.api_version,
         max_tokens=args.max_tokens,
         temperature=args.temperature,
@@ -828,14 +894,30 @@ def main(argv: list[str] | None = None) -> int:
         extra_body_json=args.extra_body_json,
         max_turns=args.max_turns,
         print_rounds=args.verbose,
+        # #### START Response 0720 ####
+        responses_reasoning_effort=args.responses_reasoning_effort,
+        responses_reasoning_summary=args.responses_reasoning_summary,
+        responses_reasoning_mode=args.responses_reasoning_mode,
+        responses_reasoning_context=args.responses_reasoning_context,
+        responses_store=args.responses_store,
+        responses_prompt_public_reasoning=not args.no_responses_public_reasoning,
+        responses_parallel_tool_calls=args.responses_parallel_tool_calls,
+        responses_i2i_wrapper_enabled=args.responses_i2i_wrapper,
+        # #### END Response 0720 ####
     )
     expert_config = None
     if args.expert_model:
         expert_config = _config_from_model_arg(
             model_arg=args.expert_model,
             api_key=args.expert_api_key or args.api_key,
+            # #### START Response 0720 ####
+            client_type=args.client_type,
+            # #### END Response 0720 ####
             api_mode="chat_completions",
             azure_endpoint=args.expert_azure_endpoint or args.azure_endpoint,
+            # #### START Response 0720 ####
+            base_url=args.base_url,
+            # #### END Response 0720 ####
             api_version=args.expert_api_version,
             max_tokens=args.expert_max_tokens,
             temperature=args.expert_temperature,
@@ -848,6 +930,9 @@ def main(argv: list[str] | None = None) -> int:
             extra_body_json=None,
             max_turns=args.max_turns,
             print_rounds=False,
+            # #### START Response 0720 ####
+            responses_prompt_public_reasoning=False,
+            # #### END Response 0720 ####
         )
 
     raw_output_path: Path | None = None

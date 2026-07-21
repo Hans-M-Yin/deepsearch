@@ -48,6 +48,15 @@ def _optional_env_int(name: str) -> int | None:
     return int(value)
 
 
+# #### START Response 0720 ####
+def _optional_env_bool(name: str) -> bool | None:
+    value = os.environ.get(name)
+    if value is None or str(value).strip() == "":
+        return None
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+# #### END Response 0720 ####
+
+
 def _message_text(content: Any) -> str:
     if content in (None, ""):
         return ""
@@ -282,6 +291,16 @@ def build_agent_config(
     extra_body: dict[str, Any] | None = None,
     max_turns: int | None = None,
     print_rounds: bool = False,
+    # #### START Response 0720 ####
+    responses_reasoning_effort: str | None = None,
+    responses_reasoning_summary: str | None = None,
+    responses_reasoning_mode: str | None = None,
+    responses_reasoning_context: str | None = None,
+    responses_parallel_tool_calls: bool | None = None,
+    responses_store: bool | None = None,
+    responses_prompt_public_reasoning: bool | None = None,
+    responses_i2i_wrapper_enabled: bool | None = None,
+    # #### END Response 0720 ####
 ) -> OpenAIToolAgentConfig:
     """Build a reusable agent config from arguments or environment defaults."""
 
@@ -314,6 +333,51 @@ def build_agent_config(
         extra_body=extra_body,
         max_turns=max_turns or int(os.environ.get("SFT_OPENAI_MAX_TURNS", "8")),
         print_rounds=print_rounds,
+        # #### START Response 0720 ####
+        responses_reasoning_effort=(
+            responses_reasoning_effort
+            if responses_reasoning_effort is not None
+            else os.environ.get("SFT_RESPONSES_REASONING_EFFORT")
+        ),
+        responses_reasoning_summary=(
+            responses_reasoning_summary
+            if responses_reasoning_summary is not None
+            else os.environ.get("SFT_RESPONSES_REASONING_SUMMARY", "auto")
+        ),
+        responses_reasoning_mode=(
+            responses_reasoning_mode
+            if responses_reasoning_mode is not None
+            else os.environ.get("SFT_RESPONSES_REASONING_MODE")
+        ),
+        responses_reasoning_context=(
+            responses_reasoning_context
+            if responses_reasoning_context is not None
+            else os.environ.get("SFT_RESPONSES_REASONING_CONTEXT", "all_turns")
+        ),
+        responses_parallel_tool_calls=(
+            responses_parallel_tool_calls
+            if responses_parallel_tool_calls is not None
+            else os.environ.get("SFT_RESPONSES_PARALLEL_TOOL_CALLS", "0").strip().lower()
+            in {"1", "true", "yes", "on"}
+        ),
+        responses_store=(
+            responses_store
+            if responses_store is not None
+            else _optional_env_bool("SFT_RESPONSES_STORE")
+        ),
+        responses_prompt_public_reasoning=(
+            responses_prompt_public_reasoning
+            if responses_prompt_public_reasoning is not None
+            else os.environ.get("SFT_RESPONSES_PUBLIC_REASONING", "1").strip().lower()
+            not in {"0", "false", "no", "off"}
+        ),
+        responses_i2i_wrapper_enabled=(
+            responses_i2i_wrapper_enabled
+            if responses_i2i_wrapper_enabled is not None
+            else os.environ.get("SFT_RESPONSES_I2I_WRAPPER", "0").strip().lower()
+            in {"1", "true", "yes", "on"}
+        ),
+        # #### END Response 0720 ####
     )
 
 

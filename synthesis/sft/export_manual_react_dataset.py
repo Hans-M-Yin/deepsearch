@@ -365,6 +365,36 @@ def _normalize_action_payload(
     }
 
 
+# #### START Response 0720 ####
+def _normalize_native_tool_call(
+    tool_call: dict[str, Any],
+    *,
+    goal_in_args_tools: set[str],
+) -> dict[str, Any] | None:
+    function = tool_call.get("function") or {}
+    if not isinstance(function, dict):
+        return None
+    tool_name = str(function.get("name") or "").strip()
+    raw_arguments = function.get("arguments")
+    if isinstance(raw_arguments, dict):
+        arguments = copy.deepcopy(raw_arguments)
+    elif isinstance(raw_arguments, str) and raw_arguments.strip():
+        try:
+            parsed_arguments = json.loads(raw_arguments)
+        except json.JSONDecodeError:
+            parsed_arguments = {}
+        arguments = parsed_arguments if isinstance(parsed_arguments, dict) else {}
+    else:
+        arguments = {}
+    goal = str(tool_call.get("goal") or "").strip()
+    if goal and tool_name in goal_in_args_tools:
+        arguments["goal"] = goal
+    if not tool_name:
+        return None
+    return {"name": tool_name, "arguments": arguments}
+# #### END Response 0720 ####
+
+
 def _convert_assistant_message(
     message: dict[str, Any],
     *,
@@ -382,6 +412,23 @@ def _convert_assistant_message(
         normalized_call = _normalize_action_payload(action_payload, goal_in_args_tools=goal_in_args_tools)
         blocks.append(f"<tool_call>{json.dumps(normalized_call, ensure_ascii=False)}</tool_call>")
         return {"role": "assistant", "content": "\n".join(blocks).strip()}
+
+    # #### START Response 0720 ####
+    native_tool_calls = [
+        normalized
+        for tool_call in (message.get("tool_calls") or [])
+        if isinstance(tool_call, dict)
+        if (normalized := _normalize_native_tool_call(tool_call, goal_in_args_tools=goal_in_args_tools)) is not None
+    ]
+    if native_tool_calls:
+        blocks: list[str] = []
+        thinking_block = _wrap_thinking(raw_text)
+        if thinking_block:
+            blocks.append(thinking_block)
+        for normalized_call in native_tool_calls:
+            blocks.append(f"<tool_call>{json.dumps(normalized_call, ensure_ascii=False)}</tool_call>")
+        return {"role": "assistant", "content": "\n".join(blocks).strip()}
+    # #### END Response 0720 ####
 
     if is_last_assistant:
         thought, answer = _extract_final_answer(raw_text, extracted_answer)

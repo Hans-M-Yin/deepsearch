@@ -18,6 +18,7 @@ Optional:
   --workdir /abs/path/to/output_dir   Override runtime working directory
   --gpt54                             Use the GPT-5.4 chat.completions branch
   --gemini35-flash                    Use the Gemini 3.5 Flash chat.completions branch
+  --responses                         Use native Responses API tool calling
   --verbose                           Enable verbose logging
   --office-net                        Switch endpoint to tiktok-row office domain
   --help                              Show this help
@@ -72,6 +73,9 @@ VERBOSE=0
 OFFICE_NET=0
 GPT54=0
 GEMINI35_FLASH=0
+# #### START Response 0720 ####
+RESPONSES=0
+# #### END Response 0720 ####
 
 PY_ARGS=()
 
@@ -105,6 +109,13 @@ while [[ $# -gt 0 ]]; do
       GEMINI35_FLASH=1
       shift
       ;;
+    # #### START Response 0720 ####
+    --responses)
+      RESPONSES=1
+      PY_ARGS+=(--api-mode responses)
+      shift
+      ;;
+    # #### END Response 0720 ####
     --office-net)
       OFFICE_NET=1
       shift
@@ -130,6 +141,12 @@ if [[ "${GPT54}" -eq 1 && "${GEMINI35_FLASH}" -eq 1 ]]; then
   echo "Use only one model shortcut: --gpt54 or --gemini35-flash." >&2
   exit 1
 fi
+# #### START Response 0720 ####
+if [[ "${RESPONSES}" -eq 1 && ("${GPT54}" -eq 1 || "${GEMINI35_FLASH}" -eq 1) ]]; then
+  echo "Use --responses only with the default SFT_OPENAI_* model configuration." >&2
+  exit 1
+fi
+# #### END Response 0720 ####
 
 if [[ -z "${PROMPT}" && -z "${MESSAGES_FILE}" ]]; then
   echo "One of --prompt or --messages-file is required." >&2
@@ -162,10 +179,24 @@ elif [[ "${GEMINI35_FLASH}" -eq 1 ]]; then
   PY_ARGS+=(--gemini35-flash)
 else
   require_env "SFT_OPENAI_MODEL"
-  require_env "SFT_OPENAI_AZURE_ENDPOINT"
-  require_env "SFT_OPENAI_API_VERSION"
+  # #### START Response 0720 ####
+  if [[ "${SFT_OPENAI_CLIENT_TYPE:-azure_openai}" == "openai" ]]; then
+    require_env "SFT_OPENAI_BASE_URL"
+  else
+    require_env "SFT_OPENAI_AZURE_ENDPOINT"
+    require_env "SFT_OPENAI_API_VERSION"
+  fi
+  # #### END Response 0720 ####
   require_env "OPENAI_API_KEY"
 fi
+
+# #### START Response 0720 ####
+if [[ "${RESPONSES}" -eq 1 ]]; then
+  # Responses defaults should normally come from synthesis/models.json via the
+  # model alias. CLI flags remain available as run-time overrides.
+  :
+fi
+# #### END Response 0720 ####
 
 if [[ -n "${WORKDIR}" ]]; then
   PY_ARGS+=(--workdir "${WORKDIR}")
@@ -185,6 +216,12 @@ else
   PY_ARGS+=(--messages-file "${MESSAGES_FILE}")
 fi
 
+# #### START Response 0720 ####
+if [[ -n "${SFT_OPENAI_MODEL:-}" ]]; then
+  PY_ARGS+=(--model-alias "${SFT_OPENAI_MODEL}")
+fi
+# #### END Response 0720 ####
+
 cd "${PROJECT_ROOT}"
 
 echo "=== SFT Agent Config ==="
@@ -199,9 +236,19 @@ elif [[ "${GEMINI35_FLASH}" -eq 1 ]]; then
   echo "azure_endpoint: ${SFT_GEMINI35_FLASH_AZURE_ENDPOINT}"
   echo "api_version: ${SFT_GEMINI35_FLASH_API_VERSION}"
 else
-  echo "api_mode: chat_completions"
+  # #### START Response 0720 ####
+  if [[ "${RESPONSES}" -eq 1 ]]; then
+    echo "api_mode: responses"
+  else
+    echo "api_mode: chat_completions"
+  fi
+  # #### END Response 0720 ####
   echo "model: ${SFT_OPENAI_MODEL}"
-  echo "azure_endpoint: ${SFT_OPENAI_AZURE_ENDPOINT}"
+  # #### START Response 0720 ####
+  echo "azure_endpoint: ${SFT_OPENAI_AZURE_ENDPOINT:-<unset>}"
+  echo "base_url: ${SFT_OPENAI_BASE_URL:-<unset>}"
+  echo "client_type: ${SFT_OPENAI_CLIENT_TYPE:-azure_openai}"
+  # #### END Response 0720 ####
   echo "api_version: ${SFT_OPENAI_API_VERSION}"
 fi
 echo "reader: ${ENHANCED_READER_URL:-${JINA_READER_URL:-<unset>}}"
