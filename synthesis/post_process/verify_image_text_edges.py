@@ -16,8 +16,10 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from synthesis.model_worker import LLM_WORKER, ModelMessage, ModelRequest, ModelWorkerClient
+from synthesis.image_discovery import ImageDiscoveryBuilder, ImageDiscoveryConfig
 from synthesis.run_min_graph import DEFAULT_ENV_PATH, load_env_file
 from synthesis.store import JsonlGraphStore
+from synthesis.test_image_grounding import _UnusedSearchClient
 from synthesis.wiki_text_builder import EnhancedReaderClient, WikiTextBuilder
 
 PREPARE_PROMPT = """You are preparing verification evidence for one Wikipedia entity page.
@@ -236,7 +238,7 @@ def _prepare_reference_image(model_client: ModelWorkerClient, model_alias: str, 
                     role="user",
                     content=[
                         {"type": "text", "text": text},
-                        {"type": "image_url", "image_url": {"url": image_item.get("image_url") or image_item.get("thumbnail_url") or ""}},
+                        {"type": "image_url", "image_url": {"url": image_item.get("model_url") or image_item.get("image_url") or image_item.get("thumbnail_url") or ""}},
                     ],
                 ),
             ],
@@ -270,7 +272,7 @@ def _judge_edge(model_client: ModelWorkerClient, model_alias: str, *, image_node
     if image_url:
         content.append({"type": "image_url", "image_url": {"url": image_url}})
     for item in reference_images:
-        reference_url = item.get("image_url") or item.get("thumbnail_url") or ""
+        reference_url = item.get("model_url") or item.get("image_url") or item.get("thumbnail_url") or ""
         if reference_url:
             content.append({"type": "image_url", "image_url": {"url": reference_url}})
     response = model_client.generate(
@@ -316,6 +318,42 @@ def _delete_edge(store: JsonlGraphStore, edge_id: str) -> bool:
         return True
 
 
+def _resolve_reference_image(
+    builder: ImageDiscoveryBuilder,
+    *,
+    image_item: dict[str, Any],
+    page_title: str,
+    entity_title: str,
+) -> dict[str, Any] | None:
+    image_url = str(image_item.get("image_url") or image_item.get("thumbnail_url") or "").strip()
+    if not image_url:
+        return None
+    from synthesis.search_client import ImageSearchResult
+
+    search_result = ImageSearchResult(
+        title=str(image_item.get("caption") or entity_title or page_title or ""),
+        image_url=image_url,
+        thumbnail_url=str(image_item.get("thumbnail_url") or "") or None,
+        source_page_url=str(image_item.get("source_page_url") or "") or None,
+        snippet=str(image_item.get("caption") or image_item.get("alt_text") or "") or None,
+        rank=image_item.get("rank"),
+    )
+    asset, error = builder._resolve_image_asset(
+        search_result,
+        persist_asset=False,
+        recovery_query=f"{entity_title} {page_title}".strip() or entity_title or page_title,
+    )
+    if asset is None:
+        return None
+    return {
+        **image_item,
+        "model_url": asset.model_url,
+        "resolved_image": asset.to_metadata(),
+        "resolve_strategy": asset.strategy,
+        "resolved_error": error,
+    }
+
+
 def main() -> int:
     args = parse_args()
     load_env_file(Path(args.env_file))
@@ -327,6 +365,12 @@ def main() -> int:
     store = JsonlGraphStore(Path(args.graph_dir))
     reader = EnhancedReaderClient(base_url=args.reader_base_url)
     model_client = LLM_WORKER
+    image_builder = ImageDiscoveryBuilder(
+        search_client=_UnusedSearchClient(),
+        config=ImageDiscoveryConfig(precheck_image_urls=True, try_source_page_recovery=True),
+        model_client=model_client,
+        image_check_model_alias=os.environ.get("IMAGE_CHECK_MODEL"),
+    )
 
     results: list[dict[str, Any]] = []
     planned_removals: list[dict[str, Any]] = []
@@ -373,8 +417,18 @@ def main() -> int:
             image_title=str(image_node.get("title") or ""),
         )
         raw_reference_images = _extract_reference_images(wiki_doc.get("raw_markdown") or wiki_doc.get("content") or "", text_url, args.max_reference_images)
-        kept_reference_images: list[dict[str, Any]] = []
+        resolved_reference_images: list[dict[str, Any]] = []
         for image_item in raw_reference_images:
+            resolved = _resolve_reference_image(
+                image_builder,
+                image_item=image_item,
+                page_title=str(wiki_doc.get("title") or text_node.get("title") or ""),
+                entity_title=str(text_node.get("title") or ""),
+            )
+            if resolved is not None:
+                resolved_reference_images.append(resolved)
+        kept_reference_images: list[dict[str, Any]] = []
+        for image_item in resolved_reference_images:
             decision = _prepare_reference_image(
                 model_client,
                 args.prepare_model,
