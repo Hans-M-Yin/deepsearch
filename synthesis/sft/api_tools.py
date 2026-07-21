@@ -179,11 +179,11 @@ Requirements:
 9. Note: you should not mention the above requirements in your solution.
 
 Tool-use tips:
-1. t2t_search is a Google text/web search tool. It returns search-result metadata such as titles, URLs, and snippets. Snippets are useful for choosing sources, but they are not full evidence. Use read_url to inspect a promising result before treating page content as verified evidence.
-2. t2i_search retrieves image-search metadata from a text description. The returned images are not visible to you yet. Review titles/snippets/source pages, then use read_url on a selected image URL or source page before making visual claims about the image.
-3. i2i_search is a reverse-image search tool for identifying unfamiliar people, objects, logos, artworks, or other visual elements. Its matches may be noisy. Treat image-search titles as hints, not proof, and verify with read_url or another source when identity matters.
-4. After i2i_search or t2i_search, do not claim that you have seen a returned image unless a successful read_url call has downloaded/read that image. Search-result metadata can suggest a direction, but it does not itself prove visual content.
-5. For i2i_search, region coordinates are x-first normalized coordinates on a 0-1000 scale in the order [x1, y1, x2, y2]. x increases left-to-right and y increases top-to-bottom. Use [0, 0, 1000, 1000] for the full image.
+1. t2t_search is a Google text/web search tool. It returns search-result metadata such as titles, URLs, and snippets. Snippets are useful for selecting sources, but they are not complete evidence. If you think the content of a page may be useful, use read_url to read that page.
+2. t2i_search returns image-search metadata based on a text description. At this stage, you cannot actually see the returned images yet. You should first review the titles, snippets, and source pages, and then use read_url on a selected image URL before making any visual judgment about the image content.
+3. i2i_search is a reverse-image search tool that can be used to identify unfamiliar people, objects, logos, artworks, or other visual elements. The page titles of its returned matches may be unrelated to the actual content. You can use read_url(image_url) to download the image, or use read_url(source_page_url) to inspect the original page. Note that the latter will not display the searched image itself.
+4. For i2i_search, region coordinates use x-first normalized coordinates on a 0–1000 scale, in the order [x1, y1, x2, y2]. The x-axis increases from left to right, and the y-axis increases from top to bottom. To search the full image, use [0, 0, 1000, 1000].
+5. For read_url, when the input is an image URL, it will download the image. For other URLs, it will extract relevant content from the page according to your goal. Note that this tool cannot see your prior reasoning history or any previously seen images, so make sure your target on the page is described clearly and explicitly in semantic terms.
 
 Next, I will provide some excerpted examples, and you can learn from them how to write a high-quality answer process. The examples use native function calls, so the written text shows the public progress update before the call and then names the intended native function call.
 
