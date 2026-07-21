@@ -135,8 +135,8 @@ def _iter_candidate_edges(store: JsonlGraphStore, image_node_id: str | None = No
             continue
         if dst_node.get("node_type") != "text":
             continue
-        metadata = edge.get("metadata") or {}
-        if str(metadata.get("source_type") or "") not in {"image_grounding", "image_grounding_delayed", "image_grounding_delayed_debug"}:
+        source = edge.get("source") or {}
+        if str(source.get("source_type") or "") not in {"image_grounding", "image_grounding_delayed", "image_grounding_delayed_debug"}:
             continue
         results.append(edge)
     return results
