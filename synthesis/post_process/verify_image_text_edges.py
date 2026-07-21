@@ -254,6 +254,37 @@ def _judge_edge(model_client: ModelWorkerClient, model_alias: str, *, image_node
     image_metadata = image_node.get("metadata") or {}
     image_grounding = image_metadata.get("image_grounding") or {}
     image_context = image_grounding.get("context") or image_metadata.get("image_grounding_context") or {}
+    compact_prepared_context = {
+        "entity_title": prepared_context.get("entity_title") or text_node.get("title"),
+        "entity_type": prepared_context.get("entity_type"),
+        "title_relevance": prepared_context.get("title_relevance"),
+        "identity_summary": prepared_context.get("identity_summary"),
+        "visual_profile": list(prepared_context.get("visual_profile") or []),
+        "event_context": list(prepared_context.get("event_context") or []),
+        "disambiguation_cues": list(prepared_context.get("disambiguation_cues") or []),
+    }
+    compact_reference_images = [
+        {
+            "caption": item.get("caption"),
+            "alt_text": item.get("alt_text"),
+            "target_localization": item.get("target_localization"),
+            "why_relevant": item.get("why_relevant"),
+            "identity_anchor_strength": item.get("identity_anchor_strength"),
+            "target_visibility": item.get("target_visibility"),
+            "resolve_strategy": item.get("resolve_strategy"),
+        }
+        for item in reference_images
+    ]
+    compact_grounding_context = {
+        "provider": image_context.get("provider"),
+        "metadata": {
+            "image_title": ((image_context.get("metadata") or {}).get("image_title")),
+            "image_snippet": ((image_context.get("metadata") or {}).get("image_snippet")),
+            "source_page_url": ((image_context.get("metadata") or {}).get("source_page_url")),
+            "page_title": ((image_context.get("metadata") or {}).get("page_title")),
+            "fallback_reason": ((image_context.get("metadata") or {}).get("fallback_reason")),
+        },
+    }
     user_text = {
         "entity_title": text_node.get("title"),
         "entity_aliases": text_node.get("aliases") or [],
@@ -263,9 +294,9 @@ def _judge_edge(model_client: ModelWorkerClient, model_alias: str, *, image_node
         "image_title": image_node.get("title") or "",
         "image_caption": image_node.get("caption") or image_node.get("summary") or "",
         "image_source_page_url": image_node.get("source_page_url") or "",
-        "image_grounding_context": image_context,
-        "prepared_context": prepared_context,
-        "reference_images": reference_images,
+        "image_grounding_context": compact_grounding_context,
+        "prepared_context": compact_prepared_context,
+        "reference_images": compact_reference_images,
     }
     image_url = image_node.get("image_url") or (((image_metadata.get("resolved_image") or {}).get("asset_uri")) or ((image_metadata.get("resolved_image") or {}).get("resolved_url")) or "")
     content = [{"type": "text", "text": json.dumps(user_text, ensure_ascii=False)}]
