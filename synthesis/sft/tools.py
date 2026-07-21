@@ -643,8 +643,27 @@ def _request_with_retry(
     raise last_error
 
 
-def _search_fetch_limit(top_k: int) -> int:
-    return max(1, int(top_k) * 3)
+def _search_fetch_multiplier(tool_name: str | None = None) -> int:
+    """Return over-fetch multiplier for search tools.
+
+    Defaults preserve the existing behavior (3x).  Set
+    SFT_SEARCH_FETCH_MULTIPLIER for all search tools, or a tool-specific env var
+    such as SFT_I2I_SEARCH_FETCH_MULTIPLIER to override only one backend.
+    """
+
+    default_multiplier = max(1, _env_int("SFT_SEARCH_FETCH_MULTIPLIER", 3))
+    normalized = str(tool_name or "").strip().lower()
+    if normalized == "t2t_search":
+        return max(1, _env_int("SFT_T2T_SEARCH_FETCH_MULTIPLIER", default_multiplier))
+    if normalized == "t2i_search":
+        return max(1, _env_int("SFT_T2I_SEARCH_FETCH_MULTIPLIER", default_multiplier))
+    if normalized == "i2i_search":
+        return max(1, _env_int("SFT_I2I_SEARCH_FETCH_MULTIPLIER", default_multiplier))
+    return default_multiplier
+
+
+def _search_fetch_limit(top_k: int, *, tool_name: str | None = None) -> int:
+    return max(1, int(top_k) * _search_fetch_multiplier(tool_name))
 
 
 def _url_matches_blocked_domain(url: str, blocked_domains: tuple[str, ...]) -> bool:
@@ -1045,7 +1064,7 @@ def t2t_search(query: str, lang: str = "en", top_k: int = DEFAULT_SEARCH_TOP_K) 
     """Search text pages and return search results only."""
     try:
         top_k = max(1, min(int(top_k), MAX_SEARCH_RESULTS))
-        fetch_limit = _search_fetch_limit(top_k)
+        fetch_limit = _search_fetch_limit(top_k, tool_name="t2t_search")
         effective_query = _sanitize_search_query(query)
         response = _serper_client().search_text(effective_query, limit=fetch_limit, hl=lang)
         results: list[dict[str, Any]] = []
@@ -1077,7 +1096,7 @@ def t2i_search(query: str, lang: str = "en", top_k: int = DEFAULT_SEARCH_TOP_K) 
     """Search images from a text query."""
     try:
         top_k = max(1, min(int(top_k), MAX_SEARCH_RESULTS))
-        fetch_limit = _search_fetch_limit(top_k)
+        fetch_limit = _search_fetch_limit(top_k, tool_name="t2i_search")
         effective_query = _sanitize_search_query(query)
         response = _serper_client().search_image(effective_query, limit=fetch_limit, hl=lang)
         results: list[dict[str, Any]] = []
@@ -1111,7 +1130,7 @@ def t2i_search(query: str, lang: str = "en", top_k: int = DEFAULT_SEARCH_TOP_K) 
 
 def _image_search_via_serper(image_url: str, top_k: int = MAX_SEARCH_RESULTS) -> object:
     serper_api_key, _ = acquire_serper_api_key()
-    fetch_limit = _search_fetch_limit(max(1, min(int(top_k), MAX_SEARCH_RESULTS)))
+    fetch_limit = _search_fetch_limit(max(1, min(int(top_k), MAX_SEARCH_RESULTS)), tool_name="i2i_search")
 
     response = requests.post(
         os.environ.get("SERPER_LENS_URL") or "https://google.serper.dev/lens",
