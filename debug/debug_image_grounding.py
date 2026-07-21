@@ -24,6 +24,7 @@ import sys
 import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote, urlparse
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -32,6 +33,7 @@ if str(ROOT) not in sys.path:
 from synthesis.image_discovery import ImageDiscoveryBuilder, ImageDiscoveryConfig, ImageValidationResult
 from synthesis.nodes import ImageNode
 from synthesis.run_min_graph import DEFAULT_ENV_PATH, load_env_file
+from synthesis.store import JsonlGraphStore
 from synthesis.test_image_grounding import (
     _UnusedSearchClient,
     _build_plan,
@@ -48,6 +50,13 @@ def parse_args() -> argparse.Namespace:
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--image-path", type=str, help="Local image file path.")
     group.add_argument("--image-url", type=str, help="Remote image URL.")
+    group.add_argument(
+        "--graph-node",
+        action="store_true",
+        help="Load one image node from --graph-dir/--node-id and rerun grounding.",
+    )
+    parser.add_argument("--graph-dir", type=str, default="", help="Directory containing nodes.jsonl and edges.jsonl.")
+    parser.add_argument("--node-id", type=str, default="", help="Image node id to rerun when using --graph-node.")
     parser.add_argument("--title", "--image-title", dest="title", type=str, default="", help="Image title.")
     parser.add_argument(
         "--snippet",
@@ -115,6 +124,103 @@ def _source_node_title(args: argparse.Namespace) -> str:
 
 def _query_text(args: argparse.Namespace) -> str:
     return (args.query_text or args.target_text or args.snippet or args.title or "").strip()
+
+
+def _choose_graph_image_input(node: dict[str, Any], resolved_image: dict[str, Any]) -> tuple[str | None, str | None]:
+    cache_path = str(resolved_image.get("cache_path") or "").strip()
+    if cache_path and Path(cache_path).exists():
+        return "image_path", cache_path
+
+    for value in (
+        node.get("image_url"),
+        resolved_image.get("asset_uri"),
+        resolved_image.get("original_url"),
+        resolved_image.get("resolved_url"),
+    ):
+        text = str(value or "").strip()
+        if not text:
+            continue
+        if text.startswith("file://"):
+            parsed = urlparse(text)
+            local_path = Path(unquote(parsed.path))
+            if local_path.exists():
+                return "image_path", str(local_path)
+        local_path = Path(text)
+        if local_path.is_absolute() and local_path.exists():
+            return "image_path", str(local_path)
+        if text.startswith(("http://", "https://")):
+            return "image_url", text
+
+    return None, None
+
+
+def _find_parent_search_edge(store: JsonlGraphStore, image_node_id: str) -> dict[str, Any] | None:
+    matches = []
+    for edge in store.iter_edges():
+        if edge.get("dst_node_id") != image_node_id:
+            continue
+        if edge.get("edge_type") != "search_retrieved":
+            continue
+        matches.append(edge)
+    if not matches:
+        return None
+    matches.sort(key=lambda item: (0 if ((item.get("metadata") or {}).get("query")) else 1, str(item.get("src_node_id") or "")))
+    return matches[0]
+
+
+def _hydrate_args_from_graph_node(args: argparse.Namespace) -> dict[str, Any]:
+    if not args.graph_dir or not args.node_id:
+        raise SystemExit("--graph-node requires both --graph-dir and --node-id")
+
+    store = JsonlGraphStore(Path(args.graph_dir))
+    node = store.get_node(args.node_id)
+    if not node:
+        raise SystemExit(f"Image node not found: {args.node_id}")
+
+    metadata = node.get("metadata") or {}
+    resolved_image = metadata.get("resolved_image") or {}
+    image_grounding = metadata.get("image_grounding") or {}
+    grounding_context = image_grounding.get("context") or metadata.get("image_grounding_context") or {}
+    parent_edge = _find_parent_search_edge(store, args.node_id)
+    parent_node = store.get_node(parent_edge.get("src_node_id")) if parent_edge else None
+
+    image_title = (grounding_context.get("metadata") or {}).get("image_title") or node.get("title") or node.get("caption") or ""
+    image_snippet = (grounding_context.get("metadata") or {}).get("image_snippet") or node.get("caption") or node.get("summary") or ""
+    source_page_url = (
+        (grounding_context.get("metadata") or {}).get("source_page_url")
+        or node.get("source_page_url")
+        or resolved_image.get("source_page_url")
+        or ""
+    )
+    source_node_title = (parent_node or {}).get("title") or metadata.get("source_text_node_id") or ""
+    query_text = (((parent_edge or {}).get("metadata") or {}).get("query") or metadata.get("search_query") or "")
+    target_text = metadata.get("visual_target") or ""
+
+    image_arg_name, image_arg_value = _choose_graph_image_input(node, resolved_image)
+    if image_arg_name == "image_path":
+        args.image_path = image_arg_value
+        args.image_url = None
+    elif image_arg_name == "image_url":
+        args.image_url = image_arg_value
+        args.image_path = None
+    else:
+        raise SystemExit(f"Could not determine image input for node: {args.node_id}")
+
+    args.title = str(image_title)
+    args.snippet = str(image_snippet)
+    args.source_page_url = str(source_page_url)
+    args.source_node_title = str(source_node_title)
+    args.query_text = str(query_text)
+    args.target_text = str(target_text)
+
+    return {
+        "node_id": node.get("node_id"),
+        "title": node.get("title"),
+        "resolved_image": resolved_image,
+        "parent_edge": parent_edge,
+        "parent_node_title": (parent_node or {}).get("title"),
+        "loaded_input": image_arg_name,
+    }
 
 
 def _compact_validation(validation: ImageValidationResult) -> dict[str, Any]:
@@ -240,6 +346,7 @@ def _emit_output(payload: dict[str, Any], *, pretty: bool) -> int:
 def main() -> int:
     args = parse_args()
     load_env_file(Path(args.env_file))
+    graph_debug = _hydrate_args_from_graph_node(args) if args.graph_node else None
 
     builder = ImageDiscoveryBuilder(
         search_client=_UnusedSearchClient(),
@@ -324,6 +431,7 @@ def main() -> int:
         )
 
     output = {
+        "graph_debug": graph_debug,
         "image": {
             "image_url": search_result.image_url,
             "title": search_result.title,

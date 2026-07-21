@@ -14,6 +14,7 @@ import asyncio
 from html import escape
 from html.parser import HTMLParser
 import hashlib
+import json
 import os
 from pathlib import Path
 import re
@@ -37,9 +38,31 @@ READERLM_MAX_TOKENS = int(os.environ.get("READERLM_MAX_TOKENS", "8192"))
 DEBUG_READERLM_URL_LEAK = os.environ.get("ENHANCED_READER_DEBUG_URL_LEAK", "1") != "0"
 DEBUG_READERLM_URL_LEAK_DIR = Path(os.environ.get("ENHANCED_READER_DEBUG_URL_LEAK_DIR", "/tmp/enhanced_reader_url_leaks"))
 TRUNCATION_MARKER = "\n<!-- enhanced_reader_truncated -->"
+ENHANCED_READER_FETCH_STRATEGY = os.environ.get("ENHANCED_READER_FETCH_STRATEGY", "markdown_first").strip().lower()
+ENHANCED_READER_CACHE_ENABLED = os.environ.get("ENHANCED_READER_CACHE_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
+ENHANCED_READER_CACHE_DIR = Path(os.environ.get("ENHANCED_READER_CACHE_DIR", "/tmp/enhanced_reader_cache"))
+ENHANCED_READER_CACHE_TTL_S = float(os.environ.get("ENHANCED_READER_CACHE_TTL_S", str(7 * 24 * 3600)))
+ENHANCED_READER_CACHE_NEGATIVE_TTL_S = float(os.environ.get("ENHANCED_READER_CACHE_NEGATIVE_TTL_S", "600"))
+ENHANCED_READER_MIN_USABLE_CHARS = int(os.environ.get("ENHANCED_READER_MIN_USABLE_CHARS", "500"))
 
 
 app = FastAPI(title="Enhanced Reader API")
+
+
+ANTI_BOT_PATTERNS = (
+    "performing security verification",
+    "security service to protect against malicious bots",
+    "verify you are not a bot",
+    "verification successful. waiting",
+    "checking your browser",
+    "just a moment",
+    "enable javascript",
+    "access denied",
+    "captcha",
+    "cloudflare",
+    "bot detection",
+    "are you a human",
+)
 
 
 SCRIPT_PATTERN = r"<[ ]*script.*?/[\s]*script[ ]*>"
@@ -121,6 +144,107 @@ def normalize_url(target_url: str) -> str:
     if target_url.startswith(("http://", "https://")):
         return target_url
     return "https://" + target_url
+
+
+def _now() -> float:
+    return time.time()
+
+
+def _cache_key(url: str, *, wants_json: bool) -> str:
+    payload = {
+        "url": url,
+        "wants_json": bool(wants_json),
+        "strategy": ENHANCED_READER_FETCH_STRATEGY,
+        "readerlm_model": READERLM_MODEL_NAME,
+        "readerlm_max_html_chars": READERLM_MAX_HTML_CHARS,
+        "readerlm_max_tokens": READERLM_MAX_TOKENS,
+    }
+    return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def _cache_path(url: str, *, wants_json: bool) -> Path:
+    return ENHANCED_READER_CACHE_DIR / f"{_cache_key(url, wants_json=wants_json)}.json"
+
+
+def _read_cache(url: str, *, wants_json: bool) -> dict[str, Any] | None:
+    if not ENHANCED_READER_CACHE_ENABLED:
+        return None
+    path = _cache_path(url, wants_json=wants_json)
+    try:
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    created_at = float(record.get("created_at") or 0.0)
+    ttl = float(record.get("ttl_s") or ENHANCED_READER_CACHE_TTL_S)
+    if ttl >= 0 and _now() - created_at > ttl:
+        return None
+    payload = record.get("payload")
+    if not isinstance(payload, dict):
+        return None
+    payload = dict(payload)
+    data = payload.get("data")
+    if isinstance(data, dict):
+        data = dict(data)
+        debug_timing = dict(data.get("debug_timing") or {})
+        debug_timing["cache_hit"] = True
+        debug_timing["cache_path"] = str(path)
+        data["debug_timing"] = debug_timing
+        payload["data"] = data
+    payload["debug_timing"] = dict(payload.get("debug_timing") or {})
+    payload["debug_timing"].update({"cache_hit": True, "cache_path": str(path)})
+    return payload
+
+
+def _write_cache(url: str, *, wants_json: bool, payload: dict[str, Any], negative: bool = False) -> None:
+    if not ENHANCED_READER_CACHE_ENABLED:
+        return
+    try:
+        ENHANCED_READER_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        path = _cache_path(url, wants_json=wants_json)
+        record = {
+            "created_at": _now(),
+            "ttl_s": ENHANCED_READER_CACHE_NEGATIVE_TTL_S if negative else ENHANCED_READER_CACHE_TTL_S,
+            "url": url,
+            "wants_json": wants_json,
+            "payload": payload,
+        }
+        tmp_path = path.with_suffix(path.suffix + f".{os.getpid()}.tmp")
+        tmp_path.write_text(json.dumps(record, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp_path, path)
+    except Exception as exc:  # pragma: no cover - best-effort cache
+        print(f"[enhanced_reader][cache_write_error] url={url} error={exc!r}", file=sys.stderr, flush=True)
+
+
+def looks_like_antibot(text: str | None) -> bool:
+    normalized = re.sub(r"\s+", " ", str(text or "").strip().lower())
+    if not normalized:
+        return False
+    return any(pattern in normalized for pattern in ANTI_BOT_PATTERNS)
+
+
+def _usable_text(text: str | None) -> bool:
+    value = str(text or "").strip()
+    return len(value) >= ENHANCED_READER_MIN_USABLE_CHARS and not looks_like_antibot(value)
+
+
+def _select_best_content(*, readerlm_markdown: str, raw_markdown: str, debug_timing: dict[str, Any]) -> tuple[str, str, str]:
+    readerlm_text = str(readerlm_markdown or "").strip()
+    raw_text = str(raw_markdown or "").strip()
+    readerlm_antibot = looks_like_antibot(readerlm_text)
+    raw_antibot = looks_like_antibot(raw_text)
+    debug_timing["content_antibot"] = readerlm_antibot
+    debug_timing["raw_markdown_antibot"] = raw_antibot
+    debug_timing["content_chars"] = len(readerlm_text)
+    debug_timing["raw_markdown_chars"] = len(raw_text)
+
+    if readerlm_antibot and raw_text and not raw_antibot:
+        return raw_text, "raw_markdown_fallback_after_antibot_content", "usable"
+    if not readerlm_text and raw_text:
+        return raw_text, "raw_markdown_fallback_empty_content", "usable" if not raw_antibot else "anti_bot"
+    if len(readerlm_text) < ENHANCED_READER_MIN_USABLE_CHARS and _usable_text(raw_text):
+        return raw_text, "raw_markdown_fallback_short_content", "usable"
+    quality = "anti_bot" if readerlm_antibot else "usable" if readerlm_text else "empty"
+    return readerlm_text, "readerlm_content", quality
 
 
 def is_wikipedia_url(url: str | None) -> bool:
@@ -367,6 +491,18 @@ def create_prompt(
     return f"{instruction}\n```html\n{html}\n```"
 
 
+def create_markdown_cleanup_prompt(
+    markdown: str,
+    instruction: str = (
+        "Clean the given raw Markdown reader output. Preserve the main content, "
+        "tables, image captions, alt text, titles, dates, names, and source-relevant details. "
+        "Remove navigation, repeated menus, boilerplate, login prompts, unrelated recommendations, "
+        "and tracking text. Do not add facts that are not present in the input. Return Markdown only."
+    ),
+) -> str:
+    return f"{instruction}\n```markdown\n{markdown}\n```"
+
+
 def strip_outer_markdown_fence(text: str) -> str:
     match = re.fullmatch(r"\s*```(?:markdown|md)?\s*\n(.*?)\n```\s*", text, flags=re.DOTALL | re.IGNORECASE)
     return match.group(1).strip() if match else text.strip()
@@ -477,6 +613,50 @@ async def convert_html_to_markdown(
     return markdown
 
 
+async def convert_raw_markdown_to_markdown(
+    client: httpx.AsyncClient,
+    raw_markdown: str,
+    *,
+    source_url: str | None = None,
+    debug_timing: dict[str, Any] | None = None,
+) -> str:
+    """Clean raw reader Markdown with ReaderLM without making a second URL fetch."""
+
+    started = time.perf_counter()
+    readerlm_input = truncate_safely(raw_markdown, READERLM_MAX_HTML_CHARS)
+    if debug_timing is not None:
+        debug_timing["raw_markdown_readerlm_input_chars"] = len(readerlm_input)
+        debug_timing["raw_markdown_readerlm_input_truncated"] = readerlm_input != raw_markdown
+        debug_timing["truncate_raw_markdown_s"] = time.perf_counter() - started
+
+    headers = {"Content-Type": "application/json"}
+    if READERLM_API_KEY:
+        headers["Authorization"] = f"Bearer {READERLM_API_KEY}"
+
+    response = await client.post(
+        f"{READERLM_API_BASE.rstrip('/')}/chat/completions",
+        headers=headers,
+        json={
+            "model": READERLM_MODEL_NAME,
+            "messages": [{"role": "user", "content": create_markdown_cleanup_prompt(readerlm_input)}],
+            "temperature": 0,
+            "max_tokens": READERLM_MAX_TOKENS,
+            "extra_body": {"repetition_penalty": 1.08},
+        },
+        timeout=READER_TIMEOUT,
+    )
+    response.raise_for_status()
+    data: dict[str, Any] = response.json()
+    markdown = strip_outer_markdown_fence(data["choices"][0]["message"]["content"])
+    debug_url_leak_after_readerlm(
+        source_url=source_url,
+        readerlm_input=readerlm_input,
+        markdown=markdown,
+        debug_timing=debug_timing,
+    )
+    return markdown
+
+
 async def timed_call(label: str, coro, timing: dict[str, Any]):
     started = time.perf_counter()
     try:
@@ -540,38 +720,80 @@ async def read(target_url: str, request: Request):
     wants_json = "application/json" in request.headers.get("accept", "")
     debug_timing: dict[str, Any] = {}
 
+    cached_payload = _read_cache(url, wants_json=wants_json)
+    if cached_payload is not None:
+        if wants_json:
+            return cached_payload
+        cached_data = cached_payload.get("data") or {}
+        body = f"URL Source: {cached_data.get('url') or url}\n\nMarkdown Content:\n{cached_data.get('content') or ''}\n"
+        return Response(
+            body,
+            media_type="text/plain; charset=utf-8",
+            headers={"X-Enhanced-Reader-Cache": "hit"},
+        )
+
     async with httpx.AsyncClient() as client:
         try:
-            fetch_started = time.perf_counter()
-            markdown_response, html_response = await asyncio.gather(
-                timed_stage_call("fetch_markdown", fetch_markdown(client, url), debug_timing),
-                timed_stage_call("fetch_html", fetch_html(client, url), debug_timing),
-            )
-            fetch_done = time.perf_counter()
-            debug_timing["fetch_markdown_html_parallel_s"] = fetch_done - fetch_started
-            html = html_response
-            readerlm_started = time.perf_counter()
-            markdown = await timed_stage_call(
-                "readerlm",
-                convert_html_to_markdown(client, html, source_url=url, debug_timing=debug_timing),
-                debug_timing,
-            )
-            debug_timing["readerlm_s"] = time.perf_counter() - readerlm_started
+            debug_timing["fetch_strategy"] = ENHANCED_READER_FETCH_STRATEGY
+            if ENHANCED_READER_FETCH_STRATEGY == "parallel":
+                fetch_started = time.perf_counter()
+                markdown_response, html_response = await asyncio.gather(
+                    timed_stage_call("fetch_markdown", fetch_markdown(client, url), debug_timing),
+                    timed_stage_call("fetch_html", fetch_html(client, url), debug_timing),
+                )
+                fetch_done = time.perf_counter()
+                debug_timing["fetch_markdown_html_parallel_s"] = fetch_done - fetch_started
+                readerlm_started = time.perf_counter()
+                readerlm_markdown = await timed_stage_call(
+                    "readerlm",
+                    convert_html_to_markdown(client, html_response, source_url=url, debug_timing=debug_timing),
+                    debug_timing,
+                )
+                debug_timing["readerlm_s"] = time.perf_counter() - readerlm_started
+                markdown, content_source, content_quality = _select_best_content(
+                    readerlm_markdown=readerlm_markdown,
+                    raw_markdown=markdown_response,
+                    debug_timing=debug_timing,
+                )
+            else:
+                markdown_response = await timed_stage_call("fetch_markdown", fetch_markdown(client, url), debug_timing)
+                debug_timing["raw_markdown_chars"] = len(markdown_response or "")
+                debug_timing["raw_markdown_antibot"] = looks_like_antibot(markdown_response)
+                readerlm_started = time.perf_counter()
+                readerlm_markdown = await timed_stage_call(
+                    "raw_markdown_readerlm",
+                    convert_raw_markdown_to_markdown(
+                        client,
+                        markdown_response,
+                        source_url=url,
+                        debug_timing=debug_timing,
+                    ),
+                    debug_timing,
+                )
+                debug_timing["readerlm_s"] = time.perf_counter() - readerlm_started
+                markdown, content_source, content_quality = _select_best_content(
+                    readerlm_markdown=readerlm_markdown,
+                    raw_markdown=markdown_response,
+                    debug_timing=debug_timing,
+                )
+                if content_source == "readerlm_content":
+                    content_source = "raw_markdown_readerlm_content"
+            debug_timing["content_source"] = content_source
+            debug_timing["content_quality"] = content_quality
         except StageError as exc:
             debug_timing["total_s"] = time.perf_counter() - total_started
             record_failure_debug(debug_timing, stage=exc.stage, exc=exc.cause)
             message = f"Enhanced Reader error for {url}: {exc.stage} failed: {exc.cause}"
+            error_payload = {
+                "data": None,
+                "code": 502,
+                "status": 502,
+                "message": message,
+                "debug_timing": debug_timing,
+            }
+            _write_cache(url, wants_json=wants_json, payload=error_payload, negative=True)
             if wants_json:
-                return JSONResponse(
-                    status_code=502,
-                    content={
-                        "data": None,
-                        "code": 502,
-                        "status": 502,
-                        "message": message,
-                        "debug_timing": debug_timing,
-                    },
-                )
+                return JSONResponse(status_code=502, content=error_payload)
             return Response(
                 message,
                 status_code=502,
@@ -582,17 +804,16 @@ async def read(target_url: str, request: Request):
             debug_timing["total_s"] = time.perf_counter() - total_started
             record_failure_debug(debug_timing, stage="unknown", exc=exc)
             message = f"Enhanced Reader error for {url}: {exc}"
+            error_payload = {
+                "data": None,
+                "code": 502,
+                "status": 502,
+                "message": message,
+                "debug_timing": debug_timing,
+            }
+            _write_cache(url, wants_json=wants_json, payload=error_payload, negative=True)
             if wants_json:
-                return JSONResponse(
-                    status_code=502,
-                    content={
-                        "data": None,
-                        "code": 502,
-                        "status": 502,
-                        "message": message,
-                        "debug_timing": debug_timing,
-                    },
-                )
+                return JSONResponse(status_code=502, content=error_payload)
             return Response(
                 message,
                 status_code=502,
@@ -601,20 +822,25 @@ async def read(target_url: str, request: Request):
             )
 
     debug_timing["total_s"] = time.perf_counter() - total_started
+    debug_timing["cache_hit"] = False
+    payload = {
+        "data": {
+            "title": "",
+            "url": url,
+            "content": markdown,
+            "raw_markdown": markdown_response,
+            "content_source": content_source,
+            "content_quality": content_quality,
+            "debug_timing": debug_timing,
+        },
+        "code": 200,
+        "status": 200,
+        "debug_timing": debug_timing,
+    }
+    _write_cache(url, wants_json=wants_json, payload=payload, negative=content_quality in {"anti_bot", "empty"})
 
     if wants_json:
-        return {
-            "data": {
-                "title": "",
-                "url": url,
-                "content": markdown,
-                "raw_markdown": markdown_response,
-                "debug_timing": debug_timing,
-            },
-            "code": 200,
-            "status": 200,
-            "debug_timing": debug_timing,
-        }
+        return payload
 
     body = f"URL Source: {url}\n\nMarkdown Content:\n{markdown}\n"
     return Response(
