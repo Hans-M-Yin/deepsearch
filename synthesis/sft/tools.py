@@ -16,7 +16,7 @@ from dataclasses import asdict, dataclass
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Callable
-from urllib.parse import urlparse
+from urllib.parse import quote, unquote, urlparse, urlunparse
 
 import requests
 from PIL import Image, ImageOps
@@ -121,6 +121,42 @@ def _read_url_debug(message: str, **kwargs: Any) -> None:
     details = " ".join(f"{key}={value!r}" for key, value in kwargs.items())
     suffix = f" {details}" if details else ""
     print(f"[read_url debug] {message}{suffix}", file=sys.stderr, flush=True)
+
+
+def _normalize_request_url(url: str) -> str:
+    """Return an HTTP URL safe for stdlib/reader clients.
+
+    Some search results contain raw non-ASCII characters in the path, e.g.
+    ``Künstler`` or curly apostrophes.  urllib-based readers can fail before the
+    request is sent with an ASCII encoding error.  Normalize by IDNA-encoding the
+    host and percent-encoding path/query/fragment while preserving normal URL
+    delimiters and existing percent escapes.
+    """
+
+    raw_url = str(url or "").strip()
+    if not raw_url:
+        return raw_url
+    if not raw_url.startswith(("http://", "https://")):
+        raw_url = f"https://{raw_url}"
+    parsed = urlparse(raw_url)
+    scheme = parsed.scheme or "https"
+    hostname = parsed.hostname or ""
+    try:
+        hostname = hostname.encode("idna").decode("ascii")
+    except UnicodeError:
+        hostname = parsed.hostname or ""
+    netloc = hostname
+    if parsed.port is not None:
+        netloc = f"{netloc}:{parsed.port}"
+    if parsed.username:
+        userinfo = quote(unquote(parsed.username), safe="")
+        if parsed.password:
+            userinfo += ":" + quote(unquote(parsed.password), safe="")
+        netloc = f"{userinfo}@{netloc}"
+    path = quote(unquote(parsed.path or "/"), safe="/%:@!$&'()*+,;=-._~")
+    query = quote(unquote(parsed.query or ""), safe="=&?/:@!$'()*+,;%-._~")
+    fragment = quote(unquote(parsed.fragment or ""), safe="=&?/:@!$'()*+,;%-._~")
+    return urlunparse((scheme, netloc, path, "", query, fragment))
 
 
 DEFAULT_SEARCH_TOP_K = _env_int("SEARCH_TOP_K", MAX_SEARCH_RESULTS)
@@ -488,17 +524,18 @@ def summarize_with_qwen(
 
     prompt = (
 f"""
-Below you will receive a piece of raw webpage content. Your goal is to preserve the relevant parts from this raw content as the search result, based on the user's objective and reasoning process. The extraction must remain faithful to the original text and must not add anything that is not present in the source.
-Rules:
-1. Based on the user's provided reasoning and goal, analyze which content may be useful and which content is definitely not useful. All content that may be useful should be preserved in detail. Also retain enough original context so that the evidence still makes sense on its own when presented separately. Do not over-compress it into vague paraphrases.
-2. Preserve the most relevant evidence in an extractive way whenever possible. When important, keep names, dates, numbers, quotations, titles, roles, locations, formulas, and qualifiers exactly as they appear.
-3. Remove obvious noise: navigation text, menus, repeated headers, footer text, social buttons, login or subscription prompts, unrelated recommendations, boilerplate, tracking text, and raw URL lists.
-4. Perform content extraction only. Do not add extra content, and do not use or introduce any world knowledge.
-5. If multiple parts of the raw text may be related, you may extract them in separate segments.
-6. Output format must be exactly:
-<thinking>your analysis</thinking>
-<result>the complete extracted content</result>
-If there is no relevant content, directly place the denoised original text in full, compressed to within 3,000 words, inside <result></result>.7. The final extracted content that will be used downstream is only the content inside the <result> tag. Therefore, all content that should be preserved must appear inside <result>.
+	Below you will receive raw webpage content. Your goal is evidence extraction for the user's current objective, not a general summary. Preserve only content that helps verify or disprove the tool goal and the assistant's current reasoning. The extraction must remain faithful to the original text and must not add anything that is not present in the source.
+	Rules:
+	1. Based on the user's provided reasoning and goal, analyze which content may be useful and which content is definitely not useful. Preserve all potentially useful evidence in detail and keep enough original context so that the evidence still makes sense on its own. Do not over-compress it into vague paraphrases.
+	2. Preserve the most relevant evidence in an extractive way whenever possible. When important, keep names, dates, numbers, rankings, table headers/rows, quotations, titles, roles, locations, formulas, and qualifiers exactly as they appear.
+	3. Remove obvious noise: navigation text, menus, repeated headers, footer text, social buttons, login or subscription prompts, unrelated recommendations, boilerplate, tracking text, and raw URL lists.
+	4. Preserve image-related evidence when relevant: captions, alt text, file titles, figure labels, surrounding paragraph text, metadata, and positional relationships between an image and nearby captions/headings. Do not detach a caption from the image/title it describes.
+	5. Perform content extraction only. Do not add extra content, and do not use or introduce any world knowledge. If the raw content does not contain the requested field or cannot substantiate the goal, explicitly write "Insufficient evidence: <brief reason>" inside <result>.
+	6. If multiple parts of the raw text may be related, you may extract them in separate segments.
+	6. Output format must be exactly:
+	<thinking>your analysis</thinking>
+	<result>the complete extracted content</result>
+	The final extracted content that will be used downstream is only the content inside the <result> tag. Therefore, all content that should be preserved must appear inside <result>. Do not put meta-comments such as "the content is already minimal" in <result> unless those words are in the source.
 
 Agent's current output:\n{assistant_output or '(empty)'}\n
 Tool goal:\n{goal or '(empty)'}\n
@@ -522,15 +559,32 @@ Raw webpage content:\n{content[:80000]}\n
         )
         content_text = response.content or ""
         if content_text:
-            match = re.search(r"<result>(.*?)</result>", content_text, flags=re.DOTALL | re.IGNORECASE)
-            if match:
-                extracted = match.group(1).strip()
-                if extracted:
-                    return extracted
-            return content_text.strip()
+            cleaned = _clean_summarizer_output(content_text)
+            if cleaned:
+                return cleaned
     except Exception as exc:  # pragma: no cover - network bound
         logger.warning("Summarization failed: %s", exc)
     return content[:1000] + ("..." if len(content) > 1000 else "")
+
+
+def _clean_summarizer_output(text: str) -> str:
+    """Extract downstream content from summarizer output robustly."""
+
+    candidate = str(text or "").strip()
+    if not candidate:
+        return ""
+    match = re.search(r"<result>(.*?)</result>", candidate, flags=re.DOTALL | re.IGNORECASE)
+    if match:
+        return match.group(1).strip()
+    open_match = re.search(r"<result>\s*(.*)$", candidate, flags=re.DOTALL | re.IGNORECASE)
+    if open_match:
+        return open_match.group(1).strip()
+    candidate = re.sub(r"<thinking>.*?</thinking>", "", candidate, flags=re.DOTALL | re.IGNORECASE)
+    candidate = re.sub(r"<think>.*?</think>", "", candidate, flags=re.DOTALL | re.IGNORECASE)
+    candidate = re.sub(r"</?thinking>", "", candidate, flags=re.IGNORECASE)
+    candidate = re.sub(r"</?think>", "", candidate, flags=re.IGNORECASE)
+    candidate = re.sub(r"</?result>", "", candidate, flags=re.IGNORECASE)
+    return candidate.strip()
 
 
 def summarize_image_search(result_obj: object) -> object:
@@ -898,11 +952,11 @@ def read_url(
 ) -> dict[str, Any]:
     """Read a URL as either text content or a downloadable image."""
 
-    normalized_url = (url or "").strip()
+    original_url = (url or "").strip()
+    normalized_url = _normalize_request_url(original_url)
     if not normalized_url:
         return {"ok": False, "error": "URL is required."}
-    if not normalized_url.startswith(("http://", "https://")):
-        normalized_url = f"https://{normalized_url}"
+    _read_url_debug("normalized_url", original_url=original_url, normalized_url=normalized_url)
 
     content_type = _probe_content_type(normalized_url)
     _read_url_debug("probed_content_type", url=normalized_url, content_type=content_type)
