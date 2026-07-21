@@ -321,6 +321,24 @@ def _judge_edge(model_client: ModelWorkerClient, model_alias: str, *, image_node
     return payload
 
 
+def _compact_reference_images_for_output(reference_images: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {
+            "caption": item.get("caption"),
+            "alt_text": item.get("alt_text"),
+            "target_localization": item.get("target_localization"),
+            "why_relevant": item.get("why_relevant"),
+            "identity_anchor_strength": item.get("identity_anchor_strength"),
+            "target_visibility": item.get("target_visibility"),
+            "resolve_strategy": item.get("resolve_strategy"),
+            "source_page_url": item.get("source_page_url"),
+            "file_page_url": item.get("file_page_url"),
+            "rank": item.get("rank"),
+        }
+        for item in reference_images
+    ]
+
+
 def _parse_json_object(text: str, default: dict[str, Any]) -> dict[str, Any]:
     payload = str(text or "").strip()
     if not payload:
@@ -501,7 +519,7 @@ def main() -> int:
         record = result.to_dict()
         record["prepared_context"] = prepared_context
         record["grounded_entity"] = grounded_entity
-        record["reference_images"] = kept_reference_images
+        record["reference_images"] = _compact_reference_images_for_output(kept_reference_images)
         results.append(record)
 
         should_drop = False
