@@ -108,6 +108,21 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _read_url_debug(message: str, **kwargs: Any) -> None:
+    if not _env_flag("SFT_READ_URL_DEBUG"):
+        return
+    details = " ".join(f"{key}={value!r}" for key, value in kwargs.items())
+    suffix = f" {details}" if details else ""
+    print(f"[read_url debug] {message}{suffix}", file=sys.stderr, flush=True)
+
+
 DEFAULT_SEARCH_TOP_K = _env_int("SEARCH_TOP_K", MAX_SEARCH_RESULTS)
 TOOL_STATS_PRINT_EVERY = max(1, _env_int("SFT_TOOL_STATS_PRINT_EVERY", 4))
 
@@ -890,6 +905,7 @@ def read_url(
         normalized_url = f"https://{normalized_url}"
 
     content_type = _probe_content_type(normalized_url)
+    _read_url_debug("probed_content_type", url=normalized_url, content_type=content_type)
     if content_type.startswith("image/"):
         failures: list[str] = []
         candidates = _resource_candidate_urls(resource, normalized_url)
@@ -964,21 +980,38 @@ def read_url(
 
     if content_type in PDF_CONTENT_TYPES:
         try:
+            _read_url_debug("pdf_branch_start", url=normalized_url, content_type=content_type)
             temp_dir = tempfile.mkdtemp(prefix="synthesis_sft_read_pdf_")
             filename = os.path.basename(urlparse(normalized_url).path) or "downloaded.pdf"
             if not filename.lower().endswith(".pdf"):
                 filename = f"{os.path.splitext(filename)[0] or 'downloaded'}.pdf"
             save_path = os.path.join(temp_dir, filename)
+            _read_url_debug("pdf_download_start", url=normalized_url, save_path=save_path)
             pdf_bytes, _ = _download_binary(
                 normalized_url,
                 timeout=int(os.environ.get("SFT_PDF_DOWNLOAD_TIMEOUT_S", "120")),
                 referer_url=resource.source_page_url if resource is not None else None,
             )
+            _read_url_debug(
+                "pdf_download_done",
+                url=normalized_url,
+                byte_count=len(pdf_bytes),
+                startswith_pdf=pdf_bytes.startswith(b"%PDF-"),
+            )
             with open(save_path, "wb") as handle:
                 handle.write(pdf_bytes)
+            _read_url_debug("pdf_extract_start", path=save_path)
             content, title = _extract_pdf_text(save_path)
+            _read_url_debug(
+                "pdf_extract_done",
+                path=save_path,
+                title=title,
+                text_chars=len(content),
+                text_preview=content[:200].replace("\n", " "),
+            )
             if not content:
                 _record_read_url_call(branch="pdf", success=False)
+                _read_url_debug("pdf_extract_empty", path=save_path)
                 return {
                     "ok": False,
                     "error": f"read_url failed for {normalized_url}: PDF text extraction returned empty content.",
@@ -1002,12 +1035,26 @@ def read_url(
                 "content_type": "application/pdf",
             }
         except Exception as exc:  # pragma: no cover - network bound
+            _read_url_debug(
+                "pdf_direct_failed",
+                url=normalized_url,
+                error_type=exc.__class__.__name__,
+                error=str(exc),
+            )
             # A browser-visible PDF may still be unreachable from the inference
             # host. Fall back to the configured reader, which may use a
             # different network path and can return extracted text directly.
             try:
+                _read_url_debug("pdf_reader_fallback_start", url=normalized_url)
                 document = _read_document(normalized_url)
                 content = str(document.get("content") or "").strip()
+                _read_url_debug(
+                    "pdf_reader_fallback_done",
+                    url=normalized_url,
+                    title=document.get("title"),
+                    content_chars=len(content),
+                    content_preview=content[:200].replace("\n", " "),
+                )
                 if content:
                     summarized_content = (
                         summarize_with_qwen(
@@ -1028,8 +1075,13 @@ def read_url(
                         "content_type": "application/pdf",
                         "resolved_via": "reader_fallback",
                     }
-            except Exception:
-                pass
+            except Exception as fallback_exc:
+                _read_url_debug(
+                    "pdf_reader_fallback_failed",
+                    url=normalized_url,
+                    error_type=fallback_exc.__class__.__name__,
+                    error=str(fallback_exc),
+                )
             _record_read_url_call(branch="pdf", success=False)
             return {"ok": False, "error": f"read_url failed for {normalized_url}: {exc}"}
 
