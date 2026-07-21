@@ -30,8 +30,9 @@ from fastapi.responses import JSONResponse
 
 
 RAW_READER_URL = os.environ.get("RAW_READER_URL", "http://127.0.0.1:8002")
-READERLM_API_BASE = os.environ.get("READERLM_API_BASE", "http://127.0.0.1:8003/v1")
+READERLM_API_BASE = os.environ.get("READERLM_API_BASE", "http://127.0.0.1:8005/v1")
 READERLM_API_BASES_ENV = os.environ.get("READERLM_API_BASES", "")
+RAW_MARKDOWN_READER_URL = os.environ.get("RAW_MARKDOWN_READER_URL", "http://127.0.0.1:8003")
 READERLM_MODEL_NAME = os.environ.get("READERLM_MODEL_NAME", "jinaai/ReaderLM-v2")
 READERLM_API_KEY = os.environ.get("READERLM_API_KEY", "")
 READERLM_MAX_HTML_CHARS = int(os.environ.get("READERLM_MAX_HTML_CHARS", "120000"))
@@ -46,6 +47,11 @@ ENHANCED_READER_CACHE_DIR = Path(os.environ.get("ENHANCED_READER_CACHE_DIR", "/m
 ENHANCED_READER_CACHE_TTL_S = float(os.environ.get("ENHANCED_READER_CACHE_TTL_S", str(7 * 24 * 3600)))
 ENHANCED_READER_CACHE_NEGATIVE_TTL_S = float(os.environ.get("ENHANCED_READER_CACHE_NEGATIVE_TTL_S", "600"))
 ENHANCED_READER_MIN_USABLE_CHARS = int(os.environ.get("ENHANCED_READER_MIN_USABLE_CHARS", "500"))
+RAW_MARKDOWN_CACHE_ENABLED = os.environ.get("RAW_MARKDOWN_CACHE_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
+RAW_MARKDOWN_CACHE_DIR = Path(os.environ.get("RAW_MARKDOWN_CACHE_DIR", str(ENHANCED_READER_CACHE_DIR / "raw_markdown")))
+RAW_MARKDOWN_CACHE_TTL_S = float(os.environ.get("RAW_MARKDOWN_CACHE_TTL_S", str(ENHANCED_READER_CACHE_TTL_S)))
+RAW_MARKDOWN_CACHE_NEGATIVE_TTL_S = float(os.environ.get("RAW_MARKDOWN_CACHE_NEGATIVE_TTL_S", str(ENHANCED_READER_CACHE_NEGATIVE_TTL_S)))
+ENHANCED_READER_MODE = os.environ.get("ENHANCED_READER_MODE", "full").strip().lower()
 
 
 app = FastAPI(title="Enhanced Reader API")
@@ -176,8 +182,17 @@ def _cache_key(url: str, *, wants_json: bool) -> str:
     return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
 
 
+def _raw_markdown_cache_key(url: str) -> str:
+    payload = {"url": url}
+    return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+
+
 def _cache_path(url: str, *, wants_json: bool) -> Path:
     return ENHANCED_READER_CACHE_DIR / f"{_cache_key(url, wants_json=wants_json)}.json"
+
+
+def _raw_markdown_cache_path(url: str) -> Path:
+    return RAW_MARKDOWN_CACHE_DIR / f"{_raw_markdown_cache_key(url)}.json"
 
 
 def _read_cache(url: str, *, wants_json: bool) -> dict[str, Any] | None:
@@ -227,6 +242,41 @@ def _write_cache(url: str, *, wants_json: bool, payload: dict[str, Any], negativ
         os.replace(tmp_path, path)
     except Exception as exc:  # pragma: no cover - best-effort cache
         print(f"[enhanced_reader][cache_write_error] url={url} error={exc!r}", file=sys.stderr, flush=True)
+
+
+def _read_raw_markdown_cache(url: str) -> dict[str, Any] | None:
+    if not RAW_MARKDOWN_CACHE_ENABLED:
+        return None
+    path = _raw_markdown_cache_path(url)
+    try:
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    created_at = float(record.get("created_at") or 0.0)
+    ttl = float(record.get("ttl_s") or RAW_MARKDOWN_CACHE_TTL_S)
+    if ttl >= 0 and _now() - created_at > ttl:
+        return None
+    payload = record.get("payload")
+    return dict(payload) if isinstance(payload, dict) else None
+
+
+def _write_raw_markdown_cache(url: str, *, payload: dict[str, Any], negative: bool = False) -> None:
+    if not RAW_MARKDOWN_CACHE_ENABLED:
+        return
+    try:
+        RAW_MARKDOWN_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        path = _raw_markdown_cache_path(url)
+        record = {
+            "created_at": _now(),
+            "ttl_s": RAW_MARKDOWN_CACHE_NEGATIVE_TTL_S if negative else RAW_MARKDOWN_CACHE_TTL_S,
+            "url": url,
+            "payload": payload,
+        }
+        tmp_path = path.with_suffix(path.suffix + f".{os.getpid()}.tmp")
+        tmp_path.write_text(json.dumps(record, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp_path, path)
+    except Exception as exc:  # pragma: no cover - best-effort cache
+        print(f"[enhanced_reader][raw_markdown_cache_write_error] url={url} error={exc!r}", file=sys.stderr, flush=True)
 
 
 def looks_like_antibot(text: str | None) -> bool:
@@ -577,6 +627,16 @@ async def fetch_markdown(client: httpx.AsyncClient, url: str) -> str:
     return response.text
 
 
+async def fetch_raw_markdown_via_cache_layer(client: httpx.AsyncClient, url: str) -> str:
+    response = await client.get(
+        f"{RAW_MARKDOWN_READER_URL.rstrip('/')}/{url}",
+        headers={"Accept": "text/plain"},
+        timeout=READER_TIMEOUT,
+    )
+    response.raise_for_status()
+    return response.text
+
+
 async def convert_html_to_markdown(
     client: httpx.AsyncClient,
     html: str,
@@ -745,6 +805,9 @@ def record_failure_debug(
 
 @app.get("/{target_url:path}")
 async def read(target_url: str, request: Request):
+    if ENHANCED_READER_MODE == "raw_only":
+        return await read_raw_markdown(target_url, request)
+
     total_started = time.perf_counter()
     url = normalize_url(target_url)
     wants_json = "application/json" in request.headers.get("accept", "")
@@ -786,7 +849,11 @@ async def read(target_url: str, request: Request):
                     debug_timing=debug_timing,
                 )
             else:
-                markdown_response = await timed_stage_call("fetch_markdown", fetch_markdown(client, url), debug_timing)
+                markdown_response = await timed_stage_call(
+                    "fetch_markdown",
+                    fetch_raw_markdown_via_cache_layer(client, url),
+                    debug_timing,
+                )
                 debug_timing["raw_markdown_chars"] = len(markdown_response or "")
                 debug_timing["raw_markdown_antibot"] = looks_like_antibot(markdown_response)
                 readerlm_started = time.perf_counter()
@@ -882,3 +949,70 @@ async def read(target_url: str, request: Request):
             "X-Debug-Timing-Total-S": f"{debug_timing['total_s']:.6f}",
         },
     )
+
+
+@app.get("/raw/{target_url:path}")
+async def read_raw_markdown(target_url: str, request: Request):
+    total_started = time.perf_counter()
+    url = normalize_url(target_url)
+    wants_json = "application/json" in request.headers.get("accept", "")
+
+    cached_payload = _read_raw_markdown_cache(url)
+    if cached_payload is not None:
+        payload = dict(cached_payload)
+        payload.setdefault("debug_timing", {})
+        payload["debug_timing"].update(
+            {
+                "cache_hit": True,
+                "cache_path": str(_raw_markdown_cache_path(url)),
+                "total_s": time.perf_counter() - total_started,
+            }
+        )
+        if wants_json:
+            return payload
+        return Response(
+            str(payload.get("content") or ""),
+            media_type="text/plain; charset=utf-8",
+            headers={"X-Raw-Markdown-Cache": "hit"},
+        )
+
+    debug_timing: dict[str, Any] = {}
+    async with httpx.AsyncClient() as client:
+        try:
+            markdown = await timed_stage_call("fetch_markdown", fetch_markdown(client, url), debug_timing)
+        except StageError as exc:
+            debug_timing["total_s"] = time.perf_counter() - total_started
+            record_failure_debug(debug_timing, stage=exc.stage, exc=exc.cause)
+            message = f"Raw markdown reader error for {url}: {exc.stage} failed: {exc.cause}"
+            error_payload = {
+                "data": None,
+                "code": 502,
+                "status": 502,
+                "message": message,
+                "debug_timing": debug_timing,
+            }
+            _write_raw_markdown_cache(url, payload=error_payload, negative=True)
+            if wants_json:
+                return JSONResponse(status_code=502, content=error_payload)
+            return Response(message, status_code=502, media_type="text/plain")
+
+    debug_timing["total_s"] = time.perf_counter() - total_started
+    debug_timing["cache_hit"] = False
+    payload = {
+        "data": {
+            "title": "",
+            "url": url,
+            "content": markdown,
+            "raw_markdown": markdown,
+            "content_source": "raw_markdown_reader",
+            "content_quality": "raw",
+            "debug_timing": debug_timing,
+        },
+        "code": 200,
+        "status": 200,
+        "debug_timing": debug_timing,
+    }
+    _write_raw_markdown_cache(url, payload=payload)
+    if wants_json:
+        return payload
+    return Response(markdown, media_type="text/plain; charset=utf-8")

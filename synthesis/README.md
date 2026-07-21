@@ -53,5 +53,5 @@ def build_from_url(
 ```
 即：Reader原始输出不保留到Node中（服从Node设计原则），而是作为trace信息挂在snapshot里。
 4. 创建`TextNode`
-5. 扩展节点，需要注意，`EnhancedReaderClient`返回了两种content，一种是根据8002端口抓取的，未经过清洗的content（`raw_markdown`)，另一种是从8004抓取的清洗过后的content (`content`)。我们用前者获取页面内的超链接，用后者构建节点的语义信息。
+5. 扩展节点，需要注意，`EnhancedReaderClient`返回了两种content，一种是根据8003端口抓取的、带缓存的未经过清洗的content（`raw_markdown`)，另一种是从8004抓取的清洗过后的content (`content`)。我们用前者获取页面内的超链接，用后者构建节点的语义信息。
 需要注意的是，这里扩展节点时进行了超链接的过滤（`wiki_text_builder.extract_wiki_links`函数，只接受wiki的超链接)，并加入到等待扩展的队列

@@ -46,12 +46,12 @@ class _UnusedSearchClient:
 
 
 class RawMarkdownReaderClient:
-    """Minimal client for the raw 8002 markdown reader endpoint."""
+    """Minimal client for the raw 8003 markdown reader endpoint."""
 
     def __init__(
         self,
         *,
-        base_url: str = "http://127.0.0.1:8002",
+        base_url: str = "http://127.0.0.1:8003/raw",
         timeout_s: float = 180.0,
     ) -> None:
         self.base_url = base_url.rstrip("/")
@@ -83,7 +83,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--reader-base-url",
         type=str,
-        default="http://127.0.0.1:8002",
+        default="http://127.0.0.1:8003/raw",
         help="Raw markdown reader base URL used for text-text augmentation.",
     )
     parser.add_argument("--reader-timeout-s", type=float, default=180.0)

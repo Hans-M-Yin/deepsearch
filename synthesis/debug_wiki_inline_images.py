@@ -126,7 +126,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--env-file", default=str(DEFAULT_ENV_PATH), help="Path to synthesis env file.")
     parser.add_argument("--override-env", action="store_true", help="Let --env-file override existing env vars.")
     parser.add_argument("--reader-base-url", default="http://127.0.0.1:8004", help="Enhanced Reader base URL for building the source text node.")
-    parser.add_argument("--raw-reader-base-url", default="http://127.0.0.1:8002", help="Raw markdown Reader base URL for extracting inline images.")
+    parser.add_argument("--raw-reader-base-url", default="http://127.0.0.1:8003/raw", help="Raw markdown Reader base URL for extracting inline images.")
     parser.add_argument("--max-links", type=int, default=60, help="Maximum Wikipedia links extracted while building the source text node.")
     parser.add_argument("--limit", type=int, default=0, help="Optional max number of inline images to inspect. <=0 means all.")
     parser.add_argument("--run-id", default="debug_wiki_inline_images", help="Run id recorded in debug evidence.")

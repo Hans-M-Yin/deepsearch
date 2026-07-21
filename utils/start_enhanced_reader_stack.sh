@@ -13,7 +13,7 @@ READERLM_MODEL_PATH="${READERLM_MODEL_PATH:-/mnt/hdfs/byte_ai_sales/user/user/yi
 # on PORT+1. We set PORT=8001 so the wrapper can call the HTTP/1.1 endpoint at 8002.
 READER_PORT="${READER_PORT:-8001}"
 RAW_READER_PORT="${RAW_READER_PORT:-8002}"
-READERLM_PORT="${READERLM_PORT:-8003}"
+RAW_MARKDOWN_READER_PORT="${RAW_MARKDOWN_READER_PORT:-8003}"
 READERLM_BASE_PORT="${READERLM_BASE_PORT:-8005}"
 ENHANCED_READER_PORT="${ENHANCED_READER_PORT:-8004}"
 ENHANCED_READER_WORKERS="${ENHANCED_READER_WORKERS:-4}"
@@ -21,10 +21,12 @@ ENHANCED_READER_WORKERS="${ENHANCED_READER_WORKERS:-4}"
 READER_LOG="${READER_LOG:-${READER_DIR}/reader_log}"
 VLLM_READER_LM_LOG="${VLLM_READER_LM_LOG:-${PROJECT_DIR}/vllm_reader_lm_log}"
 ENHANCED_READER_LOG="${ENHANCED_READER_LOG:-${PROJECT_DIR}/enhanced_reader_log}"
+RAW_MARKDOWN_READER_LOG="${RAW_MARKDOWN_READER_LOG:-${PROJECT_DIR}/raw_markdown_reader_log}"
 
-READERLM_API_BASE="${READERLM_API_BASE:-http://127.0.0.1:${READERLM_PORT}/v1}"
+READERLM_API_BASE="${READERLM_API_BASE:-http://127.0.0.1:${READERLM_BASE_PORT}/v1}"
 READERLM_API_BASES="${READERLM_API_BASES:-}"
 RAW_READER_URL="${RAW_READER_URL:-http://127.0.0.1:${RAW_READER_PORT}}"
+RAW_MARKDOWN_READER_URL="${RAW_MARKDOWN_READER_URL:-http://127.0.0.1:${RAW_MARKDOWN_READER_PORT}}"
 READERLM_SERVED_MODEL_NAME="${READERLM_SERVED_MODEL_NAME:-jinaai/ReaderLM-v2}"
 READERLM_MODEL_NAME="${READERLM_MODEL_NAME:-${READERLM_SERVED_MODEL_NAME}}"
 READERLM_MAX_HTML_CHARS="${READERLM_MAX_HTML_CHARS:-120000}"
@@ -158,7 +160,9 @@ start_enhanced_reader() {
   (
     cd "${PROJECT_DIR}"
     nohup env \
+      ENHANCED_READER_MODE="full" \
       RAW_READER_URL="${RAW_READER_URL}" \
+      RAW_MARKDOWN_READER_URL="${RAW_MARKDOWN_READER_URL}" \
       READERLM_API_BASE="${READERLM_API_BASE}" \
       READERLM_API_BASES="${READERLM_API_BASES}" \
       READERLM_MODEL_NAME="${READERLM_MODEL_NAME}" \
@@ -176,11 +180,42 @@ start_enhanced_reader() {
   echo "Enhanced Reader workers: ${ENHANCED_READER_WORKERS}"
 }
 
+start_raw_markdown_reader() {
+  require_dir "${PROJECT_DIR}" "OpenSearch-VL project directory"
+  if port_in_use "${RAW_MARKDOWN_READER_PORT}"; then
+    echo "Raw Markdown Reader appears to already be listening on ${RAW_MARKDOWN_READER_PORT}; skipping."
+    return
+  fi
+
+  echo "Starting Raw Markdown Reader from ${PROJECT_DIR} ..."
+  (
+    cd "${PROJECT_DIR}"
+    nohup env \
+      ENHANCED_READER_MODE="raw_only" \
+      RAW_READER_URL="${RAW_READER_URL}" \
+      RAW_MARKDOWN_READER_URL="${RAW_MARKDOWN_READER_URL}" \
+      READERLM_API_BASE="${READERLM_API_BASE}" \
+      READERLM_API_BASES="${READERLM_API_BASES}" \
+      READERLM_MODEL_NAME="${READERLM_MODEL_NAME}" \
+      READERLM_MAX_HTML_CHARS="${READERLM_MAX_HTML_CHARS}" \
+      READERLM_MAX_TOKENS="${READERLM_MAX_TOKENS}" \
+      ENHANCED_READER_TIMEOUT="${ENHANCED_READER_TIMEOUT}" \
+      uvicorn utils.enhanced_reader:app \
+        --host 0.0.0.0 \
+        --port "${RAW_MARKDOWN_READER_PORT}" \
+        --workers 1 \
+      > "${RAW_MARKDOWN_READER_LOG}" 2>&1 &
+    echo $! > "${PROJECT_DIR}/raw_markdown_reader.pid"
+  )
+  echo "Raw Markdown Reader log: ${RAW_MARKDOWN_READER_LOG}"
+}
+
 main() {
   require_dir "${PROJECT_DIR}" "OpenSearch-VL project directory"
 
   start_reader
   start_readerlm
+  start_raw_markdown_reader
   start_enhanced_reader
 
   cat <<EOF
@@ -189,6 +224,7 @@ Startup commands have been issued.
 
 Endpoints:
   Raw Reader HTML endpoint: ${RAW_READER_URL}
+  Raw Reader cache endpoint: ${RAW_MARKDOWN_READER_URL}
   Raw Reader Node heap:     ${READER_NODE_MAX_OLD_SPACE_MB} MB
   ReaderLM API endpoint:    ${READERLM_API_BASE}
   ReaderLM replica APIs:    ${READERLM_API_BASES}
@@ -201,6 +237,7 @@ Use this for OpenSearch-VL:
 Logs:
   Reader:          ${READER_LOG}
   ReaderLM vLLM:   ${VLLM_READER_LM_LOG}
+  Raw Markdown:    ${RAW_MARKDOWN_READER_LOG}
   Enhanced Reader: ${ENHANCED_READER_LOG}
 
 Quick test after services finish loading:

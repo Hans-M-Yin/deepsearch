@@ -424,12 +424,12 @@ class EnhancedReaderClient:
 
 
 class RawMarkdownReaderClient:
-    """Minimal client for the raw 8002 markdown reader endpoint."""
+    """Minimal client for the raw 8003 markdown reader endpoint."""
 
     def __init__(
         self,
         *,
-        base_url: str = "http://127.0.0.1:8002",
+        base_url: str = "http://127.0.0.1:8003/raw",
         timeout_s: float = 180.0,
     ) -> None:
         self.base_url = base_url.rstrip("/")
