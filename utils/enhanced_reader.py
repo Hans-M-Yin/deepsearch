@@ -14,6 +14,7 @@ import asyncio
 from html import escape
 from html.parser import HTMLParser
 import hashlib
+import itertools
 import json
 import os
 from pathlib import Path
@@ -30,6 +31,7 @@ from fastapi.responses import JSONResponse
 
 RAW_READER_URL = os.environ.get("RAW_READER_URL", "http://127.0.0.1:8002")
 READERLM_API_BASE = os.environ.get("READERLM_API_BASE", "http://127.0.0.1:8003/v1")
+READERLM_API_BASES_ENV = os.environ.get("READERLM_API_BASES", "")
 READERLM_MODEL_NAME = os.environ.get("READERLM_MODEL_NAME", "jinaai/ReaderLM-v2")
 READERLM_API_KEY = os.environ.get("READERLM_API_KEY", "")
 READERLM_MAX_HTML_CHARS = int(os.environ.get("READERLM_MAX_HTML_CHARS", "120000"))
@@ -47,6 +49,18 @@ ENHANCED_READER_MIN_USABLE_CHARS = int(os.environ.get("ENHANCED_READER_MIN_USABL
 
 
 app = FastAPI(title="Enhanced Reader API")
+
+
+def _parse_readerlm_api_bases() -> list[str]:
+    values = [item.strip().rstrip("/") for item in READERLM_API_BASES_ENV.split(",") if item.strip()]
+    if values:
+        return values
+    return [READERLM_API_BASE.rstrip("/")]
+
+
+READERLM_API_BASES = _parse_readerlm_api_bases()
+_READERLM_API_BASE_CYCLE = itertools.cycle(range(len(READERLM_API_BASES)))
+_READERLM_API_BASE_LOCK = asyncio.Lock()
 
 
 ANTI_BOT_PATTERNS = (
@@ -589,8 +603,12 @@ async def convert_html_to_markdown(
     if READERLM_API_KEY:
         headers["Authorization"] = f"Bearer {READERLM_API_KEY}"
 
+    readerlm_api_base = await _select_readerlm_api_base()
+    if debug_timing is not None:
+        debug_timing["readerlm_api_base"] = readerlm_api_base
+
     response = await client.post(
-        f"{READERLM_API_BASE.rstrip('/')}/chat/completions",
+        f"{readerlm_api_base}/chat/completions",
         headers=headers,
         json={
             "model": READERLM_MODEL_NAME,
@@ -633,8 +651,12 @@ async def convert_raw_markdown_to_markdown(
     if READERLM_API_KEY:
         headers["Authorization"] = f"Bearer {READERLM_API_KEY}"
 
+    readerlm_api_base = await _select_readerlm_api_base()
+    if debug_timing is not None:
+        debug_timing["readerlm_api_base"] = readerlm_api_base
+
     response = await client.post(
-        f"{READERLM_API_BASE.rstrip('/')}/chat/completions",
+        f"{readerlm_api_base}/chat/completions",
         headers=headers,
         json={
             "model": READERLM_MODEL_NAME,
@@ -655,6 +677,14 @@ async def convert_raw_markdown_to_markdown(
         debug_timing=debug_timing,
     )
     return markdown
+
+
+async def _select_readerlm_api_base() -> str:
+    if len(READERLM_API_BASES) == 1:
+        return READERLM_API_BASES[0]
+    async with _READERLM_API_BASE_LOCK:
+        index = next(_READERLM_API_BASE_CYCLE)
+    return READERLM_API_BASES[index]
 
 
 async def timed_call(label: str, coro, timing: dict[str, Any]):

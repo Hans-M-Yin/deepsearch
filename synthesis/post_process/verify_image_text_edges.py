@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import os
 import re
@@ -106,6 +107,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prepare-model", type=str, default=os.environ.get("IMAGE_EDGE_VERIFY_PREPARE_MODEL") or os.environ.get("TEXT_PROCESS_MODEL") or "", help="Model alias for prepare steps.")
     parser.add_argument("--judge-model", type=str, default=os.environ.get("IMAGE_EDGE_VERIFY_JUDGE_MODEL") or os.environ.get("IMAGE_GROUND_MODEL") or os.environ.get("IMAGE_CHECK_MODEL") or "", help="Model alias for final judge.")
     parser.add_argument("--max-reference-images", type=int, default=6, help="Max kept wiki reference images per entity.")
+    parser.add_argument("--workers", type=int, default=4, help="Number of parallel workers for per-edge verification.")
     parser.add_argument("--write-back", action="store_true", help="Write verification results back into edge metadata and optionally remove bad edges.")
     parser.add_argument("--dry-run", action="store_true", help="Run verification only; do not modify graph files. Print planned removals.")
     parser.add_argument("--drop-on", default="contradict", choices=["contradict", "contradict_or_insufficient", "never"], help="Edge removal policy when --write-back is set.")
@@ -367,6 +369,123 @@ def _delete_edge(store: JsonlGraphStore, edge_id: str) -> bool:
         return True
 
 
+def _should_drop(decision: str, drop_on: str) -> bool:
+    if drop_on == "contradict":
+        return decision == "contradict"
+    if drop_on == "contradict_or_insufficient":
+        return decision in {"contradict", "insufficient"}
+    return False
+
+
+def _verify_single_edge(
+    *,
+    graph_dir: str,
+    edge: dict[str, Any],
+    args: argparse.Namespace,
+) -> dict[str, Any] | None:
+    store = JsonlGraphStore(Path(graph_dir))
+    reader = EnhancedReaderClient(base_url=args.reader_base_url)
+    model_client = LLM_WORKER
+    image_builder = ImageDiscoveryBuilder(
+        search_client=_UnusedSearchClient(),
+        config=ImageDiscoveryConfig(precheck_image_urls=True, try_source_page_recovery=True),
+        model_client=model_client,
+        image_check_model_alias=os.environ.get("IMAGE_CHECK_MODEL"),
+    )
+
+    image_node = store.get_node(str(edge.get("src_node_id") or ""))
+    text_node = store.get_node(str(edge.get("dst_node_id") or ""))
+    if not image_node or not text_node:
+        return None
+    source = text_node.get("source") or {}
+    text_url = text_node.get("url") or source.get("url") or source.get("source_url") or ""
+    if not _is_wikipedia_url(text_url):
+        return None
+    grounded_entity = _find_grounded_entity(image_node, text_node, edge)
+    try:
+        wiki_doc = reader.read(text_url).to_dict()
+    except Exception as exc:
+        return VerificationResult(
+            edge_id=str(edge.get("edge_id") or ""),
+            image_node_id=str(image_node.get("node_id") or ""),
+            text_node_id=str(text_node.get("node_id") or ""),
+            decision="insufficient",
+            error_type="insufficient_evidence",
+            confidence=None,
+            reason=f"reader_error:{exc.__class__.__name__}:{exc}",
+            evidence_for=[],
+            evidence_against=["failed to read wikipedia page"],
+            judge_model_alias=args.judge_model,
+            prepare_model_alias=args.prepare_model,
+            kept_reference_image_count=0,
+            source_type=str(((edge.get("source") or {}).get("source_type")) or ""),
+        ).to_dict()
+
+    prepared_context = _prepare_entity_context(
+        model_client,
+        args.prepare_model,
+        text_node=text_node,
+        wiki_document=wiki_doc,
+        image_title=str(image_node.get("title") or ""),
+    )
+    raw_reference_images = _extract_reference_images(wiki_doc.get("raw_markdown") or wiki_doc.get("content") or "", text_url, args.max_reference_images)
+    resolved_reference_images: list[dict[str, Any]] = []
+    for image_item in raw_reference_images:
+        resolved = _resolve_reference_image(
+            image_builder,
+            image_item=image_item,
+            page_title=str(wiki_doc.get("title") or text_node.get("title") or ""),
+            entity_title=str(text_node.get("title") or ""),
+        )
+        if resolved is not None:
+            resolved_reference_images.append(resolved)
+    kept_reference_images: list[dict[str, Any]] = []
+    for image_item in resolved_reference_images:
+        decision = _prepare_reference_image(
+            model_client,
+            args.prepare_model,
+            entity_title=str(text_node.get("title") or ""),
+            visual_profile=list(prepared_context.get("visual_profile") or []),
+            event_context=list(prepared_context.get("event_context") or []),
+            image_item=image_item,
+        )
+        if decision.get("keep") is True:
+            kept_reference_images.append({**image_item, **decision})
+        if len(kept_reference_images) >= max(1, args.max_reference_images):
+            break
+
+    judged = _judge_edge(
+        model_client,
+        args.judge_model,
+        image_node=image_node,
+        text_node=text_node,
+        edge=edge,
+        grounded_entity=grounded_entity,
+        prepared_context=prepared_context,
+        reference_images=kept_reference_images,
+    )
+    result = VerificationResult(
+        edge_id=str(edge.get("edge_id") or ""),
+        image_node_id=str(image_node.get("node_id") or ""),
+        text_node_id=str(text_node.get("node_id") or ""),
+        decision=str(judged.get("decision") or "insufficient"),
+        error_type=str(judged.get("error_type") or "insufficient_evidence"),
+        confidence=float(judged.get("confidence")) if str(judged.get("confidence") or "").strip() else None,
+        reason=str(judged.get("reason") or ""),
+        evidence_for=[str(item) for item in (judged.get("evidence_for") or [])],
+        evidence_against=[str(item) for item in (judged.get("evidence_against") or [])],
+        judge_model_alias=args.judge_model,
+        prepare_model_alias=args.prepare_model,
+        kept_reference_image_count=len(kept_reference_images),
+        source_type=str(((edge.get("source") or {}).get("source_type")) or ""),
+    )
+    record = result.to_dict()
+    record["prepared_context"] = prepared_context
+    record["grounded_entity"] = grounded_entity
+    record["reference_images"] = _compact_reference_images_for_output(kept_reference_images)
+    return record
+
+
 def _resolve_reference_image(
     builder: ImageDiscoveryBuilder,
     *,
@@ -412,154 +531,58 @@ def main() -> int:
         raise SystemExit("Missing judge model. Set --judge-model or IMAGE_EDGE_VERIFY_JUDGE_MODEL/IMAGE_GROUND_MODEL/IMAGE_CHECK_MODEL.")
 
     store = JsonlGraphStore(Path(args.graph_dir))
-    reader = EnhancedReaderClient(base_url=args.reader_base_url)
-    model_client = LLM_WORKER
-    image_builder = ImageDiscoveryBuilder(
-        search_client=_UnusedSearchClient(),
-        config=ImageDiscoveryConfig(precheck_image_urls=True, try_source_page_recovery=True),
-        model_client=model_client,
-        image_check_model_alias=os.environ.get("IMAGE_CHECK_MODEL"),
-    )
-
     results: list[dict[str, Any]] = []
     planned_removals: list[dict[str, Any]] = []
     edge_records = _iter_candidate_edges(store, image_node_id=args.image_node_id or None)
     started = time.perf_counter()
 
-    for edge in edge_records:
-        image_node = store.get_node(str(edge.get("src_node_id") or ""))
-        text_node = store.get_node(str(edge.get("dst_node_id") or ""))
-        if not image_node or not text_node:
-            continue
-        source = text_node.get("source") or {}
-        text_url = text_node.get("url") or source.get("url") or source.get("source_url") or ""
-        if not _is_wikipedia_url(text_url):
-            continue
-        grounded_entity = _find_grounded_entity(image_node, text_node, edge)
-        try:
-            wiki_doc = reader.read(text_url).to_dict()
-        except Exception as exc:
-            results.append(
-                VerificationResult(
-                    edge_id=str(edge.get("edge_id") or ""),
-                    image_node_id=str(image_node.get("node_id") or ""),
-                    text_node_id=str(text_node.get("node_id") or ""),
-                    decision="insufficient",
-                    error_type="insufficient_evidence",
-                    confidence=None,
-                    reason=f"reader_error:{exc.__class__.__name__}:{exc}",
-                    evidence_for=[],
-                    evidence_against=["failed to read wikipedia page"],
-                    judge_model_alias=args.judge_model,
-                    prepare_model_alias=args.prepare_model,
-                    kept_reference_image_count=0,
-                    source_type=str((edge.get("metadata") or {}).get("source_type") or ""),
-                ).to_dict()
-            )
-            continue
+    max_workers = max(1, int(args.workers))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_edge = {
+            executor.submit(_verify_single_edge, graph_dir=args.graph_dir, edge=edge, args=args): edge
+            for edge in edge_records
+        }
+        for future in as_completed(future_to_edge):
+            record = future.result()
+            if record is None:
+                continue
+            results.append(record)
+            if _should_drop(str(record.get("decision") or ""), args.drop_on):
+                planned_removals.append(
+                    {
+                        "edge_id": record.get("edge_id"),
+                        "image_node_id": record.get("image_node_id"),
+                        "text_node_id": record.get("text_node_id"),
+                        "decision": record.get("decision"),
+                        "error_type": record.get("error_type"),
+                        "reason": record.get("reason"),
+                    }
+                )
 
-        prepared_context = _prepare_entity_context(
-            model_client,
-            args.prepare_model,
-            text_node=text_node,
-            wiki_document=wiki_doc,
-            image_title=str(image_node.get("title") or ""),
-        )
-        raw_reference_images = _extract_reference_images(wiki_doc.get("raw_markdown") or wiki_doc.get("content") or "", text_url, args.max_reference_images)
-        resolved_reference_images: list[dict[str, Any]] = []
-        for image_item in raw_reference_images:
-            resolved = _resolve_reference_image(
-                image_builder,
-                image_item=image_item,
-                page_title=str(wiki_doc.get("title") or text_node.get("title") or ""),
-                entity_title=str(text_node.get("title") or ""),
-            )
-            if resolved is not None:
-                resolved_reference_images.append(resolved)
-        kept_reference_images: list[dict[str, Any]] = []
-        for image_item in resolved_reference_images:
-            decision = _prepare_reference_image(
-                model_client,
-                args.prepare_model,
-                entity_title=str(text_node.get("title") or ""),
-                visual_profile=list(prepared_context.get("visual_profile") or []),
-                event_context=list(prepared_context.get("event_context") or []),
-                image_item=image_item,
-            )
-            if decision.get("keep") is True:
-                kept_reference_images.append({**image_item, **decision})
-            if len(kept_reference_images) >= max(1, args.max_reference_images):
-                break
+    results.sort(key=lambda item: (str(item.get("image_node_id") or ""), str(item.get("edge_id") or "")))
 
-        judged = _judge_edge(
-            model_client,
-            args.judge_model,
-            image_node=image_node,
-            text_node=text_node,
-            edge=edge,
-            grounded_entity=grounded_entity,
-            prepared_context=prepared_context,
-            reference_images=kept_reference_images,
-        )
-        result = VerificationResult(
-            edge_id=str(edge.get("edge_id") or ""),
-            image_node_id=str(image_node.get("node_id") or ""),
-            text_node_id=str(text_node.get("node_id") or ""),
-            decision=str(judged.get("decision") or "insufficient"),
-            error_type=str(judged.get("error_type") or "insufficient_evidence"),
-            confidence=float(judged.get("confidence")) if str(judged.get("confidence") or "").strip() else None,
-            reason=str(judged.get("reason") or ""),
-            evidence_for=[str(item) for item in (judged.get("evidence_for") or [])],
-            evidence_against=[str(item) for item in (judged.get("evidence_against") or [])],
-            judge_model_alias=args.judge_model,
-            prepare_model_alias=args.prepare_model,
-            kept_reference_image_count=len(kept_reference_images),
-            source_type=str((edge.get("metadata") or {}).get("source_type") or ""),
-        )
-        record = result.to_dict()
-        record["prepared_context"] = prepared_context
-        record["grounded_entity"] = grounded_entity
-        record["reference_images"] = _compact_reference_images_for_output(kept_reference_images)
-        results.append(record)
-
-        should_drop = False
-        if args.drop_on == "contradict" and result.decision == "contradict":
-            should_drop = True
-        elif args.drop_on == "contradict_or_insufficient" and result.decision in {"contradict", "insufficient"}:
-            should_drop = True
-        if should_drop:
-            planned_removals.append(
-                {
-                    "edge_id": result.edge_id,
-                    "image_node_id": result.image_node_id,
-                    "text_node_id": result.text_node_id,
-                    "decision": result.decision,
-                    "error_type": result.error_type,
-                    "reason": result.reason,
-                }
-            )
-
+    for record in results:
         if args.write_back and not args.dry_run:
-            edge_record = store.get_edge(result.edge_id) or edge
+            edge_record = store.get_edge(str(record.get("edge_id") or ""))
+            if edge_record is None:
+                continue
             edge_meta = dict(edge_record.get("metadata") or {})
             edge_meta["post_verify_image_text"] = {
-                "decision": result.decision,
-                "error_type": result.error_type,
-                "confidence": result.confidence,
-                "reason": result.reason,
-                "evidence_for": result.evidence_for,
-                "evidence_against": result.evidence_against,
-                "judge_model_alias": result.judge_model_alias,
-                "prepare_model_alias": result.prepare_model_alias,
-                "kept_reference_image_count": result.kept_reference_image_count,
+                "decision": record.get("decision"),
+                "error_type": record.get("error_type"),
+                "confidence": record.get("confidence"),
+                "reason": record.get("reason"),
+                "evidence_for": record.get("evidence_for") or [],
+                "evidence_against": record.get("evidence_against") or [],
+                "judge_model_alias": record.get("judge_model_alias"),
+                "prepare_model_alias": record.get("prepare_model_alias"),
+                "kept_reference_image_count": record.get("kept_reference_image_count"),
                 "verified_at_unix": time.time(),
             }
             edge_record["metadata"] = edge_meta
             store.upsert_edge(edge_record)
-            if args.drop_on == "contradict" and result.decision == "contradict":
-                _delete_edge(store, result.edge_id)
-            elif args.drop_on == "contradict_or_insufficient" and result.decision in {"contradict", "insufficient"}:
-                _delete_edge(store, result.edge_id)
+            if _should_drop(str(record.get("decision") or ""), args.drop_on):
+                _delete_edge(store, str(record.get("edge_id") or ""))
 
     if args.write_back and not args.dry_run and store.has_pending_writes():
         store.flush()

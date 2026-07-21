@@ -14,6 +14,7 @@ READERLM_MODEL_PATH="${READERLM_MODEL_PATH:-/mnt/hdfs/byte_ai_sales/user/user/yi
 READER_PORT="${READER_PORT:-8001}"
 RAW_READER_PORT="${RAW_READER_PORT:-8002}"
 READERLM_PORT="${READERLM_PORT:-8003}"
+READERLM_BASE_PORT="${READERLM_BASE_PORT:-8005}"
 ENHANCED_READER_PORT="${ENHANCED_READER_PORT:-8004}"
 ENHANCED_READER_WORKERS="${ENHANCED_READER_WORKERS:-4}"
 
@@ -22,6 +23,7 @@ VLLM_READER_LM_LOG="${VLLM_READER_LM_LOG:-${PROJECT_DIR}/vllm_reader_lm_log}"
 ENHANCED_READER_LOG="${ENHANCED_READER_LOG:-${PROJECT_DIR}/enhanced_reader_log}"
 
 READERLM_API_BASE="${READERLM_API_BASE:-http://127.0.0.1:${READERLM_PORT}/v1}"
+READERLM_API_BASES="${READERLM_API_BASES:-}"
 RAW_READER_URL="${RAW_READER_URL:-http://127.0.0.1:${RAW_READER_PORT}}"
 READERLM_SERVED_MODEL_NAME="${READERLM_SERVED_MODEL_NAME:-jinaai/ReaderLM-v2}"
 READERLM_MODEL_NAME="${READERLM_MODEL_NAME:-${READERLM_SERVED_MODEL_NAME}}"
@@ -29,6 +31,8 @@ READERLM_MAX_HTML_CHARS="${READERLM_MAX_HTML_CHARS:-120000}"
 READERLM_MAX_TOKENS="${READERLM_MAX_TOKENS:-8192}"
 ENHANCED_READER_TIMEOUT="${ENHANCED_READER_TIMEOUT:-180}"
 READER_NODE_MAX_OLD_SPACE_MB="${READER_NODE_MAX_OLD_SPACE_MB:-32768}"
+
+REQUESTED_READERLM_REPLICAS="${1:-}"
 
 require_dir() {
   local path="$1"
@@ -42,6 +46,31 @@ require_dir() {
 port_in_use() {
   local port="$1"
   ss -lnt 2>/dev/null | awk '{print $4}' | grep -Eq "[:.]${port}$"
+}
+
+detect_gpu_count() {
+  if command -v nvidia-smi >/dev/null 2>&1; then
+    nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null | wc -l | tr -d ' '
+    return
+  fi
+  echo 0
+}
+
+resolve_readerlm_replica_count() {
+  if [[ -n "${REQUESTED_READERLM_REPLICAS}" ]]; then
+    echo "${REQUESTED_READERLM_REPLICAS}"
+    return
+  fi
+  detect_gpu_count
+}
+
+validate_positive_int() {
+  local value="$1"
+  local label="$2"
+  if ! [[ "${value}" =~ ^[0-9]+$ ]] || [[ "${value}" -le 0 ]]; then
+    echo "${label} must be a positive integer, got: ${value}" >&2
+    exit 1
+  fi
 }
 
 start_reader() {
@@ -66,23 +95,56 @@ start_reader() {
 
 start_readerlm() {
   require_dir "${READERLM_MODEL_PATH}" "ReaderLM model path"
-  if port_in_use "${READERLM_PORT}"; then
-    echo "ReaderLM appears to already be listening on ${READERLM_PORT}; skipping."
-    return
+
+  local replica_count
+  replica_count="$(resolve_readerlm_replica_count)"
+  validate_positive_int "${replica_count}" "ReaderLM replica count"
+
+  local gpu_count
+  gpu_count="$(detect_gpu_count)"
+  validate_positive_int "${gpu_count}" "Detected GPU count"
+
+  if [[ "${replica_count}" -gt "${gpu_count}" ]]; then
+    echo "Requested ${replica_count} ReaderLM replicas but only detected ${gpu_count} GPUs." >&2
+    exit 1
   fi
 
-  echo "Starting ReaderLM with vLLM from ${READERLM_MODEL_PATH} ..."
-  (
-    cd "${PROJECT_DIR}"
-    nohup vllm serve "${READERLM_MODEL_PATH}" \
-      --host 0.0.0.0 \
-      --port "${READERLM_PORT}" \
-      --served-model-name "${READERLM_SERVED_MODEL_NAME}" \
-      --tensor-parallel-size 2 \
-      > "${VLLM_READER_LM_LOG}" 2>&1 &
-    echo $! > "${PROJECT_DIR}/vllm_reader_lm.pid"
-  )
-  echo "ReaderLM vLLM log: ${VLLM_READER_LM_LOG}"
+  local api_bases=()
+  local started_ports=()
+
+  for ((i=0; i<replica_count; i++)); do
+    local gpu_id="${i}"
+    local port=$((READERLM_BASE_PORT + i * 2))
+    local log_path="${VLLM_READER_LM_LOG}.gpu${gpu_id}.log"
+    local pid_path="${PROJECT_DIR}/vllm_reader_lm_gpu${gpu_id}.pid"
+
+    api_bases+=("http://127.0.0.1:${port}/v1")
+    started_ports+=("${port}")
+
+    if port_in_use "${port}"; then
+      echo "ReaderLM replica on port ${port} already appears to be listening; skipping GPU ${gpu_id}."
+      continue
+    fi
+
+    echo "Starting ReaderLM replica ${i} on GPU ${gpu_id} port ${port} from ${READERLM_MODEL_PATH} ..."
+    (
+      cd "${PROJECT_DIR}"
+      nohup env CUDA_VISIBLE_DEVICES="${gpu_id}" \
+        vllm serve "${READERLM_MODEL_PATH}" \
+          --host 0.0.0.0 \
+          --port "${port}" \
+          --served-model-name "${READERLM_SERVED_MODEL_NAME}" \
+          --tensor-parallel-size 1 \
+          > "${log_path}" 2>&1 &
+      echo $! > "${pid_path}"
+    )
+    echo "ReaderLM replica log (gpu ${gpu_id}): ${log_path}"
+  done
+
+  READERLM_API_BASES="$(IFS=,; echo "${api_bases[*]}")"
+  export READERLM_API_BASES
+  export READERLM_REPLICA_COUNT="${replica_count}"
+  export READERLM_STARTED_PORTS="$(IFS=,; echo "${started_ports[*]}")"
 }
 
 start_enhanced_reader() {
@@ -98,6 +160,7 @@ start_enhanced_reader() {
     nohup env \
       RAW_READER_URL="${RAW_READER_URL}" \
       READERLM_API_BASE="${READERLM_API_BASE}" \
+      READERLM_API_BASES="${READERLM_API_BASES}" \
       READERLM_MODEL_NAME="${READERLM_MODEL_NAME}" \
       READERLM_MAX_HTML_CHARS="${READERLM_MAX_HTML_CHARS}" \
       READERLM_MAX_TOKENS="${READERLM_MAX_TOKENS}" \
@@ -128,6 +191,7 @@ Endpoints:
   Raw Reader HTML endpoint: ${RAW_READER_URL}
   Raw Reader Node heap:     ${READER_NODE_MAX_OLD_SPACE_MB} MB
   ReaderLM API endpoint:    ${READERLM_API_BASE}
+  ReaderLM replica APIs:    ${READERLM_API_BASES}
   Enhanced Reader endpoint: http://127.0.0.1:${ENHANCED_READER_PORT}
   Enhanced Reader workers:  ${ENHANCED_READER_WORKERS}
 
