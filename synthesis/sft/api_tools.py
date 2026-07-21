@@ -154,37 +154,82 @@ Rules:
 """
 
 # #### START Response 0720 ####
-RESPONSES_PUBLIC_REASONING_PROMPT = """
-You are using native function tools through the Responses API. Do not write
-manual <action> blocks and do not imitate the manual-ReAct examples elsewhere in
-the base prompt.
-
-Before each function call, emit a concise but substantive public progress update
-as an assistant message. The update should:
-1. analyze what the latest tool observation actually establishes;
-2. state what remains uncertain or unresolved;
-3. explain why the selected function and its arguments are the appropriate next
-   step;
-4. avoid claiming that search-result metadata proves webpage or image content;
-5. never mention or cite the private answer, reference facts, verification
-   guidance, hidden hints, or construction-time information.
-
-The public update is an evidence-grounded explanation for a reader, not hidden
-chain-of-thought. Keep it focused and avoid repeating the entire question every
-turn. Use native function calls for tools. When the evidence is sufficient,
-return a final answer as an assistant message and do not call another tool.
-
-For i2i_search, region coordinates are x-first normalized coordinates on a
-0-1000 scale in the order [x1, y1, x2, y2]. x increases left-to-right and y
-increases top-to-bottom. Use [0, 0, 1000, 1000] for the full image.
+RESPONSES_TOOL_USE_TIPS = """
+Tool-use tips:
+1. t2t_search is a Google text/web search tool. It returns search-result metadata such as titles, URLs, and snippets. Snippets are useful for choosing sources, but they are not full evidence. Use read_url to inspect a promising result before treating page content as verified evidence.
+2. t2i_search retrieves image-search metadata from a text description. The returned images are not visible to you yet. Review titles/snippets/source pages, then use read_url on a selected image URL or source page before making visual claims about the image.
+3. i2i_search is a reverse-image search tool for identifying unfamiliar people, objects, logos, artworks, or other visual elements. Its matches may be noisy. Treat image-search titles as hints, not proof, and verify with read_url or another source when identity matters.
+4. After i2i_search or t2i_search, do not claim that you have seen a returned image unless a successful read_url call has downloaded/read that image. Search-result metadata can suggest a direction, but it does not itself prove visual content.
+5. For i2i_search, region coordinates are x-first normalized coordinates on a 0-1000 scale in the order [x1, y1, x2, y2]. x increases left-to-right and y increases top-to-bottom. Use [0, 0, 1000, 1000] for the full image.
 """.strip()
 
 
+RESPONSES_SYSTEM_PROMPT = """
+You are writing a full solution for a multi-hop knowledge question. Specifically, based on the question provided to you, you need to produce a complete solution process that includes scientifically rigorous, logically sound reasoning steps. This solution process should contain analysis and reasoning about the question, native tool calls, analysis and reflection on tool results, replanning of the solution steps, multiple search attempts when needed, and a final accurate solution.
+
+Requirements:
+1. You may think freely during your internal reasoning phase, but the statements ultimately included in the written solution process must also follow rigorous logic, ensuring that the solution remains sound and error-free even if one reads only the written solution process and ignores your private thinking.
+2. In the solution you write, the following logic should be explicitly visible: before each native function call, write a concise but substantive public progress update. This update should analyze what the latest tool observation actually establishes, state what remains uncertain, and explain why the selected function and its arguments are the appropriate next step.
+3. In the written solution, every factual claim must be grounded in the question, the image, or tool-returned evidence. Do not introduce any fact, entity, date, name, or relationship unless it is directly supported by the available evidence. If something is not yet supported, explicitly treat it as uncertain and continue searching instead of guessing.
+4. Once you believe the evidence is sufficient and there are no remaining unclear or uncertain points, provide the final answer and do not call another tool.
+5. In your solution, DO NOT use tools to directly search for pages related to Wikipedia or Wiki Commons, in order to avoid shortcuts. However, you can read related Wikipedia or Wiki Commons pages which are the results of the search tools. When a search yields no useful results, try switching the form of the content you search for.
+6. When writing the solution, make full use of the tool results. For example, a searched URL may seem irrelevant to the clues, but you should still analyze whether the webpage may contain the clues needed to solve the problem based on any available snippets, and then use read_url to read it further.
+7. The intermediate factual statements related to the question, as well as the final answer, will be provided to you, but you must never reveal any of that content in your response. You may only use it to verify whether your current solution process is correct. If the results of your search and analysis contradict the provided factual statements, that means there is a flaw in your current search or reasoning. You should promptly reflect that reconsideration and rejection process in your solution, then continue analyzing and searching for new clues until your answer is correct. Do not search directly for statements provided to you out of nowhere, and do not follow a pattern of first searching for an unsupported claim and only then trying to verify it.
+8. Use native Responses API function calls for tools. Do not output tool calls as XML, markdown, or plain-text JSON. The system will execute your native function call and provide the observation.
+9. Note: you should not mention the above requirements in your solution.
+
+Tool-use tips:
+1. t2t_search is a Google text/web search tool. It returns search-result metadata such as titles, URLs, and snippets. Snippets are useful for choosing sources, but they are not full evidence. Use read_url to inspect a promising result before treating page content as verified evidence.
+2. t2i_search retrieves image-search metadata from a text description. The returned images are not visible to you yet. Review titles/snippets/source pages, then use read_url on a selected image URL or source page before making visual claims about the image.
+3. i2i_search is a reverse-image search tool for identifying unfamiliar people, objects, logos, artworks, or other visual elements. Its matches may be noisy. Treat image-search titles as hints, not proof, and verify with read_url or another source when identity matters.
+4. After i2i_search or t2i_search, do not claim that you have seen a returned image unless a successful read_url call has downloaded/read that image. Search-result metadata can suggest a direction, but it does not itself prove visual content.
+5. For i2i_search, region coordinates are x-first normalized coordinates on a 0-1000 scale in the order [x1, y1, x2, y2]. x increases left-to-right and y increases top-to-bottom. Use [0, 0, 1000, 1000] for the full image.
+
+Next, I will provide some excerpted examples, and you can learn from them how to write a high-quality answer process. The examples use native function calls, so the written text shows the public progress update before the call and then names the intended native function call.
+
+** Example 1: Avoid using internal knowledge or other fabricated evidence.
+
+Bad writing:
+
+Based on the text and watermarks visible in the provided image, the stock photography agency is Alamy. The question asks about a specific photograph from a different media repository that Alamy is known to source content from. My first step is to identify this repository. I will call t2t_search with query: "Alamy sources content from Wikimedia Commons".
+
+Good writing:
+
+Based on the text and watermarks visible in the provided image, the stock photography agency is Alamy. The question asks about a specific photograph from a different media repository that Alamy is known to source content from. My first step is to identify this repository. I should first search which repository Alamy sources content from, without assuming the repository name in advance. I will call t2t_search with query: "The large repository Alamy sources content from".
+
+Discuss: In the bad version, the query target 'Wiki Commons' comes from nowhere, which is a typical knowledge leakage of the writer model. In good version, the answer is more logically rigorous, the reasoning is more careful, and there are no clues appearing from nowhere.
+
+** Example 2: Effective Tool Use/Coordination
+
+Original question: In 2022, Messi, as captain, lifted the World Cup trophy on the podium, surrounded by his teammates. How many goals did the player standing immediately to Messi's left score in the 2016-17 season?
+
+Good writing:
+To determine the goal total of the player standing to Messi's left on the World Cup final podium, we can search for a photo of the full Argentina team on the podium at the 2022 World Cup final award ceremony. Then I can inspect the player standing to Messi's left in the image and identify who he is. Once I know his identity, we can search his career history and find how many goals he scored in the 2016-17 season. Next, I will call t2t_search with query: "2022 World Cup final Argentina team award ceremony photo".
+(...tool result omitted...)
+The tool returned several image links. Among them, the titles of the first, second, and fourth webpages all mention Argentina winning the World Cup, so the corresponding images are likely to be the celebration photo I am looking for from the final award ceremony. However, search-result metadata is not visual evidence. Next, I will inspect the first image to check whether it is indeed the target image and whether it can provide clues for the question. I will call read_url on the selected image/page URL with the goal: "Download the target image and check whether it is the correct image I am looking for".
+(... tool result omitted ...)
+The image has been successfully downloaded, and it is indeed a photo of the full Argentina team during the trophy presentation. In the image, Messi is wearing a black bisht and lifting the World Cup trophy. The player on his left is wearing the number 21 shirt. From this image alone, I cannot be fully certain who he is. My next step should be to use i2i_search, crop out this player, and see whether I can find similar images to determine his identity. In addition, since the image shows that he is wearing number 21, if i2i_search does not produce a satisfactory result, I can also directly search who wore number 21 for Argentina in the 2022 World Cup squad. I will call i2i_search with region [420, 340, 520, 370].
+(... tool result omitted ...)
+Several of the search result titles mention Dybala, which suggests that this player is very likely Dybala. However, I still cannot be certain, because it is possible that the retrieved images are not actually of the same person as the cropped player. Therefore, I should download another image and compare it with the person in the original image to see whether they are indeed the same individual. So I will use read_url to download a new image. If it does turn out to be the same person, then I will only need to search Dybala's historical goal records, and by reading the relevant sources I will be able to determine his goal total for the 2016-17 season.
+(... omitted below ...)
+
+Discuss: In the example above, the solution first analyzes the question and then describes the target image in a detailed and precise way, rather than simply searching for something like "Argentina championship celebration photo," which could return many different images that fit that description. It then downloads the returned image URL and confirms that it is indeed the target photo. After that, it uses i2i_search on that photo for identification, and read_url to further verify the identity of a person who is not very familiar. The whole process is natural and rigorous, and it does not reveal any internal knowledge.
+""".strip()
+
+
+RESPONSES_PUBLIC_REASONING_PROMPT = RESPONSES_TOOL_USE_TIPS
+
+
 def _build_responses_instructions(base_system_prompt: str) -> str:
+    # Use a clean Responses-specific system prompt when the caller uses the
+    # default SFT prompt. If the caller explicitly supplies another system prompt,
+    # keep it and append only the tool-use tips.
+    if base_system_prompt.strip() == DEFAULT_SYSTEM_PROMPT.strip():
+        return RESPONSES_SYSTEM_PROMPT
     return "\n\n".join(
-        part for part in (base_system_prompt.strip(), RESPONSES_PUBLIC_REASONING_PROMPT) if part
+        part for part in (base_system_prompt.strip(), RESPONSES_TOOL_USE_TIPS) if part
     ).strip()
-# #### END Response 0720 ####
+
 
 _MANUAL_REACT_ACTIONS = {"t2t_search", "t2i_search", "i2i_search", "read_url", "finish"}
 _MANUAL_REACT_ACTION_RE = re.compile(r"<action>\s*(?P<json>\{.*?\})\s*</action>", re.DOTALL | re.IGNORECASE)
