@@ -58,10 +58,38 @@ app = FastAPI(title="Enhanced Reader API")
 
 
 def _parse_readerlm_api_bases() -> list[str]:
-    values = [item.strip().rstrip("/") for item in READERLM_API_BASES_ENV.split(",") if item.strip()]
-    if values:
-        return values
-    return [READERLM_API_BASE.rstrip("/")]
+    configured = [item.strip() for item in READERLM_API_BASES_ENV.split(",") if item.strip()]
+    if not configured:
+        configured = [READERLM_API_BASE]
+
+    raw_markdown_origin = urlparse(RAW_MARKDOWN_READER_URL).netloc.casefold()
+    values: list[str] = []
+    rejected: list[str] = []
+    for value in configured:
+        base = value.rstrip("/")
+        if base.endswith("/chat/completions"):
+            base = base.removesuffix("/chat/completions")
+        parsed = urlparse(base)
+        if not parsed.scheme or not parsed.netloc or parsed.netloc.casefold() == raw_markdown_origin:
+            rejected.append(value)
+            continue
+        if base not in values:
+            values.append(base)
+
+    if not values:
+        raise ValueError(
+            "No valid ReaderLM API base is configured. READERLM_API_BASE(S) must "
+            "contain OpenAI-compatible vLLM bases such as http://127.0.0.1:8005/v1, "
+            f"not the raw markdown reader {RAW_MARKDOWN_READER_URL!r}. "
+            f"Rejected values: {rejected!r}"
+        )
+    if rejected:
+        print(
+            f"[enhanced_reader] ignoring invalid ReaderLM API bases: {rejected!r}",
+            file=sys.stderr,
+            flush=True,
+        )
+    return values
 
 
 READERLM_API_BASES = _parse_readerlm_api_bases()
@@ -663,25 +691,12 @@ async def convert_html_to_markdown(
     if READERLM_API_KEY:
         headers["Authorization"] = f"Bearer {READERLM_API_KEY}"
 
-    readerlm_api_base = await _select_readerlm_api_base()
-    if debug_timing is not None:
-        debug_timing["readerlm_api_base"] = readerlm_api_base
-
-    response = await client.post(
-        f"{readerlm_api_base}/chat/completions",
+    markdown = await _readerlm_completion(
+        client=client,
         headers=headers,
-        json={
-            "model": READERLM_MODEL_NAME,
-            "messages": [{"role": "user", "content": create_prompt(readerlm_input)}],
-            "temperature": 0,
-            "max_tokens": READERLM_MAX_TOKENS,
-            "extra_body": {"repetition_penalty": 1.08},
-        },
-        timeout=READER_TIMEOUT,
+        prompt=create_prompt(readerlm_input),
+        debug_timing=debug_timing,
     )
-    response.raise_for_status()
-    data: dict[str, Any] = response.json()
-    markdown = strip_outer_markdown_fence(data["choices"][0]["message"]["content"])
     debug_url_leak_after_readerlm(
         source_url=source_url,
         readerlm_input=readerlm_input,
@@ -711,25 +726,12 @@ async def convert_raw_markdown_to_markdown(
     if READERLM_API_KEY:
         headers["Authorization"] = f"Bearer {READERLM_API_KEY}"
 
-    readerlm_api_base = await _select_readerlm_api_base()
-    if debug_timing is not None:
-        debug_timing["readerlm_api_base"] = readerlm_api_base
-
-    response = await client.post(
-        f"{readerlm_api_base}/chat/completions",
+    markdown = await _readerlm_completion(
+        client=client,
         headers=headers,
-        json={
-            "model": READERLM_MODEL_NAME,
-            "messages": [{"role": "user", "content": create_markdown_cleanup_prompt(readerlm_input)}],
-            "temperature": 0,
-            "max_tokens": READERLM_MAX_TOKENS,
-            "extra_body": {"repetition_penalty": 1.08},
-        },
-        timeout=READER_TIMEOUT,
+        prompt=create_markdown_cleanup_prompt(readerlm_input),
+        debug_timing=debug_timing,
     )
-    response.raise_for_status()
-    data: dict[str, Any] = response.json()
-    markdown = strip_outer_markdown_fence(data["choices"][0]["message"]["content"])
     debug_url_leak_after_readerlm(
         source_url=source_url,
         readerlm_input=readerlm_input,
@@ -739,12 +741,54 @@ async def convert_raw_markdown_to_markdown(
     return markdown
 
 
-async def _select_readerlm_api_base() -> str:
+async def _readerlm_api_bases_for_request() -> list[str]:
     if len(READERLM_API_BASES) == 1:
-        return READERLM_API_BASES[0]
+        return list(READERLM_API_BASES)
     async with _READERLM_API_BASE_LOCK:
         index = next(_READERLM_API_BASE_CYCLE)
-    return READERLM_API_BASES[index]
+    return READERLM_API_BASES[index:] + READERLM_API_BASES[:index]
+
+
+async def _readerlm_completion(
+    *,
+    client: httpx.AsyncClient,
+    headers: dict[str, str],
+    prompt: str,
+    debug_timing: dict[str, Any] | None,
+) -> str:
+    attempted: list[str] = []
+    failures: list[dict[str, Any]] = []
+    last_error: Exception | None = None
+    for readerlm_api_base in await _readerlm_api_bases_for_request():
+        attempted.append(readerlm_api_base)
+        try:
+            response = await client.post(
+                f"{readerlm_api_base}/chat/completions",
+                headers=headers,
+                json={
+                    "model": READERLM_MODEL_NAME,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0,
+                    "max_tokens": READERLM_MAX_TOKENS,
+                    "extra_body": {"repetition_penalty": 1.08},
+                },
+                timeout=READER_TIMEOUT,
+            )
+            response.raise_for_status()
+            data: dict[str, Any] = response.json()
+            if debug_timing is not None:
+                debug_timing["readerlm_api_base"] = readerlm_api_base
+                debug_timing["readerlm_attempted_api_bases"] = attempted
+                debug_timing["readerlm_failures"] = failures
+            return strip_outer_markdown_fence(data["choices"][0]["message"]["content"])
+        except (httpx.HTTPError, KeyError, TypeError, ValueError) as exc:
+            last_error = exc
+            failures.append({"api_base": readerlm_api_base, "error": f"{exc.__class__.__name__}: {exc}"})
+
+    if debug_timing is not None:
+        debug_timing["readerlm_attempted_api_bases"] = attempted
+        debug_timing["readerlm_failures"] = failures
+    raise RuntimeError(f"All ReaderLM replicas failed: {failures!r}") from last_error
 
 
 async def timed_call(label: str, coro, timing: dict[str, Any]):
