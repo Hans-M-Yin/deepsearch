@@ -1033,25 +1033,24 @@ class ModelRouterWorkerClient:
             totals["reasoning_tokens"] += reasoning_tokens
             totals["cached_tokens"] += cached_tokens
             snapshot = dict(totals)
-        # Temporarily disable noisy per-call usage logging while keeping token aggregation.
-        # print(
-        #     "[llm-usage]"
-        #     f" alias={alias}"
-        #     f" served_model={response.metadata.get('served_model') or response.model}"
-        #     f" call_prompt_tokens={prompt_tokens}"
-        #     f" call_completion_tokens={completion_tokens}"
-        #     f" call_total_tokens={total_tokens}"
-        #     f" call_reasoning_tokens={reasoning_tokens}"
-        #     f" call_cached_tokens={cached_tokens}"
-        #     f" cumulative_calls={snapshot['calls']}"
-        #     f" cumulative_prompt_tokens={snapshot['prompt_tokens']}"
-        #     f" cumulative_completion_tokens={snapshot['completion_tokens']}"
-        #     f" cumulative_total_tokens={snapshot['total_tokens']}"
-        #     f" cumulative_reasoning_tokens={snapshot['reasoning_tokens']}"
-        #     f" cumulative_cached_tokens={snapshot['cached_tokens']}",
-        #     file=sys.stderr,
-        #     flush=True,
-        # )
+        print(
+            "[llm-usage]"
+            f" alias={alias}"
+            f" served_model={response.metadata.get('served_model') or response.model}"
+            f" call_prompt_tokens={prompt_tokens}"
+            f" call_completion_tokens={completion_tokens}"
+            f" call_total_tokens={total_tokens}"
+            f" call_reasoning_tokens={reasoning_tokens}"
+            f" call_cached_tokens={cached_tokens}"
+            f" cumulative_calls={snapshot['calls']}"
+            f" cumulative_prompt_tokens={snapshot['prompt_tokens']}"
+            f" cumulative_completion_tokens={snapshot['completion_tokens']}"
+            f" cumulative_total_tokens={snapshot['total_tokens']}"
+            f" cumulative_reasoning_tokens={snapshot['reasoning_tokens']}"
+            f" cumulative_cached_tokens={snapshot['cached_tokens']}",
+            file=sys.stderr,
+            flush=True,
+        )
 
 
 LLM_WORKER = ModelRouterWorkerClient.from_env()

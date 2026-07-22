@@ -1136,9 +1136,9 @@ def read_url(
             return {"ok": False, "error": f"read_url failed for {normalized_url}: {exc}"}
 
     try:
-        print(f"############ {normalized_url} ##############")
+        # print(f"############ {normalized_url} ##############")
         document = _read_document(normalized_url)
-        print(f"############ {document} ##############")
+        # print(f"############ {document} ##############")
     except Exception as exc:  # pragma: no cover - network bound
         _record_read_url_call(branch="text", success=False)
         return {"ok": False, "error": f"read_url failed for {normalized_url}: {exc}"}
