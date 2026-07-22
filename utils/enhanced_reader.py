@@ -223,6 +223,24 @@ def _raw_markdown_cache_path(url: str) -> Path:
     return RAW_MARKDOWN_CACHE_DIR / f"{_raw_markdown_cache_key(url)}.json"
 
 
+def _delete_cache_path(path: Path, *, label: str) -> None:
+    """Best-effort removal for stale or manually refreshed cache entries."""
+    try:
+        path.unlink(missing_ok=True)
+    except Exception as exc:  # pragma: no cover - best-effort cache cleanup
+        print(f"[enhanced_reader][{label}_cache_delete_error] path={path} error={exc!r}", file=sys.stderr, flush=True)
+
+
+def _is_cacheable_success(payload: dict[str, Any]) -> bool:
+    """Only successful, structured responses may be replayed from cache."""
+    status = payload.get("status", payload.get("code"))
+    try:
+        is_success = 200 <= int(status) < 300
+    except (TypeError, ValueError):
+        is_success = False
+    return is_success and isinstance(payload.get("data"), dict)
+
+
 def _read_cache(url: str, *, wants_json: bool) -> dict[str, Any] | None:
     if not ENHANCED_READER_CACHE_ENABLED:
         return None
@@ -239,6 +257,11 @@ def _read_cache(url: str, *, wants_json: bool) -> dict[str, Any] | None:
     if not isinstance(payload, dict):
         return None
     payload = dict(payload)
+    if not _is_cacheable_success(payload):
+        # Old versions cached 502 payloads. Remove them so a recovered
+        # upstream is retried immediately instead of being replayed as empty.
+        _delete_cache_path(path, label="enhanced_reader")
+        return None
     data = payload.get("data")
     if isinstance(data, dict):
         data = dict(data)
@@ -285,7 +308,13 @@ def _read_raw_markdown_cache(url: str) -> dict[str, Any] | None:
     if ttl >= 0 and _now() - created_at > ttl:
         return None
     payload = record.get("payload")
-    return dict(payload) if isinstance(payload, dict) else None
+    if not isinstance(payload, dict):
+        return None
+    payload = dict(payload)
+    if not _is_cacheable_success(payload):
+        _delete_cache_path(path, label="raw_markdown")
+        return None
+    return payload
 
 
 def _write_raw_markdown_cache(url: str, *, payload: dict[str, Any], negative: bool = False) -> None:
@@ -856,8 +885,11 @@ async def read(target_url: str, request: Request):
     url = normalize_url(target_url)
     wants_json = "application/json" in request.headers.get("accept", "")
     debug_timing: dict[str, Any] = {}
+    refresh_cache = request.query_params.get("refresh", "").strip().lower() in {"1", "true", "yes"}
 
-    cached_payload = _read_cache(url, wants_json=wants_json)
+    if refresh_cache:
+        _delete_cache_path(_cache_path(url, wants_json=wants_json), label="enhanced_reader")
+    cached_payload = None if refresh_cache else _read_cache(url, wants_json=wants_json)
     if cached_payload is not None:
         if wants_json:
             return cached_payload
@@ -932,7 +964,6 @@ async def read(target_url: str, request: Request):
                 "message": message,
                 "debug_timing": debug_timing,
             }
-            _write_cache(url, wants_json=wants_json, payload=error_payload, negative=True)
             if wants_json:
                 return JSONResponse(status_code=502, content=error_payload)
             return Response(
@@ -952,7 +983,6 @@ async def read(target_url: str, request: Request):
                 "message": message,
                 "debug_timing": debug_timing,
             }
-            _write_cache(url, wants_json=wants_json, payload=error_payload, negative=True)
             if wants_json:
                 return JSONResponse(status_code=502, content=error_payload)
             return Response(
@@ -1000,8 +1030,11 @@ async def read_raw_markdown(target_url: str, request: Request):
     total_started = time.perf_counter()
     url = normalize_url(target_url)
     wants_json = "application/json" in request.headers.get("accept", "")
+    refresh_cache = request.query_params.get("refresh", "").strip().lower() in {"1", "true", "yes"}
 
-    cached_payload = _read_raw_markdown_cache(url)
+    if refresh_cache:
+        _delete_cache_path(_raw_markdown_cache_path(url), label="raw_markdown")
+    cached_payload = None if refresh_cache else _read_raw_markdown_cache(url)
     if cached_payload is not None:
         payload = dict(cached_payload)
         payload.setdefault("debug_timing", {})
@@ -1014,8 +1047,9 @@ async def read_raw_markdown(target_url: str, request: Request):
         )
         if wants_json:
             return payload
+        cached_data = payload.get("data") or {}
         return Response(
-            str(payload.get("content") or ""),
+            str(cached_data.get("content") or ""),
             media_type="text/plain; charset=utf-8",
             headers={"X-Raw-Markdown-Cache": "hit"},
         )
@@ -1035,7 +1069,6 @@ async def read_raw_markdown(target_url: str, request: Request):
                 "message": message,
                 "debug_timing": debug_timing,
             }
-            _write_raw_markdown_cache(url, payload=error_payload, negative=True)
             if wants_json:
                 return JSONResponse(status_code=502, content=error_payload)
             return Response(message, status_code=502, media_type="text/plain")
