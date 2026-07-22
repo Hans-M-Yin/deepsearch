@@ -72,10 +72,24 @@ def _node_title(node: dict[str, Any]) -> str:
     return "<untitled>"
 
 
+def _connected_node_ids(edges: list[dict[str, Any]]) -> set[str]:
+    """Return node IDs that occur at either endpoint of an edge."""
+    connected: set[str] = set()
+    for edge in edges:
+        src_node_id = edge.get("src_node_id")
+        dst_node_id = edge.get("dst_node_id")
+        if src_node_id:
+            connected.add(str(src_node_id))
+        if dst_node_id:
+            connected.add(str(dst_node_id))
+    return connected
+
+
 def main() -> int:
     args = parse_args()
     store = JsonlGraphStore(Path(args.graph_dir))
     nodes = store.list_nodes()
+    connected_node_ids = _connected_node_ids(store.list_edges())
 
     isolated: list[dict[str, Any]] = []
     node_type_counts: Counter[str] = Counter()
@@ -83,9 +97,7 @@ def main() -> int:
 
     for node in nodes:
         node_id = str(node.get("node_id") or "")
-        in_edges = store.edges_to(node_id)
-        out_edges = store.edges_from(node_id)
-        if in_edges or out_edges:
+        if node_id in connected_node_ids:
             continue
         node_type = str(node.get("node_type") or "unknown")
         record = {
