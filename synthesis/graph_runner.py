@@ -52,6 +52,7 @@ class GraphRunnerConfig:
     parallel_workers: int = 1
     batch_size: int | None = None
     max_inflight_text: int | None = None
+    prioritize_image_entity_tasks: bool = False
     show_progress: bool = True
     persist_visual_plans: bool = True
     visual_plans_file_name: str = "visual_plans.jsonl"
@@ -352,8 +353,20 @@ class GraphRunner:
         if remaining_text_slots is None or remaining_text_slots > 0:
             if (
                 not limit_text_for_images
+                and self.config.prioritize_image_entity_tasks
                 and queue_breakdown["image_entity_queue"] > 0
-                and self._text_dispatch_since_image_entity >= 3
+            ):
+                task = self.strategy.pop_next_task(
+                    allowed_task_types={ExpansionTaskType.TEXT_EXPAND},
+                    text_task_origin="image_entity",
+                )
+                if task is not None:
+                    self._text_dispatch_since_image_entity = 0
+                    return task
+            if (
+                not limit_text_for_images
+                and queue_breakdown["image_entity_queue"] > 0
+                and self._text_dispatch_since_image_entity >= 1
             ):
                 task = self.strategy.pop_next_task(
                     allowed_task_types={ExpansionTaskType.TEXT_EXPAND},

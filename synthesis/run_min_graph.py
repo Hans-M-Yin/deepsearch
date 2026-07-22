@@ -347,6 +347,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="When image tasks are queued, cap concurrently running text-expansion tasks so workers are left for images. <=0 disables the cap.",
     )
+    parser.add_argument(
+        "--prioritize-image-entity-tasks",
+        action="store_true",
+        help="Always dispatch queued image-entity text expansions before ordinary text-neighbor tasks.",
+    )
     parser.add_argument("--max-depth", type=int, default=1, help="Maximum text-neighbor BFS depth.")
     parser.add_argument(
         "--queue-pop-strategy",
@@ -562,6 +567,7 @@ def main(argv: list[str] | None = None) -> int:
             parallel_workers=args.parallel_workers,
             batch_size=args.batch_size,
             max_inflight_text=args.max_inflight_text if args.max_inflight_text and args.max_inflight_text > 0 else None,
+            prioritize_image_entity_tasks=args.prioritize_image_entity_tasks,
         ),
         run_id=args.run_id,
         resume=not args.fresh,

@@ -1034,30 +1034,9 @@ class ImageDiscoveryBuilder:
             candidate.is_primary = False
             return False, filter_summary
 
-        if expandable_entity_count == int(self.config.visual_plan_self_qa_entity_count):
-            filter_summary["self_qa_applied"] = True
-            candidate.validation = self._visual_plan_self_qa_check(
-                plan=plan,
-                search_result=search_result,
-                image_node=image_node,
-                validation=candidate.validation,
-                run_id=run_id,
-            )
-            merged_metadata = dict(candidate.validation.metadata or {})
-            merged_metadata["visual_plan_post_grounding_filter"] = filter_summary
-            candidate.validation = ImageValidationResult(
-                status=candidate.validation.status,
-                confidence=candidate.validation.confidence,
-                reason=candidate.validation.reason,
-                drop_candidate=candidate.validation.drop_candidate,
-                metadata=merged_metadata,
-            )
-            if candidate.validation.status != ImageCandidateStatus.ACCEPTED or candidate.validation.drop_candidate:
-                filter_summary["kept_in_graph"] = False
-                filter_summary["filter_reason"] = candidate.validation.reason or "visual_plan_self_qa_rejected"
-                candidate.is_primary = False
-                candidate.validation.metadata["visual_plan_post_grounding_filter"] = filter_summary
-                return False, filter_summary
+        # Intentionally do not run self-QA when exactly two expandable entities
+        # are found.  Visual plans are now filtered only when fewer than the
+        # configured minimum (default: two) can be linked or queued.
 
         if candidate.validation.metadata:
             candidate.validation.metadata["visual_plan_post_grounding_filter"] = filter_summary
@@ -5170,7 +5149,7 @@ entity: Overshooting top | dome above the cloud top | a protruding dome rises ab
             assert result.grounded_edges
             assert len(result.grounded_edges) == 1
             assert len(result.queued_tasks) == 1
-            assert result.metadata.get("visual_plan_post_grounding_filter", {}).get("self_qa_applied") is True
+            assert result.metadata.get("visual_plan_post_grounding_filter", {}).get("self_qa_applied") is False
             assert result.metadata.get("visual_plan_post_grounding_filter", {}).get("kept_in_graph") is True
             assert result.image_node.metadata.get("image_grounding", {}).get("context") is not None
             assert store.stats()["nodes"] == 3
@@ -5189,13 +5168,12 @@ entity: Overshooting top | dome above the cloud top | a protruding dome rises ab
                 wiki_resolver=MockWikiResolver(),
             )
             answerable_visual = answerable_builder.discover_for_plan(plan, run_id="run_smoke_answerable_visual")
-            assert answerable_visual.image_node is None
-            assert answerable_visual.primary_image() is None
-            assert len(answerable_visual.accepted_images()) == 0
-            assert answerable_visual.candidates[0].validation.reason == "model_answered_generated_question"
-            assert answerable_visual.metadata.get("visual_plan_post_grounding_filter", {}).get("self_qa_applied") is True
-            assert answerable_visual.metadata.get("visual_plan_post_grounding_filter", {}).get("filter_reason") == "model_answered_generated_question"
-            assert answerable_store.stats()["nodes"] == 2
+            assert answerable_visual.image_node is not None
+            assert answerable_visual.primary_image() is not None
+            assert len(answerable_visual.accepted_images()) == 1
+            assert answerable_visual.metadata.get("visual_plan_post_grounding_filter", {}).get("self_qa_applied") is False
+            assert answerable_visual.metadata.get("visual_plan_post_grounding_filter", {}).get("filter_reason") is None
+            assert answerable_store.stats()["nodes"] == 3
 
             single_entity_store = make_seed_store("single_entity_visual_plan")
             single_entity_builder = ImageDiscoveryBuilder(
