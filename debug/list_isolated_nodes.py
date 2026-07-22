@@ -72,24 +72,63 @@ def _node_title(node: dict[str, Any]) -> str:
     return "<untitled>"
 
 
-def _connected_node_ids(edges: list[dict[str, Any]]) -> set[str]:
-    """Return node IDs that occur at either endpoint of an edge."""
-    connected: set[str] = set()
+def _node_degrees(edges: list[dict[str, Any]]) -> Counter[str]:
+    """Calculate total degree (in-degree + out-degree) for every node."""
+    degrees: Counter[str] = Counter()
     for edge in edges:
         src_node_id = edge.get("src_node_id")
         dst_node_id = edge.get("dst_node_id")
         if src_node_id:
-            connected.add(str(src_node_id))
+            degrees[str(src_node_id)] += 1
         if dst_node_id:
-            connected.add(str(dst_node_id))
-    return connected
+            degrees[str(dst_node_id)] += 1
+    return degrees
+
+
+def _degree_category(node: dict[str, Any]) -> str | None:
+    node_type = str(node.get("node_type") or "unknown")
+    if node_type == "text":
+        return "text"
+    if node_type == "image":
+        origin = _image_origin(node)
+        if origin in {"wiki_inline", "visual_plan"}:
+            return origin
+    return None
+
+
+def _average_degrees(
+    nodes: list[dict[str, Any]], degrees: Counter[str]
+) -> dict[str, dict[str, int | float]]:
+    categories = ("wiki_inline", "visual_plan", "text")
+    degree_sums: Counter[str] = Counter()
+    node_counts: Counter[str] = Counter()
+    for node in nodes:
+        category = _degree_category(node)
+        if category is None:
+            continue
+        node_id = str(node.get("node_id") or "")
+        node_counts[category] += 1
+        degree_sums[category] += degrees[node_id]
+
+    return {
+        category: {
+            "node_count": node_counts[category],
+            "average_degree": (
+                degree_sums[category] / node_counts[category]
+                if node_counts[category]
+                else 0.0
+            ),
+        }
+        for category in categories
+    }
 
 
 def main() -> int:
     args = parse_args()
     store = JsonlGraphStore(Path(args.graph_dir))
     nodes = store.list_nodes()
-    connected_node_ids = _connected_node_ids(store.list_edges())
+    degrees = _node_degrees(store.list_edges())
+    connected_node_ids = set(degrees)
 
     isolated: list[dict[str, Any]] = []
     node_type_counts: Counter[str] = Counter()
@@ -122,6 +161,7 @@ def main() -> int:
         "isolated_node_count": sum(node_type_counts.values()),
         "isolated_node_type_counts": dict(node_type_counts),
         "isolated_image_origin_counts": dict(image_origin_counts),
+        "average_total_degree_by_category": _average_degrees(nodes, degrees),
         "nodes": isolated,
     }
     print(json.dumps(payload, ensure_ascii=False, indent=2 if args.pretty else None))
