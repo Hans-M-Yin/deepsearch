@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
-"""Small load test for the local Enhanced Reader service on port 8004.
+"""Concurrent load test for the local Enhanced Reader service on port 8004.
 
 Example:
   python3 utils/benchmark_enhanced_reader.py \
     --base-url http://127.0.0.1:8004 \
     --count 100 \
     --concurrency 100
+
+# Exercise forced-cache-miss, same-page cache-hit, and mixed traffic:
+  python3 utils/benchmark_enhanced_reader.py --scenario mixed \
+    --count 20 --hot-requests 40 --mixed-cold-count 20 --concurrency 16
 """
 
 from __future__ import annotations
@@ -150,6 +154,7 @@ LONG_WIKIPEDIA_URLS: list[str] = [
 
 @dataclass(slots=True)
 class RequestResult:
+    phase: str
     url: str
     ok: bool
     status_code: int | None
@@ -166,6 +171,11 @@ class RequestResult:
     failure_exception_type: str | None = None
     failure_upstream_status_code: int | None = None
     failure_upstream_url: str | None = None
+    cache_hit: bool | None = None
+    content_source: str | None = None
+    content_quality: str | None = None
+    raw_markdown_chars: int | None = None
+    anomaly: str | None = None
 
 
 def parse_args() -> argparse.Namespace:
@@ -176,6 +186,29 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--timeout", type=float, default=300.0, help="Per-request timeout in seconds.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed used to sample pages.")
     parser.add_argument("--output-json", type=str, default="", help="Optional path to write full results JSON.")
+    parser.add_argument(
+        "--scenario",
+        choices=("unique", "mixed"),
+        default="unique",
+        help="unique: concurrent distinct pages; mixed: forced-cache-miss, hot same-page, then mixed traffic.",
+    )
+    parser.add_argument(
+        "--hot-url",
+        default="https://en.wikipedia.org/wiki/ByteDance",
+        help="Page repeated by the hot-cache phase when --scenario=mixed.",
+    )
+    parser.add_argument(
+        "--hot-requests",
+        type=int,
+        default=20,
+        help="Number of concurrent same-page requests in the hot phase.",
+    )
+    parser.add_argument(
+        "--mixed-cold-count",
+        type=int,
+        default=20,
+        help="Number of forced-cache-miss pages included alongside hot requests in the mixed phase.",
+    )
     parser.add_argument(
         "--urls-file",
         type=str,
@@ -224,12 +257,16 @@ async def fetch_one(
     base_url: str,
     url: str,
     timeout_s: float,
+    *,
+    phase: str,
+    refresh: bool = False,
 ) -> RequestResult:
     started = time.perf_counter()
     try:
         response = await client.get(
             f"{base_url.rstrip('/')}/{url}",
             headers={"Accept": "application/json"},
+            params={"refresh": "1"} if refresh else None,
             timeout=timeout_s,
         )
         elapsed_s = time.perf_counter() - started
@@ -245,6 +282,7 @@ async def fetch_one(
             if isinstance(payload, dict):
                 debug = payload.get("debug_timing") or {}
             return RequestResult(
+                phase=phase,
                 url=url,
                 ok=False,
                 status_code=response.status_code,
@@ -273,7 +311,14 @@ async def fetch_one(
         data = payload.get("data") or {}
         debug = payload.get("debug_timing") or data.get("debug_timing") or {}
         content = data.get("content") or ""
+        raw_markdown_chars = debug.get("raw_markdown_chars")
+        anomaly = None
+        if not content.strip():
+            anomaly = "empty_content"
+        elif raw_markdown_chars == 0 and str(data.get("content_source") or "").endswith("readerlm_content"):
+            anomaly = "readerlm_output_with_empty_raw_input"
         return RequestResult(
+            phase=phase,
             url=url,
             ok=True,
             status_code=response.status_code,
@@ -287,9 +332,15 @@ async def fetch_one(
             ),
             debug_readerlm_s=float(debug["readerlm_s"]) if debug.get("readerlm_s") is not None else None,
             debug_payload=debug if isinstance(debug, dict) and debug else None,
+            cache_hit=bool(debug.get("cache_hit")) if isinstance(debug, dict) and "cache_hit" in debug else None,
+            content_source=data.get("content_source"),
+            content_quality=data.get("content_quality"),
+            raw_markdown_chars=int(raw_markdown_chars) if raw_markdown_chars is not None else None,
+            anomaly=anomaly,
         )
     except Exception as exc:
         return RequestResult(
+            phase=phase,
             url=url,
             ok=False,
             status_code=getattr(getattr(exc, "response", None), "status_code", None),
@@ -301,9 +352,10 @@ async def fetch_one(
 async def run_benchmark(
     *,
     base_url: str,
-    urls: list[str],
+    requests: list[tuple[str, bool]],
     concurrency: int,
     timeout_s: float,
+    phase: str,
 ) -> list[RequestResult]:
     semaphore = asyncio.Semaphore(max(1, concurrency))
     results: list[RequestResult] = []
@@ -311,19 +363,19 @@ async def run_benchmark(
     started_at = time.perf_counter()
 
     async with httpx.AsyncClient() as client:
-        async def guarded(url: str) -> RequestResult:
+        async def guarded(url: str, refresh: bool) -> RequestResult:
             async with semaphore:
-                return await fetch_one(client, base_url, url, timeout_s)
+                return await fetch_one(client, base_url, url, timeout_s, phase=phase, refresh=refresh)
 
-        tasks = [asyncio.create_task(guarded(url)) for url in urls]
+        tasks = [asyncio.create_task(guarded(url, refresh)) for url, refresh in requests]
         for coro in asyncio.as_completed(tasks):
             result = await coro
             results.append(result)
             done_count += 1
-            if done_count % 10 == 0 or done_count == len(urls):
+            if done_count % 10 == 0 or done_count == len(requests):
                 elapsed = time.perf_counter() - started_at
                 print(
-                    f"[reader-bench] completed={done_count}/{len(urls)} "
+                    f"[reader-bench] phase={phase} completed={done_count}/{len(requests)} "
                     f"elapsed_s={elapsed:.2f} "
                     f"avg_req_per_s={(done_count / elapsed) if elapsed > 0 else 0.0:.2f}",
                     flush=True,
@@ -331,7 +383,7 @@ async def run_benchmark(
     return results
 
 
-def print_summary(results: list[RequestResult], wall_s: float, concurrency: int) -> None:
+def print_summary(results: list[RequestResult], wall_s: float, concurrency: int, *, phase: str) -> None:
     ok_results = [item for item in results if item.ok]
     failed_results = [item for item in results if not item.ok]
     elapsed_values = [item.elapsed_s for item in ok_results]
@@ -340,7 +392,7 @@ def print_summary(results: list[RequestResult], wall_s: float, concurrency: int)
     total_values = [item.debug_total_s for item in ok_results if item.debug_total_s is not None]
     content_values = [item.content_chars for item in ok_results]
 
-    print("=== enhanced reader benchmark summary ===")
+    print(f"=== enhanced reader benchmark summary: {phase} ===")
     print(f"requests: {len(results)}")
     print(f"concurrency: {concurrency}")
     print(f"success: {len(ok_results)}")
@@ -387,6 +439,21 @@ def print_summary(results: list[RequestResult], wall_s: float, concurrency: int)
             f"p95={_percentile([float(v) for v in content_values], 0.95):.0f} "
             f"max={max(content_values)}"
         )
+    cache_values = [item.cache_hit for item in ok_results if item.cache_hit is not None]
+    if cache_values:
+        print(f"cache_hits: {sum(cache_values)}/{len(cache_values)}")
+    source_counts = Counter(item.content_source or "unknown" for item in ok_results)
+    if source_counts:
+        print(f"content_source_counts: {dict(source_counts)}")
+    anomaly_counts = Counter(item.anomaly for item in results if item.anomaly)
+    if anomaly_counts:
+        print(f"anomaly_counts: {dict(anomaly_counts)}")
+        print("sample_anomalies:")
+        for item in [value for value in results if value.anomaly][:10]:
+            print(
+                f"  phase={item.phase} anomaly={item.anomaly} status={item.status_code} "
+                f"content_chars={item.content_chars} raw_markdown_chars={item.raw_markdown_chars} url={item.url}"
+            )
     if failed_results:
         stage_counts = Counter(item.failure_stage or "unknown" for item in failed_results)
         exception_counts = Counter(item.failure_exception_type or "unknown" for item in failed_results)
@@ -434,6 +501,7 @@ def maybe_write_json(path: str, results: list[RequestResult], wall_s: float, arg
         "results": [
             {
                 "url": item.url,
+                "phase": item.phase,
                 "ok": item.ok,
                 "status_code": item.status_code,
                 "elapsed_s": item.elapsed_s,
@@ -449,6 +517,11 @@ def maybe_write_json(path: str, results: list[RequestResult], wall_s: float, arg
                 "failure_exception_type": item.failure_exception_type,
                 "failure_upstream_status_code": item.failure_upstream_status_code,
                 "failure_upstream_url": item.failure_upstream_url,
+                "cache_hit": item.cache_hit,
+                "content_source": item.content_source,
+                "content_quality": item.content_quality,
+                "raw_markdown_chars": item.raw_markdown_chars,
+                "anomaly": item.anomaly,
             }
             for item in results
         ],
@@ -460,12 +533,14 @@ def maybe_write_json(path: str, results: list[RequestResult], wall_s: float, arg
 def main() -> int:
     args = parse_args()
     pool = load_url_pool(args)
-    urls = choose_urls(pool, args.count, args.seed)
+    required_urls = args.count + (args.mixed_cold_count if args.scenario == "mixed" else 0)
+    urls = choose_urls(pool, required_urls, args.seed)
 
     print("=== enhanced reader benchmark ===")
     print(f"base_url: {args.base_url}")
     print(f"pool_size: {len(pool)}")
-    print(f"request_count: {len(urls)}")
+    print(f"scenario: {args.scenario}")
+    print(f"cold_page_count: {args.count}")
     print(f"concurrency: {args.concurrency}")
     print(f"timeout_s: {args.timeout}")
     print(f"seed: {args.seed}")
@@ -473,18 +548,42 @@ def main() -> int:
     for item in urls[:10]:
         print(f"  - {item}")
 
-    started = time.perf_counter()
-    results = asyncio.run(
-        run_benchmark(
-            base_url=args.base_url,
-            urls=urls,
-            concurrency=args.concurrency,
-            timeout_s=args.timeout,
+    phase_specs: list[tuple[str, list[tuple[str, bool]]]]
+    if args.scenario == "unique":
+        phase_specs = [("unique", [(url, False) for url in urls])]
+    else:
+        cold_urls = urls[: args.count]
+        mixed_cold_urls = urls[args.count :]
+        phase_specs = [
+            ("forced_cold", [(url, True) for url in cold_urls]),
+            ("prime_hot", [(args.hot_url, True)]),
+            ("hot_same_page", [(args.hot_url, False) for _ in range(args.hot_requests)]),
+            (
+                "mixed_hot_and_cold",
+                [(args.hot_url, False) for _ in range(args.hot_requests)] + [(url, True) for url in mixed_cold_urls],
+            ),
+        ]
+
+    all_results: list[RequestResult] = []
+    total_wall_s = 0.0
+    for phase, requests in phase_specs:
+        if not requests:
+            continue
+        started = time.perf_counter()
+        results = asyncio.run(
+            run_benchmark(
+                base_url=args.base_url,
+                requests=requests,
+                concurrency=args.concurrency,
+                timeout_s=args.timeout,
+                phase=phase,
+            )
         )
-    )
-    wall_s = time.perf_counter() - started
-    print_summary(results, wall_s, args.concurrency)
-    maybe_write_json(args.output_json, results, wall_s, args)
+        wall_s = time.perf_counter() - started
+        total_wall_s += wall_s
+        print_summary(results, wall_s, args.concurrency, phase=phase)
+        all_results.extend(results)
+    maybe_write_json(args.output_json, all_results, total_wall_s, args)
     return 0
 
 
