@@ -1272,12 +1272,20 @@ def i2i_search(
     max_retries: int = 3,
     base_delay: int = 2,
 ) -> dict[str, Any]:
-    """Reverse-image search using a provided backend or Serper Lens."""
+    """Reverse-image search using a provided backend or Serper Lens.
+
+    A successful Lens response with no matches can be transient when the
+    remote image URL is temporarily inaccessible to the search backend.  Retry
+    that specific case once after a short fixed delay, while retaining the
+    existing exponential retry policy for actual request errors.
+    """
 
     visual_lookup = visual_lookup or _image_search_via_serper
     top_k = max(1, min(int(top_k), MAX_SEARCH_RESULTS))
     last_error: Exception | None = None
-    for attempt in range(1, max_retries + 1):
+    retried_empty_result = False
+    attempt = 1
+    while attempt <= max_retries:
         try:
             print(
                 "[i2i_search debug] start "
@@ -1308,6 +1316,16 @@ def i2i_search(
                     )
                 ]
             result_count = len(matches) if isinstance(matches, list) else (1 if matches else 0)
+            if result_count == 0 and not retried_empty_result:
+                retried_empty_result = True
+                print(
+                    "[i2i_search debug] empty_result "
+                    "sleeping_s=5 before one retry",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                time.sleep(5)
+                continue
             _record_search_tool_call("i2i_search", success=True, result_count=result_count)
             return {
                 "ok": True,
@@ -1325,6 +1343,7 @@ def i2i_search(
             )
             if attempt < max_retries:
                 time.sleep(base_delay * (2 ** (attempt - 1)))
+            attempt += 1
     _record_search_tool_call("i2i_search", success=False, result_count=0)
     return {
         "ok": False,

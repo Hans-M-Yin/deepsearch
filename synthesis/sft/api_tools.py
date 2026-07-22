@@ -1771,7 +1771,14 @@ def execute_tool_call(
             assert bbox is not None
             x, y, width, height = bbox
             cropped = image.crop((x, y, x + width, y + height))
-            uploaded_url = _try_upload_pil_image(cropped, context, "i2i_region")
+            # The COS uploader derives its object key from ``tool_name``.  Keep
+            # each crop immutable so a previous Lens request never observes a
+            # later crop written to the same public URL.
+            uploaded_url = _try_upload_pil_image(
+                cropped,
+                context,
+                f"i2i_region_{uuid.uuid4().hex}",
+            )
             if not uploaded_url:
                 cropped_id, cropped_path = _persist_pil_image_to_cache(cropped, context, "i2i_region")
                 new_images[cropped_id] = cropped_path
