@@ -1014,14 +1014,17 @@ async def read(target_url: str, request: Request):
         return payload
 
     body = f"URL Source: {url}\n\nMarkdown Content:\n{markdown}\n"
+    response_headers = {
+        "X-Debug-Timing-Readerlm-S": f"{debug_timing['readerlm_s']:.6f}",
+        "X-Debug-Timing-Total-S": f"{debug_timing['total_s']:.6f}",
+    }
+    parallel_fetch_s = debug_timing.get("fetch_markdown_html_parallel_s")
+    if parallel_fetch_s is not None:
+        response_headers["X-Debug-Timing-Fetch-Markdown-Html-Parallel-S"] = f"{parallel_fetch_s:.6f}"
     return Response(
         body,
         media_type="text/plain; charset=utf-8",
-        headers={
-            "X-Debug-Timing-Fetch-Markdown-Html-Parallel-S": f"{debug_timing['fetch_markdown_html_parallel_s']:.6f}",
-            "X-Debug-Timing-Readerlm-S": f"{debug_timing['readerlm_s']:.6f}",
-            "X-Debug-Timing-Total-S": f"{debug_timing['total_s']:.6f}",
-        },
+        headers=response_headers,
     )
 
 
