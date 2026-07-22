@@ -1082,8 +1082,6 @@ class WikiTextBuilder:
                     raw_output=response.content,
                 )
         except Exception as exc:
-            for candidate in candidates:
-                candidate.quality_reasons.append(f"llm_neighbor_filter_failed:{exc.__class__.__name__}")
             if debug_enabled:
                 self._debug_print_neighbor_filter_failure(
                     source_title=source_title,
@@ -1091,7 +1089,10 @@ class WikiTextBuilder:
                     candidates=prompt_candidates,
                     error=exc,
                 )
-            return candidates
+            # A configured semantic filter is authoritative.  Do not let an
+            # unavailable model turn arbitrary rule-recalled links into graph
+            # nodes (for example, role labels or templated event pages).
+            return []
 
         kept: list[WikiLinkCandidate] = []
         debug_rows: list[dict[str, Any]] = []
@@ -1143,7 +1144,7 @@ class WikiTextBuilder:
 
         if not kept:
             if debug_enabled:
-                self._debug_print_neighbor_empty_fallback(
+                self._debug_print_neighbor_empty_rejection(
                     source_title=source_title,
                     source_url=source_url,
                     model_alias=model_alias,
@@ -1570,7 +1571,7 @@ class WikiTextBuilder:
         error: Exception,
     ) -> None:
         print(
-            f"[wiki_neighbor_filter] FAILED source={source_title!r} url={source_url} "
+            f"[wiki_neighbor_filter] FAILED_CLOSED source={source_title!r} url={source_url} "
             f"error={error.__class__.__name__}: {error} candidates={len(candidates)}",
             file=sys.stderr,
             flush=True,
@@ -1579,9 +1580,9 @@ class WikiTextBuilder:
         for index, candidate in enumerate(candidates, start=1):
             print(
                 "[wiki_neighbor_filter] "
-                f"FALLBACK #{index} title={candidate.title!r} anchor={candidate.anchor_text!r} "
+                f"REJECTED #{index} title={candidate.title!r} anchor={candidate.anchor_text!r} "
                 f"rank={candidate.rank} rule={candidate.score:.2f} "
-                f"fallback_reason={failure_reason!r} url={candidate.url}",
+                f"rejection_reason={failure_reason!r} url={candidate.url}",
                 file=sys.stderr,
                 flush=True,
             )
@@ -1595,7 +1596,7 @@ class WikiTextBuilder:
                     )
 
     @staticmethod
-    def _debug_print_neighbor_empty_fallback(
+    def _debug_print_neighbor_empty_rejection(
         *,
         source_title: str,
         source_url: str,
@@ -1605,20 +1606,20 @@ class WikiTextBuilder:
         prompt_candidates: int,
     ) -> None:
         print(
-            f"[wiki_neighbor_filter] EMPTY_FALLBACK source={source_title!r} url={source_url} "
+            f"[wiki_neighbor_filter] EMPTY_REJECTED source={source_title!r} url={source_url} "
             f"model={model_alias} prompt_candidates={prompt_candidates} "
-            f"total_candidates={total_candidates} reason='LLM kept no neighbors; falling back to rule-based candidates'",
+            f"total_candidates={total_candidates} reason='LLM kept no neighbors; rejecting all candidates'",
             file=sys.stderr,
             flush=True,
         )
         for row in rows:
             print(
                 "[wiki_neighbor_filter] "
-                f"FALLBACK #{row['index']} title={row['title']!r} anchor={row['anchor']!r} "
+                f"REJECTED #{row['index']} title={row['title']!r} anchor={row['anchor']!r} "
                 f"rank={row['rank']} rule={row['rule_score']:.2f} "
                 f"llm_keep={row['keep']} llm_score={row['llm_score']} final={row['final_score']:.2f} "
                 f"relation={row['relation']!r} llm_reason={row['reason']!r} "
-                f"fallback_reason='llm_kept_none' url={row['url']}",
+                f"rejection_reason='llm_kept_none' url={row['url']}",
                 file=sys.stderr,
                 flush=True,
             )

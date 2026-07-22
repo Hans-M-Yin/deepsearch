@@ -231,6 +231,16 @@ def _prepare_reference_image(model_client: ModelWorkerClient, model_alias: str, 
         f"Event context:\n" + "\n".join(f"- {item}" for item in (event_context or [])) + "\n\n"
         f"Reference image metadata:\ncaption: {image_item.get('caption') or ''}\nalt_text: {image_item.get('alt_text') or ''}\n"
     )
+    # Reference images are resolved before this point.  Do not fall back to a
+    # remote URL here: some Gemini-compatible endpoints translate it into
+    # fileData without a MIME type.
+    model_url = str(image_item.get("model_url") or "").strip()
+    if not _is_model_image_data_url(model_url):
+        return {
+            "keep": False,
+            "error_type": "reference_image_unavailable",
+            "reason": "reference image could not be resolved to a typed data URL",
+        }
     response = model_client.generate(
         ModelRequest(
             model=model_alias,
@@ -240,7 +250,7 @@ def _prepare_reference_image(model_client: ModelWorkerClient, model_alias: str, 
                     role="user",
                     content=[
                         {"type": "text", "text": text},
-                        {"type": "image_url", "image_url": {"url": image_item.get("model_url") or image_item.get("image_url") or image_item.get("thumbnail_url") or ""}},
+                        {"type": "image_url", "image_url": {"url": model_url}},
                     ],
                 ),
             ],
@@ -252,7 +262,23 @@ def _prepare_reference_image(model_client: ModelWorkerClient, model_alias: str, 
     return payload
 
 
-def _judge_edge(model_client: ModelWorkerClient, model_alias: str, *, image_node: dict[str, Any], text_node: dict[str, Any], edge: dict[str, Any], grounded_entity: dict[str, Any] | None, prepared_context: dict[str, Any], reference_images: list[dict[str, Any]]) -> dict[str, Any]:
+def _is_model_image_data_url(value: Any) -> bool:
+    """Return whether ``value`` is a MIME-typed image data URL for an LLM."""
+    url = str(value or "").strip().lower()
+    return url.startswith("data:image/") and ";base64," in url
+
+
+def _judge_edge(model_client: ModelWorkerClient, model_alias: str, *, image_node: dict[str, Any], text_node: dict[str, Any], edge: dict[str, Any], grounded_entity: dict[str, Any] | None, prepared_context: dict[str, Any], reference_images: list[dict[str, Any]], primary_image_model_url: str | None = None) -> dict[str, Any]:
+    if not _is_model_image_data_url(primary_image_model_url):
+        # The judge must never make a visual contradiction decision without the
+        # graph image.  This also avoids sending a naked remote image URL to
+        # Gemini/Vertex, whose OpenAI adapter may produce fileData with an empty
+        # MIME type.
+        return {
+            "decision": "insufficient",
+            "error_type": "insufficient_evidence",
+            "reason": "primary_image_unavailable_for_model",
+        }
     image_metadata = image_node.get("metadata") or {}
     image_grounding = image_metadata.get("image_grounding") or {}
     image_context = image_grounding.get("context") or image_metadata.get("image_grounding_context") or {}
@@ -300,13 +326,11 @@ def _judge_edge(model_client: ModelWorkerClient, model_alias: str, *, image_node
         "prepared_context": compact_prepared_context,
         "reference_images": compact_reference_images,
     }
-    image_url = image_node.get("image_url") or (((image_metadata.get("resolved_image") or {}).get("asset_uri")) or ((image_metadata.get("resolved_image") or {}).get("resolved_url")) or "")
     content = [{"type": "text", "text": json.dumps(user_text, ensure_ascii=False)}]
-    if image_url:
-        content.append({"type": "image_url", "image_url": {"url": image_url}})
+    content.append({"type": "image_url", "image_url": {"url": primary_image_model_url}})
     for item in reference_images:
-        reference_url = item.get("model_url") or item.get("image_url") or item.get("thumbnail_url") or ""
-        if reference_url:
+        reference_url = item.get("model_url")
+        if _is_model_image_data_url(reference_url):
             content.append({"type": "image_url", "image_url": {"url": reference_url}})
     response = model_client.generate(
         ModelRequest(
@@ -463,6 +487,7 @@ def _verify_single_edge(
         grounded_entity=grounded_entity,
         prepared_context=prepared_context,
         reference_images=kept_reference_images,
+        primary_image_model_url=_resolve_image_node_for_model(image_builder, image_node=image_node),
     )
     result = VerificationResult(
         edge_id=str(edge.get("edge_id") or ""),
@@ -520,6 +545,44 @@ def _resolve_reference_image(
         "resolve_strategy": asset.strategy,
         "resolved_error": error,
     }
+
+
+def _resolve_image_node_for_model(
+    builder: ImageDiscoveryBuilder,
+    *,
+    image_node: dict[str, Any],
+) -> str | None:
+    """Resolve the graph image to the typed data URL required by vision models.
+
+    Persisted graph records deliberately omit ``model_url`` because it embeds
+    base64 image bytes.  Re-resolve it at verification time instead of passing
+    the raw OSS URL through the model-worker API.
+    """
+    metadata = image_node.get("metadata") or {}
+    resolved = metadata.get("resolved_image") or {}
+    image_url = str(
+        image_node.get("image_url")
+        or resolved.get("asset_uri")
+        or resolved.get("resolved_url")
+        or ""
+    ).strip()
+    if not image_url:
+        return None
+    image_item = {
+        "image_url": image_url,
+        "thumbnail_url": image_node.get("thumbnail_url"),
+        "source_page_url": image_node.get("source_page_url"),
+        "caption": image_node.get("caption") or image_node.get("summary"),
+        "alt_text": image_node.get("title"),
+    }
+    resolved_item = _resolve_reference_image(
+        builder,
+        image_item=image_item,
+        page_title=str(image_node.get("title") or ""),
+        entity_title=str(image_node.get("title") or ""),
+    )
+    model_url = str((resolved_item or {}).get("model_url") or "").strip()
+    return model_url if _is_model_image_data_url(model_url) else None
 
 
 def main() -> int:

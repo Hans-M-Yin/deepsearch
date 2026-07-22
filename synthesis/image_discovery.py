@@ -4221,6 +4221,7 @@ class ImageDiscoveryBuilder:
                 _judge_edge,
                 _prepare_entity_context,
                 _prepare_reference_image,
+                _resolve_image_node_for_model,
                 _resolve_reference_image,
             )
 
@@ -4285,6 +4286,7 @@ class ImageDiscoveryBuilder:
                 grounded_entity=entity,
                 prepared_context=prepared_context,
                 reference_images=kept_reference_images,
+                primary_image_model_url=_resolve_image_node_for_model(self, image_node=image_record),
             )
             return {
                 **base_record,

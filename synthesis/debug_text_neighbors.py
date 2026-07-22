@@ -427,8 +427,10 @@ def _relations_by_url_from_candidates(candidates: list[WikiLinkCandidate]) -> di
 
 
 def _select_final_input(llm_result: dict[str, Any], rule_candidates: list[WikiLinkCandidate]) -> list[WikiLinkCandidate]:
-    if not llm_result.get("enabled") or llm_result.get("error"):
+    if not llm_result.get("enabled"):
         return rule_candidates
+    if llm_result.get("error"):
+        return []
     return list(llm_result.get("kept") or [])
 
 
