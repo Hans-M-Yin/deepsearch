@@ -248,7 +248,7 @@ class GraphExpansionStrategy:
         self._pending_parent_links_by_url: dict[str, list[dict[str, Any]]] = {}
         self._lock = RLock()
         self._raw_markdown_reader = RawMarkdownReaderClient(
-            base_url=os.environ.get("WIKI_INLINE_IMAGE_READER_BASE_URL", "http://127.0.0.1:8003/raw"),
+            base_url=os.environ.get("WIKI_INLINE_IMAGE_READER_BASE_URL", "http://127.0.0.1:8003"),
             timeout_s=float(os.environ.get("WIKI_INLINE_IMAGE_READER_TIMEOUT_S") or 180.0),
         )
 

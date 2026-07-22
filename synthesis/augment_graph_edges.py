@@ -51,7 +51,7 @@ class RawMarkdownReaderClient:
     def __init__(
         self,
         *,
-        base_url: str = "http://127.0.0.1:8003/raw",
+        base_url: str = "http://127.0.0.1:8003",
         timeout_s: float = 180.0,
     ) -> None:
         self.base_url = base_url.rstrip("/")
@@ -83,7 +83,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--reader-base-url",
         type=str,
-        default="http://127.0.0.1:8003/raw",
+        default="http://127.0.0.1:8003",
         help="Raw markdown reader base URL used for text-text augmentation.",
     )
     parser.add_argument("--reader-timeout-s", type=float, default=180.0)

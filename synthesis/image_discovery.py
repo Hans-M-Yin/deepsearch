@@ -584,6 +584,10 @@ class ImageDiscoveryConfig:
     image_grounding_reader_base_url: str = "http://127.0.0.1:8004"
     image_grounding_reader_timeout_s: float = 40.0
     image_grounding_max_context_chars: int = 6000
+    enable_image_entity_queue_verification: bool = True
+    image_entity_queue_verify_prepare_model: str | None = None
+    image_entity_queue_verify_judge_model: str | None = None
+    image_entity_queue_verify_max_reference_images: int = 6
     enable_wiki_inline_entity_uniqueness_filter: bool = True
     enable_visual_plan_post_grounding_filter: bool = True
     visual_plan_min_expandable_entities: int = 2
@@ -4084,6 +4088,20 @@ class ImageDiscoveryBuilder:
                 if resolved_target is None:
                     unresolved.append({**entity, "status": "unresolved"})
                     continue
+                queue_verification = self._verify_image_entity_before_queue(
+                    image_node=image_node,
+                    entity=entity,
+                    resolved_target=resolved_target,
+                    source_type="image_grounding_delayed",
+                )
+                if queue_verification is not None:
+                    # Mutate the original grounding record as well as the
+                    # pending-link copy: image-node metadata already holds
+                    # these entity dictionaries for later debugging/stats.
+                    entity["queue_verification"] = queue_verification
+                    if queue_verification.get("decision") == "contradict":
+                        unresolved.append({**entity, "status": "verification_contradict"})
+                        continue
                 queued_tasks.append(
                     {
                         "url": resolved_target["url"],
@@ -4144,6 +4162,148 @@ class ImageDiscoveryBuilder:
             if query_overlap_entities:
                 image_node.metadata["query_overlap_grounded_entities"] = query_overlap_entities
         return edges, queued_tasks
+
+    def _verify_image_entity_before_queue(
+        self,
+        *,
+        image_node: ImageNode,
+        entity: dict[str, Any],
+        resolved_target: dict[str, Any],
+        source_type: str,
+    ) -> dict[str, Any] | None:
+        """Run the existing post-process verifier before a new text task is queued.
+
+        Only a confident ``contradict`` result blocks the queue.  Evidence
+        shortages and operational failures intentionally fail open so transient
+        Reader/reference-image problems do not remove recall.
+        """
+        if not self.config.enable_image_entity_queue_verification:
+            return None
+        prepare_model = (
+            self.config.image_entity_queue_verify_prepare_model
+            or os.environ.get("IMAGE_ENTITY_QUEUE_VERIFY_PREPARE_MODEL")
+            or os.environ.get("IMAGE_EDGE_VERIFY_PREPARE_MODEL")
+            or os.environ.get("TEXT_PROCESS_MODEL")
+            or ""
+        )
+        judge_model = (
+            self.config.image_entity_queue_verify_judge_model
+            or os.environ.get("IMAGE_ENTITY_QUEUE_VERIFY_JUDGE_MODEL")
+            or os.environ.get("IMAGE_EDGE_VERIFY_JUDGE_MODEL")
+            or os.environ.get("IMAGE_GROUND_MODEL")
+            or os.environ.get("IMAGE_CHECK_MODEL")
+            or ""
+        )
+        target_url = str(resolved_target.get("url") or "").strip()
+        target_title = str(resolved_target.get("title") or entity.get("name") or "").strip()
+        base_record = {
+            "enabled": True,
+            "target_url": target_url or None,
+            "target_title": target_title or None,
+            "prepare_model_alias": prepare_model or None,
+            "judge_model_alias": judge_model or None,
+        }
+        if not target_url or not prepare_model or not judge_model:
+            return {
+                **base_record,
+                "decision": "insufficient",
+                "error_type": "verifier_not_configured",
+                "reason": "missing resolved target URL or verifier model alias",
+            }
+
+        # The post-process verifier is intentionally reused here: it prepares
+        # target-page evidence, filters Wiki reference images, and judges the
+        # exact grounding relation against the graph image.
+        try:
+            from .post_process.verify_image_text_edges import (
+                _compact_reference_images_for_output,
+                _extract_reference_images,
+                _judge_edge,
+                _prepare_entity_context,
+                _prepare_reference_image,
+                _resolve_reference_image,
+            )
+
+            reader = EnhancedReaderClient(
+                base_url=self.config.image_grounding_reader_base_url,
+                timeout_s=self.config.image_grounding_reader_timeout_s,
+            )
+            wiki_doc = reader.read(target_url).to_dict()
+            text_node = {
+                "node_id": f"pending:{resolved_target.get('canonical_id') or target_url}",
+                "title": target_title,
+                "aliases": [entity.get("name")] if entity.get("name") else [],
+                "url": target_url,
+                "source": {"url": target_url},
+            }
+            edge = {
+                "edge_id": f"pending:{image_node.node_id}:{target_url}",
+                "relation": entity.get("relation_to_image") or "depicts",
+                "source": {"source_type": source_type},
+            }
+            image_record = image_node.to_dict()
+            prepared_context = _prepare_entity_context(
+                self.model_client,
+                prepare_model,
+                text_node=text_node,
+                wiki_document=wiki_doc,
+                image_title=str(image_node.title or ""),
+            )
+            raw_reference_images = _extract_reference_images(
+                wiki_doc.get("raw_markdown") or wiki_doc.get("content") or "",
+                target_url,
+                max(1, int(self.config.image_entity_queue_verify_max_reference_images)),
+            )
+            kept_reference_images: list[dict[str, Any]] = []
+            for image_item in raw_reference_images:
+                resolved = _resolve_reference_image(
+                    self,
+                    image_item=image_item,
+                    page_title=str(wiki_doc.get("title") or target_title),
+                    entity_title=target_title,
+                )
+                if resolved is None:
+                    continue
+                reference_decision = _prepare_reference_image(
+                    self.model_client,
+                    prepare_model,
+                    entity_title=target_title,
+                    visual_profile=list(prepared_context.get("visual_profile") or []),
+                    event_context=list(prepared_context.get("event_context") or []),
+                    image_item=resolved,
+                )
+                if reference_decision.get("keep") is True:
+                    kept_reference_images.append({**resolved, **reference_decision})
+                if len(kept_reference_images) >= max(1, int(self.config.image_entity_queue_verify_max_reference_images)):
+                    break
+            judged = _judge_edge(
+                self.model_client,
+                judge_model,
+                image_node=image_record,
+                text_node=text_node,
+                edge=edge,
+                grounded_entity=entity,
+                prepared_context=prepared_context,
+                reference_images=kept_reference_images,
+            )
+            return {
+                **base_record,
+                "decision": str(judged.get("decision") or "insufficient"),
+                "error_type": str(judged.get("error_type") or "insufficient_evidence"),
+                "confidence": judged.get("confidence"),
+                "reason": str(judged.get("reason") or ""),
+                "evidence_for": list(judged.get("evidence_for") or []),
+                "evidence_against": list(judged.get("evidence_against") or []),
+                "kept_reference_image_count": len(kept_reference_images),
+                "reference_images": _compact_reference_images_for_output(kept_reference_images),
+            }
+        except Exception as exc:
+            return {
+                **base_record,
+                "decision": "insufficient",
+                "error_type": "verification_error",
+                "reason": f"{exc.__class__.__name__}: {exc}",
+            }
 
     def _query_implied_entity_labels(
         self,
