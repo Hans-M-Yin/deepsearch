@@ -751,7 +751,7 @@ class VqaBatchRunner:
             sample,
             field_name="raw_hop_summaries",
         )
-        return {
+        record = {
             "sample_id": sample.get("sample_id"),
             "status": sample.get("status"),
             "path": {
@@ -864,6 +864,19 @@ class VqaBatchRunner:
             "created_at": sample.get("created_at"),
             "updated_at": sample.get("updated_at"),
         }
+        image_target_candidates = VqaBatchRunner._extract_stage_metadata_value(
+            sample,
+            field_name="image_target_candidates",
+        )
+        if image_target_candidates is not None:
+            record["image_target_candidates"] = image_target_candidates
+        image_target_candidate_evaluation = VqaBatchRunner._extract_stage_metadata_value(
+            sample,
+            field_name="image_target_candidate_evaluation",
+        )
+        if image_target_candidate_evaluation is not None:
+            record["image_target_candidate_evaluation"] = image_target_candidate_evaluation
+        return record
 
     @staticmethod
     def _compact_writer_stage(stage: dict[str, Any]) -> dict[str, Any] | None:

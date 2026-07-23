@@ -49,6 +49,7 @@ Important evaluation principles:
 5. If an image hop is involved, prefer it only when the image is likely to provide necessary evidence rather than decorative context.
 6. Avoid near-duplicate entities that are too close to entities already present in the trajectory. For example, if the trajectory already contains "iPhone 4S", then "iPhone 5" is usually too similar and should be penalized unless the relation creates a genuinely necessary contrast.
 7. Avoid a candidate whose target has already been explicitly named in the relation text of an earlier hop, even when that target has not yet appeared as a trajectory node. Such a candidate repeats information that the chain has already exposed instead of adding a new inference step. For example, if an earlier hop reads "A -- is associated with C --> B", then a later candidate "B --> C" should receive a very low score, because C has already been revealed by the earlier relation.
+8. Give a low score when the candidate TARGET NODE ITSELF is a broad, non-unique concept page rather than a specific entity. Examples include category/concept nodes such as "Company" or "City", occupation nodes such as "Actor" or "Scientist", generic role nodes such as "Captain" or "Founder", and entity-type nodes such as "Film" or "University". This penalty is about landing on the generic concept node, not about the profession, role, or type of a specific target entity. A hop to a particular person who is an actor or scientist (for example, "Tom Hanks" or "Marie Curie"), a particular company or city (for example, "Apple Inc." or "Paris"), or another specific named entity should NOT be penalized for belonging to one of these classes; such concrete entity transitions are often desirable.
 
 Common bad candidates:
 - generic links that could connect to many entities
@@ -58,6 +59,7 @@ Common bad candidates:
 - candidates that make the chain read like a loose summary instead of a reasoning path
 - candidates whose target is just a near-duplicate, sibling variant, adjacent model/version, or minimally changed entity relative to something already in the trajectory
 - candidates whose target was already directly mentioned in an earlier relation, even if it was not yet a node in the trajectory
+- candidates whose target node is itself a generic concept page such as "Actor", "Scientist", "Captain", "Founder", "Company", "City", "Film", or "University"; do not confuse these with specific people, organizations, places, works, or institutions that belong to those classes
 
 You will receive:
 - a trajectory summary in hop format
@@ -328,12 +330,6 @@ class RandomPathSampler(PathSampler):
 
     def generate_one(self, start_node_id: str | None = None) -> PathCandidate | None:
         node_ids = self._candidate_start_nodes()
-        # ##### DEBUG #####
-        # node_ids = [
-        #     node_id for node_id in node_ids
-        #     if (self.graph.get_node(node_id) or {}).get("node_type") == "image"
-        # ]
-        # ##### END #####
         if not node_ids:
             self.last_generation_stats = SamplerGenerationStats(requested=1, attempts=0, accepted=0)
             return None
@@ -525,6 +521,10 @@ class RandomPathSampler(PathSampler):
         trajectory = self._trajectory_stats(node_types)
         if trajectory.modality_switch_count < self.config.min_modality_switches:
             return None, "modality_switch"
+        # Temporary debug guard: keep only trajectories that involve an image
+        # at the beginning, end, or in an intermediate position.
+        if not (trajectory.starts_with_image or trajectory.ends_with_image or trajectory.has_mid_image):
+            return None, "image_position_requirement"
         if not self._valid_end_type(node_types[-1]):
             return None, "end_type"
         exact_signature = "|".join(node_ids)

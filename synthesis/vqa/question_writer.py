@@ -316,9 +316,11 @@ Return valid JSON with exactly these fields:
 """
 
 
-PROMPT_SELECT_TEXT_TARGET = """Now you are an expert question designer for knowledge-based Q&A. You will create a knowledge competition question for students, designed to challenge their knowledge of a person’s life and background.
-
-You will design the question based on the complete profile of a given object. From the full material, you need to select one or more detailed, non-common-sense factual pieces of information, then organize the information you extract into a complete question. The information you extract will serve as the corresponding answer. The question may cover any aspect, including the object’s identity, life experience, major events, detailed knowledge, relevant numbers, or dates. However, you must ensure that the question is non-trivial and requires reasoning and knowledge retrieval to answer correctly.
+PROMPT_SELECT_TEXT_TARGET = """
+Now you are an expert designer of knowledge-based Q&A questions. You will design a quiz question for students to test their knowledge of a particular person’s life and background. You will be given a specific target object together with its complete profile, as well as a series of predecessor objects used to conceal that target. The final question should be designed so that the user must first start from the predecessor objects, reason step by step, and ultimately infer the specific target object, and then answer the final question based on information about that target. You only need to design this final question.
+You need to design the question based on the complete profile of the given target object. From the full material, you should select one or more detailed, non-obvious factual pieces of information, and then organize the extracted information into a complete question. The information you extract will serve as the corresponding answer. The question may concern any aspect of the target, including identity, life experience, major events, detailed knowledge, relevant numbers, or dates. However, you must ensure that the question is not trivial or common-sense, and that it requires reasoning and knowledge retrieval to answer correctly.
+If the series of predecessor objects used to conceal the target share a common topic, you may choose factual information related to that topic when constructing the question for the given target, as this will make the designed question more natural. However, note that your question does not need to mention those predecessor objects explicitly.
+You must ensure that the question is not trivial or based on common sense, but it must still ask about an objective fact rather than a subjective or open-ended matter. The question should be elegant and natural, rather than merely obscure or niche.
 
 Requirements:
 
@@ -338,72 +340,166 @@ Output format: JSON, containing the following fields:
 """
 
 
-PROMPT_SELECT_IMAGE_TARGET = """You are an expert question writer designing a high-quality image-grounded web-search question.
+PROMPT_SELECT_IMAGE_TARGET = """You are a professional designer of visual search questions, responsible for generating several candidate visual web-search questions.
+** Task Setting
+1. The solver will not receive the reference image you see. Instead, they will only be given an approximate description of the image’s content. Based on this description, the solver will search for relevant images and answer the final question by inspecting visual evidence in the retrieved images.
+2. Because the images found by the solver may differ from the reference image in shooting angle, timing, composition, and so on, the reference image is only one possible search result and may not be the one the solver ultimately finds. Therefore, the questions you write must ensure that the answer derived from images matching the search description is unique or stable.
 
-Task setting:
-- A solver will be given the same image you get.
-- The solver must use the image and answer the question you propose.
-- The image itself has already been provided to you, and the textual description has already been decided.
-- Your job is to write one strong question about the image, together with its gold answer.
+** Goals
+1. Every question must genuinely require inspection of visual information. Avoid choosing facts that can be answered reliably using only ordinary background knowledge or directly from the search query itself. For example, if a person in the image has a white pocket square in the breast pocket of a suit, you should not ask about the object in the pocket, because that answer matches common real-world expectations and could be answered correctly without inspecting the image.
+2. Prefer concrete visual details centered on the described scene or event (and the reference image). This includes not only low-level visual features but also higher-level semantic information, as long as the answer must still come from observing the image. Examples include:
+    - actions, interactions, and object states;
+    - clothing, equipment, accessories, signs, logos, labels, numbers, and visible text;
+    - event-environment details, such as advertising boards, stage displays, or nearby equipment;
+    - architectural, geographic, physical, or functional relations;
+    - multi-step details that require first locating one entity and then inspecting something associated with it.
+3. Use qualifiers to ensure answer uniqueness. Since image search from a text description can be ambiguous, use necessary qualifiers to constrain what the question refers to and avoid referential ambiguity. For example, when asking about an advertising board in a stadium, if multiple brands are present, you should specify which advertising board you mean.
+4. Avoid vague expressions such as “that advertising board,” “that person,” or “that building,” especially when multiple instances may exist.
+5. Avoid choosing details that are obviously incidental to a single photograph, such as unrelated bystanders, random vehicles, temporary objects, or arbitrary camera-relative positions.
+6. If the query points to a fixed visual work—such as a particular album cover, poster, painting, logo, manuscript page, or iconic photograph—then composition-related locators such as “the upper-left corner” or “the second person from the left” are allowed.
+7. Prioritize diversity. Do not generate multiple similar questions that differ only in the object or color being asked about. Explore different kinds of visual information and question types.
+8. Use only details supported by the provided image evidence. Do not invent facts.
 
-Core objective:
-Write a question that can only be answered reliably by finding and inspecting the details of the image. The question must be grounded in the visual content of the image, not merely in background knowledge about the subject.
+Please generate 5 candidate questions. Each candidate question must have an objective and concise gold answer. Return valid JSON, and you must follow exactly this structure:
 
-Important constraints:
-1. The question must require looking at the image.
-   - Do not ask for facts that can be answered from general knowledge, the image description alone, or a Wikipedia page about the subject. Bad Example: ask what accessory was in the breast pocket of the suit jacket as the answer should be a white pocket square based on common sense.
-   - Prefer questions about visible objects, spatial relations, counts, relative positions, gestures, clothing, text appearing in the image, composition, or other stable visual properties.
+** Example 1: A specific event photographed from multiple viewpoints
+Image description:
+Gonzalo Montiel taking the final penalty in the 2022 FIFA World Cup final shootout.
 
-2. Handle image ambiguity carefully.
-   - Some image descriptions may retrieve multiple different images referring to the same entity, scene, object, or landmark.
-   - If the description is not highly unique, ask only about visual properties that are stable across the plausible retrieved images.
-   - Example: for aerial views of a famous building, different retrieved images may differ in angle, orientation, rendering style, or lighting, but core architectural features may remain stable. In such cases, ask about those shared stable features.
-   - Avoid questions whose answer may change across plausible search results.
+Reasonable questions:
+1. Which foot did Montiel use to strike the ball?
+2. Toward which side of the goal did the goalkeeper dive?
+3. What brand appeared on the advertising board directly behind the goalkeeper?
+4. When facing the goal, which player stood at the left end of the line of Argentine players with their arms linked?
 
-3. Use wider freedom only when the image is highly specific.
-   - If the image description points very strongly to one exact image or to one nearly unique photo, artwork, cover, poster, or historically specific shot, you may ask a more specific question about fine-grained visual details.
-   - This is appropriate for cases such as a famous artwork, an album cover, a historically iconic photograph, or a well-known image from a specific event and moment.
+These questions use actions or scene-grounded qualifiers to identify stable visual evidence. The relevant detail may require finding an appropriate view, but the wording identifies what must be inspected.
 
-4. The question must be high quality.
-   - It should be clear, natural, and unambiguous.
-   - It should have one answer fully supported by the image.
-   - It should not be trivial, but it also should not require subjective interpretation.
-   - Prefer concrete visual reasoning over vague aesthetic judgment.
+Unreasonable questions:
+1. Who appears in the upper-right corner of the image?
+2. What brand appeared on an advertising board?
 
-5. Use only the provided image evidence.
-   - Base the question and answer only on the supplied image material.
-   - Do not invent details that are not visibly supported.
+The first depends on the photographer's viewpoint and composition. The second does not identify which of the many advertising boards is being asked about.
 
-**Example 1:
-A photo of Argentina defender Montiel scoring the penalty in the World Cup final.
+** Example 2: Another specific event photographed at different moments
+Image description:
+Steve Jobs unveiling the original iPhone during the Macworld 2007 keynote.
 
-Reasonable question examples:
-1. Which side of the goal did the player kick the ball toward when taking the penalty in the World Cup final?
-2. Which side of the goal did the goalkeeper dive toward?
-3. What number jersey was the goalkeeper wearing?
+Reasonable questions:
+1. When Jobs held the iPhone toward the audience with its home screen visible, which four application icons appeared in the bottom dock?
+2. During the onstage demonstration of scrolling through a list by touch, which finger did Jobs use to operate the phone?
+
+These questions use a specific action and moment within the event to locate the required visual evidence, rather than assuming that every photograph from the keynote shows the same content.
+
+Unreasonable questions:
+1. What was displayed on the presentation screen behind Jobs?
+2. What color was the shirt of the audience member closest to the stage?
+
+The first does not specify a moment even though the presentation screen changed throughout the event. The second asks about an incidental attendee who is not constrained by the event description.
+
+** Example 3: A landmark with many possible photographs
+Image description:
+The Temple of Heaven in Beijing on a sunny day.
+
+Reasonable questions:
+1. What color are the roof tiles of the landmark's main circular hall?
+2. What repeated decorative shapes appear beneath the roof of the main hall?
+
+These questions concern stable architectural details of an explicitly identified part of the landmark.
+
+Unreasonable questions:
+1. What color is the clothing of the person closest to the camera?
+2. What color is the roof of the building to the left of the Temple of Heaven?
+
+The first asks about an incidental visitor. The second uses an undefined camera-relative direction, so different photographs may refer to different buildings.
+
+** Example 4: A fixed visual work
+Image description:
+The Abbey Road album cover by the Beatles.
+
+Reasonable questions:
+1. What color suit is worn by the second person from the left?
+2. Which member of the group is not wearing shoes?
+
+Composition-relative wording is acceptable here because the description identifies a fixed visual work whose content and arrangement remain consistent across valid search results.
 
 Unreasonable question:
-What number was the penalty taker wearing?
-(Reason: this can be answered directly by searching for Montiel based on the image description, so the image itself is unnecessary.)
+What color is the car closest to the photographer in an Abbey Road street photo?
 
-**Example 2:
-An aerial photo of the University of Chicago.
+This refers to an arbitrary street photograph rather than a stable detail of the specified album cover.
 
-Reasonable question examples:
-1. What is the main color of the roofs of the campus buildings?
-2. What is the nearest building next to the tallest building on campus?
-
-Unreasonable question:
-1. What two colors are on the roof of the building in the lower-left corner of the image?
-(Reason: this is ambiguous because it depends on the orientation of the photo.)
-
-Return valid JSON with exactly these fields:
+Return valid JSON with exactly this structure:
 {
-  "ask_target": "one complete question about the target image",
-  "answer": "the gold answer",
-  "supporting_facts": ["the exact visual facts from the image that support the answer"],
-  "reasoning": "a concise explanation of how the answer follows from the image",
-  "support": "why this question is image-dependent and why its answer is stable across plausible search results"
+  "candidates": [
+    {
+      "candidate_id": "candidate_1",
+      "question_type": "action | interaction | equipment | clothing | text_or_symbol | event_environment | spatial_relation | functional_relation | composition | other",
+      "ask_target": "one complete visual web-search question",
+      "answer": "the objective and concise gold answer",
+      "visual_locator": "the words or relations that locate the intended visual evidence",
+      "visual_reasoning": ["the ordered visual localization and inspection steps"],
+      "supporting_facts": ["the exact visual facts from the image that support the answer"]
+    }
+  ]
+}
+"""
+
+
+PROMPT_EVALUATE_IMAGE_TARGET_CANDIDATES = """You are an expert evaluator selecting one valid visual web-search question from several candidates.
+
+You will receive a base image-search query, one reference image with metadata, and candidate questions with proposed answers. The solver will not receive the reference image; they will search for relevant images using the base query.
+
+Evaluate every candidate in two stages.
+
+## Stage 1: Query-level uniqueness
+
+Reason only from the base query and candidate question. Do not use the reference image to resolve ambiguity.
+
+1. Determine whether the query identifies a specific event moment, an extended event, a general subject, or a fixed visual work.
+2. Identify the visual referent asked about and reject the candidate if multiple people, signs, buildings, objects, or regions may satisfy its wording.
+3. Check whether the referent has one stable answer under reasonable changes in viewpoint and shooting time.
+   - Reject camera-relative references such as "on the left side of the image", "in the upper-right corner", "in the foreground", or "closest to the camera" when different viewpoints may change their meaning.
+   - Scene-grounded relations such as "behind the goalkeeper", "on the player's right sleeve", "west of the main building", or "the leftmost player when facing the goal" may be stable.
+   - For a specific event moment, accept facts fixed by that moment even across viewpoints.
+   - If no precise moment is specified, reject facts that may change over time, including participant positions, display content, nearby people, vehicles, weather, or temporary objects.
+   - For a fixed cover, poster, painting, logo, manuscript page, or iconic photograph, composition-relative positions may be stable.
+
+Not every matching image must show the evidence. The solver may inspect multiple images. However, changing viewpoint or time must not change the underlying referent or produce a different answer.
+
+## Stage 2: Image-level correctness
+
+Now inspect the reference image. Check whether the referent is visible and uniquely located by the question, the proposed answer is visually correct, and the supporting facts are directly supported. Reject absent, unclear, incorrect, invented, or non-visual claims. Passing Stage 2 cannot override failure in Stage 1.
+
+## Final selection
+
+A candidate is valid only if it passes both stages. Among valid candidates, prefer stronger visual dependence, deeper reasoning, precise wording, interesting details, and lower text-only answerability. Do not automatically prefer simple color, count, or identity questions. Do not rewrite candidates. If none pass, return reject_all.
+
+Return valid JSON with exactly this structure:
+{
+  "decision": "select | reject_all",
+  "selected_candidate_id": "candidate_id or null",
+  "evaluations": [
+    {
+      "candidate_id": "candidate_1",
+      "query_analysis": {
+        "query_type": "specific_moment | extended_event | general_subject | fixed_visual_work | unclear",
+        "referent": "the underlying visual referent",
+        "referent_unique": true,
+        "answer_stable_across_viewpoints": true,
+        "answer_stable_across_time": true,
+        "valid": true,
+        "rejection_reasons": []
+      },
+      "image_analysis": {
+        "referent_visible": true,
+        "referent_unique_in_image": true,
+        "answer_correct": true,
+        "supporting_facts_correct": true,
+        "valid": true,
+        "rejection_reasons": []
+      },
+      "valid": true
+    }
+  ]
 }
 """
 
@@ -1043,7 +1139,7 @@ Example: In Jacques-Louis David’s painting of the Tennis Court Oath at Versail
     Reason: The former removes the date and the specific content of the painting, preventing the solver from inferring the painting directly from the date and event without first identifying Versailles; but once Versailles is inferred, the painter’s name and the location still allow the painting to be identified smoothly. The latter removes both the painter and the date entirely, making the clue too vague: even after inferring the location, multiple painters could have depicted events there, so the question becomes ambiguous.
 3. A replacement expression must satisfy this condition: on its own, it should not directly identify the target entity, but within the full question context, it should still help uniquely constrain the correct path.
 4. The question may include an image, so you need to preserve the connection between the question and the image content. In addition, descriptions of the image or scene should only be appropriately blurred, not deleted outright. If a statement in a given reasoning_chain item refers to a specific scene or image, that item will be marked as `"image"`. In the rewritten question, preserve the description of that scene or image—especially the visual details—and only apply slight obfuscation to the entities within it.
-5. Do not fabricate any extra information.
+5. Do not fabricate any extra information. If an entity is not explicitly revealed in the current wording of the question, there is no need to revise it.
 6. Retain some explicit clues that may appear at the beginning of the reasoning chain so that the question still has an entry point. Note: this refers to the beginning of the reasoning chain, not necessarily the beginning of the surface wording of the question.
 
 Output format:
@@ -1263,14 +1359,29 @@ class QuestionWriter:
 
     def select_target_ask(self, *, context: WriterContext) -> dict[str, Any]:
         if self.model_client is None:
-            return self._fallback_select_target(context.target_node)
+            fallback = self._fallback_select_target(context.target_node)
+            if context.target_node.get("node_type") == "image":
+                fallback["image_target_candidates"] = []
+                fallback["image_target_candidate_evaluation"] = {
+                    "decision": "fallback",
+                    "selected_candidate_id": None,
+                    "evaluations": [],
+                    "reason": "no_model_client",
+                }
+            return fallback
         target_node_type = str(context.target_node.get("node_type") or "")
+        if target_node_type == "image":
+            return self._select_image_target_ask(context=context)
+
         system_prompt = PROMPT_SELECT_IMAGE_TARGET if target_node_type == "image" else PROMPT_SELECT_TEXT_TARGET
         target_image_url = self._target_image_url(context.target_node)
+        user_payload: dict[str, Any] = {"target_node": context.target_node}
+        if target_node_type != "image":
+            user_payload["predecessor_chain"] = self._format_predecessor_chain(context)
         try:
             parsed = self._generate_json(
                 system=system_prompt,
-                user_payload={"target_node": context.target_node},
+                user_payload=user_payload,
                 trace_label=f"select_target_ask_{target_node_type or 'unknown'}",
                 image_url=target_image_url,
             )
@@ -1298,6 +1409,198 @@ class QuestionWriter:
             "reasoning": reasoning,
             "support": support,
         }
+
+    def _select_image_target_ask(self, *, context: WriterContext) -> dict[str, Any]:
+        target_image_url = self._target_image_url(context.target_node)
+        generation_payload = {
+            "base_search_query": self._image_search_query(context.target_node),
+            "target_node": context.target_node,
+        }
+        try:
+            generated = self._generate_json(
+                system=PROMPT_SELECT_IMAGE_TARGET,
+                user_payload=generation_payload,
+                trace_label="select_target_ask_image_candidates",
+                image_url=target_image_url,
+                max_tokens=max(self.max_tokens, 2400),
+            )
+        except Exception as exc:
+            fallback = self._fallback_select_target(context.target_node)
+            fallback["image_target_candidates"] = []
+            fallback["image_target_candidate_evaluation"] = {
+                "decision": "fallback",
+                "selected_candidate_id": None,
+                "evaluations": [],
+                "reason": "candidate_generation_error",
+            }
+            fallback["writer_warning"] = self._writer_warning_entry(
+                stage="select_target_ask_image_candidates",
+                error=exc,
+            )
+            return fallback
+
+        candidates = self._normalize_image_target_candidates(generated.get("candidates"))
+        if not candidates:
+            fallback = self._fallback_select_target(context.target_node)
+            fallback["image_target_candidates"] = []
+            fallback["image_target_candidate_evaluation"] = {
+                "decision": "fallback",
+                "selected_candidate_id": None,
+                "evaluations": [],
+                "reason": "no_valid_generated_candidates",
+                "raw_generation": generated,
+            }
+            fallback["writer_warning"] = self._writer_warning_entry(
+                stage="select_target_ask_image_candidates_parse",
+                error=ValueError("Image target candidate generation returned no usable candidates."),
+            )
+            return fallback
+
+        evaluation_payload = {
+            "base_search_query": self._image_search_query(context.target_node),
+            "target_node": context.target_node,
+            "candidates": candidates,
+        }
+        try:
+            evaluation = self._generate_json(
+                system=PROMPT_EVALUATE_IMAGE_TARGET_CANDIDATES,
+                user_payload=evaluation_payload,
+                trace_label="evaluate_image_target_candidates",
+                image_url=target_image_url,
+                max_tokens=max(self.max_tokens, 2400),
+            )
+        except Exception as exc:
+            fallback = self._fallback_select_target(context.target_node)
+            fallback["image_target_candidates"] = candidates
+            fallback["image_target_candidate_evaluation"] = {
+                "decision": "fallback",
+                "selected_candidate_id": None,
+                "evaluations": [],
+                "reason": "candidate_evaluation_error",
+            }
+            fallback["writer_warning"] = self._writer_warning_entry(
+                stage="evaluate_image_target_candidates",
+                error=exc,
+            )
+            return fallback
+
+        selected_candidate = self._selected_image_target_candidate(
+            candidates=candidates,
+            evaluation=evaluation,
+        )
+        if selected_candidate is None:
+            fallback = self._fallback_select_target(context.target_node)
+            fallback["image_target_candidates"] = candidates
+            fallback["image_target_candidate_evaluation"] = evaluation
+            fallback["writer_warning"] = self._writer_warning_entry(
+                stage="evaluate_image_target_candidates_selection",
+                error=ValueError("Image target evaluator did not select a valid generated candidate."),
+            )
+            return fallback
+
+        result = dict(selected_candidate)
+        result["image_target_candidates"] = candidates
+        result["image_target_candidate_evaluation"] = evaluation
+        return result
+
+    @classmethod
+    def _normalize_image_target_candidates(cls, raw_candidates: Any) -> list[dict[str, Any]]:
+        if not isinstance(raw_candidates, list):
+            return []
+        candidates: list[dict[str, Any]] = []
+        used_ids: set[str] = set()
+        for index, raw_candidate in enumerate(raw_candidates, start=1):
+            if not isinstance(raw_candidate, dict):
+                continue
+            ask_target = cls._ensure_question(str(raw_candidate.get("ask_target") or "").strip())
+            answer = str(raw_candidate.get("answer") or "").strip()
+            if not ask_target or not answer:
+                continue
+            candidate_id = str(raw_candidate.get("candidate_id") or f"candidate_{index}").strip()
+            if not candidate_id or candidate_id in used_ids:
+                candidate_id = f"candidate_{index}"
+            used_ids.add(candidate_id)
+            supporting_facts = raw_candidate.get("supporting_facts") or []
+            if not isinstance(supporting_facts, list):
+                supporting_facts = []
+            visual_reasoning = raw_candidate.get("visual_reasoning") or []
+            if not isinstance(visual_reasoning, list):
+                visual_reasoning = []
+            candidate = dict(raw_candidate)
+            candidate.update(
+                {
+                    "candidate_id": candidate_id,
+                    "ask_target": ask_target,
+                    "answer": answer,
+                    "supporting_facts": [
+                        str(item).strip()
+                        for item in supporting_facts
+                        if str(item).strip()
+                    ],
+                    "visual_reasoning": [
+                        str(item).strip()
+                        for item in visual_reasoning
+                        if str(item).strip()
+                    ],
+                }
+            )
+            candidates.append(candidate)
+        return candidates
+
+    @staticmethod
+    def _selected_image_target_candidate(
+        *,
+        candidates: list[dict[str, Any]],
+        evaluation: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        if str(evaluation.get("decision") or "").strip().lower() != "select":
+            return None
+        selected_id = str(evaluation.get("selected_candidate_id") or "").strip()
+        if not selected_id:
+            return None
+        evaluations = evaluation.get("evaluations") or []
+        if isinstance(evaluations, list):
+            selected_evaluation = next(
+                (
+                    item
+                    for item in evaluations
+                    if isinstance(item, dict)
+                    and str(item.get("candidate_id") or "").strip() == selected_id
+                ),
+                None,
+            )
+            if selected_evaluation is not None and selected_evaluation.get("valid") is not True:
+                return None
+        return next(
+            (
+                dict(candidate)
+                for candidate in candidates
+                if str(candidate.get("candidate_id") or "").strip() == selected_id
+            ),
+            None,
+        )
+
+    @classmethod
+    def _format_predecessor_chain(cls, context: WriterContext) -> str:
+        """Format the sampled path as ``object --relation--> next object``."""
+        if not context.hops:
+            return ""
+
+        first_hop = context.hops[0]
+        parts = [
+            cls._compress_hop_prompt_label(
+                first_hop.src_content,
+                fallback=first_hop.src_node_id,
+            )
+        ]
+        for hop in context.hops:
+            relation = str(hop.relation or hop.edge_type or "is connected to").strip()
+            target = cls._compress_hop_prompt_label(
+                hop.dst_content,
+                fallback=hop.dst_node_id,
+            )
+            parts.append(f"--{relation}--> {target}")
+        return " ".join(parts)
 
     def build_entry_hop(
         self,
@@ -1337,6 +1640,7 @@ class QuestionWriter:
                 "source": "-",
                 "statement": statement,
                 "entry_kind": "image",
+                "mark": "image",
             }
 
         source_node = first_hop.src_content
@@ -1556,6 +1860,18 @@ class QuestionWriter:
                     "question_terminal_bridge": question_terminal_bridge,
                     "image_target_terminal_normalization": image_target_terminal_normalization,
                     "writer_context": context.to_dict(),
+                    **(
+                        {
+                            "image_target_candidates": list(
+                                raw_target_ask.get("image_target_candidates") or []
+                            ),
+                            "image_target_candidate_evaluation": dict(
+                                raw_target_ask.get("image_target_candidate_evaluation") or {}
+                            ),
+                        }
+                        if context.target_node.get("node_type") == "image"
+                        else {}
+                    ),
                 },
             ),
             warnings=draft_warnings,
@@ -1777,6 +2093,8 @@ class QuestionWriter:
             question=draft.question,
             answer=draft.answer,
             hops=draft.reasoning_steps,
+            target_ask=draft.metadata.get("question_target_ask"),
+            question_terminal_bridge=draft.metadata.get("question_terminal_bridge"),
         )
         try:
             parsed = self._generate_json(
@@ -1905,6 +2223,7 @@ class QuestionWriter:
         image_url: str | None = None,
         model_client: ModelWorkerClient | None = None,
         model: str | None = None,
+        max_tokens: int | None = None,
     ) -> dict[str, Any]:
         active_model_client = model_client or self.model_client
         active_model = model or self.model
@@ -1916,7 +2235,7 @@ class QuestionWriter:
             request = ModelRequest(
                 model=active_model,
                 temperature=self.temperature,
-                max_tokens=self.max_tokens,
+                max_tokens=self.max_tokens if max_tokens is None else max_tokens,
                 response_format={"type": "json_object"},
                 messages=[
                     ModelMessage(
@@ -2810,22 +3129,52 @@ class QuestionWriter:
         }
 
     @staticmethod
-    def _difficulty_enhancement_payload(*, question: str, answer: str, hops: list[dict[str, Any]]) -> dict[str, Any]:
+    def _difficulty_enhancement_payload(
+        *,
+        question: str,
+        answer: str,
+        hops: list[dict[str, Any]],
+        target_ask: dict[str, Any] | None = None,
+        question_terminal_bridge: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        reasoning_chain = [
+            {
+                "hop_index": item.get("hop_index"),
+                "source": item.get("source"),
+                "target": item.get("target"),
+                "statement": item.get("statement"),
+                "relation": item.get("relation"),
+                "retrieval_query": item.get("retrieval_query"),
+                "mark": item.get("mark"),
+            }
+            for item in hops
+        ]
+        target_ask = target_ask if isinstance(target_ask, dict) else {}
+        question_terminal_bridge = (
+            question_terminal_bridge
+            if isinstance(question_terminal_bridge, dict)
+            else {}
+        )
+        if target_ask.get("mark") == "image":
+            removed_hop = question_terminal_bridge.get("removed_question_hop") or {}
+            if not isinstance(removed_hop, dict):
+                removed_hop = {}
+            reasoning_chain.append(
+                {
+                    "hop_index": removed_hop.get("hop_index", len(reasoning_chain)),
+                    "source": question_terminal_bridge.get("source"),
+                    "target": question_terminal_bridge.get("target_image"),
+                    "statement": target_ask.get("ask_target"),
+                    "relation": removed_hop.get("relation"),
+                    "retrieval_query": removed_hop.get("retrieval_query"),
+                    "mark": "image",
+                    "terminal_question": True,
+                }
+            )
         return {
             "question": question,
             "answer": answer,
-            "reasoning_chain": [
-                {
-                    "hop_index": item.get("hop_index"),
-                    "source": item.get("source"),
-                    "target": item.get("target"),
-                    "statement": item.get("statement"),
-                    "relation": item.get("relation"),
-                    "retrieval_query": item.get("retrieval_query"),
-                    "mark": item.get("mark"),
-                }
-                for item in hops
-            ],
+            "reasoning_chain": reasoning_chain,
         }
 
 
@@ -3083,6 +3432,12 @@ class QuestionWriter:
             "target_ask": raw_target_ask,
             "question_target_ask": question_target_ask,
         }
+        if "image_target_candidates" in raw_target_ask:
+            metadata["image_target_candidates"] = list(raw_target_ask.get("image_target_candidates") or [])
+        if "image_target_candidate_evaluation" in raw_target_ask:
+            metadata["image_target_candidate_evaluation"] = dict(
+                raw_target_ask.get("image_target_candidate_evaluation") or {}
+            )
         if raw_hop_summaries is not None:
             metadata["raw_hop_summaries"] = raw_hop_summaries
         if image_bridge_normalization is not None:
