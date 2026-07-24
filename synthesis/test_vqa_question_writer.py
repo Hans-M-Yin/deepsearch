@@ -111,8 +111,45 @@ class ImageTargetCandidateSelectionTests(unittest.TestCase):
                 {"candidate_id": "candidate_2", "valid": True},
             ],
         }
+        verification_client = _QueuedModelClient(
+            [
+                {
+                    "answers": [
+                        {"candidate_id": "candidate_1", "answer": "white", "answerable": True},
+                        {"candidate_id": "candidate_2", "answer": "Brand B", "answerable": True},
+                    ]
+                },
+                {
+                    "answers": [
+                        {"candidate_id": "candidate_1", "answer": "white", "answerable": True},
+                        {"candidate_id": "candidate_2", "answer": "", "answerable": False},
+                    ]
+                },
+                {
+                    "evaluations": [
+                        {
+                            "candidate_id": "candidate_1",
+                            "with_image_correct": True,
+                            "without_image_correct": True,
+                            "pass": False,
+                        },
+                        {
+                            "candidate_id": "candidate_2",
+                            "with_image_correct": True,
+                            "without_image_correct": False,
+                            "pass": True,
+                        },
+                    ]
+                },
+            ]
+        )
         client = _QueuedModelClient([{"candidates": candidates}, evaluation])
-        writer = QuestionWriter(model_client=client, model="writer")
+        writer = QuestionWriter(
+            model_client=client,
+            model="writer",
+            image_target_ask_model_client=verification_client,
+            image_target_ask_model="visual-verifier",
+        )
         context = WriterContext(
             path_id="path-image",
             trajectory={},
@@ -131,9 +168,54 @@ class ImageTargetCandidateSelectionTests(unittest.TestCase):
         self.assertEqual(selected["ask_target"], "What brand is shown directly behind the goalkeeper?")
         self.assertEqual(selected["answer"], "Brand B")
         self.assertEqual(len(selected["image_target_candidates"]), 2)
+        self.assertEqual(
+            selected["image_target_candidate_verification"]["kept_candidate_ids"],
+            ["candidate_2"],
+        )
         self.assertEqual(selected["image_target_candidate_evaluation"], evaluation)
         self.assertEqual(len(client.requests), 2)
         self.assertTrue(all(request.max_tokens >= 2400 for request in client.requests))
+        self.assertEqual(len(verification_client.requests), 3)
+        self.assertTrue(all(request.model == "visual-verifier" for request in verification_client.requests))
+
+    def test_visual_verification_keeps_all_when_every_candidate_is_filtered(self) -> None:
+        candidates = [
+            {"candidate_id": "candidate_1", "ask_target": "What color is it?", "answer": "red"},
+            {"candidate_id": "candidate_2", "ask_target": "What number is shown?", "answer": "7"},
+        ]
+        client = _QueuedModelClient(
+            [
+                {"answers": []},
+                {"answers": []},
+                {
+                    "evaluations": [
+                        {
+                            "candidate_id": item["candidate_id"],
+                            "with_image_correct": False,
+                            "without_image_correct": False,
+                            "pass": False,
+                        }
+                        for item in candidates
+                    ]
+                },
+            ]
+        )
+        writer = QuestionWriter(
+            model_client=client,
+            model="visual-verifier",
+            image_target_ask_model_client=client,
+            image_target_ask_model="visual-verifier",
+        )
+
+        kept, verification = writer._verify_image_target_candidates(
+            candidates=candidates,
+            image_url="https://example.com/image.jpg",
+        )
+
+        self.assertEqual(kept, candidates)
+        self.assertEqual(verification["decision"], "skip_all_filtered")
+        self.assertEqual(verification["kept_candidate_ids"], ["candidate_1", "candidate_2"])
+        self.assertEqual(verification["filtered_candidate_ids"], ["candidate_1", "candidate_2"])
 
     def test_text_target_does_not_add_image_candidate_metadata(self) -> None:
         client = _QueuedModelClient(
@@ -181,6 +263,10 @@ class ImageTargetCandidateSelectionTests(unittest.TestCase):
                 "decision": "select",
                 "selected_candidate_id": "candidate_1",
             },
+            "image_target_candidate_verification": {
+                "decision": "filter",
+                "kept_candidate_ids": ["candidate_1"],
+            },
         }
         image_record = VqaBatchRunner._compact_sample_record(base_sample)
         self.assertEqual(len(image_record["image_target_candidates"]), 1)
@@ -188,6 +274,7 @@ class ImageTargetCandidateSelectionTests(unittest.TestCase):
             image_record["image_target_candidate_evaluation"]["selected_candidate_id"],
             "candidate_1",
         )
+        self.assertEqual(image_record["image_target_candidate_verification"]["decision"], "filter")
 
 
 class DifficultyEnhancementImageMarkTests(unittest.TestCase):

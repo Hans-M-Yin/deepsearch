@@ -549,6 +549,66 @@ Return valid JSON with exactly these fields:
 }
 """
 
+PROMPT_ANSWER_VISUAL_TARGET_CANDIDATES = """Answer every candidate question using the attached reference image.
+
+Inspect the image carefully. Do not use the proposed gold answers, which are intentionally not provided.
+If the image does not support a confident answer, return an empty answer and explain why.
+
+Return valid JSON with exactly this structure:
+{
+  "answers": [
+    {
+      "candidate_id": "candidate_1",
+      "answer": "concise answer, or empty string when not answerable",
+      "reason": "brief image-grounded reason",
+      "answerable": true
+    }
+  ]
+}
+"""
+
+PROMPT_ANSWER_TEXT_ONLY_TARGET_CANDIDATES = """Answer every candidate question without access to the reference image.
+
+The image is not provided. Answer only from ordinary background knowledge or clues exposed by the
+question. Do not assume hidden visual details. If you cannot answer confidently, return an empty answer.
+
+Return valid JSON with exactly this structure:
+{
+  "answers": [
+    {
+      "candidate_id": "candidate_1",
+      "answer": "concise answer, or empty string when not answerable",
+      "reason": "brief reason",
+      "answerable": true
+    }
+  ]
+}
+"""
+
+PROMPT_JUDGE_VISUAL_TARGET_ANSWERS = """Judge whether each model answer is semantically correct relative to its gold answer.
+
+For each candidate, separately judge:
+1. whether the answer produced with the image is correct;
+2. whether the answer produced without the image is correct.
+
+Minor wording differences, synonyms, and equivalent formatting count as correct. Empty, uncertain,
+contradictory, incomplete, or materially different answers count as incorrect.
+A candidate passes only when the with-image answer is correct AND the without-image answer is incorrect.
+
+Return valid JSON with exactly this structure:
+{
+  "evaluations": [
+    {
+      "candidate_id": "candidate_1",
+      "with_image_correct": true,
+      "without_image_correct": false,
+      "pass": true,
+      "reason": "brief comparison against the gold answer"
+    }
+  ]
+}
+"""
+
 
 PROMPT_REWRITE_IMAGE_FIRST_HOP = """You will receive one declarative sentence for the first hop of an image-start trajectory.
 
@@ -810,6 +870,8 @@ Do not use a restriction such as "the club that won the 2011 UEFA Champions Leag
 1. Merge multiple statements so that the question is compact and natural.
 
 2. In addition to source and target not being allowed to appear directly, other widely known or obvious entities or relations appearing in the statements may also be blurred. When choosing such wording, aim for language that is neither too explicit nor too ambiguous; choose a relational expression that is connected to the previous source, or one that can still support smooth downstream reasoning once the previous source has been inferred.
+
+3. Do not arbitrarily alter the details of a statement, and make sure the question content is factually accurate. For example, consider the statement: “In 1814, the British general who was killed during the battle involving the 175th Infantry Regiment (United States) at Bread and Cheese Creek was Robert Ross (British Army officer).” This does not explicitly specify Robert Ross’s side in the battle, so it must not be further interpreted as: “This general was killed in 1814 while fighting the latter at Bread and Cheese Creek.”
 
 ## Example 1
 
@@ -1456,10 +1518,14 @@ class QuestionWriter:
             )
             return fallback
 
+        verified_candidates, visual_verification = self._verify_image_target_candidates(
+            candidates=candidates,
+            image_url=target_image_url,
+        )
         evaluation_payload = {
             "base_search_query": self._image_search_query(context.target_node),
             "target_node": context.target_node,
-            "candidates": candidates,
+            "candidates": verified_candidates,
         }
         try:
             evaluation = self._generate_json(
@@ -1472,6 +1538,7 @@ class QuestionWriter:
         except Exception as exc:
             fallback = self._fallback_select_target(context.target_node)
             fallback["image_target_candidates"] = candidates
+            fallback["image_target_candidate_verification"] = visual_verification
             fallback["image_target_candidate_evaluation"] = {
                 "decision": "fallback",
                 "selected_candidate_id": None,
@@ -1485,12 +1552,13 @@ class QuestionWriter:
             return fallback
 
         selected_candidate = self._selected_image_target_candidate(
-            candidates=candidates,
+            candidates=verified_candidates,
             evaluation=evaluation,
         )
         if selected_candidate is None:
             fallback = self._fallback_select_target(context.target_node)
             fallback["image_target_candidates"] = candidates
+            fallback["image_target_candidate_verification"] = visual_verification
             fallback["image_target_candidate_evaluation"] = evaluation
             fallback["writer_warning"] = self._writer_warning_entry(
                 stage="evaluate_image_target_candidates_selection",
@@ -1500,8 +1568,111 @@ class QuestionWriter:
 
         result = dict(selected_candidate)
         result["image_target_candidates"] = candidates
+        result["image_target_candidate_verification"] = visual_verification
         result["image_target_candidate_evaluation"] = evaluation
         return result
+
+    def _verify_image_target_candidates(
+        self,
+        *,
+        candidates: list[dict[str, Any]],
+        image_url: str | None,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        """Keep questions that require the image and are answerable from it."""
+        model_client = self.image_target_ask_model_client or self.model_client
+        model = self.image_target_ask_model or self.model
+        if model_client is None or not image_url:
+            return candidates, {
+                "decision": "skip",
+                "reason": "no_verification_model" if model_client is None else "no_target_image",
+                "kept_candidate_ids": [item["candidate_id"] for item in candidates],
+                "evaluations": [],
+            }
+
+        questions = [
+            {
+                "candidate_id": item["candidate_id"],
+                "question": item["ask_target"],
+            }
+            for item in candidates
+        ]
+        try:
+            with_image = self._generate_json(
+                system=PROMPT_ANSWER_VISUAL_TARGET_CANDIDATES,
+                user_payload={"candidates": questions},
+                trace_label="verify_image_target_answers_with_image",
+                image_url=image_url,
+                model_client=model_client,
+                model=model,
+                max_tokens=max(self.max_tokens, 1600),
+            )
+            without_image = self._generate_json(
+                system=PROMPT_ANSWER_TEXT_ONLY_TARGET_CANDIDATES,
+                user_payload={
+                    "instruction": "图片未提供，请根据常识作答。",
+                    "candidates": questions,
+                },
+                trace_label="verify_image_target_answers_without_image",
+                model_client=model_client,
+                model=model,
+                max_tokens=max(self.max_tokens, 1600),
+            )
+            judgment = self._generate_json(
+                system=PROMPT_JUDGE_VISUAL_TARGET_ANSWERS,
+                user_payload={
+                    "candidates": [
+                        {
+                            "candidate_id": item["candidate_id"],
+                            "question": item["ask_target"],
+                            "gold_answer": item["answer"],
+                        }
+                        for item in candidates
+                    ],
+                    "with_image_answers": with_image.get("answers") or [],
+                    "without_image_answers": without_image.get("answers") or [],
+                },
+                trace_label="judge_image_target_answerability",
+                model_client=model_client,
+                model=model,
+                max_tokens=max(self.max_tokens, 1800),
+            )
+        except Exception as exc:
+            return candidates, {
+                "decision": "skip",
+                "reason": "verification_error",
+                "error": f"{exc.__class__.__name__}: {exc}",
+                "kept_candidate_ids": [item["candidate_id"] for item in candidates],
+                "evaluations": [],
+            }
+
+        evaluations = judgment.get("evaluations") or []
+        if not isinstance(evaluations, list):
+            evaluations = []
+        passed_ids = {
+            str(item.get("candidate_id") or "").strip()
+            for item in evaluations
+            if isinstance(item, dict)
+            and item.get("with_image_correct") is True
+            and item.get("without_image_correct") is False
+            and item.get("pass") is True
+        }
+        filtered = [item for item in candidates if item["candidate_id"] in passed_ids]
+        filtered_candidate_ids = [
+            item["candidate_id"]
+            for item in candidates
+            if item["candidate_id"] not in passed_ids
+        ]
+        skipped = not filtered
+        kept = candidates if skipped else filtered
+        return kept, {
+            "decision": "skip_all_filtered" if skipped else "filter",
+            "reason": "all_candidates_filtered; original candidates retained" if skipped else "visual_answerability_filter",
+            "kept_candidate_ids": [item["candidate_id"] for item in kept],
+            "filtered_candidate_ids": filtered_candidate_ids,
+            "with_image_answers": with_image.get("answers") or [],
+            "without_image_answers": without_image.get("answers") or [],
+            "evaluations": evaluations,
+        }
 
     @classmethod
     def _normalize_image_target_candidates(cls, raw_candidates: Any) -> list[dict[str, Any]]:
@@ -1864,6 +2035,9 @@ class QuestionWriter:
                         {
                             "image_target_candidates": list(
                                 raw_target_ask.get("image_target_candidates") or []
+                            ),
+                            "image_target_candidate_verification": dict(
+                                raw_target_ask.get("image_target_candidate_verification") or {}
                             ),
                             "image_target_candidate_evaluation": dict(
                                 raw_target_ask.get("image_target_candidate_evaluation") or {}
@@ -3434,6 +3608,10 @@ class QuestionWriter:
         }
         if "image_target_candidates" in raw_target_ask:
             metadata["image_target_candidates"] = list(raw_target_ask.get("image_target_candidates") or [])
+        if "image_target_candidate_verification" in raw_target_ask:
+            metadata["image_target_candidate_verification"] = dict(
+                raw_target_ask.get("image_target_candidate_verification") or {}
+            )
         if "image_target_candidate_evaluation" in raw_target_ask:
             metadata["image_target_candidate_evaluation"] = dict(
                 raw_target_ask.get("image_target_candidate_evaluation") or {}

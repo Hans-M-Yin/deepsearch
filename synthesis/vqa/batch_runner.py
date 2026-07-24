@@ -870,6 +870,12 @@ class VqaBatchRunner:
         )
         if image_target_candidates is not None:
             record["image_target_candidates"] = image_target_candidates
+        image_target_candidate_verification = VqaBatchRunner._extract_stage_metadata_value(
+            sample,
+            field_name="image_target_candidate_verification",
+        )
+        if image_target_candidate_verification is not None:
+            record["image_target_candidate_verification"] = image_target_candidate_verification
         image_target_candidate_evaluation = VqaBatchRunner._extract_stage_metadata_value(
             sample,
             field_name="image_target_candidate_evaluation",

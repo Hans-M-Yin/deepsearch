@@ -79,6 +79,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--llm-candidate-count", type=int, default=6)
     parser.add_argument("--llm-score-temperature", type=float, default=0.35)
     parser.add_argument(
+        "--llm-generic-category-score-cap",
+        type=float,
+        default=0.15,
+        help="Hard maximum LLM score for targets classified as generic category/concept nodes.",
+    )
+    parser.add_argument(
         "--sampler-state",
         type=Path,
         default=None,
@@ -110,6 +116,7 @@ def main(argv: list[str] | None = None) -> int:
         neighbor_selection_strategy=args.neighbor_selection_strategy,
         llm_candidate_count=args.llm_candidate_count,
         llm_score_temperature=args.llm_score_temperature,
+        llm_generic_category_score_cap=args.llm_generic_category_score_cap,
     )
     store = JsonlGraphStore(graph_dir)
     graph = GraphView(store, allowed_edge_types=set(config.allowed_edge_types))

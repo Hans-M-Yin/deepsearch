@@ -50,6 +50,7 @@ Important evaluation principles:
 6. Avoid near-duplicate entities that are too close to entities already present in the trajectory. For example, if the trajectory already contains "iPhone 4S", then "iPhone 5" is usually too similar and should be penalized unless the relation creates a genuinely necessary contrast.
 7. Avoid a candidate whose target has already been explicitly named in the relation text of an earlier hop, even when that target has not yet appeared as a trajectory node. Such a candidate repeats information that the chain has already exposed instead of adding a new inference step. For example, if an earlier hop reads "A -- is associated with C --> B", then a later candidate "B --> C" should receive a very low score, because C has already been revealed by the earlier relation.
 8. Give a low score when the candidate TARGET NODE ITSELF is a broad, non-unique concept page rather than a specific entity. Examples include category/concept nodes such as "Company" or "City", occupation nodes such as "Actor" or "Scientist", generic role nodes such as "Captain" or "Founder", and entity-type nodes such as "Film" or "University". This penalty is about landing on the generic concept node, not about the profession, role, or type of a specific target entity. A hop to a particular person who is an actor or scientist (for example, "Tom Hanks" or "Marie Curie"), a particular company or city (for example, "Apple Inc." or "Paris"), or another specific named entity should NOT be penalized for belonging to one of these classes; such concrete entity transitions are often desirable.
+9. Set `is_generic_category_target=true` exactly when principle 8 applies. This flag activates a hard score cap in the sampler, so do not use it merely because a specific entity belongs to a category.
 
 Common bad candidates:
 - generic links that could connect to many entities
@@ -78,6 +79,7 @@ Return valid JSON with exactly this shape:
       "future_potential": 0.0,
       "askability": 0.0,
       "shortcut_risk": 0.0,
+      "is_generic_category_target": false,
       "reason": "short explanation grounded in the current trajectory"
     }
   ]
@@ -233,6 +235,7 @@ class SamplerConfiguration:
     neighbor_selection_strategy: str = "random"
     llm_candidate_count: int = 6
     llm_score_temperature: float = 0.35
+    llm_generic_category_score_cap: float = 0.15
     allowed_edge_types: tuple[str, ...] = (
         "wiki_link",
         "wiki_attribute",
@@ -265,6 +268,8 @@ class SamplerConfiguration:
             raise ValueError("llm_candidate_count must be positive")
         if self.llm_score_temperature <= 0:
             raise ValueError("llm_score_temperature must be positive")
+        if not 0 <= self.llm_generic_category_score_cap <= 1:
+            raise ValueError("llm_generic_category_score_cap must be between 0 and 1")
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -1124,7 +1129,7 @@ class RandomPathSampler(PathSampler):
             edge_id = str(item.get("edge_id") or "").strip()
             if not edge_id or edge_id not in candidate_by_id:
                 continue
-            score = self._coerce_score(item.get("score"), default=0.0)
+            raw_score, score, is_generic_category_target = self._capped_llm_candidate_score(item)
             if score <= 0:
                 score = 0.01
             weight = self._score_to_weight(score)
@@ -1133,6 +1138,13 @@ class RandomPathSampler(PathSampler):
                 {
                     "edge_id": edge_id,
                     "score": score,
+                    "raw_score": raw_score,
+                    "is_generic_category_target": is_generic_category_target,
+                    "generic_category_score_cap": (
+                        self.config.llm_generic_category_score_cap
+                        if is_generic_category_target
+                        else None
+                    ),
                     "reason": str(item.get("reason") or "").strip(),
                 }
             )
@@ -1160,6 +1172,16 @@ class RandomPathSampler(PathSampler):
                 }
             )
         return chosen_edge
+
+    def _capped_llm_candidate_score(self, item: dict[str, Any]) -> tuple[float, float, bool]:
+        raw_score = self._coerce_score(item.get("score"), default=0.0)
+        is_generic_category_target = item.get("is_generic_category_target") is True
+        score = (
+            min(raw_score, self.config.llm_generic_category_score_cap)
+            if is_generic_category_target
+            else raw_score
+        )
+        return raw_score, score, is_generic_category_target
 
     def _select_llm_candidates(
         self,
@@ -1452,6 +1474,12 @@ def _debug_main() -> None:
     parser.add_argument("--llm-candidate-count", type=int, default=6)
     parser.add_argument("--llm-score-temperature", type=float, default=0.35)
     parser.add_argument(
+        "--llm-generic-category-score-cap",
+        type=float,
+        default=0.15,
+        help="Hard maximum LLM score for targets classified as generic category/concept nodes.",
+    )
+    parser.add_argument(
         "--sampler-model-alias",
         default=None,
         help="Optional model alias registered in synthesis/models.json for next-hop ranking.",
@@ -1478,6 +1506,7 @@ def _debug_main() -> None:
             neighbor_selection_strategy=args.neighbor_selection_strategy,
             llm_candidate_count=args.llm_candidate_count,
             llm_score_temperature=args.llm_score_temperature,
+            llm_generic_category_score_cap=args.llm_generic_category_score_cap,
             max_samples=1,
         ),
         model_client=LLM_WORKER if args.sampler_model_alias and args.neighbor_selection_strategy == "llm_guided" else None,
