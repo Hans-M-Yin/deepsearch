@@ -352,6 +352,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Always dispatch queued image-entity text expansions before ordinary text-neighbor tasks.",
     )
+    parser.add_argument(
+        "--image-entity-only",
+        action="store_true",
+        help="Expand root seeds, image tasks, and image-entity text tasks; leave ordinary text-neighbor tasks queued.",
+    )
     parser.add_argument("--max-depth", type=int, default=1, help="Maximum text-neighbor BFS depth.")
     parser.add_argument(
         "--queue-pop-strategy",
@@ -568,6 +573,7 @@ def main(argv: list[str] | None = None) -> int:
             batch_size=args.batch_size,
             max_inflight_text=args.max_inflight_text if args.max_inflight_text and args.max_inflight_text > 0 else None,
             prioritize_image_entity_tasks=args.prioritize_image_entity_tasks,
+            image_entity_only=args.image_entity_only,
         ),
         run_id=args.run_id,
         resume=not args.fresh,

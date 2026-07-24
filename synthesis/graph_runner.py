@@ -53,6 +53,7 @@ class GraphRunnerConfig:
     batch_size: int | None = None
     max_inflight_text: int | None = None
     prioritize_image_entity_tasks: bool = False
+    image_entity_only: bool = False
     show_progress: bool = True
     persist_visual_plans: bool = True
     visual_plans_file_name: str = "visual_plans.jsonl"
@@ -353,7 +354,7 @@ class GraphRunner:
         if remaining_text_slots is None or remaining_text_slots > 0:
             if (
                 not limit_text_for_images
-                and self.config.prioritize_image_entity_tasks
+                and (self.config.prioritize_image_entity_tasks or self.config.image_entity_only)
                 and queue_breakdown["image_entity_queue"] > 0
             ):
                 task = self.strategy.pop_next_task(
@@ -363,6 +364,10 @@ class GraphRunner:
                 if task is not None:
                     self._text_dispatch_since_image_entity = 0
                     return task
+            if not limit_text_for_images and self.config.image_entity_only:
+                seed_task = self._pop_next_seed_task()
+                if seed_task is not None:
+                    return seed_task
             if (
                 not limit_text_for_images
                 and queue_breakdown["image_entity_queue"] > 0
@@ -376,7 +381,11 @@ class GraphRunner:
                     self._text_dispatch_since_image_entity = 0
                     return task
         allowed_types = {ExpansionTaskType.IMAGE_EXPAND}
-        if (remaining_text_slots is None or remaining_text_slots > 0) and not limit_text_for_images:
+        if (
+            (remaining_text_slots is None or remaining_text_slots > 0)
+            and not limit_text_for_images
+            and not self.config.image_entity_only
+        ):
             allowed_types.add(ExpansionTaskType.TEXT_EXPAND)
         task = self.strategy.pop_next_task(allowed_task_types=allowed_types)
         if task is not None and task.task_type == ExpansionTaskType.TEXT_EXPAND:
@@ -387,10 +396,27 @@ class GraphRunner:
                 self._text_dispatch_since_image_entity += 1
         return task
 
+    def _pop_next_seed_task(self) -> ExpansionTask | None:
+        """Pop a root text seed while leaving ordinary text-neighbor tasks queued."""
+        return self.strategy.pop_next_task(
+            allowed_task_types={ExpansionTaskType.TEXT_EXPAND},
+            root_text_only=True,
+        )
+
     def _has_schedulable_tasks(self) -> bool:
         if self.strategy.queue_size(ExpansionTaskType.IMAGE_EXPAND) > 0:
             return True
         remaining_text_slots = self._remaining_text_slots()
+        if self.config.image_entity_only:
+            queue_breakdown = self._queue_breakdown()
+            if queue_breakdown["image_entity_queue"] > 0:
+                return remaining_text_slots is None or remaining_text_slots > 0
+            return any(
+                record.get("task_type") == ExpansionTaskType.TEXT_EXPAND.value
+                and record.get("parent_node_id") is None
+                and not (record.get("metadata") or {}).get("task_origin")
+                for record in self.strategy.queue_records()
+            )
         return (
             (remaining_text_slots is None or remaining_text_slots > 0)
             and self.strategy.queue_size(ExpansionTaskType.TEXT_EXPAND) > 0
@@ -983,6 +1009,47 @@ def _smoke_test() -> None:
             ExpansionTaskType.IMAGE_EXPAND,
             ExpansionTaskType.IMAGE_EXPAND,
         ]
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = JsonlGraphStore(tmpdir)
+        strategy = MockSchedulingStrategy(store)
+        runner = GraphRunner(
+            strategy=strategy,
+            store=store,
+            config=GraphRunnerConfig(max_nodes=10, image_entity_only=True, show_progress=False),
+            run_id="run_image_entity_only_smoke",
+            resume=False,
+        )
+        ordinary_neighbor = ExpansionTask(
+            url="https://en.wikipedia.org/wiki/Ordinary_Neighbor",
+            title="Ordinary Neighbor",
+            parent_node_id="text_parent",
+        )
+        seed = ExpansionTask(
+            url="https://en.wikipedia.org/wiki/Root_Seed",
+            title="Root Seed",
+        )
+        image_entity = ExpansionTask(
+            url="https://en.wikipedia.org/wiki/Image_Entity",
+            title="Image Entity",
+            parent_node_id="image_parent",
+            metadata={"task_origin": "image_entity"},
+        )
+        image_expand = ExpansionTask.from_image_expansion(
+            url="https://en.wikipedia.org/wiki/Root_Seed",
+            title="Root Seed",
+            depth=0,
+            source_text_node_id="text_seed",
+            source_evidence_id="evidence_seed",
+        )
+        for task in (ordinary_neighbor, seed, image_entity, image_expand):
+            strategy.enqueue(task)
+
+        assert runner._pop_next_schedulable_task(in_flight_text_count=0) is image_entity
+        assert runner._pop_next_schedulable_task(in_flight_text_count=0) is seed
+        assert runner._pop_next_schedulable_task(in_flight_text_count=0) is image_expand
+        assert runner._pop_next_schedulable_task(in_flight_text_count=0) is None
+        assert strategy.queue_records() == [ordinary_neighbor.to_dict()]
     print("graph_runner smoke test passed")
 
 

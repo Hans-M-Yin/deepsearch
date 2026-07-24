@@ -300,6 +300,7 @@ class GraphExpansionStrategy:
         allowed_task_types: set[ExpansionTaskType] | None = None,
         text_task_origin: str | None = None,
         exclude_text_task_origin: str | None = None,
+        root_text_only: bool = False,
     ) -> ExpansionTask | None:
         with self._lock:
             if not self._queue:
@@ -316,6 +317,13 @@ class GraphExpansionStrategy:
                             continue
                     if exclude_text_task_origin is not None:
                         if task.task_type == ExpansionTaskType.TEXT_EXPAND and task_origin == exclude_text_task_origin:
+                            continue
+                    if root_text_only:
+                        if (
+                            task.task_type != ExpansionTaskType.TEXT_EXPAND
+                            or task.parent_node_id is not None
+                            or task_origin is not None
+                        ):
                             continue
                     eligible_indices.append(index)
             if not eligible_indices:
