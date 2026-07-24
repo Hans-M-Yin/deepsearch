@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import unittest
+from types import SimpleNamespace
 
 from synthesis.vqa.path_sampler import RandomPathSampler, SamplerConfiguration
 
@@ -79,6 +81,98 @@ class GenericCategoryScoreCapTests(unittest.TestCase):
         self.assertEqual(raw, 0.92)
         self.assertEqual(effective, 0.92)
         self.assertFalse(classified)
+
+
+class _Graph:
+    def __init__(self) -> None:
+        self.nodes = {
+            "source": {"node_id": "source", "node_type": "text", "title": "See of Constantinople", "summary": "An episcopal see."},
+            "text_target": {"node_id": "text_target", "node_type": "text", "title": "1204", "summary": "A year."},
+            "image_target": {
+                "node_id": "image_target",
+                "node_type": "image",
+                "caption": "Entry of the Crusaders into Constantinople",
+                "metadata": {"search_query": "Entry of the Crusaders into Constantinople", "visual_target": "Delacroix painting"},
+            },
+        }
+
+    def get_node(self, node_id: str):
+        return self.nodes.get(node_id)
+
+    def node_type(self, node_id: str):
+        node = self.get_node(node_id)
+        return node.get("node_type") if node else None
+
+
+class _QueuedModelClient:
+    def __init__(self, payload: dict) -> None:
+        self.payload = payload
+        self.requests = []
+
+    def generate(self, request):
+        self.requests.append(request)
+        return SimpleNamespace(content=json.dumps(self.payload))
+
+
+class EdgeQualityFilterTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.graph = _Graph()
+        self.wiki_edge = {
+            "edge_id": "wiki_bad",
+            "edge_type": "wiki_link",
+            "src_node_id": "source",
+            "dst_node_id": "text_target",
+            "relation": "the crusaders captured the city in 1204",
+            "evidence_refs": [{"quote": "The Fourth Crusade captured Constantinople in 1204."}],
+        }
+        self.image_edge = {
+            "edge_id": "image_bad",
+            "edge_type": "search_retrieved",
+            "src_node_id": "source",
+            "dst_node_id": "image_target",
+            "relation": "Delacroix painting of the Fourth Crusade",
+            "evidence_refs": [{"metadata": {"snippet": "The painting depicts the sack of Constantinople."}}],
+        }
+
+    def sampler(self, response: dict) -> tuple[RandomPathSampler, _QueuedModelClient]:
+        client = _QueuedModelClient(response)
+        return (
+            RandomPathSampler(
+                graph=self.graph,
+                config=SamplerConfiguration(),
+                history_exposure_model_client=client,
+                history_exposure_model="overlap-model",
+            ),
+            client,
+        )
+
+    def test_rejects_when_any_text_judgment_fails_and_batches_candidates(self) -> None:
+        sampler, client = self.sampler(
+            {"evaluations": [
+                {"edge_id": "wiki_bad", "relevance_analysis": "The relation omits the see.", "relevance_ok": False,
+                 "correctness_analysis": "The evidence concerns a crusade.", "correctness_ok": False,
+                 "unambiguous_analysis": "1204 is clear but irrelevant.", "unambiguous_ok": True, "keep": True},
+                {"edge_id": "image_bad", "relevance_analysis": "The painting is about the sack, not the see.", "relevance_ok": False,
+                 "correctness_analysis": "", "correctness_ok": True,
+                 "unambiguous_analysis": "", "unambiguous_ok": True, "keep": False},
+            ]}
+        )
+
+        rejected = sampler._edge_quality_rejections([self.wiki_edge, self.image_edge])
+
+        self.assertEqual(set(rejected), {"wiki_bad", "image_bad"})
+        self.assertFalse(rejected["wiki_bad"]["evaluation"]["keep"])
+        self.assertEqual(len(client.requests), 1)
+        self.assertEqual(client.requests[0].model, "overlap-model")
+        payload = json.loads(client.requests[0].messages[1].content)
+        self.assertEqual([item["edge_kind"] for item in payload["candidates"]], ["text_to_text", "text_to_image"])
+
+    def test_missing_model_result_fails_open_and_is_cached(self) -> None:
+        sampler, client = self.sampler({"evaluations": []})
+
+        self.assertEqual(sampler._edge_quality_rejections([self.wiki_edge]), {})
+        self.assertEqual(sampler._edge_quality_rejections([self.wiki_edge]), {})
+        self.assertEqual(len(client.requests), 1)
 
 
 if __name__ == "__main__":
