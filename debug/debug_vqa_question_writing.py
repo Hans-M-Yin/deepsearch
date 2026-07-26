@@ -40,6 +40,25 @@ def _resolve_samples_path(vqa_dir: Path) -> Path:
     return path
 
 
+def _load_graph_nodes(vqa_dir: Path) -> dict[str, dict[str, Any]]:
+    """Load graph nodes from the graph directory that contains ``vqa_dir``.
+
+    VQA samples only persist endpoint node IDs in their hop summaries.  Walk up
+    from the VQA output directory to find the graph's ``nodes.jsonl`` so image
+    endpoints can be resolved back to their stored image paths.
+    """
+    for candidate in (vqa_dir.resolve(), *vqa_dir.resolve().parents):
+        nodes_path = candidate / "nodes.jsonl"
+        if not nodes_path.exists():
+            continue
+        return {
+            str(node_id): node
+            for node in _load_jsonl(nodes_path)
+            if (node_id := node.get("node_id"))
+        }
+    return {}
+
+
 def _load_jsonl(path: Path) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     with path.open("r", encoding="utf-8") as handle:
@@ -141,11 +160,37 @@ def _find_merged_question_hop(
     return None
 
 
-def _format_hop(hop: dict[str, Any], *, width: int, title: str) -> list[str]:
+def _image_path(node: dict[str, Any]) -> str:
+    """Return the preferred persisted path/URL for an image node."""
+    for value in (
+        node.get("image_url"),
+        node.get("oss_uri"),
+        node.get("thumb_oss_uri"),
+        (node.get("source") or {}).get("url") if isinstance(node.get("source"), dict) else None,
+    ):
+        path = str(value or "").strip()
+        if path:
+            return path
+    return ""
+
+
+def _format_hop(
+    hop: dict[str, Any],
+    *,
+    width: int,
+    title: str,
+    nodes_by_id: dict[str, dict[str, Any]],
+) -> list[str]:
     lines = [f"  {title}"]
     lines.extend(_format_field("source", hop.get("source"), width=width, indent=4))
+    source_node = nodes_by_id.get(str(hop.get("src_node_id") or ""))
+    if source_node and source_node.get("node_type") == "image":
+        lines.extend(_format_field("source_image_path", _image_path(source_node), width=width, indent=4))
     lines.extend(_format_field("relation", hop.get("relation"), width=width, indent=4))
     lines.extend(_format_field("target", hop.get("target"), width=width, indent=4))
+    target_node = nodes_by_id.get(str(hop.get("dst_node_id") or ""))
+    if target_node and target_node.get("node_type") == "image":
+        lines.extend(_format_field("target_image_path", _image_path(target_node), width=width, indent=4))
     lines.extend(_format_field("statement", hop.get("statement"), width=width, indent=4))
     retrieval_query = _first_non_empty(hop.get("retrieval_query"))
     if retrieval_query:
@@ -167,7 +212,12 @@ def _final_question(sample: dict[str, Any]) -> str:
     )
 
 
-def _format_image_bridge_section(sample: dict[str, Any], *, width: int) -> list[str]:
+def _format_image_bridge_section(
+    sample: dict[str, Any],
+    *,
+    width: int,
+    nodes_by_id: dict[str, dict[str, Any]],
+) -> list[str]:
     raw_hops = list(sample.get("hop_chain") or [])
     question_hops = list(sample.get("question_hop_chain") or [])
     raw_by_index = _hop_index_map(raw_hops)
@@ -191,9 +241,23 @@ def _format_image_bridge_section(sample: dict[str, Any], *, width: int) -> list[
         outgoing_hop = raw_by_index.get(outgoing_index) if isinstance(outgoing_index, int) else None
 
         if incoming_hop:
-            lines.extend(_format_hop(incoming_hop, width=width, title=f"Before Hop {incoming_index}"))
+            lines.extend(
+                _format_hop(
+                    incoming_hop,
+                    width=width,
+                    title=f"Before Hop {incoming_index}",
+                    nodes_by_id=nodes_by_id,
+                )
+            )
         if outgoing_hop:
-            lines.extend(_format_hop(outgoing_hop, width=width, title=f"Before Hop {outgoing_index}"))
+            lines.extend(
+                _format_hop(
+                    outgoing_hop,
+                    width=width,
+                    title=f"Before Hop {outgoing_index}",
+                    nodes_by_id=nodes_by_id,
+                )
+            )
 
         if diag.get("applied"):
             merged_hop = _find_merged_question_hop(
@@ -203,7 +267,14 @@ def _format_image_bridge_section(sample: dict[str, Any], *, width: int) -> list[
                 outgoing_hop=outgoing_hop,
             )
             if merged_hop:
-                lines.extend(_format_hop(merged_hop, width=width, title="After Merged Hop"))
+                lines.extend(
+                    _format_hop(
+                        merged_hop,
+                        width=width,
+                        title="After Merged Hop",
+                        nodes_by_id=nodes_by_id,
+                    )
+                )
             else:
                 lines.append("  After Merged Hop")
                 lines.extend(_format_field("statement", diag.get("rewritten_statement"), width=width, indent=4))
@@ -214,7 +285,12 @@ def _format_image_bridge_section(sample: dict[str, Any], *, width: int) -> list[
     return lines
 
 
-def _format_terminal_merge_section(sample: dict[str, Any], *, width: int) -> list[str]:
+def _format_terminal_merge_section(
+    sample: dict[str, Any],
+    *,
+    width: int,
+    nodes_by_id: dict[str, dict[str, Any]],
+) -> list[str]:
     target_ask = sample.get("target_ask") or {}
     question_target_ask = sample.get("question_target_ask") or {}
     bridge = sample.get("question_terminal_bridge") or {}
@@ -231,7 +307,14 @@ def _format_terminal_merge_section(sample: dict[str, Any], *, width: int) -> lis
 
     removed_hop = bridge.get("removed_question_hop") or diag.get("removed_question_hop") or {}
     if isinstance(removed_hop, dict) and removed_hop:
-        lines.extend(_format_hop(removed_hop, width=width, title="  Before Final Text -> Image Hop"))
+        lines.extend(
+            _format_hop(
+                removed_hop,
+                width=width,
+                title="  Before Final Text -> Image Hop",
+                nodes_by_id=nodes_by_id,
+            )
+        )
 
     lines.extend(_format_field("before_raw_ask_target", target_ask.get("ask_target"), width=width, indent=2))
     lines.extend(_format_field("after_question_ask_target", question_target_ask.get("ask_target"), width=width, indent=2))
@@ -312,7 +395,12 @@ def _json_text(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True)
 
 
-def _format_polish_section(sample: dict[str, Any], *, width: int) -> list[str]:
+def _format_polish_section(
+    sample: dict[str, Any],
+    *,
+    width: int,
+    nodes_by_id: dict[str, dict[str, Any]],
+) -> list[str]:
     polish = sample.get("polish") or {}
     if not isinstance(polish, dict):
         polish = {}
@@ -333,7 +421,7 @@ def _format_polish_section(sample: dict[str, Any], *, width: int) -> list[str]:
             if isinstance(hop, dict):
                 hop_index = hop.get("hop_index")
                 title = f"Polish Hop {hop_index}" if hop_index is not None else "Polish Hop"
-                lines.extend(_format_hop(hop, width=width, title=title))
+                lines.extend(_format_hop(hop, width=width, title=title, nodes_by_id=nodes_by_id))
 
     if isinstance(subtasks, dict) and subtasks:
         lines.append("  Subtask Diagnostics")
@@ -374,7 +462,13 @@ def _format_questions_section(sample: dict[str, Any], *, width: int) -> list[str
     return lines
 
 
-def _format_sample(sample: dict[str, Any], *, ordinal: int, width: int) -> str:
+def _format_sample(
+    sample: dict[str, Any],
+    *,
+    ordinal: int,
+    width: int,
+    nodes_by_id: dict[str, dict[str, Any]],
+) -> str:
     sample_id = _first_non_empty(sample.get("sample_id"), f"sample_{ordinal:06d}")
     status = _first_non_empty(sample.get("status"), "unknown")
     path = sample.get("path") or {}
@@ -395,7 +489,7 @@ def _format_sample(sample: dict[str, Any], *, ordinal: int, width: int) -> str:
         for hop in raw_hops:
             hop_index = hop.get("hop_index")
             title = f"Hop {hop_index}" if hop_index is not None else "Hop"
-            lines.extend(_format_hop(hop, width=width, title=title))
+            lines.extend(_format_hop(hop, width=width, title=title, nodes_by_id=nodes_by_id))
             lines.append("")
         if lines[-1] == "":
             lines.pop()
@@ -403,10 +497,10 @@ def _format_sample(sample: dict[str, Any], *, ordinal: int, width: int) -> str:
         lines.append("  - No raw hop chain found.")
 
     lines.append(SUB_SEPARATOR)
-    lines.extend(_format_image_bridge_section(sample, width=width))
+    lines.extend(_format_image_bridge_section(sample, width=width, nodes_by_id=nodes_by_id))
 
     lines.append(SUB_SEPARATOR)
-    lines.extend(_format_terminal_merge_section(sample, width=width))
+    lines.extend(_format_terminal_merge_section(sample, width=width, nodes_by_id=nodes_by_id))
 
     lines.append(SUB_SEPARATOR)
     lines.extend(_format_entry_hop_section(sample, width=width))
@@ -415,7 +509,7 @@ def _format_sample(sample: dict[str, Any], *, ordinal: int, width: int) -> str:
     lines.extend(_format_target_ask_section(sample, width=width))
 
     lines.append(SUB_SEPARATOR)
-    lines.extend(_format_polish_section(sample, width=width))
+    lines.extend(_format_polish_section(sample, width=width, nodes_by_id=nodes_by_id))
 
     lines.append(SUB_SEPARATOR)
     lines.append("Question-Facing Hop Chain")
@@ -423,7 +517,7 @@ def _format_sample(sample: dict[str, Any], *, ordinal: int, width: int) -> str:
         for hop in question_hops:
             hop_index = hop.get("hop_index")
             title = f"Hop {hop_index}" if hop_index is not None else "Hop"
-            lines.extend(_format_hop(hop, width=width, title=title))
+            lines.extend(_format_hop(hop, width=width, title=title, nodes_by_id=nodes_by_id))
             lines.append("")
         if lines[-1] == "":
             lines.pop()
@@ -440,6 +534,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     samples_path = _resolve_samples_path(args.vqa_dir)
     records = _load_jsonl(samples_path)
+    nodes_by_id = _load_graph_nodes(args.vqa_dir)
     sample_ids = {str(item).strip() for item in args.sample_id if str(item).strip()}
     selected = _iter_filtered_samples(records, sample_ids=sample_ids, limit=args.limit)
 
@@ -451,7 +546,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     rendered = [
-        _format_sample(sample, ordinal=index, width=args.width)
+        _format_sample(sample, ordinal=index, width=args.width, nodes_by_id=nodes_by_id)
         for index, sample in enumerate(selected, start=1)
     ]
     print("\n\n".join(rendered))
