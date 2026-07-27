@@ -4,6 +4,7 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import os
+import random
 import re
 import sys
 import time
@@ -107,6 +108,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prepare-model", type=str, default=os.environ.get("IMAGE_EDGE_VERIFY_PREPARE_MODEL") or os.environ.get("TEXT_PROCESS_MODEL") or "", help="Model alias for prepare steps.")
     parser.add_argument("--judge-model", type=str, default=os.environ.get("IMAGE_EDGE_VERIFY_JUDGE_MODEL") or os.environ.get("IMAGE_GROUND_MODEL") or os.environ.get("IMAGE_CHECK_MODEL") or "", help="Model alias for final judge.")
     parser.add_argument("--max-reference-images", type=int, default=6, help="Max kept wiki reference images per entity.")
+    parser.add_argument(
+        "--max-image-nodes",
+        type=int,
+        default=0,
+        help="Randomly sample at most this many candidate image nodes before verification; <=0 verifies all.",
+    )
+    parser.add_argument(
+        "--random-seed",
+        type=int,
+        default=0,
+        help="Seed used with --max-image-nodes so an image-node sample can be reproduced.",
+    )
     parser.add_argument("--workers", type=int, default=4, help="Number of parallel workers for per-edge verification.")
     parser.add_argument("--write-back", action="store_true", help="Write verification results back into edge metadata and optionally remove bad edges.")
     parser.add_argument("--dry-run", action="store_true", help="Run verification only; do not modify graph files. Print planned removals.")
@@ -144,6 +157,45 @@ def _iter_candidate_edges(store: JsonlGraphStore, image_node_id: str | None = No
             continue
         results.append(edge)
     return results
+
+
+def _sample_image_node_ids(
+    edge_records: list[dict[str, Any]],
+    *,
+    max_image_nodes: int,
+    random_seed: int,
+) -> list[str]:
+    """Return a reproducible random subset of image nodes represented by edges."""
+    image_node_ids = sorted(
+        {
+            str(edge.get("src_node_id") or "").strip()
+            for edge in edge_records
+            if str(edge.get("src_node_id") or "").strip()
+        }
+    )
+    if max_image_nodes <= 0 or len(image_node_ids) <= max_image_nodes:
+        return image_node_ids
+    return sorted(random.Random(random_seed).sample(image_node_ids, max_image_nodes))
+
+
+def _grounding_entity_counts(
+    store: JsonlGraphStore,
+    image_node_ids: list[str],
+) -> dict[str, int]:
+    """Count persisted grounding entities for the image nodes being verified."""
+    total = 0
+    images_with_grounding = 0
+    for image_node_id in image_node_ids:
+        node = store.get_node(image_node_id) or {}
+        metadata = node.get("metadata") or {}
+        grounded_entities = metadata.get("grounded_entities") or [] if isinstance(metadata, dict) else []
+        if grounded_entities:
+            images_with_grounding += 1
+        total += len(grounded_entities)
+    return {
+        "grounded_entity_count": total,
+        "image_node_count_with_grounded_entities": images_with_grounding,
+    }
 
 
 def _image_node_debug_stats(store: JsonlGraphStore, image_node_id: str) -> dict[str, Any]:
@@ -596,7 +648,19 @@ def main() -> int:
     store = JsonlGraphStore(Path(args.graph_dir))
     results: list[dict[str, Any]] = []
     planned_removals: list[dict[str, Any]] = []
-    edge_records = _iter_candidate_edges(store, image_node_id=args.image_node_id or None)
+    all_edge_records = _iter_candidate_edges(store, image_node_id=args.image_node_id or None)
+    selected_image_node_ids = _sample_image_node_ids(
+        all_edge_records,
+        max_image_nodes=args.max_image_nodes,
+        random_seed=args.random_seed,
+    )
+    selected_image_node_id_set = set(selected_image_node_ids)
+    edge_records = [
+        edge
+        for edge in all_edge_records
+        if str(edge.get("src_node_id") or "") in selected_image_node_id_set
+    ]
+    grounding_counts = _grounding_entity_counts(store, selected_image_node_ids)
     started = time.perf_counter()
 
     max_workers = max(1, int(args.workers))
@@ -623,6 +687,8 @@ def main() -> int:
                 )
 
     results.sort(key=lambda item: (str(item.get("image_node_id") or ""), str(item.get("edge_id") or "")))
+    contradict_count = sum(1 for record in results if record.get("decision") == "contradict")
+    grounded_entity_count = grounding_counts["grounded_entity_count"]
 
     for record in results:
         if args.write_back and not args.dry_run:
@@ -657,7 +723,21 @@ def main() -> int:
         "judge_model": args.judge_model,
         "dry_run": bool(args.dry_run),
         "write_back": bool(args.write_back and not args.dry_run),
+        "candidate_image_node_count": len(
+            {str(edge.get("src_node_id") or "") for edge in all_edge_records if edge.get("src_node_id")}
+        ),
+        "sampled_image_node_count": len(selected_image_node_ids),
+        "sampled_image_node_ids": selected_image_node_ids,
+        "max_image_nodes": args.max_image_nodes,
+        "random_seed": args.random_seed,
         "edge_count": len(results),
+        "candidate_edge_count": len(edge_records),
+        "grounded_entity_count": grounded_entity_count,
+        "image_node_count_with_grounded_entities": grounding_counts["image_node_count_with_grounded_entities"],
+        "contradict_count": contradict_count,
+        "contradict_grounded_entity_ratio": (
+            contradict_count / grounded_entity_count if grounded_entity_count else None
+        ),
         "elapsed_s": time.perf_counter() - started,
         "planned_removal_count": len(planned_removals),
         "planned_removals": planned_removals,
