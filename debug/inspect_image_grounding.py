@@ -54,6 +54,59 @@ def _image_input_references(node: dict[str, Any], resolved_image: dict[str, Any]
     }
 
 
+def _post_verification_report(store: JsonlGraphStore, node_id: str, grounded_entities: list[Any]) -> dict[str, Any]:
+    """Collect both historical and in-pipeline verifier records for an image.
+
+    The standalone post-process verifier persists its result on ``image_depicts``
+    edge metadata.  The newer queue-time verifier instead attaches a
+    ``queue_verification`` record to a grounded entity before its text node and
+    edge exist.  These locations intentionally differ, so show both.
+    """
+    edge_verifications: list[dict[str, Any]] = []
+    for edge in store.edges_from(node_id):
+        if edge.get("edge_type") != "image_depicts":
+            continue
+        verification = (edge.get("metadata") or {}).get("post_verify_image_text")
+        if not isinstance(verification, dict):
+            continue
+        edge_verifications.append(
+            {
+                "edge_id": edge.get("edge_id"),
+                "text_node_id": edge.get("dst_node_id"),
+                "entity_name": (edge.get("metadata") or {}).get("entity_name"),
+                "verification": verification,
+            }
+        )
+
+    queue_verifications: list[dict[str, Any]] = []
+    for entity in grounded_entities:
+        if not isinstance(entity, dict):
+            continue
+        verification = entity.get("queue_verification")
+        if isinstance(verification, dict):
+            queue_verifications.append(
+                {
+                    "entity_name": entity.get("name"),
+                    "relation_to_image": entity.get("relation_to_image"),
+                    "verification": verification,
+                }
+            )
+
+    has_post_verification = bool(edge_verifications or queue_verifications)
+    return {
+        "has_post_verification": has_post_verification,
+        "status": "available" if has_post_verification else "没有Post process",
+        "standalone_post_process_edge_verifications": edge_verifications,
+        "in_pipeline_queue_verifications": queue_verifications,
+        "note": (
+            "Standalone synthesis/post_process/verify_image_text_edges.py writes "
+            "post_verify_image_text to image_depicts edge metadata, not to the image node. "
+            "The in-pipeline queue-time verifier writes queue_verification inside the "
+            "corresponding grounded entity on the image node."
+        ),
+    }
+
+
 def build_report(graph_dir: Path, node_id: str) -> dict[str, Any]:
     graph_dir = graph_dir.expanduser().resolve()
     store = JsonlGraphStore(graph_dir)
@@ -83,6 +136,9 @@ def build_report(graph_dir: Path, node_id: str) -> dict[str, Any]:
     user_text = grounding.get("debug_prompt_user_text") or legacy_prompt.get("user_text")
     raw_output = grounding.get("raw_model_output")
     persisted = bool(system_prompt or user_text or raw_output or grounding)
+    grounded_entities = metadata.get("grounded_entities") or []
+    if not isinstance(grounded_entities, list):
+        grounded_entities = []
 
     return {
         "graph_dir": str(graph_dir),
@@ -107,9 +163,14 @@ def build_report(graph_dir: Path, node_id: str) -> dict[str, Any]:
             "model_alias": grounding.get("model_alias"),
             "usage": grounding.get("usage"),
             "raw_model_output": raw_output,
-            "grounded_entities": metadata.get("grounded_entities") or [],
+            "grounded_entities": grounded_entities,
             "run_id": grounding.get("run_id"),
         },
+        "post_grounding_verification": _post_verification_report(
+            store,
+            node_id,
+            grounded_entities,
+        ),
     }
 
 
