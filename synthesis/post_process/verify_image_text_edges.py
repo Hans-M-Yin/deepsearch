@@ -25,6 +25,8 @@ from synthesis.store import JsonlGraphStore
 from synthesis.test_image_grounding import _UnusedSearchClient
 from synthesis.wiki_text_builder import EnhancedReaderClient, WikiTextBuilder
 
+_VERIFY_FIXED_REQUEST_ID = "3200636808"
+
 PREPARE_PROMPT = """You are preparing verification evidence for one Wikipedia entity page.
 
 Your job is NOT to judge whether the graph edge is correct.
@@ -98,6 +100,17 @@ class VerificationResult:
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+def _verify_worker_metadata(trace_label: str) -> dict[str, str]:
+    """Attach stable gateway routing fields so repeated verifier prompts can cache."""
+    return {
+        "trace_label": trace_label,
+        "session_id": _VERIFY_FIXED_REQUEST_ID,
+        "prompt_cache_key": _VERIFY_FIXED_REQUEST_ID,
+        "user_id": _VERIFY_FIXED_REQUEST_ID,
+        "x_tt_logid": _VERIFY_FIXED_REQUEST_ID,
+    }
 
 
 def parse_args() -> argparse.Namespace:
@@ -271,7 +284,9 @@ def _prepare_entity_context(model_client: ModelWorkerClient, model_alias: str, *
                 ModelMessage(role="system", content=PREPARE_PROMPT),
                 ModelMessage(role="user", content=prompt),
             ],
-            metadata={"trace_label": f"image_edge_verify_prepare:{text_node.get('node_id') or ''}"},
+            metadata=_verify_worker_metadata(
+                f"image_edge_verify_prepare:{text_node.get('node_id') or ''}"
+            ),
         )
     )
     return _parse_json_object(response.content, default={"raw_model_output": response.content})
@@ -307,7 +322,9 @@ def _prepare_reference_image(model_client: ModelWorkerClient, model_alias: str, 
                     ],
                 ),
             ],
-            metadata={"trace_label": f"image_edge_verify_reference:{entity_title[:80]}"},
+            metadata=_verify_worker_metadata(
+                f"image_edge_verify_reference:{entity_title[:80]}"
+            ),
         )
     )
     payload = _parse_json_object(response.content, default={"keep": False, "raw_model_output": response.content})
@@ -392,7 +409,9 @@ def _judge_edge(model_client: ModelWorkerClient, model_alias: str, *, image_node
                 ModelMessage(role="system", content=JUDGE_PROMPT),
                 ModelMessage(role="user", content=content),
             ],
-            metadata={"trace_label": f"image_edge_verify_judge:{edge.get('edge_id') or ''}"},
+            metadata=_verify_worker_metadata(
+                f"image_edge_verify_judge:{edge.get('edge_id') or ''}"
+            ),
         )
     )
     payload = _parse_json_object(response.content, default={"decision": "insufficient", "error_type": "insufficient_evidence", "reason": response.content})

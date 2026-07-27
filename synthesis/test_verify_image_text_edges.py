@@ -5,6 +5,7 @@ from pathlib import Path
 from synthesis.post_process.verify_image_text_edges import (
     _grounding_entity_counts,
     _sample_image_node_ids,
+    _verify_worker_metadata,
 )
 from synthesis.store import JsonlGraphStore
 
@@ -44,6 +45,13 @@ class ImageTextEdgeVerificationSamplingTests(unittest.TestCase):
                 _grounding_entity_counts(store, selected),
                 {"grounded_entity_count": 3, "image_node_count_with_grounded_entities": 2},
             )
+
+    def test_verifier_metadata_uses_fixed_cache_routing_values(self) -> None:
+        metadata = _verify_worker_metadata("image_edge_verify_prepare:text-1")
+
+        self.assertEqual(metadata["trace_label"], "image_edge_verify_prepare:text-1")
+        for key in ("session_id", "prompt_cache_key", "user_id", "x_tt_logid"):
+            self.assertEqual(metadata[key], "3200636808")
 
 
 if __name__ == "__main__":
