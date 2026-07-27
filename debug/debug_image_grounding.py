@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -243,6 +244,16 @@ def _compact_candidate(candidate: Any) -> dict[str, Any]:
     }
 
 
+def _grounding_analysis(raw_model_output: Any) -> str | None:
+    """Extract the optional reasoning block emitted before ``<ground>``."""
+    match = re.search(
+        r"<analysis>\s*(.*?)\s*</analysis>",
+        str(raw_model_output or ""),
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    return match.group(1).strip() if match and match.group(1).strip() else None
+
+
 def _entity_filter_status(
     *,
     builder: ImageDiscoveryBuilder,
@@ -448,6 +459,7 @@ def main() -> int:
             "check": grounding.get("check"),
             "model_alias": grounding.get("model_alias"),
             "caption": grounding.get("caption"),
+            "analysis": _grounding_analysis(grounding.get("raw_model_output")),
             "grounded_entity_count": len(grounded_entities),
             "blocked_query_entities": sorted(blocked_query_entities),
             "grounded_entities": grounding_entities_summary,

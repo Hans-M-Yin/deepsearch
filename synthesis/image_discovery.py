@@ -249,7 +249,16 @@ Examples:
 - For a John Wick 4 poster:
   `entity: Eiffel Tower | landmark behind the man in the black suit | visible rising behind the standing man in the black suit`
 
-Output exactly one block:
+Before the final grounding block, output one brief analysis block. For each
+entity you plan to ground, explain why the entity is visually supported by the
+image and why the webpage context is only being used for disambiguation rather
+than to guess the entity. Do not introduce entities in this analysis that you
+do not include in the final grounding block.
+
+Output exactly these two blocks, in this order:
+<analysis>
+Brief grounding rationale for each retained entity.
+</analysis>
 <ground>
 caption: one concise image caption
 entity: name | locator | evidence
