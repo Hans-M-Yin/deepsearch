@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import mimetypes
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import os
@@ -11,7 +12,7 @@ import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
@@ -612,9 +613,34 @@ def _resolve_image_node_for_model(
     """
     metadata = image_node.get("metadata") or {}
     resolved = metadata.get("resolved_image") or {}
+    if not isinstance(resolved, dict):
+        resolved = {}
+
+    # Graph construction may persist an already-downloaded cache path as either
+    # ``resolved_image.cache_path`` / ``asset_uri`` or ``image_url``.  Do not
+    # send such paths through the HTTP downloader; turn their bytes directly
+    # into the typed data URL required by vision models.
+    for value in (
+        resolved.get("cache_path"),
+        image_node.get("image_url"),
+        image_node.get("oss_uri"),
+        resolved.get("asset_uri"),
+        resolved.get("original_url"),
+        resolved.get("resolved_url"),
+    ):
+        local_path = _local_image_path(value)
+        if local_path is not None:
+            return _local_image_path_to_model_url(
+                builder,
+                local_path,
+                content_type_hint=resolved.get("content_type") or image_node.get("content_type"),
+            )
+
     image_url = str(
         image_node.get("image_url")
+        or image_node.get("oss_uri")
         or resolved.get("asset_uri")
+        or resolved.get("original_url")
         or resolved.get("resolved_url")
         or ""
     ).strip()
@@ -635,6 +661,50 @@ def _resolve_image_node_for_model(
     )
     model_url = str((resolved_item or {}).get("model_url") or "").strip()
     return model_url if _is_model_image_data_url(model_url) else None
+
+
+def _local_image_path(value: Any) -> Path | None:
+    """Return an existing local path for an absolute path or file URI."""
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if text.startswith("file://"):
+        path = Path(unquote(urlparse(text).path))
+    else:
+        path = Path(text)
+    return path if path.is_absolute() and path.is_file() else None
+
+
+def _local_image_path_to_model_url(
+    builder: ImageDiscoveryBuilder,
+    image_path: Path,
+    *,
+    content_type_hint: Any,
+) -> str | None:
+    """Read a persisted local image and convert it to a model data URL."""
+    try:
+        payload = image_path.read_bytes()
+        builder._image_dimensions(payload, verify=True)
+    except Exception:
+        return None
+
+    content_type = (
+        builder._sniff_content_type(payload)
+        or str(content_type_hint or "").strip().lower()
+        or mimetypes.guess_type(str(image_path))[0]
+        or "image/jpeg"
+    )
+    if not content_type.startswith("image/"):
+        return None
+    try:
+        content_type, payload = builder._prepare_model_payload(
+            payload=payload,
+            content_type=content_type,
+            max_edge=builder.config.model_image_max_edge,
+        )
+    except Exception:
+        return None
+    return builder._data_url(content_type, payload)
 
 
 def main() -> int:

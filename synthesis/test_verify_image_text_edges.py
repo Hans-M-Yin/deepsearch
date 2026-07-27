@@ -48,3 +48,31 @@ class ImageTextEdgeVerificationSamplingTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class LocalImagePathResolutionTests(unittest.TestCase):
+    def test_resolves_persisted_local_image_path_without_http_download(self) -> None:
+        from synthesis.image_discovery import ImageDiscoveryBuilder, ImageDiscoveryConfig
+        from synthesis.post_process.verify_image_text_edges import _resolve_image_node_for_model
+        from synthesis.test_image_grounding import _UnusedSearchClient
+
+        # A valid 1x1 PNG. The path deliberately has no URL scheme.
+        png_bytes = bytes.fromhex(
+            "89504e470d0a1a0a0000000d4948445200000002000000020802000000fdd49a73"
+            "0000001049444154789c63fccf00024c609201000d1d010382c971ff0000000049454e44ae426082"
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image_path = Path(temp_dir) / "cached.jpg"
+            image_path.write_bytes(png_bytes)
+            builder = ImageDiscoveryBuilder(
+                search_client=_UnusedSearchClient(),
+                config=ImageDiscoveryConfig(precheck_image_urls=False),
+            )
+            model_url = _resolve_image_node_for_model(
+                builder,
+                image_node={
+                    "image_url": str(image_path),
+                    "metadata": {"resolved_image": {"cache_path": str(image_path)}},
+                },
+            )
+
+        self.assertTrue(str(model_url).startswith("data:image/png;base64,"))
