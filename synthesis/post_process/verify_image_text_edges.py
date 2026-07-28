@@ -134,6 +134,25 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="Seed used with --max-image-nodes so an image-node sample can be reproduced.",
     )
+    parser.add_argument(
+        "--results-jsonl",
+        type=Path,
+        default=None,
+        help=(
+            "Append one completed edge result at a time to this JSONL checkpoint file. "
+            "Use with --resume to continue an interrupted run."
+        ),
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Reuse completed edge records from --results-jsonl and only verify remaining edges.",
+    )
+    parser.add_argument(
+        "--reverify",
+        action="store_true",
+        help="Do not skip graph edges that already contain metadata.post_verify_image_text.",
+    )
     parser.add_argument("--workers", type=int, default=4, help="Number of parallel workers for per-edge verification.")
     parser.add_argument("--write-back", action="store_true", help="Write verification results back into edge metadata and optionally remove bad edges.")
     parser.add_argument("--dry-run", action="store_true", help="Run verification only; do not modify graph files. Print planned removals.")
@@ -171,6 +190,46 @@ def _iter_candidate_edges(store: JsonlGraphStore, image_node_id: str | None = No
             continue
         results.append(edge)
     return results
+
+
+def _edge_has_post_verification(edge: dict[str, Any]) -> bool:
+    return isinstance((edge.get("metadata") or {}).get("post_verify_image_text"), dict)
+
+
+def _load_checkpoint_results(path: Path) -> dict[str, dict[str, Any]]:
+    """Load the most recent valid result for every edge from a JSONL checkpoint."""
+    results: dict[str, dict[str, Any]] = {}
+    if not path.exists():
+        return results
+    with path.open("r", encoding="utf-8") as handle:
+        for line_number, raw_line in enumerate(handle, start=1):
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                print(
+                    f"[verify_image_text_edges] ignoring invalid checkpoint JSON on line {line_number}: {path}",
+                    file=sys.stderr,
+                )
+                continue
+            if not isinstance(record, dict):
+                continue
+            edge_id = str(record.get("edge_id") or "").strip()
+            if edge_id:
+                results[edge_id] = record
+    return results
+
+
+def _append_checkpoint_result(path: Path, record: dict[str, Any]) -> None:
+    """Durably append one result so completed edges survive interruption."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True))
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
 
 
 def _sample_image_node_ids(
@@ -726,6 +785,25 @@ def _local_image_path_to_model_url(
     return builder._data_url(content_type, payload)
 
 
+def _worker_exception_record(edge: dict[str, Any], args: argparse.Namespace, exc: Exception) -> dict[str, Any]:
+    """Make a failed worker resumable instead of aborting the whole batch."""
+    return VerificationResult(
+        edge_id=str(edge.get("edge_id") or ""),
+        image_node_id=str(edge.get("src_node_id") or ""),
+        text_node_id=str(edge.get("dst_node_id") or ""),
+        decision="insufficient",
+        error_type="worker_exception",
+        confidence=None,
+        reason=f"{exc.__class__.__name__}: {exc}",
+        evidence_for=[],
+        evidence_against=[],
+        judge_model_alias=args.judge_model,
+        prepare_model_alias=args.prepare_model,
+        kept_reference_image_count=0,
+        source_type=str(((edge.get("source") or {}).get("source_type")) or ""),
+    ).to_dict()
+
+
 def main() -> int:
     args = parse_args()
     load_env_file(Path(args.env_file))
@@ -734,21 +812,42 @@ def main() -> int:
     if not args.judge_model:
         raise SystemExit("Missing judge model. Set --judge-model or IMAGE_EDGE_VERIFY_JUDGE_MODEL/IMAGE_GROUND_MODEL/IMAGE_CHECK_MODEL.")
 
+    checkpoint_path = args.results_jsonl.expanduser().resolve() if args.results_jsonl else None
+    if args.resume and checkpoint_path is None:
+        raise SystemExit("--resume requires --results-jsonl.")
+    if checkpoint_path is not None and checkpoint_path.exists() and checkpoint_path.stat().st_size > 0 and not args.resume:
+        raise SystemExit(f"Checkpoint already exists; pass --resume to reuse it: {checkpoint_path}")
+    checkpoint_results = _load_checkpoint_results(checkpoint_path) if args.resume and checkpoint_path else {}
+
     store = JsonlGraphStore(Path(args.graph_dir))
-    results: list[dict[str, Any]] = []
+    results_by_edge_id: dict[str, dict[str, Any]] = {}
     planned_removals: list[dict[str, Any]] = []
     all_edge_records = _iter_candidate_edges(store, image_node_id=args.image_node_id or None)
+    graph_verified_edges = [edge for edge in all_edge_records if _edge_has_post_verification(edge)]
+    graph_pending_edge_records = [
+        edge for edge in all_edge_records if args.reverify or not _edge_has_post_verification(edge)
+    ]
     selected_image_node_ids = _sample_image_node_ids(
-        all_edge_records,
+        graph_pending_edge_records,
         max_image_nodes=args.max_image_nodes,
         random_seed=args.random_seed,
     )
     selected_image_node_id_set = set(selected_image_node_ids)
-    edge_records = [
+    selected_edge_records = [
         edge
-        for edge in all_edge_records
+        for edge in graph_pending_edge_records
         if str(edge.get("src_node_id") or "") in selected_image_node_id_set
     ]
+    checkpoint_edge_ids = set(checkpoint_results)
+    edge_records = [
+        edge
+        for edge in selected_edge_records
+        if (args.reverify or not _edge_has_post_verification(edge))
+        and str(edge.get("edge_id") or "") not in checkpoint_edge_ids
+    ]
+    for edge_id, record in checkpoint_results.items():
+        if any(str(edge.get("edge_id") or "") == edge_id for edge in selected_edge_records):
+            results_by_edge_id[edge_id] = record
     grounding_counts = _grounding_entity_counts(store, selected_image_node_ids)
     started = time.perf_counter()
 
@@ -759,23 +858,35 @@ def main() -> int:
             for edge in edge_records
         }
         for future in as_completed(future_to_edge):
-            record = future.result()
+            edge = future_to_edge[future]
+            try:
+                record = future.result()
+            except Exception as exc:
+                record = _worker_exception_record(edge, args, exc)
             if record is None:
                 continue
-            results.append(record)
-            if _should_drop(str(record.get("decision") or ""), args.drop_on):
-                planned_removals.append(
-                    {
-                        "edge_id": record.get("edge_id"),
-                        "image_node_id": record.get("image_node_id"),
-                        "text_node_id": record.get("text_node_id"),
-                        "decision": record.get("decision"),
-                        "error_type": record.get("error_type"),
-                        "reason": record.get("reason"),
-                    }
-                )
+            edge_id = str(record.get("edge_id") or "").strip()
+            if edge_id:
+                results_by_edge_id[edge_id] = record
+            if checkpoint_path is not None:
+                _append_checkpoint_result(checkpoint_path, record)
 
-    results.sort(key=lambda item: (str(item.get("image_node_id") or ""), str(item.get("edge_id") or "")))
+    results = sorted(
+        results_by_edge_id.values(),
+        key=lambda item: (str(item.get("image_node_id") or ""), str(item.get("edge_id") or "")),
+    )
+    for record in results:
+        if _should_drop(str(record.get("decision") or ""), args.drop_on):
+            planned_removals.append(
+                {
+                    "edge_id": record.get("edge_id"),
+                    "image_node_id": record.get("image_node_id"),
+                    "text_node_id": record.get("text_node_id"),
+                    "decision": record.get("decision"),
+                    "error_type": record.get("error_type"),
+                    "reason": record.get("reason"),
+                }
+            )
     contradict_count = sum(1 for record in results if record.get("decision") == "contradict")
     grounded_entity_count = grounding_counts["grounded_entity_count"]
 
@@ -812,15 +923,27 @@ def main() -> int:
         "judge_model": args.judge_model,
         "dry_run": bool(args.dry_run),
         "write_back": bool(args.write_back and not args.dry_run),
+        "results_jsonl": str(checkpoint_path) if checkpoint_path else None,
+        "resume": bool(args.resume),
+        "reverify": bool(args.reverify),
+        "skip_graph_post_verified": not bool(args.reverify),
         "candidate_image_node_count": len(
             {str(edge.get("src_node_id") or "") for edge in all_edge_records if edge.get("src_node_id")}
+        ),
+        "pending_graph_post_verification_image_node_count": len(
+            {str(edge.get("src_node_id") or "") for edge in graph_pending_edge_records if edge.get("src_node_id")}
         ),
         "sampled_image_node_count": len(selected_image_node_ids),
         "sampled_image_node_ids": selected_image_node_ids,
         "max_image_nodes": args.max_image_nodes,
         "random_seed": args.random_seed,
         "edge_count": len(results),
+        "selected_candidate_edge_count": len(selected_edge_records),
         "candidate_edge_count": len(edge_records),
+        "skipped_graph_post_verified_edge_count": 0 if args.reverify else len(graph_verified_edges),
+        "skipped_checkpoint_edge_count": len(
+            {str(edge.get("edge_id") or "") for edge in selected_edge_records} & checkpoint_edge_ids
+        ),
         "grounded_entity_count": grounded_entity_count,
         "image_node_count_with_grounded_entities": grounding_counts["image_node_count_with_grounded_entities"],
         "contradict_count": contradict_count,
