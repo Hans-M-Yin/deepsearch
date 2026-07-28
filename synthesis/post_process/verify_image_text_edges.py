@@ -1,3 +1,23 @@
+"""Verify image-to-text graph edges with wiki-based visual evidence.
+
+Restore edges previously soft-deleted by this verifier:
+
+    python synthesis/post_process/verify_image_text_edges.py \
+      --graph-dir runs/my_graph \
+      --restore-post-verify-rejected \
+      --pretty
+
+Restore selected edges only:
+
+    python synthesis/post_process/verify_image_text_edges.py \
+      --graph-dir runs/my_graph \
+      --restore-edge-id edge_aaa \
+      --restore-edge-id edge_bbb \
+      --pretty
+
+Add ``--dry-run`` to preview the restore without modifying ``edges.jsonl``.
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -154,9 +174,12 @@ def parse_args() -> argparse.Namespace:
         help="Do not skip graph edges that already contain metadata.post_verify_image_text.",
     )
     parser.add_argument("--workers", type=int, default=4, help="Number of parallel workers for per-edge verification.")
-    parser.add_argument("--write-back", action="store_true", help="Write verification results back into edge metadata and optionally remove bad edges.")
-    parser.add_argument("--dry-run", action="store_true", help="Run verification only; do not modify graph files. Print planned removals.")
-    parser.add_argument("--drop-on", default="contradict", choices=["contradict", "contradict_or_insufficient", "never"], help="Edge removal policy when --write-back is set.")
+    parser.add_argument("--write-back", action="store_true", help="Write verification results back into edge metadata and soft-delete matching rejected edges.")
+    parser.add_argument("--hard-delete", action="store_true", help="Physically delete matching edges instead of the default reversible soft delete. Requires --write-back.")
+    parser.add_argument("--restore-post-verify-rejected", action="store_true", help="Restore all verifier-soft-deleted edges in --graph-dir without running models.")
+    parser.add_argument("--restore-edge-id", action="append", default=[], help="Restore one verifier-soft-deleted edge ID. Repeatable; implies restore mode.")
+    parser.add_argument("--dry-run", action="store_true", help="Run verification or restoration planning only; do not modify graph files.")
+    parser.add_argument("--drop-on", default="contradict", choices=["contradict", "contradict_or_insufficient", "never"], help="Edge soft/hard deletion policy when --write-back is set.")
     parser.add_argument("--pretty", action="store_true", help="Pretty-print JSON output.")
     return parser.parse_args()
 
@@ -173,6 +196,9 @@ def _is_wikipedia_url(url: str | None) -> bool:
 def _iter_candidate_edges(store: JsonlGraphStore, image_node_id: str | None = None) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
     for edge in store.list_edges():
+        # Never re-verify an edge already hidden by any lifecycle policy.
+        if str(edge.get("status") or "active").lower() != "active":
+            continue
         if edge.get("edge_type") != "image_depicts":
             continue
         if image_node_id and edge.get("src_node_id") != image_node_id:
@@ -513,7 +539,11 @@ def _parse_json_object(text: str, default: dict[str, Any]) -> dict[str, Any]:
         return dict(default)
 
 
+_POST_VERIFY_ACTOR = "verify_image_text_edges"
+
+
 def _delete_edge(store: JsonlGraphStore, edge_id: str) -> bool:
+    """Permanently delete an edge; used only with explicit --hard-delete."""
     with store._lock:  # reuse existing store lock for surgical deletion
         existed = edge_id in store._tables["edges"]
         if not existed:
@@ -522,6 +552,119 @@ def _delete_edge(store: JsonlGraphStore, edge_id: str) -> bool:
         store._dirty.add("edges")
         store._pending_write_count += 1
         return True
+
+
+def _lifecycle_history(metadata: dict[str, Any]) -> list[dict[str, Any]]:
+    raw = metadata.get("edge_lifecycle_history")
+    return [dict(item) for item in raw if isinstance(item, dict)] if isinstance(raw, list) else []
+
+
+def _soft_delete_verified_edge(edge_record: dict[str, Any], *, decision: str) -> dict[str, Any]:
+    """Make a verifier-rejected edge invisible to consumers while retaining it."""
+    metadata = dict(edge_record.get("metadata") or {})
+    previous_status = str(edge_record.get("status") or "active")
+    now = time.time()
+    event = {
+        "action": "soft_deleted",
+        "actor": _POST_VERIFY_ACTOR,
+        "reason_code": f"post_verify_{decision}",
+        "previous_status": previous_status,
+        "changed_at_unix": now,
+    }
+    history = _lifecycle_history(metadata)
+    history.append(event)
+    metadata["edge_lifecycle_history"] = history
+    metadata["edge_lifecycle"] = {
+        "current_action": "soft_deleted",
+        "actor": _POST_VERIFY_ACTOR,
+        "reason_code": event["reason_code"],
+        "previous_status": previous_status,
+        "changed_at_unix": now,
+    }
+    edge_record["metadata"] = metadata
+    edge_record["status"] = "rejected"
+    return edge_record
+
+
+def _is_verifier_soft_deleted(edge_record: dict[str, Any]) -> bool:
+    if str(edge_record.get("status") or "active").lower() != "rejected":
+        return False
+    lifecycle = (edge_record.get("metadata") or {}).get("edge_lifecycle")
+    return (
+        isinstance(lifecycle, dict)
+        and lifecycle.get("current_action") == "soft_deleted"
+        and lifecycle.get("actor") == _POST_VERIFY_ACTOR
+        and str(lifecycle.get("reason_code") or "").startswith("post_verify_")
+    )
+
+
+def _restore_verified_edge(edge_record: dict[str, Any]) -> dict[str, Any]:
+    """Restore only an edge previously soft-deleted by this verifier."""
+    if not _is_verifier_soft_deleted(edge_record):
+        raise ValueError("edge is not currently soft-deleted by verify_image_text_edges")
+    metadata = dict(edge_record.get("metadata") or {})
+    lifecycle = dict(metadata.get("edge_lifecycle") or {})
+    restored_status = str(lifecycle.get("previous_status") or "active")
+    now = time.time()
+    history = _lifecycle_history(metadata)
+    history.append(
+        {
+            "action": "restored",
+            "actor": _POST_VERIFY_ACTOR,
+            "reason_code": "manual_restore",
+            "restored_to_status": restored_status,
+            "changed_at_unix": now,
+        }
+    )
+    metadata["edge_lifecycle_history"] = history
+    metadata["edge_lifecycle"] = {
+        "current_action": "restored",
+        "actor": _POST_VERIFY_ACTOR,
+        "reason_code": "manual_restore",
+        "restored_to_status": restored_status,
+        "changed_at_unix": now,
+    }
+    edge_record["metadata"] = metadata
+    edge_record["status"] = restored_status
+    return edge_record
+
+
+def _restore_post_verify_edges(
+    store: JsonlGraphStore,
+    *,
+    edge_ids: list[str],
+    restore_all: bool,
+    dry_run: bool,
+) -> dict[str, Any]:
+    requested = {str(edge_id).strip() for edge_id in edge_ids if str(edge_id).strip()}
+    if requested and restore_all:
+        raise ValueError("use either --restore-post-verify-rejected or --restore-edge-id, not both")
+    candidates = [
+        edge for edge in store.list_edges()
+        if _is_verifier_soft_deleted(edge)
+        and (restore_all or str(edge.get("edge_id") or "") in requested)
+    ]
+    if requested:
+        found = {str(edge.get("edge_id") or "") for edge in candidates}
+        missing = sorted(requested - found)
+    else:
+        missing = []
+    restored: list[str] = []
+    if not dry_run:
+        for edge in candidates:
+            restored_edge = _restore_verified_edge(dict(edge))
+            store.upsert_edge(restored_edge)
+            restored.append(str(restored_edge.get("edge_id") or ""))
+        if store.has_pending_writes():
+            store.flush()
+    return {
+        "mode": "restore_post_verify_rejected",
+        "dry_run": bool(dry_run),
+        "requested_edge_ids": sorted(requested),
+        "candidate_edge_ids": [str(edge.get("edge_id") or "") for edge in candidates],
+        "restored_edge_ids": restored,
+        "missing_or_ineligible_edge_ids": missing,
+    }
 
 
 def _should_drop(decision: str, drop_on: str) -> bool:
@@ -804,8 +947,57 @@ def _worker_exception_record(edge: dict[str, Any], args: argparse.Namespace, exc
     ).to_dict()
 
 
+def _emit_image_node_complete_status(
+    *,
+    image_node_id: str,
+    records: list[dict[str, Any]],
+    completed_image_node_count: int,
+    total_image_node_count: int,
+    elapsed_s: float,
+) -> None:
+    """Log one concise stderr status line after all scheduled edges of an image finish."""
+    decisions = {name: 0 for name in ("support", "contradict", "insufficient")}
+    for record in records:
+        decision = str(record.get("decision") or "insufficient")
+        decisions[decision] = decisions.get(decision, 0) + 1
+    worker_error_count = sum(
+        1 for record in records if record.get("error_type") == "worker_exception"
+    )
+    print(
+        "[verify_image_text_edges] "
+        f"image_node_complete image_node_id={image_node_id!r} "
+        f"edge_count={len(records)} "
+        f"support={decisions['support']} "
+        f"contradict={decisions['contradict']} "
+        f"insufficient={decisions['insufficient']} "
+        f"worker_exceptions={worker_error_count} "
+        f"completed_image_nodes={completed_image_node_count}/{total_image_node_count} "
+        f"elapsed_s={elapsed_s:.1f}",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
 def main() -> int:
     args = parse_args()
+    restore_requested = bool(args.restore_post_verify_rejected or args.restore_edge_id)
+    if restore_requested:
+        if args.write_back or args.results_jsonl or args.resume or args.reverify:
+            raise SystemExit("restore mode cannot be combined with --write-back, checkpoint, --resume, or --reverify.")
+        try:
+            payload = _restore_post_verify_edges(
+                JsonlGraphStore(Path(args.graph_dir)),
+                edge_ids=args.restore_edge_id,
+                restore_all=bool(args.restore_post_verify_rejected),
+                dry_run=bool(args.dry_run),
+            )
+        except ValueError as exc:
+            raise SystemExit(f"error: {exc}") from exc
+        print(json.dumps(payload, ensure_ascii=False, indent=2 if args.pretty else None))
+        return 0
+
+    if args.hard_delete and not args.write_back:
+        raise SystemExit("--hard-delete requires --write-back.")
     load_env_file(Path(args.env_file))
     if not args.prepare_model:
         raise SystemExit("Missing prepare model. Set --prepare-model or IMAGE_EDGE_VERIFY_PREPARE_MODEL/TEXT_PROCESS_MODEL.")
@@ -852,6 +1044,23 @@ def main() -> int:
     started = time.perf_counter()
 
     max_workers = max(1, int(args.workers))
+    pending_edge_counts_by_image_node: dict[str, int] = {}
+    records_by_image_node: dict[str, list[dict[str, Any]]] = {}
+    for edge in edge_records:
+        image_node_id = str(edge.get("src_node_id") or "")
+        pending_edge_counts_by_image_node[image_node_id] = (
+            pending_edge_counts_by_image_node.get(image_node_id, 0) + 1
+        )
+    total_scheduled_image_nodes = len(pending_edge_counts_by_image_node)
+    completed_scheduled_image_nodes = 0
+    if total_scheduled_image_nodes:
+        print(
+            "[verify_image_text_edges] "
+            f"scheduled_image_nodes={total_scheduled_image_nodes} "
+            f"scheduled_edges={len(edge_records)} workers={max_workers}",
+            file=sys.stderr,
+            flush=True,
+        )
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_edge = {
             executor.submit(_verify_single_edge, graph_dir=args.graph_dir, edge=edge, args=args): edge
@@ -864,12 +1073,27 @@ def main() -> int:
             except Exception as exc:
                 record = _worker_exception_record(edge, args, exc)
             if record is None:
+                image_node_id = str(edge.get("src_node_id") or "")
+                pending_edge_counts_by_image_node[image_node_id] -= 1
                 continue
             edge_id = str(record.get("edge_id") or "").strip()
             if edge_id:
                 results_by_edge_id[edge_id] = record
             if checkpoint_path is not None:
                 _append_checkpoint_result(checkpoint_path, record)
+            image_node_id = str(edge.get("src_node_id") or "")
+            node_records = records_by_image_node.setdefault(image_node_id, [])
+            node_records.append(record)
+            pending_edge_counts_by_image_node[image_node_id] -= 1
+            if pending_edge_counts_by_image_node[image_node_id] == 0:
+                completed_scheduled_image_nodes += 1
+                _emit_image_node_complete_status(
+                    image_node_id=image_node_id,
+                    records=node_records,
+                    completed_image_node_count=completed_scheduled_image_nodes,
+                    total_image_node_count=total_scheduled_image_nodes,
+                    elapsed_s=time.perf_counter() - started,
+                )
 
     results = sorted(
         results_by_edge_id.values(),
@@ -909,9 +1133,18 @@ def main() -> int:
                 "verified_at_unix": time.time(),
             }
             edge_record["metadata"] = edge_meta
-            store.upsert_edge(edge_record)
             if _should_drop(str(record.get("decision") or ""), args.drop_on):
-                _delete_edge(store, str(record.get("edge_id") or ""))
+                if args.hard_delete:
+                    _delete_edge(store, str(record.get("edge_id") or ""))
+                else:
+                    store.upsert_edge(
+                        _soft_delete_verified_edge(
+                            edge_record,
+                            decision=str(record.get("decision") or ""),
+                        )
+                    )
+            else:
+                store.upsert_edge(edge_record)
 
     if args.write_back and not args.dry_run and store.has_pending_writes():
         store.flush()
@@ -951,6 +1184,7 @@ def main() -> int:
             contradict_count / grounded_entity_count if grounded_entity_count else None
         ),
         "elapsed_s": time.perf_counter() - started,
+        "drop_mode": "hard_delete" if args.hard_delete else "soft_delete",
         "planned_removal_count": len(planned_removals),
         "planned_removals": planned_removals,
         "results": results,
@@ -959,7 +1193,7 @@ def main() -> int:
         payload["empty_result_debug"] = _image_node_debug_stats(store, args.image_node_id)
     print(json.dumps(payload, ensure_ascii=False, indent=2 if args.pretty else None))
     if args.dry_run and planned_removals:
-        print("\n[verify_image_text_edges][dry-run] planned removals:", file=sys.stderr)
+        print("\n[verify_image_text_edges][dry-run] planned edge hides/deletions:", file=sys.stderr)
         for item in planned_removals:
             print(
                 "- "

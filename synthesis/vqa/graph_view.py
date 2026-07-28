@@ -15,6 +15,7 @@ class GraphView:
 
     store: JsonlGraphStore
     allowed_edge_types: set[str] | None = None
+    include_inactive_edges: bool = False
     nodes_by_id: dict[str, dict[str, Any]] = field(init=False)
     edges_by_id: dict[str, dict[str, Any]] = field(init=False)
     out_edges: dict[str, list[dict[str, Any]]] = field(init=False)
@@ -30,6 +31,10 @@ class GraphView:
         self.out_edges: dict[str, list[dict[str, Any]]] = defaultdict(list)
         self.in_edges: dict[str, list[dict[str, Any]]] = defaultdict(list)
         for edge in self.edges_by_id.values():
+            # Keep the full edge index for provenance/debugging, but hide soft-deleted
+            # edges from adjacency traversal by default. Missing legacy statuses mean active.
+            if not self.include_inactive_edges and str(edge.get("status") or "active").lower() != "active":
+                continue
             if self.allowed_edge_types and edge.get("edge_type") not in self.allowed_edge_types:
                 continue
             self.out_edges[edge["src_node_id"]].append(edge)
