@@ -222,6 +222,7 @@ def main() -> int:
             f"{row['image_node_id']}\t{row['search_query']}\t"
             f"{row['source_text_node']}\t{row['image_url']}"
         )
+        print()
     return 0
 
 
