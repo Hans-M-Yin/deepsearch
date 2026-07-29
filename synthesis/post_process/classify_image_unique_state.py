@@ -407,8 +407,7 @@ def classify_graph(
         )
         origins[node_id] = origin
         counters[f"origin_{origin}"] += 1
-        existing_state = str(node.get(UNIQUE_STATE_FIELD) or "").strip()
-        if not overwrite and existing_state in VALID_UNIQUE_STATES:
+        if not overwrite and UNIQUE_STATE_FIELD in node:
             counters["already_classified"] += 1
             continue
         if origin == "wiki_inline":
@@ -475,15 +474,14 @@ def classify_graph(
         for node_id, origin in origins.items()
         if origin == "visual_plan"
         and not image_search_query(nodes_by_id[node_id])
-        and (overwrite or str(nodes_by_id[node_id].get(UNIQUE_STATE_FIELD) or "") not in VALID_UNIQUE_STATES)
+        and (overwrite or UNIQUE_STATE_FIELD not in nodes_by_id[node_id])
     ]
     blocking_failures = len(failed_results) + len(missing_query_ids)
 
     mutations: dict[str, str] = {}
     for node_id, origin in origins.items():
         node = nodes_by_id[node_id]
-        existing_state = str(node.get(UNIQUE_STATE_FIELD) or "").strip()
-        if not overwrite and existing_state in VALID_UNIQUE_STATES:
+        if not overwrite and UNIQUE_STATE_FIELD in node:
             continue
         if origin == "wiki_inline":
             mutations[node_id] = "wiki_inline"
@@ -551,7 +549,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Judge checkpoint path; default: <graph-dir>/image_unique_state_results.jsonl.",
     )
     parser.add_argument("--no-resume", action="store_true", help="Do not reuse a compatible judge checkpoint.")
-    parser.add_argument("--overwrite", action="store_true", help="Rejudge and replace existing valid unique_state values.")
+    parser.add_argument("--overwrite", action="store_true", help="Rejudge and replace nodes that already contain a unique_state field.")
     parser.add_argument("--dry-run", action="store_true", help="Run judges and report mutations without modifying nodes.jsonl.")
     parser.add_argument(
         "--allow-partial",

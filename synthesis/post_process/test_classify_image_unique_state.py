@@ -112,6 +112,33 @@ class ClassifyGraphTest(unittest.TestCase):
             self.assertIsNone(request.max_tokens)
             self.assertIsNone(request.response_format)
 
+    def test_existing_unique_state_field_is_skipped_without_judge_call(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            graph_dir = Path(tmpdir)
+            store = JsonlGraphStore(graph_dir)
+            store.upsert_node(
+                {
+                    "node_id": "image_visual",
+                    "node_type": "image",
+                    "source": {"source_type": "image_search"},
+                    "metadata": {"search_query": "A specific album cover"},
+                    "unique_state": "legacy_value",
+                }
+            )
+            store.flush()
+            worker = FakeWorker({})
+            summary = classify_graph(
+                graph_dir=graph_dir,
+                judge_model_alias="fake-alias",
+                model_client=worker,
+                workers=1,
+                retries=0,
+            )
+            reloaded = JsonlGraphStore(graph_dir)
+            self.assertEqual(reloaded.get_node("image_visual")["unique_state"], "legacy_value")
+            self.assertEqual(worker.requests, [])
+            self.assertEqual(summary["counters"]["already_classified"], 1)
+
     def test_atomic_default_does_not_write_when_query_is_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             graph_dir = Path(tmpdir)
