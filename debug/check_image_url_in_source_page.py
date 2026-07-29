@@ -126,6 +126,39 @@ def _url_match_report(markdown: str, *, image_url: str, original_url: str, resol
     }
 
 
+def _match_summary(results: list[dict[str, Any]]) -> dict[str, Any]:
+    """Build readable per-field match statistics for the sampled nodes."""
+    fields = ("image_url", "original_url", "resolved_url")
+    successful_reads = [item for item in results if "error" not in item]
+    per_url_field: dict[str, dict[str, Any]] = {}
+    for field_name in fields:
+        present = [item for item in successful_reads if item.get(field_name)]
+        matched = [
+            item for item in present
+            if bool(((item.get("url_checks") or {}).get(field_name) or {}).get("matched"))
+        ]
+        match_types = Counter(
+            str(((item.get("url_checks") or {}).get(field_name) or {}).get("match_type") or "none")
+            for item in present
+        )
+        per_url_field[field_name] = {
+            "url_present_count": len(present),
+            "matched_count": len(matched),
+            "matched_rate_among_present_urls": (len(matched) / len(present)) if present else 0.0,
+            "match_type_counts": dict(match_types),
+        }
+
+    return {
+        "reader_success_count": len(successful_reads),
+        "reader_success_rate": (len(successful_reads) / len(results)) if results else 0.0,
+        "per_url_field": per_url_field,
+        "any_url_matched_count": sum(1 for item in successful_reads if item.get("any_url_matched")),
+        "original_or_resolved_url_matched_count": sum(
+            1 for item in successful_reads if item.get("original_or_resolved_url_matched")
+        ),
+    }
+
+
 def main() -> int:
     args = parse_args()
     store = JsonlGraphStore(Path(args.graph_dir))
@@ -191,6 +224,7 @@ def main() -> int:
     original_or_resolved_matched_count = sum(
         1 for item in results if item.get("original_or_resolved_url_matched")
     )
+    match_summary = _match_summary(results)
     payload = {
         "graph_dir": str(Path(args.graph_dir).resolve()),
         "reader_base_url": args.reader_base_url,
@@ -204,6 +238,7 @@ def main() -> int:
         ),
         "match_type_counts": dict(match_counter),
         "reader_error_counts": dict(error_counter),
+        "match_summary": match_summary,
         "results": results,
     }
     print(json.dumps(payload, ensure_ascii=False, indent=2 if args.pretty else None))
