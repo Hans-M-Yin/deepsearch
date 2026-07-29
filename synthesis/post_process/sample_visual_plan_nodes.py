@@ -1,4 +1,4 @@
-"""Print sampled visual-plan image nodes for manual quality review.
+"""Print sampled visual-plan image nodes or failed persisted visual plans.
 
 A visual-plan image node is identified using the same precedence as
 ``debug/visualize_graph.py``: Wikipedia-inline images are excluded first, and
@@ -9,6 +9,14 @@ Example:
   python synthesis/post_process/sample_visual_plan_nodes.py \
     --graph-dir runs/my_graph \
     --num-sample 100 \
+    --seed 20260729
+
+List persisted visual plans that did not materialize any image node:
+
+  python synthesis/post_process/sample_visual_plan_nodes.py \
+    --graph-dir runs/my_graph \
+    --num-sample 100 \
+    --failure-case \
     --seed 20260729
 """
 
@@ -44,6 +52,14 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=20260729,
         help="Deterministic random seed for sampling.",
+    )
+    parser.add_argument(
+        "--failure-case",
+        action="store_true",
+        help=(
+            "List persisted visual plans from visual_plans.jsonl whose target evidence "
+            "did not produce a persisted text->image edge or image node."
+        ),
     )
     return parser.parse_args()
 
@@ -209,6 +225,64 @@ def build_rows(nodes: list[dict[str, Any]], edges: list[dict[str, Any]]) -> list
     return sorted(rows, key=lambda row: row["image_node_id"])
 
 
+def _edge_evidence_ids(edge: dict[str, Any]) -> set[str]:
+    return {
+        str(reference.get("evidence_id") or "")
+        for reference in edge.get("evidence_refs") or []
+        if isinstance(reference, dict) and str(reference.get("evidence_id") or "")
+    }
+
+
+def build_failure_rows(
+    visual_plans: list[dict[str, Any]],
+    nodes: list[dict[str, Any]],
+    edges: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Return persisted plans lacking any materialized text->image result.
+
+    ``visual_plans.jsonl`` contains plans that survived planner filtering.  A
+    plan counts as materialized when its target evidence ID is referenced by a
+    persisted text->image edge whose destination is an image node.
+    """
+    nodes_by_id = {
+        str(node.get("node_id") or ""): node
+        for node in nodes
+        if node.get("node_id")
+    }
+    materialized_target_evidence_ids: set[str] = set()
+    for edge in edges:
+        if edge.get("edge_type") != SEARCH_RETRIEVED:
+            continue
+        source = nodes_by_id.get(str(edge.get("src_node_id") or ""))
+        target = nodes_by_id.get(str(edge.get("dst_node_id") or ""))
+        if not source or not target:
+            continue
+        if source.get("node_type") != "text" or target.get("node_type") != "image":
+            continue
+        materialized_target_evidence_ids.update(_edge_evidence_ids(edge))
+
+    rows: list[dict[str, Any]] = []
+    for plan in visual_plans:
+        target_evidence_id = str(plan.get("target_evidence_id") or "")
+        if not target_evidence_id or target_evidence_id in materialized_target_evidence_ids:
+            continue
+        queries = [str(query) for query in (plan.get("queries") or []) if str(query).strip()]
+        rows.append(
+            {
+                "plan_id": str(plan.get("plan_id") or "<missing-plan-id>"),
+                "target_evidence_id": target_evidence_id,
+                "search_query": _clean(plan.get("expected_visual") or plan.get("target_description")) or "<missing-search-query>",
+                "queries": queries,
+                "source_text_node": (
+                    f"{plan.get('node_id') or '<missing-text-node-id>'} | "
+                    f"{_clean(plan.get('node_title')) or '<missing-text-node-title>'}"
+                ),
+                "reason": _clean(plan.get("reason") or (plan.get("metadata") or {}).get("reason")) or "<missing-reason>",
+            }
+        )
+    return sorted(rows, key=lambda row: row["plan_id"])
+
+
 def main() -> int:
     args = parse_args()
     graph_dir = args.graph_dir.expanduser().resolve()
@@ -216,15 +290,19 @@ def main() -> int:
         raise SystemExit(f"error: graph directory does not exist: {graph_dir}")
 
     try:
-        rows = build_rows(
-            load_jsonl(graph_dir / "nodes.jsonl"),
-            load_jsonl(graph_dir / "edges.jsonl"),
+        nodes = load_jsonl(graph_dir / "nodes.jsonl")
+        edges = load_jsonl(graph_dir / "edges.jsonl")
+        rows = (
+            build_failure_rows(load_jsonl(graph_dir / "visual_plans.jsonl"), nodes, edges)
+            if args.failure_case
+            else build_rows(nodes, edges)
         )
     except (FileNotFoundError, ValueError) as exc:
         raise SystemExit(f"error: {exc}") from exc
 
     if not rows:
-        raise SystemExit("error: no visual-plan image nodes found")
+        label = "non-materialized persisted visual plans" if args.failure_case else "visual-plan image nodes"
+        raise SystemExit(f"error: no {label} found")
 
     requested = int(args.num_sample)
     if requested <= 0 or requested >= len(rows):
@@ -234,18 +312,30 @@ def main() -> int:
         selected.sort(key=lambda row: row["image_node_id"])
 
     print(
-        f"visual_plan_image_nodes={len(rows)} sampled={len(selected)} "
+        f"mode={'failure_case' if args.failure_case else 'image_nodes'} "
+        f"available={len(rows)} sampled={len(selected)} "
         f"seed={args.seed} graph_dir={graph_dir}"
     )
-    print("image_node_id\tsearch_query\tsource_text_node\timage_url")
-    for row in selected:
-        print(
-            f"{row['image_node_id']}\t{row['search_query']}\t"
-            f"{row['source_text_node']}\t{row['image_url']}"
-        )
-        for downstream in row["downstream_text_relations"]:
-            print(f"  {downstream['relation']} -> {downstream['title']}")
-        print()
+    if args.failure_case:
+        print("plan_id\ttarget_evidence_id\tsearch_query\tsource_text_node\treason")
+        for row in selected:
+            print(
+                f"{row['plan_id']}\t{row['target_evidence_id']}\t{row['search_query']}\t"
+                f"{row['source_text_node']}\t{row['reason']}"
+            )
+            if row["queries"]:
+                print(f"  queries: {' | '.join(row['queries'])}")
+            print()
+    else:
+        print("image_node_id\tsearch_query\tsource_text_node\timage_url")
+        for row in selected:
+            print(
+                f"{row['image_node_id']}\t{row['search_query']}\t"
+                f"{row['source_text_node']}\t{row['image_url']}"
+            )
+            for downstream in row["downstream_text_relations"]:
+                print(f"  {downstream['relation']} -> {downstream['title']}")
+            print()
     return 0
 
 
