@@ -92,6 +92,13 @@ Important rules:
 - If the graph image does not provide enough evidence, return insufficient.
 - If the target in the graph image appears to be a different entity/object, return contradict.
 
+Output exactly one JSON object, with no Markdown or extra prose, containing:
+- decision: support|contradict|insufficient
+- error_type: none|wrong_identity|wrong_relation|ambiguous|insufficient_evidence
+- confidence: number from 0.0 to 1.0
+- reason: string
+- evidence_for: string[]
+- evidence_against: string[]
 """
 
 
@@ -487,12 +494,13 @@ def _judge_edge(model_client: ModelWorkerClient, model_alias: str, *, image_node
                 ModelMessage(role="system", content=JUDGE_PROMPT),
                 ModelMessage(role="user", content=content),
             ],
+            response_format={"type": "json_object"},
             metadata=_verify_worker_metadata(
                 f"image_edge_verify_judge:{edge.get('edge_id') or ''}"
             ),
         )
     )
-    payload = _parse_json_object(response.content, default={"decision": "insufficient", "error_type": "insufficient_evidence", "reason": response.content})
+    payload = _parse_judge_response(response.content)
     payload["raw_model_output"] = response.content
     return payload
 
@@ -530,6 +538,35 @@ def _parse_json_object(text: str, default: dict[str, Any]) -> dict[str, Any]:
         return json.loads(match.group(0))
     except Exception:
         return dict(default)
+
+
+def _parse_judge_response(text: str) -> dict[str, Any]:
+    """Parse and validate the final judge response without mistaking format errors for weak evidence."""
+    parsed = _parse_json_object(text, default={})
+    decision = str(parsed.get("decision") or "").strip().lower()
+    if decision not in {"support", "contradict", "insufficient"}:
+        return {
+            "decision": "insufficient",
+            "error_type": "judge_output_parse_failed",
+            "reason": "judge did not return a valid JSON decision",
+            "evidence_for": [],
+            "evidence_against": [],
+        }
+    error_type = str(parsed.get("error_type") or "").strip() or (
+        "none" if decision == "support" else "insufficient_evidence"
+    )
+    try:
+        confidence = float(parsed["confidence"]) if parsed.get("confidence") is not None else None
+    except (TypeError, ValueError):
+        confidence = None
+    return {
+        "decision": decision,
+        "error_type": error_type,
+        "confidence": confidence,
+        "reason": str(parsed.get("reason") or "").strip(),
+        "evidence_for": [str(item) for item in (parsed.get("evidence_for") or [])],
+        "evidence_against": [str(item) for item in (parsed.get("evidence_against") or [])],
+    }
 
 
 _POST_VERIFY_ACTOR = "verify_image_text_edges"

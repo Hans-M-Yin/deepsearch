@@ -10,6 +10,7 @@ from synthesis.post_process.verify_image_text_edges import (
     _edge_has_post_verification,
     _emit_image_node_complete_status,
     _load_checkpoint_results,
+    _parse_judge_response,
     _sample_image_node_ids,
     _soft_delete_verified_edge,
     _restore_verified_edge,
@@ -178,6 +179,19 @@ class ImageTextEdgeVerificationSamplingTests(unittest.TestCase):
         self.assertIn("contradict=1", output)
         self.assertIn("insufficient=1", output)
         self.assertIn("completed_image_nodes=2/5", output)
+
+    def test_judge_response_requires_a_structured_decision(self) -> None:
+        parsed = _parse_judge_response(
+            '{"decision":"contradict","error_type":"wrong_identity",'
+            '"confidence":0.9,"reason":"Wrong person.",'
+            '"evidence_for":["Caption identifies another person."],"evidence_against":[]}'
+        )
+        self.assertEqual(parsed["decision"], "contradict")
+        self.assertEqual(parsed["confidence"], 0.9)
+
+        malformed = _parse_judge_response("The answer is wrong. **Verdict:** contradict")
+        self.assertEqual(malformed["decision"], "insufficient")
+        self.assertEqual(malformed["error_type"], "judge_output_parse_failed")
 
 
 
