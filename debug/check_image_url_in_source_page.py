@@ -1,4 +1,4 @@
-"""Sample image nodes from a graph and test whether each image_url appears in its source page markdown.
+"""Sample image nodes and check persisted image URLs against source-page raw markdown.
 
 Uses the raw markdown reader (default port 8003) so URLs are preserved as much as possible.
 
@@ -30,7 +30,12 @@ from synthesis.wiki_text_builder import RawMarkdownReaderClient
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Check whether image_url appears in source_page markdown for sampled image nodes.")
+    parser = argparse.ArgumentParser(
+        description=(
+            "Check whether image_url, resolved_image.original_url, and "
+            "resolved_image.resolved_url appear in source-page raw markdown."
+        )
+    )
     parser.add_argument("--graph-dir", required=True, help="Directory containing nodes.jsonl and edges.jsonl.")
     parser.add_argument("--sample-size", type=int, default=100, help="Maximum number of image nodes to sample.")
     parser.add_argument("--seed", type=int, default=0, help="Random seed for sampling.")
@@ -49,9 +54,14 @@ def _image_nodes(store: JsonlGraphStore) -> list[dict[str, Any]]:
     for node in store.list_nodes():
         if node.get("node_type") != "image":
             continue
+        resolved_image = (node.get("metadata") or {}).get("resolved_image") or {}
+        if not isinstance(resolved_image, dict):
+            resolved_image = {}
         image_url = str(node.get("image_url") or "").strip()
+        original_url = str(resolved_image.get("original_url") or "").strip()
+        resolved_url = str(resolved_image.get("resolved_url") or "").strip()
         source_page_url = str(node.get("source_page_url") or "").strip()
-        if not image_url or not source_page_url:
+        if not source_page_url or not any((image_url, original_url, resolved_url)):
             continue
         nodes.append(node)
     return nodes
@@ -99,6 +109,23 @@ def _match_info(page_markdown: str, image_url: str) -> dict[str, Any]:
     return {"matched": False, "match_type": "none", "matched_form": None}
 
 
+def _url_match_report(markdown: str, *, image_url: str, original_url: str, resolved_url: str) -> dict[str, Any]:
+    """Check each persisted URL independently; original/resolved may coincide."""
+    urls = {
+        "image_url": image_url,
+        "original_url": original_url,
+        "resolved_url": resolved_url,
+    }
+    checks = {name: _match_info(markdown, url) if url else {"matched": False, "match_type": "missing_url", "matched_form": None} for name, url in urls.items()}
+    return {
+        "url_checks": checks,
+        "any_url_matched": any(check["matched"] for check in checks.values()),
+        "original_or_resolved_url_matched": bool(
+            checks["original_url"]["matched"] or checks["resolved_url"]["matched"]
+        ),
+    }
+
+
 def main() -> int:
     args = parse_args()
     store = JsonlGraphStore(Path(args.graph_dir))
@@ -115,23 +142,34 @@ def main() -> int:
     for node in sampled:
         node_id = str(node.get("node_id") or "")
         image_url = str(node.get("image_url") or "").strip()
+        resolved_image = (node.get("metadata") or {}).get("resolved_image") or {}
+        if not isinstance(resolved_image, dict):
+            resolved_image = {}
+        original_url = str(resolved_image.get("original_url") or "").strip()
+        resolved_url = str(resolved_image.get("resolved_url") or "").strip()
         source_page_url = str(node.get("source_page_url") or "").strip()
         title = _normalize_text(node.get("title") or node.get("caption") or node.get("summary") or node_id)
         try:
             document = reader.read(source_page_url)
             markdown = document.raw_markdown or document.content or ""
-            match = _match_info(markdown, image_url)
+            match = _url_match_report(
+                markdown,
+                image_url=image_url,
+                original_url=original_url,
+                resolved_url=resolved_url,
+            )
             record = {
                 "node_id": node_id,
                 "title": title,
                 "image_url": image_url,
+                "original_url": original_url or None,
+                "resolved_url": resolved_url or None,
                 "source_page_url": source_page_url,
-                "matched": bool(match["matched"]),
-                "match_type": match["match_type"],
-                "matched_form": match["matched_form"],
+                **match,
                 "markdown_chars": len(markdown),
             }
-            match_counter[record["match_type"]] += 1
+            for field_name, check in match["url_checks"].items():
+                match_counter[f"{field_name}:{check['match_type']}"] += 1
         except Exception as exc:
             error_key = f"{exc.__class__.__name__}"
             error_counter[error_key] += 1
@@ -139,22 +177,31 @@ def main() -> int:
                 "node_id": node_id,
                 "title": title,
                 "image_url": image_url,
+                "original_url": original_url or None,
+                "resolved_url": resolved_url or None,
                 "source_page_url": source_page_url,
-                "matched": False,
-                "match_type": "reader_error",
-                "matched_form": None,
+                "any_url_matched": False,
+                "original_or_resolved_url_matched": False,
+                "url_checks": {},
                 "error": f"{exc.__class__.__name__}: {exc}",
             }
         results.append(record)
 
-    matched_count = sum(1 for item in results if item.get("matched"))
+    matched_count = sum(1 for item in results if item.get("any_url_matched"))
+    original_or_resolved_matched_count = sum(
+        1 for item in results if item.get("original_or_resolved_url_matched")
+    )
     payload = {
         "graph_dir": str(Path(args.graph_dir).resolve()),
         "reader_base_url": args.reader_base_url,
         "sample_size_requested": int(args.sample_size),
         "sample_size_actual": len(sampled),
-        "matched_count": matched_count,
-        "matched_rate": (matched_count / len(sampled)) if sampled else 0.0,
+        "any_url_matched_count": matched_count,
+        "any_url_matched_rate": (matched_count / len(sampled)) if sampled else 0.0,
+        "original_or_resolved_url_matched_count": original_or_resolved_matched_count,
+        "original_or_resolved_url_matched_rate": (
+            original_or_resolved_matched_count / len(sampled) if sampled else 0.0
+        ),
         "match_type_counts": dict(match_counter),
         "reader_error_counts": dict(error_counter),
         "results": results,
