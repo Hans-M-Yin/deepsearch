@@ -27,6 +27,7 @@ import json
 import os
 import re
 import sys
+import random
 import threading
 import time
 from collections import Counter, defaultdict
@@ -371,6 +372,8 @@ def classify_graph(
     workers: int = 4,
     retries: int = 2,
     retry_backoff: float = 1.0,
+    num_samples: int = 0,
+    seed: int = 20260730,
     overwrite: bool = False,
     dry_run: bool = False,
     allow_partial: bool = False,
@@ -394,7 +397,8 @@ def classify_graph(
 
     counters: Counter[str] = Counter()
     origins: dict[str, str] = {}
-    visual_queries: dict[str, str] = {}
+    visual_candidate_ids: list[str] = []
+    visual_queries_all: dict[str, str] = {}
     all_nodes_by_id = {str(node.get("node_id")): node for node in nodes if node.get("node_id")}
     nodes_by_id = {str(node.get("node_id")): node for node in image_nodes}
 
@@ -416,11 +420,26 @@ def classify_graph(
         if origin != "visual_plan":
             counters["other_skipped"] += 1
             continue
+        visual_candidate_ids.append(node_id)
         query = image_search_query(node)
-        if not query:
-            counters["missing_search_query"] += 1
-            continue
-        visual_queries[node_id] = query
+        if query:
+            visual_queries_all[node_id] = query
+
+    if num_samples > 0 and num_samples < len(visual_candidate_ids):
+        selected_visual_ids = set(random.Random(seed).sample(visual_candidate_ids, num_samples))
+    else:
+        selected_visual_ids = set(visual_candidate_ids)
+    visual_queries = {
+        node_id: visual_queries_all[node_id]
+        for node_id in visual_candidate_ids
+        if node_id in selected_visual_ids and node_id in visual_queries_all
+    }
+    counters["visual_plan_candidates"] = len(visual_candidate_ids)
+    counters["visual_plan_selected"] = len(selected_visual_ids)
+    counters["visual_plan_not_selected"] = len(visual_candidate_ids) - len(selected_visual_ids)
+    counters["missing_search_query"] = sum(
+        node_id not in visual_queries_all for node_id in selected_visual_ids
+    )
 
     judge_results: dict[str, JudgeResult] = {}
     pending: list[tuple[str, str]] = []
@@ -473,6 +492,7 @@ def classify_graph(
         node_id
         for node_id, origin in origins.items()
         if origin == "visual_plan"
+        and node_id in selected_visual_ids
         and not image_search_query(nodes_by_id[node_id])
         and (overwrite or UNIQUE_STATE_FIELD not in nodes_by_id[node_id])
     ]
@@ -485,7 +505,7 @@ def classify_graph(
             continue
         if origin == "wiki_inline":
             mutations[node_id] = "wiki_inline"
-        elif origin == "visual_plan":
+        elif origin == "visual_plan" and node_id in selected_visual_ids:
             result = judge_results.get(node_id)
             if result and result.unique_state:
                 mutations[node_id] = result.unique_state
@@ -519,6 +539,9 @@ def classify_graph(
         "dry_run": dry_run,
         "allow_partial": allow_partial,
         "overwrite": overwrite,
+        "num_samples": num_samples,
+        "seed": seed,
+        "selected_visual_plan_image_node_ids": sorted(selected_visual_ids),
         "graph_written": graph_written,
         "checkpoint_path": str(checkpoint_path),
         "image_node_count": len(image_nodes),
@@ -542,6 +565,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--workers", type=int, default=4, help="Maximum concurrent judge requests.")
     parser.add_argument("--retries", type=int, default=2, help="Retries after the first failed request.")
     parser.add_argument("--retry-backoff", type=float, default=1.0, help="Initial exponential retry delay in seconds.")
+    parser.add_argument(
+        "--num-samples",
+        type=int,
+        default=0,
+        help="Randomly judge at most this many unclassified visual-plan image nodes; <=0 means all.",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=20260730,
+        help="Deterministic random seed used with --num-samples.",
+    )
     parser.add_argument(
         "--results-jsonl",
         type=Path,
@@ -576,6 +611,8 @@ def main(argv: list[str] | None = None) -> int:
         workers=args.workers,
         retries=args.retries,
         retry_backoff=args.retry_backoff,
+        num_samples=args.num_samples,
+        seed=args.seed,
         overwrite=args.overwrite,
         dry_run=args.dry_run,
         allow_partial=args.allow_partial,

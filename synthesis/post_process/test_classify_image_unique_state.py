@@ -112,6 +112,90 @@ class ClassifyGraphTest(unittest.TestCase):
             self.assertIsNone(request.max_tokens)
             self.assertIsNone(request.response_format)
 
+    def test_dry_run_calls_judge_but_does_not_modify_nodes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            graph_dir = Path(tmpdir)
+            store = JsonlGraphStore(graph_dir)
+            store.upsert_node(
+                {
+                    "node_id": "image_visual",
+                    "node_type": "image",
+                    "source": {"source_type": "image_search"},
+                    "metadata": {"search_query": "A specific album cover"},
+                }
+            )
+            store.upsert_node(
+                {
+                    "node_id": "image_wiki",
+                    "node_type": "image",
+                    "source": {"source_type": "wikipedia_inline_image"},
+                    "metadata": {},
+                }
+            )
+            store.flush()
+            worker = FakeWorker(
+                {
+                    "image_visual": (
+                        "分析：这是固定封面。\n"
+                        "image_visual  分类：唯一性  ｜  理由：固定图案。"
+                    )
+                }
+            )
+            summary = classify_graph(
+                graph_dir=graph_dir,
+                judge_model_alias="fake-alias",
+                model_client=worker,
+                workers=1,
+                retries=0,
+                dry_run=True,
+                results_jsonl=graph_dir / "checkpoint.jsonl",
+            )
+            reloaded = JsonlGraphStore(graph_dir)
+            self.assertNotIn("unique_state", reloaded.get_node("image_visual"))
+            self.assertNotIn("unique_state", reloaded.get_node("image_wiki"))
+            self.assertFalse(summary["graph_written"])
+            self.assertEqual(summary["mutations"]["image_visual"], "unique")
+            self.assertEqual(summary["mutations"]["image_wiki"], "wiki_inline")
+            self.assertEqual(len(worker.requests), 1)
+
+    def test_num_samples_limits_visual_plan_judging_deterministically(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            graph_dir = Path(tmpdir)
+            store = JsonlGraphStore(graph_dir)
+            responses = {}
+            for index in range(5):
+                image_id = f"image_{index}"
+                store.upsert_node(
+                    {
+                        "node_id": image_id,
+                        "node_type": "image",
+                        "source": {"source_type": "image_search"},
+                        "metadata": {"search_query": f"Description {index}"},
+                    }
+                )
+                responses[image_id] = (
+                    f"分析：测试 {index}。\n"
+                    f"{image_id}  分类：半唯一性  ｜  理由：可多角度拍摄。"
+                )
+            store.flush()
+            worker = FakeWorker(responses)
+            summary = classify_graph(
+                graph_dir=graph_dir,
+                judge_model_alias="fake-alias",
+                model_client=worker,
+                workers=1,
+                retries=0,
+                num_samples=2,
+                seed=17,
+                dry_run=True,
+                results_jsonl=graph_dir / "checkpoint.jsonl",
+            )
+            self.assertEqual(len(worker.requests), 2)
+            self.assertEqual(summary["counters"]["visual_plan_selected"], 2)
+            self.assertEqual(summary["counters"]["visual_plan_not_selected"], 3)
+            self.assertEqual(len(summary["selected_visual_plan_image_node_ids"]), 2)
+            self.assertEqual(set(summary["mutations"]), set(summary["selected_visual_plan_image_node_ids"]))
+
     def test_existing_unique_state_field_is_skipped_without_judge_call(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             graph_dir = Path(tmpdir)
