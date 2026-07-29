@@ -715,11 +715,11 @@ def _should_drop(decision: str, drop_on: str) -> bool:
 
 def _verify_single_edge(
     *,
-    graph_dir: str,
     edge: dict[str, Any],
+    image_node: dict[str, Any],
+    text_node: dict[str, Any],
     args: argparse.Namespace,
 ) -> dict[str, Any] | None:
-    store = JsonlGraphStore(Path(graph_dir))
     reader = EnhancedReaderClient(base_url=args.reader_base_url)
     model_client = LLM_WORKER
     image_builder = ImageDiscoveryBuilder(
@@ -729,10 +729,6 @@ def _verify_single_edge(
         image_check_model_alias=os.environ.get("IMAGE_CHECK_MODEL"),
     )
 
-    image_node = store.get_node(str(edge.get("src_node_id") or ""))
-    text_node = store.get_node(str(edge.get("dst_node_id") or ""))
-    if not image_node or not text_node:
-        return None
     source = text_node.get("source") or {}
     text_url = text_node.get("url") or source.get("url") or source.get("source_url") or ""
     if not _is_wikipedia_url(text_url):
@@ -1057,6 +1053,14 @@ def main() -> int:
     checkpoint_results = _load_checkpoint_results(checkpoint_path) if args.resume and checkpoint_path else {}
 
     store = JsonlGraphStore(Path(args.graph_dir))
+    # The graph is immutable during dry-run verification. Build one shared
+    # read-only node index here instead of having every edge worker construct a
+    # JsonlGraphStore and reparse every graph JSONL table from disk.
+    nodes_by_id = {
+        str(node.get("node_id") or ""): node
+        for node in store.list_nodes()
+        if str(node.get("node_id") or "")
+    }
     results_by_edge_id: dict[str, dict[str, Any]] = {}
     planned_removals: list[dict[str, Any]] = []
     all_edge_records = _iter_candidate_edges(store, image_node_id=args.image_node_id or None)
@@ -1091,6 +1095,27 @@ def main() -> int:
             }
             for edge in edge_records
         ]
+    worker_inputs_by_edge_id: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {}
+    missing_worker_nodes = 0
+    for edge in edge_records:
+        edge_id = str(edge.get("edge_id") or "")
+        image_node = nodes_by_id.get(str(edge.get("src_node_id") or ""))
+        text_node = nodes_by_id.get(str(edge.get("dst_node_id") or ""))
+        if not edge_id or image_node is None or text_node is None:
+            missing_worker_nodes += 1
+            continue
+        worker_inputs_by_edge_id[edge_id] = (image_node, text_node)
+    if missing_worker_nodes:
+        print(
+            "[verify_image_text_edges] "
+            f"skipping_edges_with_missing_preloaded_nodes={missing_worker_nodes}",
+            file=sys.stderr,
+            flush=True,
+        )
+    edge_records = [
+        edge for edge in edge_records
+        if str(edge.get("edge_id") or "") in worker_inputs_by_edge_id
+    ]
     for edge_id, record in checkpoint_results.items():
         if any(str(edge.get("edge_id") or "") == edge_id for edge in selected_edge_records):
             results_by_edge_id[edge_id] = record
@@ -1111,13 +1136,20 @@ def main() -> int:
         print(
             "[verify_image_text_edges] "
             f"scheduled_image_nodes={total_scheduled_image_nodes} "
-            f"scheduled_edges={len(edge_records)} workers={max_workers}",
+            f"scheduled_edges={len(edge_records)} workers={max_workers} "
+            f"preloaded_nodes={len(nodes_by_id)}",
             file=sys.stderr,
             flush=True,
         )
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_edge = {
-            executor.submit(_verify_single_edge, graph_dir=args.graph_dir, edge=edge, args=args): edge
+            executor.submit(
+                _verify_single_edge,
+                edge=edge,
+                image_node=worker_inputs_by_edge_id[str(edge.get("edge_id") or "")][0],
+                text_node=worker_inputs_by_edge_id[str(edge.get("edge_id") or "")][1],
+                args=args,
+            ): edge
             for edge in edge_records
         }
         for future in as_completed(future_to_edge):
