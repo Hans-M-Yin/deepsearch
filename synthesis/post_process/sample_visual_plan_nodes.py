@@ -309,7 +309,9 @@ def main() -> int:
         selected = rows
     else:
         selected = random.Random(args.seed).sample(rows, requested)
-        selected.sort(key=lambda row: row["image_node_id"])
+        selected.sort(
+            key=lambda row: row["plan_id"] if args.failure_case else row["image_node_id"]
+        )
 
     print(
         f"mode={'failure_case' if args.failure_case else 'image_nodes'} "
