@@ -10,8 +10,6 @@ from synthesis.post_process.verify_image_text_edges import (
     _edge_has_post_verification,
     _emit_image_node_complete_status,
     _load_checkpoint_results,
-    _repair_actions,
-    _repair_action_counts,
     _sample_image_node_ids,
     _soft_delete_verified_edge,
     _restore_verified_edge,
@@ -181,52 +179,7 @@ class ImageTextEdgeVerificationSamplingTests(unittest.TestCase):
         self.assertIn("insufficient=1", output)
         self.assertIn("completed_image_nodes=2/5", output)
 
-    def test_repair_actions_allow_both_modifications_but_remove_is_exclusive(self) -> None:
-        both_modifications = _repair_actions(
-            {
-                "decision": "contradict",
-                "repair_actions": {
-                    "modify_relation": {"apply": True, "corrected_relation": "yellow-shirted man"},
-                    "modify_target": {"apply": True, "corrected_target_name": "Correct Person"},
-                    "remove_target": {"apply": False},
-                },
-            }
-        )
-        self.assertTrue(both_modifications["modify_relation"]["apply"])
-        self.assertTrue(both_modifications["modify_target"]["apply"])
 
-        removal = _repair_actions(
-            {
-                "decision": "contradict",
-                "repair_actions": {
-                    "modify_relation": {"apply": True, "corrected_relation": "ignored"},
-                    "modify_target": {"apply": True, "corrected_target_name": "Ignored"},
-                    "remove_target": {"apply": True, "reason": "unknown object"},
-                },
-            }
-        )
-        self.assertTrue(removal["remove_target"]["apply"])
-        self.assertFalse(removal["modify_relation"]["apply"])
-        self.assertFalse(removal["modify_target"]["apply"])
-
-    def test_repair_action_counts_include_cooccurring_modifications(self) -> None:
-        counts = _repair_action_counts(
-            [
-                {
-                    "repair_actions": {
-                        "modify_relation": {"apply": True},
-                        "modify_target": {"apply": True},
-                        "remove_target": {"apply": False},
-                    }
-                },
-                {"repair_actions": {"remove_target": {"apply": True}}},
-            ]
-        )
-
-        self.assertEqual(counts["modify_relation"], 1)
-        self.assertEqual(counts["modify_target"], 1)
-        self.assertEqual(counts["remove_target"], 1)
-        self.assertEqual(counts["any_repair"], 2)
 
 
 if __name__ == "__main__":

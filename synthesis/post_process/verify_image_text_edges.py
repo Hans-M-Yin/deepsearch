@@ -40,8 +40,6 @@ if str(ROOT) not in sys.path:
 
 from synthesis.model_worker import LLM_WORKER, ModelMessage, ModelRequest, ModelWorkerClient
 from synthesis.image_discovery import ImageDiscoveryBuilder, ImageDiscoveryConfig
-from synthesis.edges import Edge, EdgeSource, EdgeType, EvidenceRef
-from synthesis.graph_expansion import ExpansionTask
 from synthesis.run_min_graph import DEFAULT_ENV_PATH, load_env_file
 from synthesis.store import JsonlGraphStore
 from synthesis.test_image_grounding import _UnusedSearchClient
@@ -94,25 +92,6 @@ Important rules:
 - If the graph image does not provide enough evidence, return insufficient.
 - If the target in the graph image appears to be a different entity/object, return contradict.
 
-When decision is contradict, also propose safe repair actions where visual evidence is sufficient.
-- modify_relation: The current target entity really appears in the image, but the existing relation/locator points to the wrong object. Supply the target's correct scene-relative locator and visible evidence.
-- modify_target: The existing relation/locator identifies a real object, but its target entity is wrong. Supply the canonical, Wikipedia-searchable identity of the object at that existing locator, its type, and visible evidence.
-- remove_target: The current target is absent and the object at the existing locator cannot be reliably identified. This action is incompatible with both modification actions.
-
-modify_relation and modify_target may both be true: they then describe two separate corrected facts. Do not propose an action based only on webpage context; every proposed correction must be visually supported by the graph image and reference images.
-
-Output exactly one JSON object with keys:
-- decision: support|contradict|insufficient
-- error_type: none|wrong_identity|wrong_relation|ambiguous|insufficient_evidence
-- confidence: number
-- reason: string
-- evidence_for: string[]
-- evidence_against: string[]
-- repair_actions: {
-    modify_relation: {apply: boolean, corrected_relation: string|null, corrected_evidence: string|null, reason: string|null, confidence: number|null},
-    modify_target: {apply: boolean, corrected_target_name: string|null, corrected_target_type: string|null, corrected_target_evidence: string|null, reason: string|null, confidence: number|null},
-    remove_target: {apply: boolean, reason: string|null}
-  }
 """
 
 
@@ -189,14 +168,6 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--workers", type=int, default=4, help="Number of parallel workers for per-edge verification.")
     parser.add_argument("--write-back", action="store_true", help="Write verification results back into edge metadata and soft-delete matching rejected edges.")
-    parser.add_argument(
-        "--apply-repairs",
-        action="store_true",
-        help=(
-            "Apply validated repair actions for contradict edges. Requires --write-back. "
-            "modify_target may enqueue a standard image_entity task in graph_runner_state.json."
-        ),
-    )
     parser.add_argument("--hard-delete", action="store_true", help="Physically delete matching edges instead of the default reversible soft delete. Requires --write-back.")
     parser.add_argument("--restore-post-verify-rejected", action="store_true", help="Restore all verifier-soft-deleted edges in --graph-dir without running models.")
     parser.add_argument("--restore-edge-id", action="append", default=[], help="Restore one verifier-soft-deleted edge ID. Repeatable; implies restore mode.")
@@ -544,63 +515,6 @@ def _compact_reference_images_for_output(reference_images: list[dict[str, Any]])
     ]
 
 
-def _empty_repair_actions() -> dict[str, dict[str, Any]]:
-    return {
-        "modify_relation": {
-            "apply": False,
-            "corrected_relation": None,
-            "corrected_evidence": None,
-            "reason": None,
-            "confidence": None,
-        },
-        "modify_target": {
-            "apply": False,
-            "corrected_target_name": None,
-            "corrected_target_type": None,
-            "corrected_target_evidence": None,
-            "reason": None,
-            "confidence": None,
-        },
-        "remove_target": {"apply": False, "reason": None},
-    }
-
-
-def _repair_actions(judged: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    """Normalize and validate repair actions proposed by the judge."""
-    normalized = _empty_repair_actions()
-    raw_actions = judged.get("repair_actions")
-    if not isinstance(raw_actions, dict):
-        return normalized
-    for name, fields in normalized.items():
-        raw = raw_actions.get(name)
-        if not isinstance(raw, dict):
-            continue
-        fields["apply"] = bool(raw.get("apply"))
-        for key in fields:
-            if key == "apply" or key not in raw:
-                continue
-            if key == "confidence":
-                try:
-                    fields[key] = float(raw[key]) if raw[key] is not None else None
-                except (TypeError, ValueError):
-                    fields[key] = None
-            else:
-                text = str(raw[key] or "").strip()
-                fields[key] = text or None
-
-    if str(judged.get("decision") or "") != "contradict":
-        return _empty_repair_actions()
-    if normalized["remove_target"]["apply"]:
-        return _empty_repair_actions() | {
-            "remove_target": normalized["remove_target"],
-        }
-    if normalized["modify_relation"]["apply"] and not normalized["modify_relation"]["corrected_relation"]:
-        normalized["modify_relation"]["apply"] = False
-    if normalized["modify_target"]["apply"] and not normalized["modify_target"]["corrected_target_name"]:
-        normalized["modify_target"]["apply"] = False
-    return normalized
-
-
 def _parse_json_object(text: str, default: dict[str, Any]) -> dict[str, Any]:
     payload = str(text or "").strip()
     if not payload:
@@ -746,357 +660,6 @@ def _restore_post_verify_edges(
     }
 
 
-def _repair_audit_path(graph_dir: Path) -> Path:
-    return graph_dir / "image_edge_repair_log.jsonl"
-
-
-def _append_repair_audit(graph_dir: Path, payload: dict[str, Any]) -> None:
-    path = _repair_audit_path(graph_dir)
-    payload = {**payload, "recorded_at_unix": time.time()}
-    with path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(payload, ensure_ascii=False, sort_keys=True))
-        handle.write("\n")
-
-
-def _edge_grounded_entity(edge: dict[str, Any], fallback: dict[str, Any] | None) -> dict[str, Any]:
-    for ref in edge.get("evidence_refs") or []:
-        if not isinstance(ref, dict):
-            continue
-        entity = (ref.get("metadata") or {}).get("grounded_entity")
-        if isinstance(entity, dict):
-            return dict(entity)
-    return dict(fallback or {})
-
-
-def _replacement_edge(
-    *,
-    old_edge: dict[str, Any],
-    target_node: dict[str, Any],
-    entity: dict[str, Any],
-    action: str,
-    repair: dict[str, Any],
-) -> dict[str, Any]:
-    relation = str(entity.get("relation_to_image") or old_edge.get("relation") or "depicts")
-    source = old_edge.get("source") or {}
-    old_metadata = old_edge.get("metadata") or {}
-    evidence_refs = list(old_edge.get("evidence_refs") or [])
-    if evidence_refs and isinstance(evidence_refs[0], dict):
-        evidence_refs[0] = {
-            **evidence_refs[0],
-            "quote": entity.get("evidence"),
-            "metadata": {
-                **dict(evidence_refs[0].get("metadata") or {}),
-                "grounded_entity": entity,
-            },
-        }
-    metadata = {
-        **dict(old_metadata),
-        "entity_name": entity.get("name") or target_node.get("title"),
-        "entity_type": entity.get("type") or old_metadata.get("entity_type"),
-        "post_verify_repair": {
-            "action": action,
-            "replaces_edge_id": old_edge.get("edge_id"),
-            "repair": repair,
-            "applied_at_unix": time.time(),
-        },
-    }
-    replacement = Edge.create(
-        str(old_edge.get("src_node_id") or ""),
-        str(target_node.get("node_id") or ""),
-        edge_type=EdgeType.IMAGE_DEPICTS,
-        relation=relation,
-        src_node_type=old_edge.get("src_node_type") or "image",
-        dst_node_type=target_node.get("node_type") or "text",
-        evidence_refs=[EvidenceRef(**ref) for ref in evidence_refs if isinstance(ref, dict)],
-        source=EdgeSource(**source) if isinstance(source, dict) and source else None,
-        confidence=old_edge.get("confidence"),
-        extractor="verify_image_text_edges_repair",
-        metadata=metadata,
-        evidence_key=f"repair:{old_edge.get('edge_id')}:{action}:{target_node.get('node_id')}:{relation}",
-    )
-    return replacement.to_dict()
-
-
-def _enqueue_repair_task(
-    *,
-    graph_dir: Path,
-    old_edge: dict[str, Any],
-    image_node: dict[str, Any],
-    corrected_entity: dict[str, Any],
-    resolved_target: dict[str, Any],
-    resolution_debug: dict[str, Any] | None,
-) -> tuple[bool, str]:
-    """Persist a standard image_entity task into the stopped runner's queue."""
-    state_path = graph_dir / "graph_runner_state.json"
-    if not state_path.exists():
-        return False, "missing_graph_runner_state"
-    source_evidence_id = ""
-    for ref in old_edge.get("evidence_refs") or []:
-        if isinstance(ref, dict) and ref.get("evidence_id"):
-            source_evidence_id = str(ref["evidence_id"])
-            break
-    if not source_evidence_id:
-        return False, "missing_image_evidence_id"
-    if not resolved_target.get("url"):
-        return False, "missing_resolved_target_url"
-
-    with state_path.open("r", encoding="utf-8") as handle:
-        state = json.load(handle)
-    queue = list(state.get("queue") or [])
-    seen = set(state.get("seen_task_keys") or [])
-    url = str(resolved_target["url"])
-    task_key = f"text_expand:{url}"
-    pending_link = {
-        "link_type": "image_entity",
-        "parent_node_id": image_node.get("node_id"),
-        "source_evidence_id": source_evidence_id,
-        "entity": corrected_entity,
-        "resolved_target": resolved_target,
-        "query_overlap_entity": False,
-        "entity_resolution": resolution_debug or {},
-        "post_verify_repair": {"replaces_edge_id": old_edge.get("edge_id")},
-    }
-    for task in queue:
-        if str(task.get("url") or "") != url:
-            continue
-        links = list((task.get("metadata") or {}).get("pending_parent_links") or [])
-        if not any(
-            str((link.get("entity") or {}).get("name") or "") == str(corrected_entity.get("name") or "")
-            and str(link.get("parent_node_id") or "") == str(image_node.get("node_id") or "")
-            for link in links
-            if isinstance(link, dict)
-        ):
-            links.append(pending_link)
-            task["metadata"] = {**dict(task.get("metadata") or {}), "pending_parent_links": links}
-        break
-    else:
-        task = ExpansionTask.from_image_entity(
-            url=url,
-            title=str(resolved_target.get("title") or corrected_entity.get("name") or ""),
-            parent_image_node_id=str(image_node.get("node_id") or ""),
-            source_evidence_id=source_evidence_id,
-            entity=corrected_entity,
-        ).to_dict()
-        task["metadata"] = {
-            **dict(task.get("metadata") or {}),
-            "pending_parent_links": [pending_link],
-            "post_verify_repair": {"replaces_edge_id": old_edge.get("edge_id")},
-        }
-        if task_key not in seen:
-            queue.append(task)
-            seen.add(task_key)
-    state["queue"] = queue
-    state["seen_task_keys"] = sorted(seen)
-    state["status"] = "paused"
-    state["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    temporary_path = state_path.with_suffix(".json.tmp")
-    with temporary_path.open("w", encoding="utf-8") as handle:
-        json.dump(state, handle, ensure_ascii=False, sort_keys=True, indent=2)
-        handle.write("\n")
-    os.replace(temporary_path, state_path)
-    return True, "queued_image_entity_task"
-
-
-def _verify_corrected_target(
-    *,
-    image_node: dict[str, Any],
-    old_edge: dict[str, Any],
-    corrected_entity: dict[str, Any],
-    target: dict[str, Any],
-    args: argparse.Namespace,
-) -> dict[str, Any]:
-    """Require fresh visual support before repairing an edge's target."""
-    target_url = str(target.get("url") or ((target.get("source") or {}).get("url") or "")).strip()
-    if not _is_wikipedia_url(target_url):
-        return {"decision": "insufficient", "reason": "corrected_target_not_wikipedia"}
-    model_client = LLM_WORKER
-    reader = EnhancedReaderClient(base_url=args.reader_base_url)
-    builder = ImageDiscoveryBuilder(
-        search_client=_UnusedSearchClient(),
-        config=ImageDiscoveryConfig(precheck_image_urls=True, try_source_page_recovery=True),
-        model_client=model_client,
-    )
-    try:
-        wiki_doc = reader.read(target_url).to_dict()
-        target_node = {
-            "node_id": target.get("node_id") or f"repair:{target_url}",
-            "title": target.get("title") or corrected_entity.get("name"),
-            "aliases": target.get("aliases") or [],
-            "url": target_url,
-            "source": {"url": target_url},
-        }
-        prepared_context = _prepare_entity_context(
-            model_client,
-            args.prepare_model,
-            text_node=target_node,
-            wiki_document=wiki_doc,
-            image_title=str(image_node.get("title") or ""),
-        )
-        kept_reference_images: list[dict[str, Any]] = []
-        for image_item in _extract_reference_images(
-            wiki_doc.get("raw_markdown") or wiki_doc.get("content") or "",
-            target_url,
-            args.max_reference_images,
-        ):
-            resolved = _resolve_reference_image(
-                builder,
-                image_item=image_item,
-                page_title=str(wiki_doc.get("title") or target_node["title"] or ""),
-                entity_title=str(target_node["title"] or ""),
-            )
-            if resolved is None:
-                continue
-            decision = _prepare_reference_image(
-                model_client,
-                args.prepare_model,
-                entity_title=str(target_node["title"] or ""),
-                visual_profile=list(prepared_context.get("visual_profile") or []),
-                event_context=list(prepared_context.get("event_context") or []),
-                image_item=resolved,
-            )
-            if decision.get("keep") is True:
-                kept_reference_images.append({**resolved, **decision})
-            if len(kept_reference_images) >= max(1, args.max_reference_images):
-                break
-        judged = _judge_edge(
-            model_client,
-            args.judge_model,
-            image_node=image_node,
-            text_node=target_node,
-            edge={**old_edge, "relation": corrected_entity.get("relation_to_image")},
-            grounded_entity=corrected_entity,
-            prepared_context=prepared_context,
-            reference_images=kept_reference_images,
-            primary_image_model_url=_resolve_image_node_for_model(builder, image_node=image_node),
-        )
-        return {
-            "decision": judged.get("decision"),
-            "reason": judged.get("reason"),
-            "error_type": judged.get("error_type"),
-            "confidence": judged.get("confidence"),
-            "kept_reference_image_count": len(kept_reference_images),
-        }
-    except Exception as exc:
-        return {"decision": "insufficient", "reason": f"repair_reverify_error:{exc.__class__.__name__}:{exc}"}
-
-
-def _apply_repair_actions(
-    *,
-    store: JsonlGraphStore,
-    graph_dir: Path,
-    old_edge: dict[str, Any],
-    record: dict[str, Any],
-    args: argparse.Namespace,
-) -> dict[str, Any]:
-    actions = record.get("repair_actions") or _empty_repair_actions()
-    if str(record.get("decision") or "") != "contradict":
-        return {"status": "not_applicable", "actions": []}
-    image_node = store.get_node(str(old_edge.get("src_node_id") or "")) or {}
-    old_target = store.get_node(str(old_edge.get("dst_node_id") or "")) or {}
-    original_entity = _edge_grounded_entity(old_edge, record.get("grounded_entity"))
-    applied: list[dict[str, Any]] = []
-    replacement_created = False
-
-    relation_action = actions.get("modify_relation") or {}
-    if relation_action.get("apply") and old_target:
-        entity = {
-            **original_entity,
-            "name": old_target.get("title") or original_entity.get("name"),
-            "relation_to_image": relation_action.get("corrected_relation"),
-            "evidence": relation_action.get("corrected_evidence"),
-        }
-        reverify = _verify_corrected_target(
-            image_node=image_node,
-            old_edge=old_edge,
-            corrected_entity=entity,
-            target=old_target,
-            args=args,
-        )
-        if reverify.get("decision") != "support":
-            applied.append({"action": "modify_relation", "status": "reverification_not_support", "reverification": reverify})
-        else:
-            replacement = _replacement_edge(
-                old_edge=old_edge,
-                target_node=old_target,
-                entity=entity,
-                action="modify_relation",
-                repair={**relation_action, "reverification": reverify},
-            )
-            if not args.dry_run:
-                store.upsert_edge(replacement)
-            replacement_created = True
-            applied.append({"action": "modify_relation", "status": "replacement_edge_created", "edge_id": replacement["edge_id"], "reverification": reverify})
-
-    target_action = actions.get("modify_target") or {}
-    if target_action.get("apply"):
-        corrected_entity = {
-            "name": target_action.get("corrected_target_name"),
-            "type": target_action.get("corrected_target_type"),
-            "relation_to_image": old_edge.get("relation"),
-            "evidence": target_action.get("corrected_target_evidence"),
-        }
-        builder = ImageDiscoveryBuilder(
-            store=store,
-            search_client=_UnusedSearchClient(),
-            config=ImageDiscoveryConfig(enable_image_entity_queue_verification=False),
-            model_client=LLM_WORKER,
-        )
-        resolution = builder._resolve_grounded_entity_link_target(
-            corrected_entity,
-            source_node_title=None,
-            source_query_text=None,
-            image_caption=image_node.get("caption") or image_node.get("summary"),
-        )
-        if resolution is None:
-            applied.append({"action": "modify_target", "status": "unresolved_target"})
-        else:
-            target_node = resolution.get("matched_node") or resolution.get("resolved_target") or {}
-            reverify = _verify_corrected_target(
-                image_node=image_node,
-                old_edge=old_edge,
-                corrected_entity=corrected_entity,
-                target=target_node,
-                args=args,
-            )
-            if reverify.get("decision") != "support":
-                applied.append({"action": "modify_target", "status": "reverification_not_support", "reverification": reverify})
-            elif resolution.get("matched_node") is not None:
-                target_node = resolution["matched_node"]
-                replacement = _replacement_edge(
-                    old_edge=old_edge,
-                    target_node=target_node,
-                    entity=corrected_entity,
-                    action="modify_target",
-                    repair={**target_action, "reverification": reverify},
-                )
-                if not args.dry_run:
-                    store.upsert_edge(replacement)
-                replacement_created = True
-                applied.append({"action": "modify_target", "status": "replacement_edge_created", "edge_id": replacement["edge_id"], "reverification": reverify})
-            else:
-                queued, status = _enqueue_repair_task(
-                    graph_dir=graph_dir,
-                    old_edge=old_edge,
-                    image_node=image_node,
-                    corrected_entity=corrected_entity,
-                    resolved_target=resolution.get("resolved_target") or {},
-                    resolution_debug=resolution.get("debug"),
-                )
-                replacement_created = replacement_created or queued
-                applied.append({"action": "modify_target", "status": status, "reverification": reverify})
-
-    remove_action = actions.get("remove_target") or {}
-    should_remove = bool(remove_action.get("apply")) or replacement_created
-    if should_remove:
-        if not args.dry_run:
-            store.upsert_edge(_soft_delete_verified_edge(dict(old_edge), decision="contradict"))
-        applied.append({"action": "remove_target" if remove_action.get("apply") else "supersede_original", "status": "soft_deleted"})
-    audit = {"source_edge_id": old_edge.get("edge_id"), "image_node_id": old_edge.get("src_node_id"), "actions": applied}
-    if not args.dry_run:
-        _append_repair_audit(graph_dir, audit)
-    return {"status": "applied" if applied else "no_safe_repair", "actions": applied}
-
-
 def _should_drop(decision: str, drop_on: str) -> bool:
     if drop_on == "contradict":
         return decision == "contradict"
@@ -1213,7 +776,6 @@ def _verify_single_edge(
     record["prepared_context"] = prepared_context
     record["grounded_entity"] = grounded_entity
     record["reference_images"] = _compact_reference_images_for_output(kept_reference_images)
-    record["repair_actions"] = _repair_actions(judged)
     return record
 
 
@@ -1410,40 +972,6 @@ def _emit_image_node_complete_status(
     )
 
 
-def _repair_action_counts(records: list[dict[str, Any]]) -> dict[str, int]:
-    """Count proposed repair actions; modify actions may co-occur per edge."""
-    counts = {
-        "modify_relation": 0,
-        "modify_target": 0,
-        "remove_target": 0,
-        "any_repair": 0,
-    }
-    for record in records:
-        actions = record.get("repair_actions") or {}
-        applied = False
-        for action in ("modify_relation", "modify_target", "remove_target"):
-            if bool((actions.get(action) or {}).get("apply")):
-                counts[action] += 1
-                applied = True
-        if applied:
-            counts["any_repair"] += 1
-    return counts
-
-
-def _repair_apply_status_counts(records: list[dict[str, Any]]) -> dict[str, int]:
-    """Summarize outcome statuses emitted by --apply-repairs."""
-    counts: dict[str, int] = {}
-    for record in records:
-        for item in ((record.get("repair_apply_result") or {}).get("actions") or []):
-            if not isinstance(item, dict):
-                continue
-            action = str(item.get("action") or "unknown")
-            status = str(item.get("status") or "unknown")
-            key = f"{action}:{status}"
-            counts[key] = counts.get(key, 0) + 1
-    return counts
-
-
 def main() -> int:
     args = parse_args()
     restore_requested = bool(args.restore_post_verify_rejected or args.restore_edge_id)
@@ -1464,10 +992,6 @@ def main() -> int:
 
     if args.hard_delete and not args.write_back:
         raise SystemExit("--hard-delete requires --write-back.")
-    if args.apply_repairs and not args.write_back:
-        raise SystemExit("--apply-repairs requires --write-back.")
-    if args.apply_repairs and args.hard_delete:
-        raise SystemExit("--apply-repairs cannot be combined with --hard-delete; repairs use reversible soft deletion.")
     load_env_file(Path(args.env_file))
     if not args.prepare_model:
         raise SystemExit("Missing prepare model. Set --prepare-model or IMAGE_EDGE_VERIFY_PREPARE_MODEL/TEXT_PROCESS_MODEL.")
@@ -1600,20 +1124,9 @@ def main() -> int:
                 "judge_model_alias": record.get("judge_model_alias"),
                 "prepare_model_alias": record.get("prepare_model_alias"),
                 "kept_reference_image_count": record.get("kept_reference_image_count"),
-                "repair_actions": record.get("repair_actions") or _empty_repair_actions(),
                 "verified_at_unix": time.time(),
             }
             edge_record["metadata"] = edge_meta
-            if args.apply_repairs:
-                repair_result = _apply_repair_actions(
-                    store=store,
-                    graph_dir=Path(args.graph_dir).resolve(),
-                    old_edge=edge_record,
-                    record=record,
-                    args=args,
-                )
-                record["repair_apply_result"] = repair_result
-                continue
             if _should_drop(str(record.get("decision") or ""), args.drop_on):
                 if args.hard_delete:
                     _delete_edge(store, str(record.get("edge_id") or ""))
@@ -1637,7 +1150,6 @@ def main() -> int:
         "judge_model": args.judge_model,
         "dry_run": bool(args.dry_run),
         "write_back": bool(args.write_back and not args.dry_run),
-        "apply_repairs": bool(args.apply_repairs),
         "results_jsonl": str(checkpoint_path) if checkpoint_path else None,
         "resume": bool(args.resume),
         "reverify": bool(args.reverify),
@@ -1665,8 +1177,6 @@ def main() -> int:
         "contradict_grounded_entity_ratio": (
             contradict_count / grounded_entity_count if grounded_entity_count else None
         ),
-        "repair_action_counts": _repair_action_counts(results),
-        "repair_apply_status_counts": _repair_apply_status_counts(results),
         "elapsed_s": time.perf_counter() - started,
         "drop_mode": "hard_delete" if args.hard_delete else "soft_delete",
         "planned_removal_count": len(planned_removals),
