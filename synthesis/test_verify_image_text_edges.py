@@ -193,6 +193,19 @@ class ImageTextEdgeVerificationSamplingTests(unittest.TestCase):
         self.assertEqual(malformed["decision"], "insufficient")
         self.assertEqual(malformed["error_type"], "judge_output_parse_failed")
 
+    def test_relation_override_debug_fields_are_retained_in_result_shape(self) -> None:
+        edge = {
+            "edge_id": "edge-1",
+            "relation": "the man on the right",
+            "_debug_original_relation": "the man on the left",
+        }
+        record = {
+            "original_relation": edge.get("_debug_original_relation"),
+            "relation_override": edge.get("relation"),
+        }
+        self.assertEqual(record["original_relation"], "the man on the left")
+        self.assertEqual(record["relation_override"], "the man on the right")
+
 
 
 

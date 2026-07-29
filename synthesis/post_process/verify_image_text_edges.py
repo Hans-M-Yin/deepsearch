@@ -137,6 +137,14 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Verify image->text graph edges with wiki-based visual evidence.")
     parser.add_argument("--graph-dir", required=True, help="Directory containing graph JSONL tables.")
     parser.add_argument("--image-node-id", default="", help="Optional image node id; when set, verify only edges from this image node.")
+    parser.add_argument(
+        "--relation-override",
+        default="",
+        help=(
+            "Dry-run-only replacement relation/locator to test against every selected edge. "
+            "The graph is not modified."
+        ),
+    )
     parser.add_argument("--env-file", type=str, default=str(DEFAULT_ENV_PATH), help="Path to env file.")
     parser.add_argument("--reader-base-url", type=str, default="http://127.0.0.1:8004", help="Enhanced Reader base URL.")
     parser.add_argument("--prepare-model", type=str, default=os.environ.get("IMAGE_EDGE_VERIFY_PREPARE_MODEL") or os.environ.get("TEXT_PROCESS_MODEL") or "", help="Model alias for prepare steps.")
@@ -809,6 +817,9 @@ def _verify_single_edge(
         source_type=str(((edge.get("source") or {}).get("source_type")) or ""),
     )
     record = result.to_dict()
+    if edge.get("_debug_original_relation") is not None:
+        record["original_relation"] = edge.get("_debug_original_relation")
+        record["relation_override"] = edge.get("relation")
     record["image_url"] = image_node.get("image_url")
     record["prepared_context"] = prepared_context
     record["grounded_entity"] = grounded_entity
@@ -1029,6 +1040,9 @@ def main() -> int:
 
     if args.hard_delete and not args.write_back:
         raise SystemExit("--hard-delete requires --write-back.")
+    relation_override = str(args.relation_override or "").strip()
+    if relation_override and args.write_back:
+        raise SystemExit("--relation-override is dry-run-only and cannot be combined with --write-back.")
     load_env_file(Path(args.env_file))
     if not args.prepare_model:
         raise SystemExit("Missing prepare model. Set --prepare-model or IMAGE_EDGE_VERIFY_PREPARE_MODEL/TEXT_PROCESS_MODEL.")
@@ -1068,6 +1082,15 @@ def main() -> int:
         if (args.reverify or not _edge_has_post_verification(edge))
         and str(edge.get("edge_id") or "") not in checkpoint_edge_ids
     ]
+    if relation_override:
+        edge_records = [
+            {
+                **edge,
+                "relation": relation_override,
+                "_debug_original_relation": edge.get("relation"),
+            }
+            for edge in edge_records
+        ]
     for edge_id, record in checkpoint_results.items():
         if any(str(edge.get("edge_id") or "") == edge_id for edge in selected_edge_records):
             results_by_edge_id[edge_id] = record
@@ -1190,6 +1213,7 @@ def main() -> int:
         "results_jsonl": str(checkpoint_path) if checkpoint_path else None,
         "resume": bool(args.resume),
         "reverify": bool(args.reverify),
+        "relation_override": relation_override or None,
         "skip_graph_post_verified": not bool(args.reverify),
         "candidate_image_node_count": len(
             {str(edge.get("src_node_id") or "") for edge in all_edge_records if edge.get("src_node_id")}
