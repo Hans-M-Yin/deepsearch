@@ -193,6 +193,14 @@ def _image_node_stats(
         uniqueness_block_reasons: Counter[str] = Counter()
         node_counts: Counter[str] = Counter()
         initial_grounded_entity_count = 0
+        active_downstream_text_node_count_distribution: Counter[int] = Counter()
+        all_downstream_text_node_count_distribution: Counter[int] = Counter()
+        active_image_depicts_edge_count_distribution: Counter[int] = Counter()
+        inactive_image_depicts_edge_count_distribution: Counter[int] = Counter()
+        total_active_downstream_text_nodes = 0
+        total_all_downstream_text_nodes = 0
+        total_active_image_depicts_edges = 0
+        total_inactive_image_depicts_edges = 0
 
         for node in image_subset:
             node_id = str(node.get("node_id") or "")
@@ -214,6 +222,35 @@ def _image_node_stats(
                 node_counts["nodes_with_materialized_text_edge"] += 1
             if any(report.get("status") == "queued_pending" for report in reports):
                 node_counts["nodes_with_pending_text_expansion"] += 1
+
+            # Count actual image -> text connections from persisted image_depicts
+            # edges. The active distribution is the graph view consumed by VQA
+            # sampling; the all-status distribution remains available for audit
+            # after verifier soft deletes.
+            node_image_depicts_edges = out_edges.get(node_id, [])
+            active_edges = [
+                edge
+                for edge in node_image_depicts_edges
+                if str(edge.get("status") or "active").strip().lower() == "active"
+            ]
+            active_text_targets = {
+                str(edge.get("dst_node_id") or "")
+                for edge in active_edges
+                if nodes_by_id.get(str(edge.get("dst_node_id") or ""), {}).get("node_type") == "text"
+            }
+            all_text_targets = {
+                str(edge.get("dst_node_id") or "")
+                for edge in node_image_depicts_edges
+                if nodes_by_id.get(str(edge.get("dst_node_id") or ""), {}).get("node_type") == "text"
+            }
+            active_downstream_text_node_count_distribution[len(active_text_targets)] += 1
+            all_downstream_text_node_count_distribution[len(all_text_targets)] += 1
+            active_image_depicts_edge_count_distribution[len(active_edges)] += 1
+            inactive_image_depicts_edge_count_distribution[len(node_image_depicts_edges) - len(active_edges)] += 1
+            total_active_downstream_text_nodes += len(active_text_targets)
+            total_all_downstream_text_nodes += len(all_text_targets)
+            total_active_image_depicts_edges += len(active_edges)
+            total_inactive_image_depicts_edges += len(node_image_depicts_edges) - len(active_edges)
 
             for report in reports:
                 entity_statuses[str(report.get("status") or "grounded_only")] += 1
@@ -251,6 +288,53 @@ def _image_node_stats(
                 + entity_statuses["queued_pending"]
                 + entity_statuses["task_completed"]
             ),
+            "downstream_text_node_connection_distribution": {
+                "definition": (
+                    "Per image node, the number of unique downstream text-node IDs "
+                    "reachable through image_depicts edges. Active-only is the default "
+                    "VQA-visible graph; all-status includes verifier-soft-deleted edges."
+                ),
+                "active_unique_text_nodes_per_image": {
+                    "total_connections": total_active_downstream_text_nodes,
+                    "average_per_image_node": (
+                        total_active_downstream_text_nodes / node_counts["image_nodes"]
+                        if node_counts["image_nodes"] else 0.0
+                    ),
+                    "distribution": {
+                        str(count): image_count
+                        for count, image_count in sorted(active_downstream_text_node_count_distribution.items())
+                    },
+                },
+                "all_status_unique_text_nodes_per_image": {
+                    "total_connections": total_all_downstream_text_nodes,
+                    "average_per_image_node": (
+                        total_all_downstream_text_nodes / node_counts["image_nodes"]
+                        if node_counts["image_nodes"] else 0.0
+                    ),
+                    "distribution": {
+                        str(count): image_count
+                        for count, image_count in sorted(all_downstream_text_node_count_distribution.items())
+                    },
+                },
+                "active_image_depicts_edges_per_image": {
+                    "total_edges": total_active_image_depicts_edges,
+                    "average_per_image_node": (
+                        total_active_image_depicts_edges / node_counts["image_nodes"]
+                        if node_counts["image_nodes"] else 0.0
+                    ),
+                    "distribution": {
+                        str(count): image_count
+                        for count, image_count in sorted(active_image_depicts_edge_count_distribution.items())
+                    },
+                },
+                "inactive_image_depicts_edges_per_image": {
+                    "total_edges": total_inactive_image_depicts_edges,
+                    "distribution": {
+                        str(count): image_count
+                        for count, image_count in sorted(inactive_image_depicts_edge_count_distribution.items())
+                    },
+                },
+            },
             "post_grounding_filter_reasons_observed_on_persisted_nodes": _counter_dict(post_filter_reasons),
             "wiki_inline_uniqueness_block_reasons_observed_on_persisted_nodes": _counter_dict(uniqueness_block_reasons),
         }
