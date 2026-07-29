@@ -151,19 +151,23 @@ def source_text_node(
     }
 
 
-def build_rows(nodes: list[dict[str, Any]], edges: list[dict[str, Any]]) -> list[dict[str, str]]:
+def build_rows(nodes: list[dict[str, Any]], edges: list[dict[str, Any]]) -> list[dict[str, Any]]:
     nodes_by_id = {
         str(node.get("node_id") or ""): node
         for node in nodes
         if node.get("node_id")
     }
     incoming: dict[str, list[dict[str, Any]]] = {}
+    outgoing: dict[str, list[dict[str, Any]]] = {}
     for edge in edges:
         dst_node_id = str(edge.get("dst_node_id") or "")
+        src_node_id = str(edge.get("src_node_id") or "")
         if dst_node_id:
             incoming.setdefault(dst_node_id, []).append(edge)
+        if src_node_id:
+            outgoing.setdefault(src_node_id, []).append(edge)
 
-    rows: list[dict[str, str]] = []
+    rows: list[dict[str, Any]] = []
     for node in nodes:
         if node.get("node_type") != "image" or image_origin(node) != "visual_plan":
             continue
@@ -173,9 +177,25 @@ def build_rows(nodes: list[dict[str, Any]], edges: list[dict[str, Any]]) -> list
             incoming_edges=incoming.get(str(node.get("node_id") or ""), []),
             nodes_by_id=nodes_by_id,
         )
+        image_node_id = str(node.get("node_id") or "")
+        downstream_text_relations: list[dict[str, str]] = []
+        for edge in outgoing.get(image_node_id, []):
+            target = nodes_by_id.get(str(edge.get("dst_node_id") or ""))
+            if edge.get("edge_type") != "image_depicts" or not target or target.get("node_type") != "text":
+                continue
+            downstream_text_relations.append(
+                {
+                    "relation": _clean(edge.get("relation")) or "<missing-relation>",
+                    "title": _clean(target.get("title") or target.get("canonical_id") or target.get("node_id")),
+                    "edge_id": str(edge.get("edge_id") or ""),
+                }
+            )
+        downstream_text_relations.sort(
+            key=lambda item: (item["relation"].lower(), item["title"].lower(), item["edge_id"])
+        )
         rows.append(
             {
-                "image_node_id": str(node.get("node_id") or ""),
+                "image_node_id": image_node_id,
                 "search_query": _clean(metadata.get("search_query") or metadata.get("query")) or "<missing-search-query>",
                 "source_text_node": (
                     f"{source['node_id']} | {source['title']}"
@@ -183,6 +203,7 @@ def build_rows(nodes: list[dict[str, Any]], edges: list[dict[str, Any]]) -> list
                     else "<missing-source-text-node>"
                 ),
                 "image_url": image_url(node),
+                "downstream_text_relations": downstream_text_relations,
             }
         )
     return sorted(rows, key=lambda row: row["image_node_id"])
@@ -222,6 +243,8 @@ def main() -> int:
             f"{row['image_node_id']}\t{row['search_query']}\t"
             f"{row['source_text_node']}\t{row['image_url']}"
         )
+        for downstream in row["downstream_text_relations"]:
+            print(f"  {downstream['relation']} -> {downstream['title']}")
         print()
     return 0
 
