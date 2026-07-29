@@ -333,8 +333,6 @@ def _request_one(
     example: GoldExample,
     *,
     model_alias: str,
-    temperature: float,
-    max_tokens: int,
     include_source_label: bool,
     include_url: bool,
     retries: int,
@@ -356,8 +354,6 @@ def _request_one(
                         ModelMessage(role="system", content=SYSTEM_PROMPT + OUTPUT_CONTRACT),
                         ModelMessage(role="user", content=user_prompt),
                     ],
-                    temperature=temperature,
-                    max_tokens=max_tokens,
                     metadata={
                         "trace_label": "eval_image_uniqueness",
                         "image_id": example.image_id,
@@ -566,8 +562,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--model", default=DEFAULT_MODEL, help="Registered LLM_WORKER model alias.")
     parser.add_argument("--output-dir", type=Path, default=None, help="Output directory. Reusing it resumes completed image IDs by default.")
     parser.add_argument("--workers", type=int, default=4, help="Maximum concurrent requests (default: 4).")
-    parser.add_argument("--temperature", type=float, default=0.0)
-    parser.add_argument("--max-tokens", type=int, default=512)
     parser.add_argument("--retries", type=int, default=2, help="Retries after the first failed request.")
     parser.add_argument("--retry-backoff", type=float, default=1.0, help="Initial exponential retry delay in seconds.")
     parser.add_argument("--limit", type=int, default=0, help="Evaluate only the first N selected examples; <=0 means all.")
@@ -635,8 +629,6 @@ def main(argv: list[str] | None = None) -> int:
         "created_at": datetime.now().isoformat(),
         "discussion": str(discussion),
         "model_alias": args.model,
-        "temperature": args.temperature,
-        "max_tokens": args.max_tokens,
         "workers": args.workers,
         "retries": args.retries,
         "include_url": not args.omit_url,
@@ -657,8 +649,6 @@ def main(argv: list[str] | None = None) -> int:
                     _request_one,
                     example,
                     model_alias=args.model,
-                    temperature=args.temperature,
-                    max_tokens=args.max_tokens,
                     include_source_label=not args.omit_source_label,
                     include_url=not args.omit_url,
                     retries=args.retries,
