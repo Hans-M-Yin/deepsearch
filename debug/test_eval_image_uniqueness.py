@@ -67,5 +67,45 @@ class ModelResponseParserTest(unittest.TestCase):
         self.assertEqual(parsed["parse_error"], "missing_final_label")
 
 
+class MetricsTest(unittest.TestCase):
+    @staticmethod
+    def _result(image_id: str, gold: str, predicted: str | None) -> object:
+        return MODULE.EvalResult(
+            image_id=image_id,
+            description="test",
+            source_text_id="text_test",
+            source_label="test",
+            image_url="",
+            gold_label=gold,
+            expert_reason="",
+            predicted_label=predicted,
+            correct=predicted == gold,
+            parse_error=None if predicted else "missing_final_label",
+            analysis="",
+            model_reason="",
+            raw_response="",
+            model_alias="test",
+            served_model="test",
+            usage=None,
+            elapsed_seconds=0.0,
+            attempt_count=1,
+            error=None,
+        )
+
+    def test_unique_precision_and_recall_include_unparsed_false_negative(self) -> None:
+        results = [
+            self._result("image_00000001", "唯一性", "唯一性"),  # TP
+            self._result("image_00000002", "唯一性", "半唯一性"),  # FN
+            self._result("image_00000003", "唯一性", None),       # FN (unparsed)
+            self._result("image_00000004", "半唯一性", "唯一性"), # FP
+        ]
+        metrics = MODULE.compute_metrics(results)
+        self.assertAlmostEqual(metrics["unique_image_precision"], 0.5)
+        self.assertAlmostEqual(metrics["unique_image_recall"], 1 / 3, places=6)
+        self.assertEqual(metrics["unique_image_metrics"]["true_positive"], 1)
+        self.assertEqual(metrics["unique_image_metrics"]["predicted_positive"], 2)
+        self.assertEqual(metrics["unique_image_metrics"]["gold_positive"], 3)
+
+
 if __name__ == "__main__":
     unittest.main()

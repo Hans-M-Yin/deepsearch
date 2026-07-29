@@ -456,10 +456,12 @@ def compute_metrics(results: list[EvalResult]) -> dict[str, Any]:
     for label in LABELS:
         tp = confusion[label][label]
         fp = sum(confusion[gold][label] for gold in LABELS if gold != label)
-        fn = sum(confusion[label][pred] for pred in LABELS if pred != label)
         support = sum(1 for item in results if item.gold_label == label)
+        # Unparsed/request-failed examples count as false negatives for recall:
+        # they were gold members of this class but were not correctly recovered.
+        fn = support - tp
         precision = tp / (tp + fp) if tp + fp else 0.0
-        recall = tp / (tp + fn) if tp + fn else 0.0
+        recall = tp / support if support else 0.0
         f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
         per_class[label] = {
             "precision": round(precision, 6),
@@ -470,6 +472,14 @@ def compute_metrics(results: list[EvalResult]) -> dict[str, Any]:
 
     correct = sum(item.correct for item in results)
     macro_f1 = sum(float(per_class[label]["f1"]) for label in LABELS) / len(LABELS)
+    unique_metrics = dict(per_class["唯一性"])
+    unique_metrics.update(
+        {
+            "true_positive": confusion["唯一性"]["唯一性"],
+            "predicted_positive": sum(confusion[gold]["唯一性"] for gold in LABELS),
+            "gold_positive": sum(1 for item in results if item.gold_label == "唯一性"),
+        }
+    )
     usage_totals: Counter[str] = Counter()
     for item in results:
         if isinstance(item.usage, dict):
@@ -485,6 +495,9 @@ def compute_metrics(results: list[EvalResult]) -> dict[str, Any]:
         "accuracy_all": round(correct / total, 6) if total else 0.0,
         "accuracy_parsed": round(correct / len(parsed), 6) if parsed else 0.0,
         "macro_f1": round(macro_f1, 6),
+        "unique_image_precision": unique_metrics["precision"],
+        "unique_image_recall": unique_metrics["recall"],
+        "unique_image_metrics": unique_metrics,
         "gold_distribution": dict(Counter(item.gold_label for item in results)),
         "prediction_distribution": dict(Counter(item.predicted_label or "UNPARSED" for item in results)),
         "confusion_matrix": confusion,
@@ -522,6 +535,8 @@ def _write_markdown_report(path: Path, results: list[EvalResult], metrics: dict[
         f"- Accuracy (all): {metrics['accuracy_all']:.2%}",
         f"- Accuracy (parsed): {metrics['accuracy_parsed']:.2%}",
         f"- Macro F1: {metrics['macro_f1']:.4f}",
+        f"- Unique-image precision: {metrics['unique_image_precision']:.2%}",
+        f"- Unique-image recall: {metrics['unique_image_recall']:.2%}",
         f"- Request errors: {metrics['request_errors']}",
         "",
         "## Confusion matrix",
@@ -690,7 +705,10 @@ def main(argv: list[str] | None = None) -> int:
     print(
         "[summary] "
         f"accuracy={metrics['accuracy_all']:.2%} parsed={metrics['parse_rate']:.2%} "
-        f"macro_f1={metrics['macro_f1']:.4f} errors={metrics['request_errors']}"
+        f"macro_f1={metrics['macro_f1']:.4f} "
+        f"unique_precision={metrics['unique_image_precision']:.2%} "
+        f"unique_recall={metrics['unique_image_recall']:.2%} "
+        f"errors={metrics['request_errors']}"
     )
     print(f"[output] {output_dir}")
     return 0 if len(ordered_results) == len(examples) else 2
