@@ -199,6 +199,7 @@ Minimality requirements:
 - Normally add no more than 12 English words.
 - Do not add phrases such as 'an image showing', 'a photograph of', or 'in this picture' unless already present.
 - Every added word must narrow the pictured sub-moment.
+- Keep the query concise: do not add details that merely repeat or paraphrase information already in the original query, and do not add overly specific visual details.
 
 Decision rules:
 - keep: fixed visual work, already precise moment, or no meaningful improvement is possible.

@@ -93,6 +93,14 @@ def _fixture(payload: dict):
     return builder, client, plan, candidate, asset
 
 
+class QueryRefinementPromptTest(unittest.TestCase):
+    def test_prompt_forbids_redundant_and_overly_visual_details(self) -> None:
+        from synthesis.image_discovery import PROMPT_IMAGE_SEARCH_QUERY_REFINEMENT
+
+        self.assertIn("do not add details that merely repeat or paraphrase", PROMPT_IMAGE_SEARCH_QUERY_REFINEMENT)
+        self.assertIn("do not add overly specific visual details", PROMPT_IMAGE_SEARCH_QUERY_REFINEMENT)
+
+
 class PrimaryQueryRefinementTest(unittest.TestCase):
     def test_accepts_one_short_event_centered_refinement(self) -> None:
         refined = (
