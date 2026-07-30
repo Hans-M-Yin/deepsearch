@@ -23,7 +23,7 @@ vllm serve "${MODEL_PATH}" \
   --tensor-parallel-size "${TENSOR_PARALLEL_SIZE}" \
   --max-model-len 48000 \
   --port "${PORT}" \
-  --gpu-memory-utilization 0.85 \
+  --gpu-memory-utilization 0.8 \
   --trust-remote-code \
   --max-num-seqs 200 \
   --allowed-local-media-path /mnt/hdfs/byte_ai_sales/user/user/yinzhihan/agent/OpenSearch-VL
