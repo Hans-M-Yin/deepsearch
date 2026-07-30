@@ -1288,16 +1288,20 @@ def i2i_search(
     while attempt <= max_retries:
         try:
             print(
-                "[i2i_search debug] start "
+                "[i2i_search debug] backend_search_start "
                 f"attempt={attempt} image_url={image_url!r} top_k={top_k} "
                 f"max_retries={max_retries} base_delay={base_delay} "
                 f"visual_lookup={getattr(visual_lookup, '__name__', type(visual_lookup).__name__)}",
                 file=sys.stderr,
                 flush=True,
             )
+            backend_started_at = time.perf_counter()
             result = visual_lookup(image_url=image_url, top_k=top_k)
+            backend_elapsed_s = time.perf_counter() - backend_started_at
             print(
-                f"[i2i_search debug] raw_output={json.dumps(_jsonify(result), ensure_ascii=False)}",
+                "[i2i_search debug] backend_search_done "
+                f"attempt={attempt} elapsed_s={backend_elapsed_s:.3f} "
+                f"raw_output={json.dumps(_jsonify(result), ensure_ascii=False)}",
                 file=sys.stderr,
                 flush=True,
             )
