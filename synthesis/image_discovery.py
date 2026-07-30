@@ -215,6 +215,16 @@ Examples:
 - 'The Abbey Road album cover by the Beatles' must be kept because it identifies a fixed visual work.
 - Do not add a red bus to an Eiffel Tower query merely because one happens to appear in the selected photograph.
 
+Negative example (do NOT do this):
+Query: "...Sepp Blatter being showered with fake money by comedian Simon Brodkin during a press conference in Zurich on July 20, 2015"
+Bad refinement: adding "sitting at the podium as banknotes fall around him"
+Why it is wrong: the event is already a short, one-time act; it needs no refinement (decision = keep). "banknotes fall around him" describes the transient position of moving objects, which varies shot to shot — it is NOT stable across photographs, despite appearing to add detail.
+
+Negative example (do NOT do this):
+Query: "...marching down the Champs-Elysees after the liberation of Paris on August 26, 1944"
+Bad refinement: adding "with the Arc de Triomphe in the background"
+Why it is wrong: "in the background" describes composition (forbidden), and "Arc de Triomphe" is a named landmark absent from the original query (forbidden). If the only available constraint is compositional or a new named entity, the correct decision is reject, not a rule-violating refinement.
+
 Return exactly one JSON object with this structure:
 {
   "decision": "keep | refine | reject",
