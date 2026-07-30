@@ -137,6 +137,7 @@ def build_report(graph_dir: Path, image_node_id: str) -> dict[str, Any]:
             "caption": image_node.get("caption"),
             "image_url": source.get("url") if isinstance(source, dict) else None,
             "image_origin": metadata.get("image_origin"),
+            "unique_state": image_node.get("unique_state"),
         },
         "source_text_nodes": _source_text_nodes(
             store=store, image_node=image_node, nodes_by_id=nodes_by_id
@@ -150,6 +151,7 @@ def build_report(graph_dir: Path, image_node_id: str) -> dict[str, Any]:
 def print_report(report: dict[str, Any]) -> None:
     image = report["image_node"]
     print(f"Image node: {image['node_id']} ({image['title']})")
+    print(f"Unique state: {image.get('unique_state') or '<missing>'}")
     print(f"Search query: {report.get('search_query') or '<missing>'}")
     print("Source text node(s):")
     sources = report["source_text_nodes"]
