@@ -199,7 +199,7 @@ Minimality requirements:
 - Normally add no more than 12 English words.
 - Do not add phrases such as 'an image showing', 'a photograph of', or 'in this picture' unless already present.
 - Every added word must narrow the pictured sub-moment.
-- Keep the query concise: do not add details that merely repeat or paraphrase information already in the original query, and do not add overly specific visual details.
+- Only add a constraint that stays essentially the same across all photographs of the same sub-moment. Do not add details that vary shot to shot — transient gestures, exact positions of moving objects, momentary expressions, or lighting. A detail can be visually specific and still be forbidden if it is unstable across photos of that moment.
 
 Decision rules:
 - keep: fixed visual work, already precise moment, or no meaningful improvement is possible.
