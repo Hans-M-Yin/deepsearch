@@ -154,6 +154,16 @@ def apply_results(
             counters["missing_graph_edge"] += 1
             affected_edges.append({"edge_id": edge_id, "status": "missing_graph_edge"})
             continue
+        if str(edge.get("status") or "active").lower() != "active":
+            counters["skipped_inactive_graph_edge"] += 1
+            affected_edges.append(
+                {
+                    "edge_id": edge_id,
+                    "status": "skipped_inactive_graph_edge",
+                    "edge_status": edge.get("status"),
+                }
+            )
+            continue
 
         metadata = dict(edge.get("metadata") or {})
         metadata["post_verify_image_text"] = _graph_verification_payload(record)
