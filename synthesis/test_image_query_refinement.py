@@ -111,12 +111,7 @@ class PrimaryQueryRefinementTest(unittest.TestCase):
             {
                 "decision": "refine",
                 "refined_query": refined,
-                "added_constraint": "speaking on stage",
-                "constraint_type": "action",
                 "reason": "The original query identifies the event but not the pictured sub-moment.",
-                "new_named_entities": [],
-                "removed_information": [],
-                "expected_uniqueness": "unique",
             }
         )
 
@@ -130,7 +125,6 @@ class PrimaryQueryRefinementTest(unittest.TestCase):
         self.assertTrue(result["applied"])
         self.assertTrue(result["accepted"])
         self.assertEqual(result["refined_query"], refined)
-        self.assertEqual(result["added_constraint"], "speaking on stage")
         self.assertEqual(len(client.requests), 1)
         request = client.requests[0]
         self.assertEqual(request.model, "query-refiner")
@@ -138,6 +132,12 @@ class PrimaryQueryRefinementTest(unittest.TestCase):
         self.assertIsNone(request.max_tokens)
         self.assertEqual(request.response_format, {"type": "json_object"})
         self.assertIsInstance(request.messages[1].content, list)
+        prompt_payload = json.loads(request.messages[1].content[0]["text"])
+        self.assertNotIn("unique_state", prompt_payload)
+        self.assertEqual(
+            set(prompt_payload),
+            {"original_search_query", "primary_image_title", "primary_image_snippet", "visual_target"},
+        )
 
     def test_keep_preserves_already_precise_query(self) -> None:
         candidate_query = (
@@ -148,12 +148,7 @@ class PrimaryQueryRefinementTest(unittest.TestCase):
             {
                 "decision": "keep",
                 "refined_query": candidate_query,
-                "added_constraint": "",
-                "constraint_type": "none",
                 "reason": "Already sufficiently precise.",
-                "new_named_entities": [],
-                "removed_information": [],
-                "expected_uniqueness": "unique",
             }
         )
         self.assertEqual(candidate.source_query.query, candidate_query)
@@ -169,7 +164,7 @@ class PrimaryQueryRefinementTest(unittest.TestCase):
         self.assertEqual(result["decision"], "keep")
         self.assertEqual(result["refined_query"], candidate.source_query.query)
 
-    def test_rejects_refinement_that_adds_named_entities(self) -> None:
+    def test_invalid_overlong_refinement_falls_back_to_original_query(self) -> None:
         original_query = (
             "Zhang Yiming attending the opening ceremony of the Sixth World Internet "
             "Conference in Wuzhen, China, on October 20, 2019"
@@ -177,13 +172,11 @@ class PrimaryQueryRefinementTest(unittest.TestCase):
         builder, _, plan, candidate, asset = _fixture(
             {
                 "decision": "refine",
-                "refined_query": original_query + " while speaking beside Jack Ma",
-                "added_constraint": "speaking beside Jack Ma",
-                "constraint_type": "interaction",
-                "reason": "More specific.",
-                "new_named_entities": ["Jack Ma"],
-                "removed_information": [],
-                "expected_uniqueness": "unique",
+                "refined_query": original_query + (
+                    " while standing behind a large white lectern beneath a bright blue display "
+                    "and speaking into two microphones before a crowded auditorium"
+                ),
+                "reason": "Adds many visual details.",
             }
         )
 
@@ -196,7 +189,7 @@ class PrimaryQueryRefinementTest(unittest.TestCase):
 
         self.assertFalse(result["accepted"])
         self.assertEqual(result["refined_query"], candidate.source_query.query)
-        self.assertIn("new_named_entities_not_empty", result["validation_errors"])
+        self.assertIn("too_many_added_words", result["validation_errors"])
 
     def test_wiki_inline_skips_refinement(self) -> None:
         builder, client, plan, candidate, asset = _fixture({})

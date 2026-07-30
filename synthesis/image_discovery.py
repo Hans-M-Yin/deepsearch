@@ -199,12 +199,12 @@ Minimality requirements:
 - Normally add no more than 12 English words.
 - Do not add phrases such as 'an image showing', 'a photograph of', or 'in this picture' unless already present.
 - Every added word must narrow the pictured sub-moment.
+- Keep the query concise: do not add details that merely repeat or paraphrase information already in the original query, and do not add overly specific visual details.
 - Only add a constraint that stays essentially the same across all photographs of the same sub-moment. Do not add details that vary shot to shot — transient gestures, exact positions of moving objects, momentary expressions, or lighting. A detail can be visually specific and still be forbidden if it is unstable across photos of that moment.
 
 Decision rules:
 - keep: fixed visual work, already precise moment, or no meaningful improvement is possible.
 - refine: one short event-centered constraint safely narrows a broader event to the pictured sub-moment.
-- reject: the query is broad and the image provides no reliable meaningful sub-moment; only incidental, composition-based, uncertain, or entity-leaking refinements are possible.
 
 Tips:
 First, identify the main event described by the query. Then, using the selected image, judge whether the image shows only a single instant or a small fragment of that event. The key signal: ask whether the same event plausibly produced many other photographs that share only the topic with this one, yet differ in visual content, composition, and even the people or objects that appear. If such divergent photographs of the same event are likely to exist, the query is under-specified and you MUST refine it — add the smallest visually supported constraint that pins down the specific sub-moment shown, so that later searches converge on photographs whose groundable content stays essentially the same. If instead the event is inherently short and any photograph of it would show essentially the same content, people, and objects, the query is already precise enough and should be kept.
@@ -223,18 +223,13 @@ Why it is wrong: the event is already a short, one-time act; it needs no refinem
 Negative example (do NOT do this):
 Query: "...marching down the Champs-Elysees after the liberation of Paris on August 26, 1944"
 Bad refinement: adding "with the Arc de Triomphe in the background"
-Why it is wrong: "in the background" describes composition (forbidden), and "Arc de Triomphe" is a named landmark absent from the original query (forbidden). If the only available constraint is compositional or a new named entity, the correct decision is reject, not a rule-violating refinement.
+Why it is wrong: "in the background" describes composition (forbidden), and "Arc de Triomphe" is a named landmark absent from the original query (forbidden). If no safe event-centered refinement is available, keep the original query unchanged rather than producing a rule-violating refinement.
 
 Return exactly one JSON object with this structure:
 {
-  "decision": "keep | refine | reject",
+  "decision": "keep | refine",
   "refined_query": "the original or minimally refined query",
-  "added_constraint": "the exact short constraint added, or an empty string",
-  "constraint_type": "action | interaction | event_phase | object_state | none",
-  "reason": "brief explanation",
-  "new_named_entities": [],
-  "removed_information": [],
-  "expected_uniqueness": "unique | semi-unique | no-unique"
+  "reason": "brief explanation"
 }
 """
 
@@ -1694,8 +1689,6 @@ class ImageDiscoveryBuilder:
             "decision": "keep",
             "original_query": original_query,
             "refined_query": original_query,
-            "added_constraint": "",
-            "constraint_type": "none",
             "reason": "",
         }
         if self._is_wiki_inline_plan(plan):
@@ -1703,7 +1696,7 @@ class ImageDiscoveryBuilder:
         if not self.config.enable_primary_query_refinement:
             return {**base, "reason": "disabled"}
         if not original_query:
-            return {**base, "decision": "reject", "reason": "missing_original_query"}
+            return {**base, "reason": "missing_original_query"}
         model_alias = (
             self.config.primary_query_refinement_model
             or os.environ.get("IMAGE_QUERY_REFINEMENT_MODEL")
@@ -1754,45 +1747,30 @@ class ImageDiscoveryBuilder:
             }
         decision = str(parsed.get("decision") or "").strip().lower()
         refined_query = re.sub(r"\s+", " ", str(parsed.get("refined_query") or "")).strip()
-        added_constraint = re.sub(r"\s+", " ", str(parsed.get("added_constraint") or "")).strip()
-        constraint_type = str(parsed.get("constraint_type") or "none").strip().lower()
-        new_named_entities = parsed.get("new_named_entities") or []
-        removed_information = parsed.get("removed_information") or []
         validation_errors: list[str] = []
-        if decision not in {"keep", "refine", "reject"}:
+        if decision not in {"keep", "refine"}:
             validation_errors.append("invalid_decision")
         if "\n" in refined_query or ";" in refined_query:
             validation_errors.append("query_not_single_compact_phrase")
         if decision == "keep":
-            if refined_query != original_query or added_constraint:
+            if refined_query != original_query:
                 validation_errors.append("keep_must_preserve_query")
         elif decision == "refine":
             if not refined_query or refined_query == original_query:
                 validation_errors.append("refine_must_change_query")
-            if not added_constraint:
-                validation_errors.append("missing_added_constraint")
             added_words = max(0, self._query_word_count(refined_query) - self._query_word_count(original_query))
             if added_words > int(self.config.primary_query_refinement_max_added_words):
                 validation_errors.append("too_many_added_words")
-        if not isinstance(new_named_entities, list) or new_named_entities:
-            validation_errors.append("new_named_entities_not_empty")
-        if not isinstance(removed_information, list) or removed_information:
-            validation_errors.append("removed_information_not_empty")
         accepted = decision == "refine" and not validation_errors
         effective_query = refined_query if accepted else original_query
         return {
             **base,
             "applied": True,
             "accepted": accepted,
-            "decision": decision if decision in {"keep", "refine", "reject"} else "keep",
+            "decision": decision if decision in {"keep", "refine"} else "keep",
             "refined_query": effective_query,
             "proposed_refined_query": refined_query,
-            "added_constraint": added_constraint if accepted else "",
-            "constraint_type": constraint_type if accepted else "none",
             "reason": str(parsed.get("reason") or "").strip(),
-            "expected_uniqueness": str(parsed.get("expected_uniqueness") or "").strip(),
-            "new_named_entities": new_named_entities if isinstance(new_named_entities, list) else [],
-            "removed_information": removed_information if isinstance(removed_information, list) else [],
             "validation_errors": validation_errors,
             "model_alias": model_alias,
             "usage": response.usage,
@@ -1836,11 +1814,6 @@ class ImageDiscoveryBuilder:
         candidate.validation.metadata["primary_query_refinement"] = dict(query_refinement)
         result.metadata = dict(result.metadata or {})
         result.metadata["primary_query_refinement"] = dict(query_refinement)
-        if query_refinement.get("applied") and query_refinement.get("decision") == "reject":
-            candidate.validation.status = ImageCandidateStatus.REJECTED
-            candidate.validation.reason = "primary_query_refinement_rejected"
-            candidate.is_primary = False
-            return
         primary_query = str(query_refinement.get("refined_query") or candidate.source_query.query or plan.target.content or candidate.search_result.title or "").strip()
 
         provisional_node = self._image_node_from_result(

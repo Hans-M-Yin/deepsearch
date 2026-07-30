@@ -240,14 +240,9 @@ def evaluate_case(case: RefinementCase, *, model_alias: str) -> dict[str, Any]:
         "constraint_term_present": (
             True
             if decision != "refine" or not case.expected_constraint_terms
-            else _contains_any(
-                " ".join([proposed_query, str(result.get("added_constraint") or "")]),
-                case.expected_constraint_terms,
-            )
+            else _contains_any(proposed_query, case.expected_constraint_terms)
         ),
         "keep_preserves_original": decision != "keep" or effective_query == case.original_query,
-        "no_named_entity_leak_declared": not bool(result.get("new_named_entities")),
-        "no_information_removal_declared": not bool(result.get("removed_information")),
     }
     return {
         "case": asdict(case),
