@@ -57,6 +57,7 @@ class GraphRunnerConfig:
     show_progress: bool = True
     persist_visual_plans: bool = True
     visual_plans_file_name: str = "visual_plans.jsonl"
+    visual_plan_attempts_file_name: str = "visual_plan_attempts.jsonl"
 
     def to_dict(self) -> dict[str, Any]:
         return _jsonify(asdict(self))
@@ -136,6 +137,7 @@ class GraphRunner:
         self.config = config or GraphRunnerConfig()
         self.state_path = Path(state_path) if state_path else store.root_dir / self.config.state_file_name
         self.visual_plans_path = store.root_dir / self.config.visual_plans_file_name
+        self.visual_plan_attempts_path = store.root_dir / self.config.visual_plan_attempts_file_name
         self.state = self._load_or_create_state(run_id=run_id, resume=resume)
         self._restore_strategy_state()
         self._saved_visual_plan_ids = self._load_saved_visual_plan_ids()
@@ -463,6 +465,7 @@ class GraphRunner:
             "parent_link_failure_count": len(result.parent_link_failures),
             "parent_link_failures": [dict(item) for item in result.parent_link_failures],
             "visual_plan_count": len(result.visual_plans),
+            "visual_plan_trace": dict(result.visual_plan_trace or {}),
             "image_result_count": len(result.image_results),
             "image_summary": self._summarize_image_results(result.image_results),
             "timing": result.timing,
@@ -474,6 +477,7 @@ class GraphRunner:
         else:
             self.state.completed_tasks.append(record)
         self._persist_visual_plans(result)
+        self._persist_visual_plan_attempts(result)
 
     def _persist_visual_plans(self, result: NodeExpansionResult) -> None:
         if not self.config.persist_visual_plans or not result.visual_plans:
@@ -492,6 +496,100 @@ class GraphRunner:
             for record in records:
                 handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True))
                 handle.write("\n")
+
+    def _persist_visual_plan_attempts(self, result: NodeExpansionResult) -> None:
+        """Append planner and discovery outcomes without changing graph behavior."""
+        if not self.config.persist_visual_plans:
+            return
+        if not result.visual_plans and not result.visual_plan_trace:
+            return
+        node = result.text_result.node.to_dict() if result.text_result is not None else {}
+        plan_by_id = {str(plan.plan_id): plan for plan in result.visual_plans}
+        result_by_plan_id = {
+            str(image_result.plan_id): image_result
+            for image_result in result.image_results
+            if getattr(image_result, "plan_id", None)
+        }
+        records: list[dict[str, Any]] = []
+        for plan_id, plan in plan_by_id.items():
+            image_result = result_by_plan_id.get(plan_id)
+            records.append(
+                self._visual_plan_attempt_record(
+                    result=result,
+                    node=node,
+                    plan=plan,
+                    image_result=image_result,
+                )
+            )
+
+        trace = result.visual_plan_trace or {}
+        for candidate in trace.get("judge_results") or []:
+            if not isinstance(candidate, dict) or candidate.get("plan_judge_keep") is not False:
+                continue
+            records.append(
+                self._visual_plan_rejected_candidate_record(
+                    result=result,
+                    node=node,
+                    candidate=candidate,
+                )
+            )
+        if not records:
+            return
+        self.visual_plan_attempts_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.visual_plan_attempts_path.open("a", encoding="utf-8") as handle:
+            for record in records:
+                handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True))
+                handle.write("\n")
+
+    def _visual_plan_attempt_record(self, *, result: NodeExpansionResult, node: dict[str, Any], plan: Any, image_result: Any | None) -> dict[str, Any]:
+        target = plan.target
+        metadata = dict(getattr(image_result, "metadata", {}) or {})
+        image_node = getattr(image_result, "image_node", None)
+        if image_node is not None:
+            outcome = "materialized_image_node"
+        elif image_result is None:
+            outcome = "not_executed"
+        else:
+            outcome = "not_materialized"
+        return {
+            "record_type": "visual_plan_attempt",
+            "run_id": self.state.run_id,
+            "step": self.state.step,
+            "task_url": result.task.url,
+            "node_id": node.get("node_id"),
+            "node_title": node.get("title") or node.get("canonical_id"),
+            "plan_id": plan.plan_id,
+            "target_evidence_id": target.evidence_id,
+            "target_description": target.content,
+            "queries": [query.query for query in plan.queries],
+            "planner_reason": target.metadata.get("reason"),
+            "planner_metadata": dict(plan.metadata or {}),
+            "outcome": outcome,
+            "image_node_id": image_node.node_id if image_node is not None else None,
+            "candidate_decisions": list(metadata.get("candidate_decisions") or []),
+            "retrieval_consistency": dict(metadata.get("retrieval_consistency") or {}),
+            "visual_plan_post_grounding_filter": dict(metadata.get("visual_plan_post_grounding_filter") or {}),
+            "image_result_metadata": metadata,
+        }
+
+    def _visual_plan_rejected_candidate_record(self, *, result: NodeExpansionResult, node: dict[str, Any], candidate: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "record_type": "planner_rejected_candidate",
+            "run_id": self.state.run_id,
+            "step": self.state.step,
+            "task_url": result.task.url,
+            "node_id": node.get("node_id"),
+            "node_title": node.get("title") or node.get("canonical_id"),
+            "plan_id": None,
+            "target_evidence_id": None,
+            "target_description": candidate.get("query"),
+            "queries": [candidate.get("query")] if candidate.get("query") else [],
+            "planner_reason": candidate.get("reason"),
+            "outcome": "planner_uniqueness_rejected",
+            "plan_judge_reason": candidate.get("plan_judge_reason"),
+            "plan_judge_raw_output": candidate.get("plan_judge_raw_output"),
+            "candidate": dict(candidate),
+        }
 
     def _load_saved_visual_plan_ids(self) -> set[str]:
         if not self.config.persist_visual_plans or not self.visual_plans_path.exists():

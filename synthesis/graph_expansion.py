@@ -187,6 +187,7 @@ class NodeExpansionResult:
     attribute_evidence: Evidence | None = None
     attribute_error: str | None = None
     visual_plans: list[VisualSearchPlan] = field(default_factory=list)
+    visual_plan_trace: dict[str, Any] = field(default_factory=dict)
     image_results: list[ImageDiscoveryResult] = field(default_factory=list)
     materialized_edges: list[Edge] = field(default_factory=list)
     parent_link_failures: list[dict[str, Any]] = field(default_factory=list)
@@ -201,6 +202,7 @@ class NodeExpansionResult:
             "attribute_evidence": self.attribute_evidence.to_dict() if self.attribute_evidence else None,
             "attribute_error": self.attribute_error,
             "visual_plans": [plan.to_dict() for plan in self.visual_plans],
+            "visual_plan_trace": _jsonify(self.visual_plan_trace),
             "image_results": [result.to_dict() for result in self.image_results],
             "materialized_edges": [edge.to_dict() for edge in self.materialized_edges],
             "parent_link_failures": [dict(item) for item in self.parent_link_failures],
@@ -516,7 +518,7 @@ class GraphExpansionStrategy:
             )
 
             started = time.perf_counter()
-            visual_plans, image_results, queued_tasks = self._expand_images(text_result, run_id=run_id)
+            visual_plans, image_results, queued_tasks, visual_plan_trace = self._expand_images(text_result, run_id=run_id)
             timing["image_expansion_s"] = time.perf_counter() - started
             _trace_timing(
                 f"[expand-image-task] stage=image_expand url={task.url!r} elapsed_s={timing['image_expansion_s']:.3f} plans={len(visual_plans)} image_nodes={sum(1 for item in image_results if item.image_node is not None)}"
@@ -528,6 +530,7 @@ class GraphExpansionStrategy:
                 task=task,
                 text_result=text_result,
                 visual_plans=visual_plans,
+                visual_plan_trace=visual_plan_trace,
                 image_results=image_results,
                 materialized_edges=[],
                 parent_link_failures=[],
@@ -1036,11 +1039,11 @@ class GraphExpansionStrategy:
         text_result: WikiTextBuildResult,
         *,
         run_id: str | None,
-    ) -> tuple[list[VisualSearchPlan], list[ImageDiscoveryResult], list[ExpansionTask]]:
+    ) -> tuple[list[VisualSearchPlan], list[ImageDiscoveryResult], list[ExpansionTask], dict[str, Any]]:
         if not self.config.enable_image_expansion:
-            return [], [], []
+            return [], [], [], {"status": "image_expansion_disabled"}
         if self.visual_planner is None or self.image_builder is None:
-            return [], [], []
+            return [], [], [], {"status": "image_expansion_unavailable"}
 
         visual_plans = self.visual_planner.plan(
             node=text_result.node.to_dict(),
@@ -1048,6 +1051,8 @@ class GraphExpansionStrategy:
             source_evidence_ids=[text_result.text_evidence.evidence_id],
             run_id=run_id,
         )
+        planner_trace = getattr(self.visual_planner, "last_plan_trace", {})
+        visual_plan_trace = dict(planner_trace) if isinstance(planner_trace, dict) else {}
         wiki_plans = self._build_wiki_inline_image_plans(text_result, run_id=run_id)
         plans = list(visual_plans) + list(wiki_plans)
         self._log_image_plan_start(text_result, plans)
@@ -1089,7 +1094,7 @@ class GraphExpansionStrategy:
                 task = self._enqueue_image_entity_task(pending)
                 if task is not None:
                     queued_tasks.append(task)
-        return plans, image_results, queued_tasks
+        return plans, image_results, queued_tasks, visual_plan_trace
 
     def _execute_wiki_inline_plans(
         self,
