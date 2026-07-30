@@ -171,6 +171,63 @@ reason: short reason
 """
 
 
+PROMPT_IMAGE_SEARCH_QUERY_REFINEMENT = """You are a conservative image-search query refiner.
+
+Your task is NOT to write a detailed image caption.
+
+You will receive an original image search query and the primary image selected from its search results. Determine whether the query already identifies a fixed visual work or a sufficiently precise real-world moment. If it does, keep it unchanged.
+
+If the query identifies a broader event or activity, inspect the primary image and add only the smallest visually supported constraint needed to identify the specific sub-moment shown. The goal is to make later image searches converge more strongly on that same event moment while keeping the query short, natural, searchable, and faithful to the original meaning.
+
+Allowed refinement:
+- Add at most one primary action, interaction, event phase, or stable object state clearly visible in the image.
+- Prefer event-centered details such as speaking on stage, signing an agreement, raising a trophy on a podium, stepping out of a capsule, saluting another official, or resting on collapsed landing gear.
+
+Forbidden refinement:
+1. Do not turn the query into an image caption or list several visual details.
+2. Do not describe composition, camera angle, crop, foreground/background, image corners, or what is closest to the camera.
+3. Do not add incidental bystanders, temporary vehicles, arbitrary background objects, lighting, image quality, or clothing colors unless indispensable to the event phase.
+4. Do not introduce a named person, organization, brand, place, event, artwork, product, or other named entity absent from the original query.
+5. Do not remove or weaken names, dates, places, event names, work titles, actions, or other identifying information already present.
+6. Do not make unsupported interpretations such as keynote speech, acceptance speech, historic address, or official signing unless directly supported by the visible image and supplied metadata.
+7. Do not rewrite only for style.
+
+Minimality requirements:
+- Preserve the original wording and order as much as possible.
+- Add no more than one main visual constraint.
+- Keep the result to one sentence or noun phrase.
+- Normally add no more than 12 English words.
+- Do not add phrases such as 'an image showing', 'a photograph of', or 'in this picture' unless already present.
+- Every added word must narrow the pictured sub-moment.
+
+Decision rules:
+- keep: fixed visual work, already precise moment, or no meaningful improvement is possible.
+- refine: one short event-centered constraint safely narrows a broader event to the pictured sub-moment.
+- reject: the query is broad and the image provides no reliable meaningful sub-moment; only incidental, composition-based, uncertain, or entity-leaking refinements are possible.
+
+Tips:
+First, identify the main event described by the query. Then, using the selected image, judge whether the image shows only a single instant or a small fragment of that event. The key signal: ask whether the same event plausibly produced many other photographs that share only the topic with this one, yet differ in visual content, composition, and even the people or objects that appear. If such divergent photographs of the same event are likely to exist, the query is under-specified and you MUST refine it — add the smallest visually supported constraint that pins down the specific sub-moment shown, so that later searches converge on photographs whose groundable content stays essentially the same. If instead the event is inherently short and any photograph of it would show essentially the same content, people, and objects, the query is already precise enough and should be kept.
+
+Examples:
+- 'Zhang Yiming attending the opening ceremony of the Sixth World Internet Conference in Wuzhen, China, on October 20, 2019' may be refined to 'Zhang Yiming speaking on stage at the opening ceremony of the Sixth World Internet Conference in Wuzhen, China, on October 20, 2019' when the image clearly shows him addressing the audience from the stage.
+- 'Felix Baumgartner jumping from the Red Bull Stratos capsule on October 14, 2012' must be kept because it already identifies a short moment.
+- 'The Abbey Road album cover by the Beatles' must be kept because it identifies a fixed visual work.
+- Do not add a red bus to an Eiffel Tower query merely because one happens to appear in the selected photograph.
+
+Return exactly one JSON object with this structure:
+{
+  "decision": "keep | refine | reject",
+  "refined_query": "the original or minimally refined query",
+  "added_constraint": "the exact short constraint added, or an empty string",
+  "constraint_type": "action | interaction | event_phase | object_state | none",
+  "reason": "brief explanation",
+  "new_named_entities": [],
+  "removed_information": [],
+  "expected_uniqueness": "unique | semi-unique | no-unique"
+}
+"""
+
+
 PROMPT_IMAGE_GROUND = """You are analyzing an accepted image for multimodal graph construction.
 
 Task:
@@ -630,6 +687,9 @@ class ImageDiscoveryConfig:
     image_grounding_reader_base_url: str = "http://127.0.0.1:8004"
     image_grounding_reader_timeout_s: float = 40.0
     image_grounding_max_context_chars: int = 6000
+    enable_primary_query_refinement: bool = True
+    primary_query_refinement_model: str | None = None
+    primary_query_refinement_max_added_words: int = 12
     enable_image_entity_queue_verification: bool = True
     image_entity_queue_verify_prepare_model: str | None = None
     image_entity_queue_verify_judge_model: str | None = None
@@ -684,6 +744,7 @@ class ImageSearchCandidate:
     grounded_entities: list[dict[str, Any]] = field(default_factory=list)
     grounded_caption: str | None = None
     visual_facts: list[str] = field(default_factory=list)
+    query_refinement: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -697,6 +758,7 @@ class ImageSearchCandidate:
             "grounded_entities": _jsonify(self.grounded_entities),
             "grounded_caption": self.grounded_caption,
             "visual_facts": list(self.visual_facts),
+            "query_refinement": _jsonify(self.query_refinement),
         }
 
 
@@ -1565,6 +1627,167 @@ class ImageDiscoveryBuilder:
         primary.is_primary = True
         return primary
 
+    @staticmethod
+    def _query_word_count(text: str | None) -> int:
+        return len(re.findall(r"\b[\w'-]+\b", str(text or ""), flags=re.UNICODE))
+
+    @staticmethod
+    def _query_tokens_are_subsequence(original: str, refined: str) -> bool:
+        original_tokens = re.findall(r"[\w'-]+", original.lower(), flags=re.UNICODE)
+        refined_tokens = re.findall(r"[\w'-]+", refined.lower(), flags=re.UNICODE)
+        if not original_tokens:
+            return True
+        index = 0
+        for token in refined_tokens:
+            if token == original_tokens[index]:
+                index += 1
+                if index == len(original_tokens):
+                    return True
+        return False
+
+    @staticmethod
+    def _parse_primary_query_refinement(text: str) -> dict[str, Any] | None:
+        candidate = str(text or "").strip()
+        if candidate.startswith("```"):
+            candidate = re.sub(r"^```(?:json)?\s*", "", candidate, flags=re.IGNORECASE)
+            candidate = re.sub(r"\s*```$", "", candidate)
+        try:
+            parsed = json.loads(candidate)
+        except json.JSONDecodeError:
+            match = re.search(r"\{.*\}", candidate, flags=re.DOTALL)
+            if not match:
+                return None
+            try:
+                parsed = json.loads(match.group(0))
+            except json.JSONDecodeError:
+                return None
+        return parsed if isinstance(parsed, dict) else None
+
+    def _refine_primary_search_query(
+        self,
+        *,
+        plan: VisualSearchPlan,
+        candidate: ImageSearchCandidate,
+        resolved_asset: ResolvedImageAsset | None,
+        run_id: str | None,
+    ) -> dict[str, Any]:
+        original_query = str(
+            candidate.source_query.query
+            or plan.target.content
+            or candidate.search_result.title
+            or ""
+        ).strip()
+        base: dict[str, Any] = {
+            "applied": False,
+            "accepted": False,
+            "decision": "keep",
+            "original_query": original_query,
+            "refined_query": original_query,
+            "added_constraint": "",
+            "constraint_type": "none",
+            "reason": "",
+        }
+        if self._is_wiki_inline_plan(plan):
+            return {**base, "reason": "wiki_inline_image"}
+        if not self.config.enable_primary_query_refinement:
+            return {**base, "reason": "disabled"}
+        if not original_query:
+            return {**base, "decision": "reject", "reason": "missing_original_query"}
+        model_alias = (
+            self.config.primary_query_refinement_model
+            or os.environ.get("IMAGE_QUERY_REFINEMENT_MODEL")
+            or os.environ.get("IMAGE_CHECK_MODEL")
+        )
+        if not model_alias:
+            return {**base, "reason": "missing_model_alias"}
+        model_image_url = resolved_asset.model_url if resolved_asset is not None else candidate.search_result.image_url
+        if not model_image_url:
+            return {**base, "reason": "missing_primary_image"}
+        payload = {
+            "original_search_query": original_query,
+            "primary_image_title": candidate.search_result.title or "",
+            "primary_image_snippet": candidate.search_result.snippet or "",
+            "visual_target": plan.target.content or "",
+        }
+        try:
+            response = self.model_client.generate(
+                ModelRequest(
+                    model=model_alias,
+                    response_format={"type": "json_object"},
+                    messages=[
+                        ModelMessage(role="system", content=PROMPT_IMAGE_SEARCH_QUERY_REFINEMENT),
+                        ModelMessage(
+                            role="user",
+                            content=[
+                                {"type": "text", "text": json.dumps(payload, ensure_ascii=False)},
+                                {"type": "image_url", "image_url": {"url": model_image_url}},
+                            ],
+                        ),
+                    ],
+                    metadata={
+                        "trace_label": f"primary_query_refinement:{plan.plan_id}",
+                        "run_id": run_id,
+                    },
+                )
+            )
+        except Exception as exc:
+            return {**base, "reason": f"model_error:{exc.__class__.__name__}:{exc}", "model_alias": model_alias}
+        parsed = self._parse_primary_query_refinement(response.content)
+        if parsed is None:
+            return {
+                **base,
+                "reason": "invalid_json",
+                "model_alias": model_alias,
+                "raw_model_output": response.content,
+                "usage": response.usage,
+            }
+        decision = str(parsed.get("decision") or "").strip().lower()
+        refined_query = re.sub(r"\s+", " ", str(parsed.get("refined_query") or "")).strip()
+        added_constraint = re.sub(r"\s+", " ", str(parsed.get("added_constraint") or "")).strip()
+        constraint_type = str(parsed.get("constraint_type") or "none").strip().lower()
+        new_named_entities = parsed.get("new_named_entities") or []
+        removed_information = parsed.get("removed_information") or []
+        validation_errors: list[str] = []
+        if decision not in {"keep", "refine", "reject"}:
+            validation_errors.append("invalid_decision")
+        if "\n" in refined_query or ";" in refined_query:
+            validation_errors.append("query_not_single_compact_phrase")
+        if decision == "keep":
+            if refined_query != original_query or added_constraint:
+                validation_errors.append("keep_must_preserve_query")
+        elif decision == "refine":
+            if not refined_query or refined_query == original_query:
+                validation_errors.append("refine_must_change_query")
+            if not added_constraint:
+                validation_errors.append("missing_added_constraint")
+            added_words = max(0, self._query_word_count(refined_query) - self._query_word_count(original_query))
+            if added_words > int(self.config.primary_query_refinement_max_added_words):
+                validation_errors.append("too_many_added_words")
+        if not isinstance(new_named_entities, list) or new_named_entities:
+            validation_errors.append("new_named_entities_not_empty")
+        if not isinstance(removed_information, list) or removed_information:
+            validation_errors.append("removed_information_not_empty")
+        accepted = decision == "refine" and not validation_errors
+        effective_query = refined_query if accepted else original_query
+        return {
+            **base,
+            "applied": True,
+            "accepted": accepted,
+            "decision": decision if decision in {"keep", "refine", "reject"} else "keep",
+            "refined_query": effective_query,
+            "proposed_refined_query": refined_query,
+            "added_constraint": added_constraint if accepted else "",
+            "constraint_type": constraint_type if accepted else "none",
+            "reason": str(parsed.get("reason") or "").strip(),
+            "expected_uniqueness": str(parsed.get("expected_uniqueness") or "").strip(),
+            "new_named_entities": new_named_entities if isinstance(new_named_entities, list) else [],
+            "removed_information": removed_information if isinstance(removed_information, list) else [],
+            "validation_errors": validation_errors,
+            "model_alias": model_alias,
+            "usage": response.usage,
+            "raw_model_output": response.content,
+        }
+
     def _materialize_primary_candidate(
         self,
         *,
@@ -1591,10 +1814,36 @@ class ImageDiscoveryBuilder:
                     resolved_asset,
                     persist_asset=persist,
                 )
+        query_refinement = self._refine_primary_search_query(
+            plan=plan,
+            candidate=candidate,
+            resolved_asset=resolved_asset,
+            run_id=run_id,
+        )
+        candidate.query_refinement = dict(query_refinement)
+        candidate.validation.metadata = dict(candidate.validation.metadata or {})
+        candidate.validation.metadata["primary_query_refinement"] = dict(query_refinement)
+        result.metadata = dict(result.metadata or {})
+        result.metadata["primary_query_refinement"] = dict(query_refinement)
+        if query_refinement.get("applied") and query_refinement.get("decision") == "reject":
+            candidate.validation.status = ImageCandidateStatus.REJECTED
+            candidate.validation.reason = "primary_query_refinement_rejected"
+            candidate.is_primary = False
+            return
+        primary_query = str(query_refinement.get("refined_query") or candidate.source_query.query or plan.target.content or candidate.search_result.title or "").strip()
+
         provisional_node = self._image_node_from_result(
             candidate.search_result,
             run_id=run_id,
             resolved_asset=resolved_asset,
+        )
+        provisional_node.metadata = dict(provisional_node.metadata or {})
+        provisional_node.metadata.update(
+            {
+                "search_query": primary_query,
+                "original_search_query": str(query_refinement.get("original_query") or candidate.source_query.query or ""),
+                "primary_query_refinement": dict(query_refinement),
+            }
         )
         grounding = self.image_ground(
             plan=plan,
@@ -1603,6 +1852,7 @@ class ImageDiscoveryBuilder:
             validation=candidate.validation,
             run_id=run_id,
             persist_asset=persist,
+            search_query=primary_query,
         )
         candidate.grounded_entities = list(grounding.get("grounded_entities", []))
         candidate.grounded_caption = grounding.get("caption")
@@ -1617,12 +1867,6 @@ class ImageDiscoveryBuilder:
         ]
         source_node_title = self._source_node_title(plan.source_node_id) or plan.target.content
         primary_caption = candidate.grounded_caption or provisional_node.caption or candidate.search_result.snippet
-        primary_query = (
-            candidate.source_query.query
-            or plan.target.content
-            or candidate.search_result.title
-            or ""
-        )
         primary_image_uri = (
             resolved_asset.asset_uri
             if resolved_asset is not None
@@ -1641,6 +1885,8 @@ class ImageDiscoveryBuilder:
             run_id=run_id,
             metadata={
                 "search_query": primary_query,
+                "original_search_query": str(query_refinement.get("original_query") or candidate.source_query.query or ""),
+                "primary_query_refinement": dict(query_refinement),
                 "candidate_count": len(result.candidates),
                 "visual_target": plan.target.content,
                 "resolved_image": resolved_asset.to_metadata() if resolved_asset is not None else None,
@@ -1673,6 +1919,14 @@ class ImageDiscoveryBuilder:
             image_node=image_node,
             resolved_asset=resolved_asset,
         )
+        relation_rewrite_metadata = dict(relation_rewrite_metadata or {})
+        relation_rewrite_metadata.update(
+            {
+                "original_search_query": str(query_refinement.get("original_query") or candidate.source_query.query or ""),
+                "refined_search_query": primary_query,
+                "query_refinement_applied": bool(query_refinement.get("accepted")),
+            }
+        )
 
         original_asset = self._image_asset(
             candidate.search_result,
@@ -1695,6 +1949,8 @@ class ImageDiscoveryBuilder:
             metadata={
                 "query_id": candidate.source_query.query_id,
                 "query": candidate.source_query.query,
+                "refined_query": primary_query,
+                "query_refinement_applied": bool(query_refinement.get("accepted")),
                 "rank": candidate.search_result.rank,
                 "engine": candidate.source_snapshot.engine.value,
                 "snapshot_id": candidate.source_snapshot.snapshot_id,
@@ -1717,6 +1973,9 @@ class ImageDiscoveryBuilder:
                 "thumbnail_url": candidate.search_result.thumbnail_url,
                 "snapshot_id": candidate.source_snapshot.snapshot_id,
                 "query_id": candidate.source_query.query_id,
+                "query": candidate.source_query.query,
+                "refined_query": primary_query,
+                "query_refinement_applied": bool(query_refinement.get("accepted")),
                 "target_evidence_id": plan.target.evidence_id,
                 "validation": candidate.validation.to_dict(),
                 "primary_candidate_id": candidate.candidate_id,
@@ -1744,7 +2003,7 @@ class ImageDiscoveryBuilder:
             image_evidence=image_evidence,
             run_id=run_id,
             source_node_title=source_node_title,
-            source_query_text=candidate.source_query.query,
+            source_query_text=primary_query,
         )
 
         keep_materialized_result, post_grounding_filter = self._apply_visual_plan_post_grounding_filter(
@@ -1805,6 +2064,8 @@ class ImageDiscoveryBuilder:
             is_primary=is_primary,
             metadata={
                 "query": candidate.source_query.query,
+                "refined_query": (candidate.query_refinement or {}).get("refined_query") or candidate.source_query.query,
+                "query_refinement": dict(candidate.query_refinement or {}),
                 "snapshot_id": candidate.source_snapshot.snapshot_id,
                 "visual_facts": list(candidate.visual_facts),
                 "resolved_image": (candidate.validation.metadata or {}).get("resolved_image"),
@@ -1820,6 +2081,7 @@ class ImageDiscoveryBuilder:
         validation: ImageValidationResult,
         run_id: str | None,
         persist_asset: bool = True,
+        search_query: str | None = None,
     ) -> dict[str, Any]:
         """Analyze an accepted image and ground unique visible entities."""
 
@@ -1871,7 +2133,7 @@ class ImageDiscoveryBuilder:
             image_node.metadata = dict(image_node.metadata or {})
             image_node.metadata["resolved_image"] = resolved_asset.to_metadata()
 
-        grounding_context = self._build_image_grounding_context(search_result)
+        grounding_context = self._build_image_grounding_context(search_result, search_query=search_query)
         image_node.metadata = dict(image_node.metadata or {})
         image_node.metadata["image_grounding_context"] = grounding_context.to_dict()
         image_node.metadata["image_grounding_prompt"] = {
@@ -1952,30 +2214,43 @@ class ImageDiscoveryBuilder:
         self._apply_grounding_to_image_node(image_node, grounding)
         return grounding
 
-    def _build_image_grounding_context(self, search_result: ImageSearchResult) -> ImageGroundingContext:
+    def _build_image_grounding_context(
+        self,
+        search_result: ImageSearchResult,
+        *,
+        search_query: str | None = None,
+    ) -> ImageGroundingContext:
         backend = (self.config.image_grounding_context_backend or "source_page_reader").strip().lower()
-        cache_key = f"{backend}::{search_result.source_page_url or ''}::{search_result.title or ''}"
+        cache_key = f"{backend}::{search_query or ''}::{search_result.source_page_url or ''}::{search_result.title or ''}"
         cached = self._grounding_context_cache.get(cache_key)
         if cached is not None:
             return cached
 
         if backend == "source_page_reader":
-            context = self._build_source_page_reader_grounding_context(search_result)
+            context = self._build_source_page_reader_grounding_context(search_result, search_query=search_query)
         elif backend == "title_only":
-            context = self._build_title_only_grounding_context(search_result)
+            context = self._build_title_only_grounding_context(search_result, search_query=search_query)
         else:
             context = self._build_title_only_grounding_context(
                 search_result,
+                search_query=search_query,
                 fallback_reason=f"unsupported_backend:{backend}",
             )
 
         self._grounding_context_cache[cache_key] = context
         return context
 
-    def _build_source_page_reader_grounding_context(self, search_result: ImageSearchResult) -> ImageGroundingContext:
+    def _build_source_page_reader_grounding_context(
+        self,
+        search_result: ImageSearchResult,
+        *,
+        search_query: str | None = None,
+    ) -> ImageGroundingContext:
         source_page_url = (search_result.source_page_url or "").strip()
         if not source_page_url:
-            return self._build_title_only_grounding_context(search_result, fallback_reason="missing_source_page_url")
+            return self._build_title_only_grounding_context(
+                search_result, search_query=search_query, fallback_reason="missing_source_page_url"
+            )
 
         page_title = ""
         page_content = ""
@@ -1991,6 +2266,7 @@ class ImageDiscoveryBuilder:
         return ImageGroundingContext(
             provider="source_page_reader",
             prompt_text=self._format_image_grounding_prompt_text(
+                search_query=search_query,
                 image_title=search_result.title,
                 image_snippet=search_result.snippet,
                 source_page_title=page_title,
@@ -2010,6 +2286,7 @@ class ImageDiscoveryBuilder:
         self,
         search_result: ImageSearchResult,
         *,
+        search_query: str | None = None,
         fallback_reason: str | None = None,
     ) -> ImageGroundingContext:
         title = (search_result.title or "").strip()
@@ -2017,6 +2294,7 @@ class ImageDiscoveryBuilder:
         return ImageGroundingContext(
             provider="title_only",
             prompt_text=self._format_image_grounding_prompt_text(
+                search_query=search_query,
                 image_title=title,
                 image_snippet=snippet,
                 source_page_title="",
@@ -2032,6 +2310,7 @@ class ImageDiscoveryBuilder:
     @staticmethod
     def _format_image_grounding_prompt_text(
         *,
+        search_query: str | None,
         image_title: str | None,
         image_snippet: str | None,
         source_page_title: str | None,
@@ -2040,7 +2319,9 @@ class ImageDiscoveryBuilder:
         return (
             "Use the text fields below only to help identify entities that are actually visible in the image.\n"
             "If the text mentions entities not shown in the image, do not output them.\n"
-            "For every output entity, ensure the entity name is unambiguous and can be used directly to look up the correct Wikipedia page.\n\n"
+            "For every output entity, ensure the entity name is unambiguous and can be used directly to look up the correct Wikipedia page.\n"
+            "The visual search query is context for disambiguation only; do not treat an entity as visible merely because the query names it.\n\n"
+            f"Visual Search Query: {(search_query or '').strip()}\n"
             f"Image Title: {(image_title or '').strip()}\n"
             f"Image Snippet: {(image_snippet or '').strip()}\n"
             f"Source Page Title: {(source_page_title or '').strip()}\n"
