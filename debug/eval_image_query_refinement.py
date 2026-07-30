@@ -11,10 +11,10 @@ Examples:
       --model multimodal_process --list-cases
 
     python debug/eval_image_query_refinement.py \
-      --model multimodal_process --case broad_ceremony_speech --pretty
+      --model multimodal_process --case broad_ceremony_speech
 
     python debug/eval_image_query_refinement.py \
-      --model multimodal_process --all --pretty
+      --model multimodal_process --all
 """
 
 from __future__ import annotations
@@ -23,7 +23,6 @@ import argparse
 import json
 import os
 import sys
-from collections import Counter
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -264,7 +263,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--case", action="append", default=[], help="Case ID to run; may be repeated.")
     parser.add_argument("--all", action="store_true", help="Run every built-in case.")
     parser.add_argument("--list-cases", action="store_true", help="List case IDs and exit.")
-    parser.add_argument("--pretty", action="store_true", help="Pretty-print JSON output.")
     return parser.parse_args()
 
 
@@ -283,27 +281,24 @@ def main() -> int:
     outputs = []
     for index, case_id in enumerate(selected_ids, start=1):
         case = by_id[case_id]
-        result = evaluate_case(case, model_alias=args.model)
-        outputs.append(result)
-        print(
-            f"[{index}/{len(selected_ids)}] {case_id} "
-            f"decision={result['result'].get('decision')} passed={result['passed']}",
-            file=sys.stderr,
-            flush=True,
-        )
+        evaluated = evaluate_case(case, model_alias=args.model)
+        outputs.append(evaluated)
+        result = evaluated["result"]
+        proposed_query = str(
+            result.get("proposed_refined_query")
+            or result.get("refined_query")
+            or case.original_query
+        ).strip()
+        reason = str(result.get("reason") or "<missing>").strip()
+        print(f"[{index}/{len(selected_ids)}] {case_id}")
+        print(f"改动前：{case.original_query}")
+        print(f"改动后：{proposed_query}")
+        print(f"模型理由：{reason}")
+        if index < len(selected_ids):
+            print()
 
-    summary = {
-        "model_alias": args.model,
-        "case_count": len(outputs),
-        "passed": sum(bool(item["passed"]) for item in outputs),
-        "failed": sum(not bool(item["passed"]) for item in outputs),
-        "decision_distribution": dict(
-            Counter(str(item["result"].get("decision") or "missing") for item in outputs)
-        ),
-        "cases": outputs,
-    }
-    print(json.dumps(summary, ensure_ascii=False, indent=2 if args.pretty else None))
-    return 0 if summary["failed"] == 0 else 1
+    failed = sum(not bool(item["passed"]) for item in outputs)
+    return 0 if failed == 0 else 1
 
 
 if __name__ == "__main__":
