@@ -172,6 +172,78 @@ def _binding_counts(images: list[dict[str, Any]], plans: list[dict[str, Any]]) -
     }
 
 
+def _unique_state_stats(
+    images: list[dict[str, Any]],
+    edges: list[dict[str, Any]],
+    nodes_by_id: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    """Count image nodes and their image->text edges by unique_state."""
+
+    image_ids_by_state: dict[str, set[str]] = defaultdict(set)
+    for node in images:
+        node_id = str(node.get("node_id") or "").strip()
+        if not node_id:
+            continue
+        raw_state = node.get("unique_state")
+        state = str(raw_state).strip() if raw_state is not None else ""
+        image_ids_by_state[state or "missing"].add(node_id)
+
+    active_edges: Counter[str] = Counter()
+    inactive_edges: Counter[str] = Counter()
+    for edge in edges:
+        if edge.get("edge_type") != IMAGE_DEPICTS:
+            continue
+        src_node_id = str(edge.get("src_node_id") or "").strip()
+        dst_node_id = str(edge.get("dst_node_id") or "").strip()
+        src_node = nodes_by_id.get(src_node_id)
+        dst_node = nodes_by_id.get(dst_node_id)
+        if not src_node or src_node.get("node_type") != "image":
+            continue
+        if not dst_node or dst_node.get("node_type") != "text":
+            continue
+        raw_state = src_node.get("unique_state")
+        state = str(raw_state).strip() if raw_state is not None else ""
+        state = state or "missing"
+        if str(edge.get("status") or "active").strip().lower() == "active":
+            active_edges[state] += 1
+        else:
+            inactive_edges[state] += 1
+
+    preferred_order = ("unique", "semi-unique", "no-unique", "wiki_inline", "missing")
+    states = list(preferred_order)
+    states.extend(
+        sorted(
+            (set(image_ids_by_state) | set(active_edges) | set(inactive_edges)) - set(preferred_order)
+        )
+    )
+    by_state: dict[str, dict[str, int]] = {}
+    for state in states:
+        image_node_count = len(image_ids_by_state.get(state, set()))
+        active_count = active_edges[state]
+        inactive_count = inactive_edges[state]
+        by_state[state] = {
+            "image_node_count": image_node_count,
+            "active_image_to_text_edge_count": active_count,
+            "inactive_image_to_text_edge_count": inactive_count,
+            "all_status_image_to_text_edge_count": active_count + inactive_count,
+        }
+
+    return {
+        "definition": (
+            "Counts image nodes by top-level unique_state and sums persisted image_depicts "
+            "edges whose source is that image node and whose destination is a text node. "
+            "The 'missing' bucket contains image nodes without a non-empty unique_state."
+        ),
+        "by_unique_state": by_state,
+        "totals": {
+            "image_node_count": sum(len(ids) for ids in image_ids_by_state.values()),
+            "active_image_to_text_edge_count": sum(active_edges.values()),
+            "inactive_image_to_text_edge_count": sum(inactive_edges.values()),
+            "all_status_image_to_text_edge_count": sum(active_edges.values()) + sum(inactive_edges.values()),
+        },
+    }
+
+
 def _image_node_stats(
     images: list[dict[str, Any]],
     edges: list[dict[str, Any]],
@@ -379,6 +451,7 @@ def build_report(
             },
         },
         "candidate_image_summary_from_runner_state": _image_summary(state),
+        "unique_state_summary": _unique_state_stats(images, edges, nodes_by_id),
         "persisted_image_node_state": _image_node_stats(images, edges, nodes_by_id, state),
         "plan_to_image_binding_diagnostics": _binding_counts(images, plans),
         "filter_stage_observability": {
