@@ -95,6 +95,15 @@ def parse_args() -> argparse.Namespace:
         help="Path to synthesis env file.",
     )
     parser.add_argument(
+        "--ground-model",
+        type=str,
+        default="",
+        help=(
+            "Optional IMAGE_GROUND_MODEL override for this rerun. Especially useful "
+            "with --graph-node; it does not modify the graph or env file."
+        ),
+    )
+    parser.add_argument(
         "--reader-base-url",
         type=str,
         default="http://127.0.0.1:8004",
@@ -357,6 +366,11 @@ def _emit_output(payload: dict[str, Any], *, pretty: bool) -> int:
 def main() -> int:
     args = parse_args()
     load_env_file(Path(args.env_file))
+    ground_model = str(args.ground_model or "").strip()
+    if ground_model:
+        # image_ground() reads this environment variable at call time. This
+        # process-local override leaves the persisted graph and .env unchanged.
+        os.environ["IMAGE_GROUND_MODEL"] = ground_model
     graph_debug = _hydrate_args_from_graph_node(args) if args.graph_node else None
 
     builder = ImageDiscoveryBuilder(
@@ -458,6 +472,7 @@ def main() -> int:
         "grounding": {
             "check": grounding.get("check"),
             "model_alias": grounding.get("model_alias"),
+            "requested_ground_model": ground_model or os.environ.get("IMAGE_GROUND_MODEL") or None,
             "caption": grounding.get("caption"),
             "analysis": _grounding_analysis(grounding.get("raw_model_output")),
             "grounded_entity_count": len(grounded_entities),
