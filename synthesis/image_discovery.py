@@ -207,6 +207,7 @@ Decision rules:
 - refine: one short event-centered constraint safely narrows a broader event to the pictured sub-moment.
 
 Tips:
+
 First, identify the main event described by the query. Then, using the selected image, judge whether the image shows only a single instant or a small fragment of that event. The key signal: ask whether the same event plausibly produced many other photographs that share only the topic with this one, yet differ in visual content, composition, and even the people or objects that appear. If such divergent photographs of the same event are likely to exist, the query is under-specified and you MUST refine it — add the smallest visually supported constraint that pins down the specific sub-moment shown, so that later searches converge on photographs whose groundable content stays essentially the same. If instead the event is inherently short and any photograph of it would show essentially the same content, people, and objects, the query is already precise enough and should be kept.
 
 Examples:
@@ -232,7 +233,6 @@ Return exactly one JSON object with this structure:
   "reason": "brief explanation"
 }
 """
-
 
 PROMPT_IMAGE_GROUND = """You are analyzing an accepted image for multimodal graph construction.
 
