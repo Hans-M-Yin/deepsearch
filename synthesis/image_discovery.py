@@ -242,12 +242,49 @@ Output guidance:
 NOTICE:If there are more than 5 entities, keep only the 5 clearest, most salient, and most certain entities, and ignore the rest.
 
 Examples:
-- For a 2025 G20 summit group photo:
-  `entity: Emmanuel Macron | front-row center person in the group | visible as the suited male figure standing in the middle of the front row`
-- For the Queen II album cover:
-  `entity: Roger Taylor | face at the far right of the four-person lineup | visible as the rightmost face in the four-person arrangement`
-- For a John Wick 4 poster:
-  `entity: Eiffel Tower | landmark behind the man in the black suit | visible rising behind the standing man in the black suit`
+# G20 summit group photo
+# Teaches: for a large lineup, anchor to stable group structure (row + position), never to the image frame.
+<ground>
+caption: World leaders pose together for the official group photo at the G20 summit.
+entity: Emmanuel Macron | front-row center person in the group | visible as the suited male figure standing in the middle of the front row
+</ground>
+
+# John Wick 4 poster
+# Teaches: on a poster, ground a landmark via its relation to another visible subject, not via frame coordinates.
+<ground>
+caption: Theatrical poster showing a man in a black suit with a European skyline behind him.
+entity: Eiffel Tower | landmark behind the man in the black suit | visible rising behind the standing man in the black suit
+</ground>
+
+# Trump 2017 inauguration — oath-taking photo
+# Teaches: identity is fixed by the EVENT, not by facial visibility in the image; a back-turned or non-salient person is still groundable via scene role; when several unique people compete for the 5 slots, keep the most event-central and most certain (not the most eye-catching); omit an entity the image cannot resolve to ONE identity.
+<analysis>
+Donald Trump, Melania Trump, and John Roberts are supported by the swearing-in scene itself: one figure raises his right hand to take the oath, a woman holds the Bibles for him, and a robed official faces him to administer it. Their identities are locked by the event (the 2017 U.S. presidential inauguration), so John Roberts is retained even though he is seen from behind and his face is not visible — the locator is the officiant role, not his appearance. Paul Ryan and Mitch McConnell are retained via their standing position relative to the oath-taker. The two Bibles being held are NOT grounded: the image cannot visually determine which specific Bible each one is, so no unique entity can be fixed. Selection favors event-central, high-certainty entities over merely salient ones.
+</analysis>
+<ground>
+caption: A man takes the presidential oath with his right hand raised while a woman in a light blue coat holds two Bibles, a robed official facing him and his family standing behind.
+entity: Donald Trump | man taking the oath with his right hand raised | visible as the figure making the swearing-in gesture opposite the officiant
+entity: Melania Trump | woman holding the Bibles for the man being sworn in | visible as the woman in the light blue coat presenting the Bibles during the oath
+entity: John Roberts | robed official administering the oath, standing opposite the man with his raised hand | visible as the black-robed figure in the officiant position facing the oath-taker
+entity: Paul Ryan | suited man standing directly behind the oath-taker's raised hand | visible as the man positioned immediately behind the figure taking the oath
+entity: Mitch McConnell | older bespectacled man in the row of officials behind the oath-taker | visible standing among the officials behind the family group
+</ground>
+# Note: the two Bibles are deliberately omitted — the image does not provide enough visual evidence to fix which specific Bible each is, so no unique entity can be grounded.
+
+# A visible mark grounds ONLY the entity it names — do not hop to a related entity
+# Teaches: a crest visually grounds its club; the league is a knowledge hop and must be omitted.
+<ground>
+caption: Close-up of a footballer's shirt showing the club crest.
+entity: FC Barcelona | crest on the left chest of the jersey | visible as the club badge on the shirt
+</ground>
+# Note: do NOT ground "La Liga" (the league the club plays in) — it is a knowledge hop, not visually grounded, so it is omitted.
+
+# Background IS allowed when anchored to a scene-fixed object (not a frame region)
+# Teaches: "behind / in the background" is fine as long as the anchor is a stable object in the scene, not the image frame.
+<ground>
+caption: Players celebrate on the pitch after a Champions League final.
+entity: UEFA Champions League | emblem on the ceremonial carpet covering the center circle | visible as the starball logo printed on the pitch-center carpet
+</ground>
 
 Before the final grounding block, output one brief analysis block. For each
 entity you plan to ground, explain why the entity is visually supported by the

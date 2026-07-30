@@ -104,6 +104,81 @@ class _Graph:
         return node.get("node_type") if node else None
 
 
+class _TraversalGraph:
+    def __init__(self, unique_state: str | None) -> None:
+        image = {"node_id": "image", "node_type": "image"}
+        if unique_state is not None:
+            image["unique_state"] = unique_state
+        self.nodes = {
+            "source": {"node_id": "source", "node_type": "text"},
+            "image": image,
+            "target": {"node_id": "target", "node_type": "text"},
+            "page": {"node_id": "page", "node_type": "text"},
+        }
+        self.out_edges = {
+            "image": [
+                {
+                    "edge_id": "depicts",
+                    "edge_type": "image_depicts",
+                    "src_node_id": "image",
+                    "dst_node_id": "target",
+                    "metadata": {},
+                },
+                {
+                    "edge_id": "source_page",
+                    "edge_type": "image_source_page",
+                    "src_node_id": "image",
+                    "dst_node_id": "page",
+                    "metadata": {},
+                },
+            ]
+        }
+
+    def get_node(self, node_id: str):
+        return self.nodes.get(node_id)
+
+    def node_type(self, node_id: str):
+        node = self.get_node(node_id)
+        return node.get("node_type") if node else None
+
+    def neighbors(self, node_id: str):
+        return list(self.out_edges.get(node_id, []))
+
+
+class ImageUniqueStateTraversalTests(unittest.TestCase):
+    @staticmethod
+    def sampler(unique_state: str | None) -> RandomPathSampler:
+        return RandomPathSampler(
+            graph=_TraversalGraph(unique_state),
+            config=SamplerConfiguration(),
+        )
+
+    def test_non_unique_image_at_start_can_traverse_to_text(self) -> None:
+        for state in ("semi-unique", "no-unique", "wiki_inline", None):
+            with self.subTest(unique_state=state):
+                sampler = self.sampler(state)
+                edges = sampler._traversable_neighbors("image", node_ids=["image"])
+                self.assertEqual({edge["edge_id"] for edge in edges}, {"depicts", "source_page"})
+
+    def test_non_unique_intermediate_image_cannot_use_image_depicts_edge(self) -> None:
+        for state in ("semi-unique", "no-unique", "wiki_inline", None):
+            with self.subTest(unique_state=state):
+                sampler = self.sampler(state)
+                edges = sampler._traversable_neighbors("image", node_ids=["source", "image"])
+                self.assertEqual(edges, [])
+
+    def test_unique_intermediate_image_can_traverse_to_text(self) -> None:
+        sampler = self.sampler("unique")
+        edges = sampler._traversable_neighbors("image", node_ids=["source", "image"])
+        self.assertEqual({edge["edge_id"] for edge in edges}, {"depicts", "source_page"})
+
+    def test_query_overlap_filter_still_applies_to_unique_intermediate_image(self) -> None:
+        sampler = self.sampler("unique")
+        sampler.graph.out_edges["image"][0]["metadata"] = {"query_overlap_entity": True}
+        edges = sampler._traversable_neighbors("image", node_ids=["source", "image"])
+        self.assertEqual([edge["edge_id"] for edge in edges], ["source_page"])
+
+
 class _QueuedModelClient:
     def __init__(self, payload: dict) -> None:
         self.payload = payload

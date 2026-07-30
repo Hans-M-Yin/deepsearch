@@ -597,8 +597,26 @@ class RandomPathSampler(PathSampler):
         neighbors = self.graph.neighbors(node_id)
         if node_type == "text":
             return [edge for edge in neighbors if edge.get("edge_type") != "image_depicts"]
-        if node_type == "image" and len(node_ids) >= 2 and self.graph.node_type(node_ids[-2]) == "text":
-            return [
+        if node_type != "image":
+            return neighbors
+
+        # A non-unique image may be used as the path's visual entry point, and it
+        # may be selected as the final node because no further traversal is
+        # needed. It must not bridge an earlier node to a downstream text node.
+        # Missing/unknown states fail closed: graph runs should classify images
+        # before VQA sampling, and only the explicit ``unique`` state permits an
+        # intermediate image -> text transition.
+        image_node = self.graph.get_node(node_id) or {}
+        unique_state = str(image_node.get("unique_state") or "").strip().lower()
+        is_start_node = bool(node_ids) and node_ids[0] == node_id and len(node_ids) == 1
+        if not is_start_node and unique_state != "unique":
+            # Returning no outgoing edge makes this image terminal in a sampled
+            # trajectory. If it was selected on the final hop, this method is
+            # never called again and the image remains a valid path endpoint.
+            return []
+
+        if len(node_ids) >= 2 and self.graph.node_type(node_ids[-2]) == "text":
+            neighbors = [
                 edge
                 for edge in neighbors
                 if not (
