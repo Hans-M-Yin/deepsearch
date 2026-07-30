@@ -1863,6 +1863,7 @@ class ImageDiscoveryBuilder:
             source_page_url=candidate.search_result.source_page_url,
             caption=primary_caption,
             title=primary_query or candidate.search_result.title,
+            raw_search_query=str(query_refinement.get("original_query") or candidate.source_query.query or ""),
             width=resolved_asset.width if resolved_asset is not None and resolved_asset.width is not None else candidate.search_result.width,
             height=resolved_asset.height if resolved_asset is not None and resolved_asset.height is not None else candidate.search_result.height,
             content_type=resolved_asset.content_type if resolved_asset is not None else self._content_type(candidate.search_result),

@@ -14,6 +14,7 @@ from synthesis.image_discovery import (
     ImageValidationResult,
     ResolvedImageAsset,
 )
+from synthesis.nodes import ImageNode, ImageVariant
 from synthesis.model_worker import ModelResponse
 from synthesis.search_client import ImageSearchResult
 from synthesis.visual_planner import SearchQuerySpec, VisualSearchPlan
@@ -99,6 +100,22 @@ class QueryRefinementPromptTest(unittest.TestCase):
 
         self.assertIn("do not add details that merely repeat or paraphrase", PROMPT_IMAGE_SEARCH_QUERY_REFINEMENT)
         self.assertIn("do not add overly specific visual details", PROMPT_IMAGE_SEARCH_QUERY_REFINEMENT)
+
+
+class ImageNodeRawSearchQueryTest(unittest.TestCase):
+    def test_bundle_serializes_raw_search_query_as_top_level_field(self) -> None:
+        node = ImageNode.from_bundle(
+            "https://example.com/image.jpg",
+            primary_image_id="variant_1",
+            image_variants=[ImageVariant(variant_id="variant_1", image_url="https://example.com/image.jpg")],
+            title="Refined query",
+            raw_search_query="Original query",
+            metadata={"search_query": "Refined query"},
+        )
+
+        record = node.to_dict()
+        self.assertEqual(record["raw_search_query"], "Original query")
+        self.assertEqual(record["metadata"]["search_query"], "Refined query")
 
 
 class PrimaryQueryRefinementTest(unittest.TestCase):

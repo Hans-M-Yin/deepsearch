@@ -217,6 +217,7 @@ class ImageNode(Node):
     oss_uri: str | None = None
     thumb_oss_uri: str | None = None
     caption: str | None = None
+    raw_search_query: str | None = None
     width: int | None = None
     height: int | None = None
     content_type: str | None = None
@@ -235,6 +236,7 @@ class ImageNode(Node):
         source_page_url: str | None = None,
         caption: str | None = None,
         title: str | None = None,
+        raw_search_query: str | None = None,
         run_id: str | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> "ImageNode":
@@ -245,6 +247,7 @@ class ImageNode(Node):
             image_url=image_url,
             source_page_url=source_page_url,
             caption=caption,
+            raw_search_query=raw_search_query,
             source=NodeSource(
                 source_type="image_search",
                 url=image_url,
@@ -264,6 +267,7 @@ class ImageNode(Node):
         source_page_url: str | None = None,
         caption: str | None = None,
         title: str | None = None,
+        raw_search_query: str | None = None,
         width: int | None = None,
         height: int | None = None,
         content_type: str | None = None,
@@ -279,6 +283,7 @@ class ImageNode(Node):
             image_url=primary_image_url,
             source_page_url=source_page_url,
             caption=caption,
+            raw_search_query=raw_search_query,
             width=width,
             height=height,
             content_type=content_type,
