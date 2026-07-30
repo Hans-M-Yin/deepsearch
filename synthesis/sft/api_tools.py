@@ -1470,20 +1470,30 @@ def _print_manual_react_round_io(
         print(assistant_text)
 
 
-def _message_content_to_responses_content(content: Any) -> list[dict[str, Any]]:
+def _message_content_to_responses_content(
+    content: Any,
+    *,
+    role: str = "user",
+) -> list[dict[str, Any]]:
+    """Convert local message content to role-valid Responses API content.
+
+    The Responses API accepts ``input_text`` for user/developer input, but
+    assistant history must be replayed as ``output_text``. This matters when a
+    backend cannot continue with ``previous_response_id`` and the agent falls
+    back to full conversation replay.
+    """
+    text_type = "output_text" if role == "assistant" else "input_text"
     if isinstance(content, str):
-        return [{"type": "input_text", "text": content}]
+        return [{"type": text_type, "text": content}]
     if isinstance(content, list):
         normalized_parts: list[dict[str, Any]] = []
         for part in content:
             if not isinstance(part, dict):
-                normalized_parts.append({"type": "input_text", "text": str(part)})
+                normalized_parts.append({"type": text_type, "text": str(part)})
                 continue
             part_type = part.get("type")
-            if part_type == "text":
-                normalized_parts.append({"type": "input_text", "text": str(part.get("text", ""))})
-            elif part_type == "input_text":
-                normalized_parts.append({"type": "input_text", "text": str(part.get("text", ""))})
+            if part_type in {"text", "input_text", "output_text"}:
+                normalized_parts.append({"type": text_type, "text": str(part.get("text", ""))})
             elif part_type == "image_url":
                 image_url = part.get("image_url")
                 if isinstance(image_url, dict):
@@ -1502,8 +1512,8 @@ def _message_content_to_responses_content(content: Any) -> list[dict[str, Any]]:
                 normalized_parts.append(dict(part))
         return normalized_parts
     if content is None:
-        return [{"type": "input_text", "text": ""}]
-    return [{"type": "input_text", "text": str(content)}]
+        return [{"type": text_type, "text": ""}]
+    return [{"type": text_type, "text": str(content)}]
 
 
 def _messages_to_responses_input(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1516,7 +1526,9 @@ def _messages_to_responses_input(messages: list[dict[str, Any]]) -> list[dict[st
             # #### START Response 0720 ####
             {
                 "role": role,
-                "content": _message_content_to_responses_content(message.get("content")),
+                "content": _message_content_to_responses_content(
+                    message.get("content"), role=role
+                ),
             }
             | ({"phase": message.get("phase")} if role == "assistant" and message.get("phase") else {})
             # #### END Response 0720 ####
@@ -1537,7 +1549,7 @@ def _conversation_messages_to_responses_input(messages: list[dict[str, Any]]) ->
                     # #### START Response 0720 ####
                     input_item = {
                             "role": role,
-                            "content": _message_content_to_responses_content(content),
+                            "content": _message_content_to_responses_content(content, role=role),
                         }
                     if role == "assistant" and message.get("phase"):
                         input_item["phase"] = message.get("phase")

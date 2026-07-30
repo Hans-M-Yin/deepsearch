@@ -327,6 +327,7 @@ Requirements:
 1. Use only the information provided to you about the object.
 2. The question must have a clear, unambiguous answer supported by evidence.
 3. The factual information you select must not be revealed in the question, and the question must not tell students that any material exists.
+4. If the content of your question contains highly distinctive markers that could reveal the target entity, you should make the question more ambiguous. For example, in the question “When was a certain politician’s slogan ‘Make America Great Again’ introduced?”, the highly distinctive slogan should be blurred. It can be rewritten as: “When was a certain politician’s own campaign slogan introduced?”
 
 Output format: JSON, containing the following fields:
 
