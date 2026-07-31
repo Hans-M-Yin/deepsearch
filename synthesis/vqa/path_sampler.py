@@ -359,7 +359,6 @@ class RandomPathSampler(PathSampler):
     model: str | None = None
     history_exposure_model_client: ModelWorkerClient | None = None
     history_exposure_model: str | None = None
-    llm_temperature: float = 0.0
     llm_max_tokens: int = 800
     edge_quality_cache: dict[str, dict[str, Any]] = field(default_factory=dict)
     _rng: random.Random = field(init=False, repr=False)
@@ -734,7 +733,6 @@ class RandomPathSampler(PathSampler):
                 trace_label="sampler_edge_quality",
                 model_client=model_client,
                 model=model_alias,
-                temperature=0.0,
             )
         except Exception as exc:
             if os.environ.get("VQA_EDGE_QUALITY_DEBUG", "1") != "0":
@@ -1180,7 +1178,6 @@ class RandomPathSampler(PathSampler):
                 trace_label="sampler_history_exposure",
                 model_client=model_client,
                 model=model_alias,
-                temperature=0.0,
             )
         except Exception as exc:
             return {
@@ -1454,7 +1451,6 @@ class RandomPathSampler(PathSampler):
         trace_label: str,
         model_client: ModelWorkerClient | None = None,
         model: str | None = None,
-        temperature: float | None = None,
     ) -> dict[str, Any]:
         request_client = model_client or self.model_client
         request_model = model or self.model
@@ -1465,7 +1461,6 @@ class RandomPathSampler(PathSampler):
         response = request_client.generate(
             ModelRequest(
                 model=request_model,
-                temperature=self.llm_temperature if temperature is None else temperature,
                 max_tokens=self.llm_max_tokens,
                 response_format={"type": "json_object"},
                 messages=[

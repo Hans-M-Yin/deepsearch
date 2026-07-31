@@ -505,7 +505,6 @@ class VqaBatchRunner:
             model=template.model,
             history_exposure_model_client=template.history_exposure_model_client,
             history_exposure_model=template.history_exposure_model,
-            llm_temperature=template.llm_temperature,
             llm_max_tokens=template.llm_max_tokens,
         )
         sampler.load_state(sampler_state, replace=True)
