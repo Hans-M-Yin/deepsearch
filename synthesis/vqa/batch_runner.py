@@ -11,6 +11,11 @@ import time
 import traceback
 from typing import Any
 
+try:
+    from tqdm.auto import tqdm
+except ImportError:  # pragma: no cover - optional progress dependency
+    tqdm = None
+
 from .path_sampler import RandomPathSampler, SamplerConfiguration
 from .pipeline import VqaGenerationError, VqaGenerationPipeline
 from .schemas import PathCandidate, VqaSample
@@ -156,6 +161,15 @@ class VqaBatchRunner:
             sampled_paths=0,
         )
         started_at = time.perf_counter()
+        progress = None
+        if remaining and tqdm is not None:
+            progress = tqdm(
+                total=limit,
+                initial=len(existing),
+                desc="VQA samples",
+                unit="sample",
+                dynamic_ncols=True,
+            )
         if not remaining:
             summary.elapsed_seconds = time.perf_counter() - started_at
             self._write_summary(summary)
@@ -258,6 +272,9 @@ class VqaBatchRunner:
                             warnings_file=warnings_file,
                             persisted_signatures=persisted_signatures,
                             persisted_edge_usage_counts=persisted_edge_usage_counts,
+                            progress=progress,
+                            started_at=started_at,
+                            target_total=limit,
                         )
                         continue
 
@@ -305,6 +322,8 @@ class VqaBatchRunner:
                 fill_sampler_futures()
                 self._write_summary(summary, elapsed=time.perf_counter() - started_at)
 
+        if progress is not None:
+            progress.close()
         summary.elapsed_seconds = time.perf_counter() - started_at
         self._write_summary(summary)
         self._write_sampler_state(
@@ -338,6 +357,9 @@ class VqaBatchRunner:
         warnings_file,
         persisted_signatures: set[str],
         persisted_edge_usage_counts: dict[str, int],
+        progress: Any | None = None,
+        started_at: float | None = None,
+        target_total: int | None = None,
     ) -> None:
         try:
             sample = future.result()
@@ -385,6 +407,25 @@ class VqaBatchRunner:
             used_exact_signatures=persisted_signatures,
             edge_usage_counts=persisted_edge_usage_counts,
         )
+        elapsed_s = time.perf_counter() - started_at if started_at is not None else 0.0
+        generated_total = summary.existing_samples + summary.completed
+        remaining_total = max(0, (target_total or generated_total) - generated_total)
+        if progress is not None:
+            progress.update(1)
+            progress.set_postfix(
+                generated=generated_total,
+                remaining=remaining_total,
+                elapsed=f"{elapsed_s:.1f}s",
+                verified=summary.verified,
+                rejected=summary.rejected,
+            )
+        else:
+            print(
+                "[vqa-progress] "
+                f"generated={generated_total} remaining={remaining_total} "
+                f"elapsed_s={elapsed_s:.1f} verified={summary.verified} rejected={summary.rejected}",
+                flush=True,
+            )
         self._print_sample_timing(sample)
 
         for warning in sample.metadata.get("writer_warnings") or []:
