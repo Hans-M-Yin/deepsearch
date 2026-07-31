@@ -13,22 +13,23 @@ from synthesis.sft.api_tools import ToolRuntimeContext
 class UrlResourceFallbackTests(unittest.TestCase):
     def test_search_result_registers_all_resource_urls(self) -> None:
         context = ToolRuntimeContext(working_dir=tempfile.mkdtemp())
-        context.register_search_output(
-            "t2i_search",
-            {
-                "ok": True,
-                "query": "example image",
-                "results": [
-                    {
-                        "title": "Example",
-                        "image_url": "https://cdn.example.com/original.jpg",
-                        "thumbnail_url": "https://thumb.example.com/thumb.jpg",
-                        "source_page_url": "https://example.com/page",
-                        "rank": 1,
-                    }
-                ],
-            },
-        )
+        with mock.patch("synthesis.sft.tools.extract_url_semantic_keywords", return_value=""):
+            context.register_search_output(
+                "t2i_search",
+                {
+                    "ok": True,
+                    "query": "example image",
+                    "results": [
+                        {
+                            "title": "Example",
+                            "image_url": "https://cdn.example.com/original.jpg",
+                            "thumbnail_url": "https://thumb.example.com/thumb.jpg",
+                            "source_page_url": "https://example.com/page",
+                            "rank": 1,
+                        }
+                    ],
+                },
+            )
 
         resource = context.resolve_url_resource("https://cdn.example.com/original.jpg")
         self.assertIsNotNone(resource)

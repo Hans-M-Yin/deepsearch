@@ -313,9 +313,9 @@ def _format_read_url_tool_response(
 
     image_store.save(source, preferred_stem="read_url")
     lines = ["读取图片如下:", "<image>"]
-    original_url = str(payload.get("url") or "").strip()
-    if original_url:
-        lines.append(f"原始URL: {original_url}")
+    resource_id = str(payload.get("resource_id") or "").strip()
+    if resource_id:
+        lines.append(f"资源ID: {resource_id}")
     title = str(payload.get("title") or "").strip()
     if title:
         lines.append(f"标题: {title}")

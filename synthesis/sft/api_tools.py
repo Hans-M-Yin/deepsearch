@@ -97,13 +97,13 @@ To determine the goal total of the player standing to Messi’s left on the Worl
 }
 </action>
 (...tool result omitted...)
-The tool returned several image links. Among them, the titles of the first, second, and fourth webpages all mention “Argentina winning the World Cup,” so the corresponding images are likely to be the celebration photo I am looking for from the final award ceremony. Next, I will inspect the first image to check whether it is indeed the target image and whether it can provide clues for the question. So I will now use read_url to download and inspect it.
+The tool returned several compact search-result records. The titles of the first, second, and fourth results mention “Argentina winning the World Cup,” so the corresponding images are likely candidates. Search metadata is only a clue, not visual proof. I will inspect the first candidate image using its returned image_id.
 <action>
 {
 "tool_name": "read_url",
 "arguments": {
- "url": "... url omitted ...",
- "goal": "Download the target image and check whether it is the correct image I am looking for"
+ "resource_id": "image_id from the selected search result",
+ "goal": "Download the candidate image and check whether it is the target trophy-presentation photo."
 }
 }
 </action>
@@ -121,17 +121,18 @@ The image has been successfully downloaded, and it is indeed a photo of the full
 Several of the search result titles mention Dybala, which suggests that this player is very likely Dybala. However, I still cannot be certain, because it is possible that the retrieved images are not actually of the same person as the cropped player. Therefore, I should download another image and compare it with the person in the original image to see whether they are indeed the same individual. So I will use read_url to download a new image. If it does turn out to be the same person, then I will only need to search Dybala’s historical goal records, and by reading the relevant sources I will be able to determine his goal total for the 2016–17 season.
 (... omitted below ...)
 
-Discuss: In the example above, the solution first analyzes the question and then describes the target image in a detailed and precise way, rather than simply searching for something like “Argentina championship celebration photo,” which could return many different images that fit that description. It then downloads the returned image URL and confirms that it is indeed the target photo. After that, it uses i2i_search on that photo for identification, and read_url to further verify the identity of a person who is not very familiar. The whole process is natural and rigorous, and it does not reveal any internal knowledge.
+Discuss: In the example above, the solution first analyzes the question and then describes the target image in a detailed and precise way, rather than simply searching for something like “Argentina championship celebration photo,” which could return many different images that fit that description. It then opens a returned image resource by image_id and confirms that it is indeed the target photo. After that, it uses i2i_search on that photo for identification, and read_url with another result ID to further verify an unfamiliar person. The whole process is natural and rigorous, and it does not reveal any internal knowledge.
 
 """
 
 MANUAL_REACT_PROTOCOL = """
-When you writing the solution, you can use tools following these useful tips:
+When writing the solution, follow these tool rules:
 
-1. t2t_search is a google search tool that returns a list of URLs for text pages. You should select the potentially useful ones using the returned snippets, and then use the read_url tool to access the page content to get new clues. Use this tool when you need to look up world knowledge or content information.
-2. i2i_search is a google lens tool that is very useful for identifying unfamiliar people or objects in the image. Note that the return results might be not related to your original image, so you should first select the search results that are likely to match your current image according to the textual title, then use `read_url` to download those images and inspect their conten to determine that the new image and the previous image depict the same object.
-3. t2i_search retrieves relevant images based on a text description. You should review the returned information and then use read_url to inspect those images. Use this tool when the missing clues require you to inspect relevant images, or when the images you find are likely to help you answer the question. Note that after using this tool, the searched images are still not provided to you, and you should use `read_url` to inspect the corresponding images.
-4. After using i2i_search and t2i_search, images still cannot be seen in the solution; you need to call read_url to view the thumbnail or the original image.
+1. t2t_search returns compact records with title, snippet, and source_page_id. Use read_url with source_page_id to inspect a selected webpage.
+2. t2i_search returns compact records with image_id and source_page_id. Use read_url with image_id to inspect an image, or source_page_id to read its source page.
+3. i2i_search performs reverse-image search. It returns compact records with image_id and source_page_id instead of raw URLs. Titles, source labels, snippets, and URL-derived keywords expose useful source metadata and can help choose which ID to read; verify the selected resource before treating it as evidence.
+4. Search-result images are not visible until read_url succeeds with their image_id. The runtime may privately use a thumbnail fallback if the primary image cannot be downloaded.
+5. For read_url, use resource_id from a prior search result whenever available. Include a focused arguments.goal explaining the evidence to extract. The legacy url argument is only for direct links already available in the conversation.
 
 You must answer exactly one step at a time. Then end your response with exactly one action block in the following format:
 
@@ -149,17 +150,16 @@ Rules:
 - The content inside <action> must be valid JSON.
 - The JSON must contain exactly these top-level keys: tool_name, arguments.
 - For most tools, put only the real execution arguments inside arguments.
-- Only for read_url, include the focused reading intention as arguments.goal.
-
+- For read_url, use resource_id from a search result whenever available and include arguments.goal.
 """
 
 # #### START Response 0720 ####
 RESPONSES_TOOL_USE_TIPS = """
 Tool-use tips:
-1. t2t_search is a Google text/web search tool. It returns search-result metadata such as titles, URLs, and snippets. Snippets are useful for choosing sources, but they are not full evidence. Use read_url to inspect a promising result before treating page content as verified evidence.
-2. t2i_search retrieves image-search metadata from a text description. The returned images are not visible to you yet. Review titles/snippets/source pages, then use read_url on a selected image URL or source page before making visual claims about the image.
-3. i2i_search is a reverse-image search tool for identifying unfamiliar people, objects, logos, artworks, or other visual elements. Its matches may be noisy. Treat image-search titles as hints, not proof, and verify with read_url or another source when identity matters.
-4. After i2i_search or t2i_search, do not claim that you have seen a returned image unless a successful read_url call has downloaded/read that image. Search-result metadata can suggest a direction, but it does not itself prove visual content.
+1. t2t_search returns compact records with title, snippet, and source_page_id. Use read_url with source_page_id to inspect a promising page before treating page content as verified evidence.
+2. t2i_search returns compact image-search records with image_id and source_page_id. The images are not visible yet. Use read_url with image_id to inspect an image or source_page_id to inspect its page before making visual claims.
+3. i2i_search returns compact reverse-image-search records with image_id and source_page_id. Matches may be noisy. Use titles, sources, and URL-derived keyword hints to select the most appropriate image_id or source_page_id for the next read_url call; verify the selected resource before making factual claims.
+4. After i2i_search or t2i_search, do not claim that you have seen a returned image unless a successful read_url call with its image_id has downloaded/read that image. Search metadata and URL-derived keyword hints help select which resource ID to read, but a successful read_url inspection is still required before making visual claims.
 5. For i2i_search, region coordinates are x-first normalized coordinates on a 0-1000 scale in the order [x1, y1, x2, y2]. x increases left-to-right and y increases top-to-bottom. Use [0, 0, 1000, 1000] for the full image.
 """.strip()
 
@@ -181,11 +181,11 @@ Requirements:
 Note: the solution must not mention any of the above writing requirements. In every round of solution writing, you must check one by one that the above requirements are satisfied.
 
 Tool-use tips:
-1. t2t_search is a Google text/web search tool. It returns metadata for search results, such as titles, URLs, and snippets. The snippet may contain valuable clues. If you think a page may be useful but the snippet contains no clues or only vague ones, you may further use read_url to inspect that page.
-2. t2i_search searches for images based on a text description. When you think an image may contain clues relevant to the question, or that the needed clue can be obtained by visually examining an image, you may use this tool to first find candidate images and then inspect them carefully. Note that this tool returns only the page title, snippet, source page, and image URL. You can use read_url on the image URL to download the image.
-3. i2i_search is a reverse image search tool that can be used to identify unfamiliar people, objects, logos, artworks, or other visual elements. Its results include the page title and image URL. Note that the returned images may differ in content from the image being searched. You may use read_url(image_url) to download an image for inspection, or read_url(source_page_url) to inspect the original page. However, note that the latter will not directly display the searched image itself.
+1. t2t_search returns title, snippet, and source_page_id. Use read_url with source_page_id when you need to inspect the page.
+2. t2i_search returns title, snippet, image_id, and source_page_id. Use read_url with image_id to download the image, or source_page_id to inspect the source page.
+3. i2i_search returns title, source, image_id, and source_page_id. The returned images may differ from the queried crop. Use read_url with image_id to inspect an image or source_page_id to inspect its original page. URL-derived keywords expose relevant information from the original URLs and can help select an appropriate image_id or source_page_id to inspect; verify that resource before using it as factual evidence.
 4. For i2i_search, region coordinates use x-first normalized coordinates on a 0–1000 scale, in the order [x1, y1, x2, y2]. The x-axis increases from left to right, and the y-axis increases from top to bottom. To search the full image, use [0, 0, 1000, 1000].
-5. For read_url, when the input is an image URL, it downloads the image; when the input is another kind of URL, it extracts relevant content from the page according to your objective. Note that this tool cannot see your prior reasoning history or any images you have previously seen, so in your target description you must clearly and explicitly describe what content you want from the page, using semantic language.
+5. For read_url, use a source_page_id or image_id returned by search whenever available. A source_page_id reads the webpage; an image_id downloads the image. Legacy raw URLs are supported only for direct links already available in the conversation. The tool cannot see your prior reasoning history, so clearly state what evidence you need in goal.
 
 Next, I will provide some excerpted examples, and you can learn from them how to write a high-quality answer process. The examples use native function calls, so the written text shows the public progress update before the call and then names the intended native function call.
 
@@ -208,14 +208,14 @@ Original question: In 2022, Messi, as captain, lifted the World Cup trophy on th
 Good writing:
 To determine the goal total of the player standing to Messi's left on the World Cup final podium, we can search for a photo of the full Argentina team on the podium at the 2022 World Cup final award ceremony. Then I can inspect the player standing to Messi's left in the image and identify who he is. Once I know his identity, we can search his career history and find how many goals he scored in the 2016-17 season. Next, I will call t2i_search with query: "2022 World Cup final Argentina team award ceremony photo".
 (...tool result omitted...)
-The tool returned several image links. Among them, the titles of the first, second, and fourth webpages all mention Argentina winning the World Cup, so the corresponding images are likely to be the celebration photo I am looking for from the final award ceremony. However, search-result metadata is not visual evidence. Next, I will inspect the first image to check whether it is indeed the target image and whether it can provide clues for the question. I will call read_url on the selected image/page URL with the goal: "Download the target image and check whether it is the correct image I am looking for".
+The tool returned several compact image-search records. Among them, the titles of the first, second, and fourth results mention Argentina winning the World Cup, so they are plausible candidates. However, search metadata is not visual evidence. Next, I will inspect the first candidate image using its image_id to check whether it is the target image and whether it can provide clues for the question.
 (... tool result omitted ...)
 The image has been successfully downloaded, and it is indeed a photo of the full Argentina team during the trophy presentation. In the image, Messi is wearing a black bisht and lifting the World Cup trophy. The player on his left is wearing the number 21 shirt. From this image alone, I cannot be fully certain who he is. My next step should be to use i2i_search, crop out this player, and see whether I can find similar images to determine his identity. In addition, since the image shows that he is wearing number 21, if i2i_search does not produce a satisfactory result, I can also directly search who wore number 21 for Argentina in the 2022 World Cup squad. I will call i2i_search with region [420, 340, 520, 370].
 (... tool result omitted ...)
 Several of the search result titles mention Dybala, which suggests that this player is very likely Dybala. However, I still cannot be certain, because it is possible that the retrieved images are not actually of the same person as the cropped player. Therefore, I should download another image and compare it with the person in the original image to see whether they are indeed the same individual. So I will use read_url to download a new image. If it does turn out to be the same person, then I will only need to search Dybala's historical goal records, and by reading the relevant sources I will be able to determine his goal total for the 2016-17 season.
 (... omitted below ...)
 
-Discuss: In the example above, the solution first analyzes the question and then describes the target image in a detailed and precise way, rather than simply searching for something like "Argentina championship celebration photo," which could return many different images that fit that description. It then downloads the returned image URL and confirms that it is indeed the target photo. After that, it uses i2i_search on that photo for identification, and read_url to further verify the identity of a person who is not very familiar. The whole process is natural and rigorous, and it does not reveal any internal knowledge.
+Discuss: In the example above, the solution first analyzes the question and then describes the target image in a detailed and precise way, rather than simply searching for something like "Argentina championship celebration photo," which could return many different images that fit that description. It then opens a returned image resource by image_id and confirms that it is indeed the target photo. After that, it uses i2i_search on that photo for identification, and read_url with another result ID to further verify an unfamiliar person. The whole process is natural and rigorous, and it does not reveal any internal knowledge.
 """.strip()
 
 
@@ -394,6 +394,7 @@ class ToolRuntimeContext:
     session_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
     image_registry: dict[str, Any] = field(default_factory=dict)
     url_registry: dict[str, tools.UrlResource] = field(default_factory=dict)
+    resource_registry: dict[str, tools.UrlResource] = field(default_factory=dict)
     filename_prefix: str = "sft"
     case_id: str = "sft_session"
     visual_lookup: Callable[..., object] | None = None
@@ -458,6 +459,11 @@ class ToolRuntimeContext:
         return urllib.parse.urlunsplit((parsed.scheme.lower(), netloc, parsed.path or "/", parsed.query, ""))
 
     def register_url_resource(self, resource: tools.UrlResource) -> None:
+        if resource.resource_id:
+            existing = self.resource_registry.get(resource.resource_id)
+            if existing is not None and existing.primary_url != resource.primary_url:
+                raise ValueError(f"Resource ID collision: {resource.resource_id}")
+            self.resource_registry[resource.resource_id] = resource
         for candidate in (
             resource.primary_url,
             resource.image_url,
@@ -471,46 +477,25 @@ class ToolRuntimeContext:
     def resolve_url_resource(self, url: str) -> tools.UrlResource | None:
         return self.url_registry.get(self._normalize_resource_url(url))
 
+    def resolve_resource_id(self, resource_id: str) -> tools.UrlResource | None:
+        return self.resource_registry.get(str(resource_id or "").strip())
+
     def register_search_output(self, tool_name: str, output: dict[str, Any]) -> None:
-        query = str(output.get("query") or "").strip() or None
-        raw_results = output.get("results") if tool_name in {"t2t_search", "t2i_search"} else output.get("matches")
-        if not isinstance(raw_results, list):
-            return
-        for raw in raw_results:
-            if not isinstance(raw, dict):
-                continue
-            image_url = str(raw.get("image_url") or raw.get("imageUrl") or "").strip() or None
-            thumbnail_url = str(raw.get("thumbnail_url") or raw.get("thumbnailUrl") or "").strip() or None
-            source_page_url = str(
-                raw.get("source_page_url") or raw.get("link") or raw.get("url") or raw.get("source") or ""
-            ).strip() or None
-            if tool_name == "t2t_search":
-                primary_url = source_page_url
-                kind = "text"
-            else:
-                primary_url = image_url or thumbnail_url or source_page_url
-                kind = "image"
-            if not primary_url:
-                continue
-            rank_value = raw.get("rank")
-            try:
-                rank = int(rank_value) if rank_value is not None else None
-            except (TypeError, ValueError):
-                rank = None
-            self.register_url_resource(
-                tools.UrlResource(
-                    primary_url=primary_url,
-                    kind=kind,
-                    title=str(raw.get("title") or "").strip() or None,
-                    snippet=str(raw.get("snippet") or "").strip() or None,
-                    image_url=image_url,
-                    thumbnail_url=thumbnail_url,
-                    source_page_url=source_page_url,
-                    search_tool=tool_name,
-                    search_query=query,
-                    rank=rank,
-                )
-            )
+        _compact, resources = tools.postprocess_search_output(
+            tool_name=tool_name,
+            output=output,
+        )
+        for resource in resources:
+            self.register_url_resource(resource)
+
+    def postprocess_search_output(self, tool_name: str, output: dict[str, Any]) -> dict[str, Any]:
+        compact, resources = tools.postprocess_search_output(
+            tool_name=tool_name,
+            output=output,
+        )
+        for resource in resources:
+            self.register_url_resource(resource)
+        return compact
 
 
 @dataclass(slots=True)
@@ -1721,7 +1706,7 @@ def execute_tool_call(
                 top_k=int(params.get("top_k", tools.DEFAULT_SEARCH_TOP_K)),
             )
         if isinstance(output, dict) and output.get("ok"):
-            context.register_search_output("t2t_search", output)
+            output = context.postprocess_search_output("t2t_search", output)
         return ToolExecutionResult(name=name, arguments=params, output=output, output_text=_json_text(output))
 
     if name == "t2i_search":
@@ -1735,21 +1720,30 @@ def execute_tool_call(
                 top_k=int(params.get("top_k", tools.DEFAULT_SEARCH_TOP_K)),
             )
         if isinstance(output, dict) and output.get("ok"):
-            context.register_search_output("t2i_search", output)
+            output = context.postprocess_search_output("t2i_search", output)
         return ToolExecutionResult(name=name, arguments=params, output=output, output_text=_json_text(output))
 
     if name == "read_url":
-        url = params.get("url") or params.get("URL") or ""
+        resource_id = str(params.get("resource_id") or "").strip()
+        direct_url = str(params.get("url") or params.get("URL") or "").strip()
+        resource = context.resolve_resource_id(resource_id) if resource_id else None
+        if resource_id and resource is None and not direct_url:
+            output = {"ok": False, "error": f"Unknown resource_id: {resource_id}"}
+            return ToolExecutionResult(name=name, arguments=params, output=output, output_text=_json_text(output))
+        url = resource.primary_url if resource is not None else direct_url
         if not url:
-            output = {"ok": False, "error": "url is required for read_url"}
+            output = {"ok": False, "error": "url or resource_id is required for read_url"}
             return ToolExecutionResult(name=name, arguments=params, output=output, output_text=_json_text(output))
         effective_goal = str(params.get("goal") or tool_goal or "").strip()
         output = tools.read_url(
             url=url,
             goal=effective_goal,
             assistant_output=assistant_text,
-            resource=context.resolve_url_resource(url),
+            resource=resource or context.resolve_url_resource(url),
         )
+        if resource_id:
+            output = dict(output)
+            output["resource_id"] = resource_id
         new_images: dict[str, Any] = {}
         if output.get("ok") and output.get("local_path"):
             image_id = context.register_image(output["local_path"])
@@ -1815,7 +1809,7 @@ def execute_tool_call(
             output = dict(output)
             output["cropped_image_url"] = uploaded_url
             if output.get("ok"):
-                context.register_search_output("i2i_search", output)
+                output = context.postprocess_search_output("i2i_search", output)
             return ToolExecutionResult(name=name, arguments=params, output=output, output_text=_json_text(output), new_images=new_images)
 
         remote_url, err = _materialize_remote_image_url(image_source, context, "i2i_search")
@@ -1828,7 +1822,7 @@ def execute_tool_call(
             top_k=int(params.get("top_k", tools.DEFAULT_SEARCH_TOP_K)),
         )
         if isinstance(output, dict) and output.get("ok"):
-            context.register_search_output("i2i_search", output)
+            output = context.postprocess_search_output("i2i_search", output)
         return ToolExecutionResult(name=name, arguments=params, output=output, output_text=_json_text(output))
 
     output = {"ok": False, "error": f"Unknown tool: {name}"}

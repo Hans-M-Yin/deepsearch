@@ -117,10 +117,11 @@ Inspect the assistant response carefully. Focus on four failure modes:
    Reject if the final answer is correct but the trajectory reaches it through a clearly wrong or unsupported key step, such as a wrong entity identification, a wrong image, a misread source, or a sudden jump to a private reference fact.
 
 Tool semantics you must enforce:
-- t2t_search returns search result metadata/snippets only. It does not prove full webpage contents.
-- t2i_search returns image search result metadata only. It does not show the images to the assistant.
-- i2i_search returns visually similar image metadata only. It does not prove identity by itself and does not let the assistant inspect returned images.
-- read_url may read a webpage or download an image. Only after a successful read_url image result may the assistant make visual observations about that downloaded image.
+- t2t_search returns compact metadata with title, snippet, and source_page_id only. It does not prove full webpage contents.
+- t2i_search returns compact metadata with image_id and source_page_id only. It does not show the images to the assistant.
+- i2i_search returns compact reverse-image metadata with image_id and source_page_id only. It does not prove identity by itself and does not let the assistant inspect returned images.
+- URL-derived keyword fields expose information from original URLs and may help select an ID to inspect, but they are not factual evidence.
+- read_url may read a source_page_id webpage or download an image_id image. Only after a successful read_url image result may the assistant make visual observations about that downloaded image.
 - If a tool output has ok=false, the assistant must not use it as successful evidence.
 
 Repair policy:
@@ -138,7 +139,7 @@ Few-shot examples:
 Example A: image metadata overclaim
 Transcript excerpt:
 Assistant: I searched images and the first result shows the actor holding the trophy, so I can identify him as Alex Smith.
-Tool t2i_search: {"ok": true, "results": [{"title": "Alex Smith trophy photo", "image_url": "..."}]}
+Tool t2i_search: {"ok": true, "results": [{"title": "Alex Smith trophy photo", "image_id": "image_a1b2c3d4", "source_page_id": "page_b2c3d4e5"}]}
 Judgment:
 {"verdict":"reject","severity":"major","unsupported_claims":[{"assistant_step":1,"claim":"the first result shows the actor holding the trophy","support_status":"unsupported","severity":"major","suggested_fix":"reject"}],"reason":"t2i_search only returned metadata; no image was read, so the assistant cannot claim visual content."}
 
@@ -151,7 +152,7 @@ Judgment:
 Example C: repairable overconfidence
 Transcript excerpt:
 Assistant: The search results prove that the person is Maria Chen.
-Tool i2i_search: {"ok": true, "matches": [{"title": "Maria Chen at the ceremony", "link": "..."}]}
+Tool i2i_search: {"ok": true, "results": [{"title": "Maria Chen at the ceremony", "image_id": "image_a1b2c3d4", "source_page_id": "page_b2c3d4e5"}]}
 Judgment:
 {"verdict":"repair","severity":"minor","unsupported_claims":[{"assistant_step":1,"claim":"prove that the person is Maria Chen","support_status":"weak","severity":"minor","suggested_fix":"soften"}],"repair":{"needed":true,"repaired_assistant_messages":[{"message_index":1,"content":"The reverse-image results include a result titled \"Maria Chen at the ceremony\", which suggests the person may be Maria Chen. I should verify this with an additional source before treating it as certain."}]}}
 (NOTICE: In this example, if most of the search results indicate that it is Maria Chen, then the evidence should be considered sufficient. What is meant here is the situation where multiple search results do not converge at all and no verification has been done with read_url)

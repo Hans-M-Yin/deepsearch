@@ -12,11 +12,13 @@ import sys
 import tempfile
 import threading
 import time
-from dataclasses import asdict, dataclass
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import asdict, dataclass, field
+from hashlib import sha256
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Callable
-from urllib.parse import quote, unquote, urlparse, urlunparse
+from urllib.parse import quote, unquote, urlparse, urlsplit, urlunparse
 
 import requests
 from PIL import Image, ImageOps
@@ -63,6 +65,30 @@ T2I_BLOCKED_IMAGE_SEARCH_DOMAINS = (
 )
 I2I_BLOCKED_IMAGE_SEARCH_DOMAINS: tuple[str, ...] = ()
 _SFT_FIXED_REQUEST_ID = "3200636808"
+_URL_KEYWORD_CACHE: dict[tuple[str, str], str] = {}
+_URL_KEYWORD_CACHE_LOCK = threading.Lock()
+
+_URL_KEYWORD_NOISE_TOKENS = {
+    "image", "images", "img", "upload", "uploads", "static", "media",
+    "cdn", "cache", "cached", "thumbnail", "thumbnails", "thumb", "thumbs",
+    "resize", "resizer", "width", "height", "quality", "auto", "best",
+    "format", "fit", "crop", "newscms", "original", "download", "file",
+    "files", "content", "assets", "asset", "public", "private", "vision",
+    "deepresearch", "synthesis", "trajectory", "turn", "region", "search",
+    "hans", "oss", "aliyuncs", "com", "www", "http", "https",
+}
+
+PROMPT_URL_SEMANTIC_KEYWORDS = """Extract retrieval keywords that are explicitly present in URL metadata.
+
+You receive a URL after technical noise, signatures, hashes, resize directives,
+and opaque identifiers have been removed. Return only useful semantic keywords
+or short phrases made entirely from words that appear in the supplied URL
+metadata. Do not infer identities, expand abbreviations, correct spellings,
+add context, or make factual claims. An empty result is better than guessing.
+
+Return exactly one JSON object:
+{"keywords":"semicolon-separated URL-derived keywords, or an empty string"}
+"""
 
 
 @dataclass(slots=True)
@@ -70,6 +96,8 @@ class UrlResource:
     """Search-result provenance used internally by read_url fallbacks."""
 
     primary_url: str
+    resource_id: str = ""
+    result_id: str | None = None
     kind: str = "unknown"
     title: str | None = None
     snippet: str | None = None
@@ -79,6 +107,8 @@ class UrlResource:
     search_tool: str | None = None
     search_query: str | None = None
     rank: int | None = None
+    url_keywords: str | None = None
+    fallback_urls: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -278,6 +308,8 @@ def _resource_candidate_urls(resource: UrlResource | None, requested_url: str) -
     add("image_url", resource.image_url, referer)
     add("primary_url", resource.primary_url, referer)
     add("thumbnail_url", resource.thumbnail_url, referer)
+    for fallback_url in resource.fallback_urls:
+        add("resource_fallback", fallback_url, referer)
     return candidates
 
 
@@ -324,9 +356,10 @@ def get_tool_definitions() -> list[dict[str, Any]]:
                 "name": "t2t_search",
                 "description": (
                     "Search text/web documents on Google from a text query. Returns "
-                    "search results such as title, url, and snippet. If the "
+                    "search results such as title, snippet, and a compact source_page_id. "
+                    "Full URLs are kept privately by the runtime. If the "
                     "agent wants the full content of a result, it should call "
-                    "read_url separately."
+                    "read_url with that source_page_id. URL keyword fields expose information from the original URL and can help select which resource ID to read; inspect the resource before treating it as evidence."
                 ),
                 "parameters": {
                     "type": "object",
@@ -344,7 +377,11 @@ def get_tool_definitions() -> list[dict[str, Any]]:
             "type": "function",
             "function": {
                 "name": "t2i_search",
-                "description": "Search images from a text query on Google.",
+                "description": (
+                    "Search images from a text query on Google. Results provide compact "
+                    "image_id and source_page_id references instead of raw URLs. Use read_url "
+                    "with one of those IDs to inspect the image or source page."
+                ),
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -362,7 +399,8 @@ def get_tool_definitions() -> list[dict[str, Any]]:
             "function": {
                 "name": "i2i_search",
                 "description": (
-                    "Search for visually similar or matching images from the most recent image in the current context."
+                    "Search for visually similar or matching images from the most recent image in the current context. "
+                    "Results provide compact image_id and source_page_id references instead of raw URLs. "
                     "You can locate the bounding box of the entity you want to recognize in the image and then search that region separately as an image."
                 ),
                 "parameters": {
@@ -396,14 +434,19 @@ def get_tool_definitions() -> list[dict[str, Any]]:
                     "Read a URL. If it returns text, fetch content through a "
                     "reader backend and optionally summarize only the part "
                     "relevant to the current tool goal. If it returns an image, the image will be downloaded for you. "
-                    "NOTICE, only the URLs you have got from search tools can be read. Wikipedia and Wiki commons is excluded for safety reasons."
+                    "Use resource_id from a prior search result whenever available; url remains supported for direct links. "
+                    "NOTICE, only resources or URLs you have got from search tools can be read. Wikipedia and Wiki commons is excluded for safety reasons."
                 ),
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "url": {
                             "type": "string",
-                            "description": "The URL to read.",
+                            "description": "Legacy direct URL to read. Prefer resource_id from a prior search result.",
+                        },
+                        "resource_id": {
+                            "type": "string",
+                            "description": "Compact page_id or image_id returned by a prior search result.",
                         },
                         "goal": {
                             "type": "string",
@@ -413,7 +456,7 @@ def get_tool_definitions() -> list[dict[str, Any]]:
                             ),
                         },
                     },
-                    "required": ["url"],
+                    "required": [],
                 },
             },
         },
@@ -509,6 +552,234 @@ def _sft_worker_metadata(trace_label: str) -> dict[str, Any]:
         "user_id": _SFT_FIXED_REQUEST_ID,
         "x_tt_logid": _SFT_FIXED_REQUEST_ID,
     }
+
+
+def _url_keyword_tokens(url: str) -> list[str]:
+    """Return non-technical word tokens explicitly present in a URL."""
+    try:
+        parsed = urlsplit(str(url or "").strip())
+    except ValueError:
+        return []
+    hostname = (parsed.hostname or "").lower()
+    raw_parts = [hostname, unquote(parsed.path or "")]
+    tokens: list[str] = []
+    for raw_part in raw_parts:
+        for token in re.findall(r"[A-Za-z][A-Za-z0-9]{1,}", raw_part):
+            normalized = token.lower()
+            if normalized in _URL_KEYWORD_NOISE_TOKENS:
+                continue
+            if normalized.isdigit() or re.fullmatch(r"[a-f0-9]{8,}", normalized):
+                continue
+            # Wire-service IDs, UUID-like strings, and compact cache keys are
+            # usually not meaningful to an agent even when alphabetic.
+            if re.fullmatch(r"[a-z]{1,4}\d[a-z0-9]{4,}", normalized):
+                continue
+            if normalized not in tokens:
+                tokens.append(normalized)
+    return tokens
+
+
+def _clean_url_for_keyword_prompt(url: str) -> dict[str, Any]:
+    """Expose only URL-derived lexical material, never auth/query noise."""
+    try:
+        parsed = urlsplit(str(url or "").strip())
+    except ValueError:
+        return {"hostname": "", "path": "", "tokens": []}
+    return {
+        "hostname": (parsed.hostname or "").lower(),
+        "path": unquote(parsed.path or ""),
+        "tokens": _url_keyword_tokens(url),
+    }
+
+
+def _validate_url_keyword_hint(value: Any, *, allowed_tokens: list[str]) -> str:
+    """Keep only LLM keywords whose word tokens were present in the URL."""
+    allowed = set(allowed_tokens)
+    candidates = [part.strip() for part in str(value or "").split(";") if part.strip()]
+    accepted: list[str] = []
+    for candidate in candidates:
+        words = [word.lower() for word in re.findall(r"[A-Za-z][A-Za-z0-9]{1,}", candidate)]
+        if words and all(word in allowed for word in words):
+            accepted.append(" ".join(words))
+    return "; ".join(dict.fromkeys(accepted))
+
+
+def extract_url_semantic_keywords(
+    url: str,
+    *,
+    model_alias: str = "multimodal_process",
+) -> str:
+    """Return a conservative, URL-derived retrieval hint.
+
+    The returned string contains only words present in the URL host/path. It is
+    discovery metadata, not evidence about the underlying webpage or image.
+    """
+    raw_url = str(url or "").strip()
+    if not raw_url:
+        return ""
+    cleaned = _clean_url_for_keyword_prompt(raw_url)
+    allowed_tokens = list(cleaned["tokens"])
+    if not allowed_tokens:
+        return ""
+    cache_key = (raw_url, model_alias)
+    with _URL_KEYWORD_CACHE_LOCK:
+        cached = _URL_KEYWORD_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    try:
+        response = LLM_WORKER.generate(
+            ModelRequest(
+                model=model_alias,
+                messages=[
+                    ModelMessage(role="system", content=PROMPT_URL_SEMANTIC_KEYWORDS),
+                    ModelMessage(
+                        role="user",
+                        content=json.dumps(cleaned, ensure_ascii=False, sort_keys=True),
+                    ),
+                ],
+                response_format={"type": "json_object"},
+                max_tokens=128,
+                metadata=_sft_worker_metadata("extract_url_semantic_keywords"),
+            )
+        )
+        parsed = json.loads(response.content or "{}")
+        hint = _validate_url_keyword_hint(
+            parsed.get("keywords") if isinstance(parsed, dict) else "",
+            allowed_tokens=allowed_tokens,
+        )
+    except Exception as exc:  # pragma: no cover - remote model bound
+        logger.warning("URL keyword extraction failed: %s", exc)
+        hint = ""
+    with _URL_KEYWORD_CACHE_LOCK:
+        _URL_KEYWORD_CACHE[cache_key] = hint
+    return hint
+
+
+def _canonical_resource_url(value: Any) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    try:
+        parsed = urlsplit(raw)
+    except ValueError:
+        return raw
+    if parsed.scheme not in {"http", "https"}:
+        return raw
+    hostname = (parsed.hostname or "").lower()
+    return f"{parsed.scheme.lower()}://{hostname}{parsed.path or '/'}" + (f"?{parsed.query}" if parsed.query else "")
+
+
+def _resource_id(kind: str, url: str) -> str:
+    digest = sha256(_canonical_resource_url(url).encode("utf-8")).hexdigest()[:8]
+    return f"{kind}_{digest}"
+
+
+def _canonical_search_result(tool_name: str, raw: dict[str, Any], rank: int) -> dict[str, Any]:
+    image_url = str(raw.get("image_url") or raw.get("imageUrl") or "").strip()
+    thumbnail_url = str(raw.get("thumbnail_url") or raw.get("thumbnailUrl") or "").strip()
+    page_url = str(raw.get("source_page_url") or raw.get("link") or raw.get("url") or "").strip()
+    return {
+        "title": str(raw.get("title") or "").strip(),
+        "source": str(raw.get("source") or "").strip(),
+        "snippet": str(raw.get("snippet") or "").strip(),
+        "rank": int(raw.get("rank") or rank),
+        "page_url": page_url,
+        "image_url": image_url,
+        "thumbnail_url": thumbnail_url,
+        "kind": "image" if tool_name in {"t2i_search", "i2i_search"} else "page",
+    }
+
+
+def postprocess_search_output(
+    *,
+    tool_name: str,
+    output: dict[str, Any],
+    url_keyword_model: str = "multimodal_process",
+) -> tuple[dict[str, Any], list[UrlResource]]:
+    """Convert search results into compact agent output plus private resources.
+
+    Agent-visible records contain IDs, semantic metadata, and conservative
+    URL-derived hints. Full URLs, thumbnail fallbacks, and provenance remain in
+    ``UrlResource`` objects for the runtime context.
+    """
+    raw_items = output.get("results") if tool_name in {"t2t_search", "t2i_search"} else output.get("matches")
+    if not isinstance(raw_items, list):
+        return dict(output), []
+    canonical = [
+        _canonical_search_result(tool_name, item, index)
+        for index, item in enumerate(raw_items, start=1)
+        if isinstance(item, dict)
+    ]
+    unique_urls = {
+        url for item in canonical for url in (item["page_url"], item["image_url"])
+        if url
+    }
+    hints: dict[str, str] = {}
+    max_workers = len(unique_urls)
+    if max_workers:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_url = {
+                executor.submit(extract_url_semantic_keywords, url, model_alias=url_keyword_model): url
+                for url in unique_urls
+            }
+            for future in as_completed(future_to_url):
+                url = future_to_url[future]
+                try:
+                    hints[url] = future.result()
+                except Exception:
+                    hints[url] = ""
+
+    resources: list[UrlResource] = []
+    agent_results: list[dict[str, Any]] = []
+    for index, item in enumerate(canonical, start=1):
+        result_id = f"{tool_name}_r_{index:02d}"
+        page_id = _resource_id("page", item["page_url"]) if item["page_url"] else None
+        image_id = _resource_id("image", item["image_url"]) if item["image_url"] else None
+        if item["page_url"]:
+            resources.append(
+                UrlResource(
+                    primary_url=item["page_url"], resource_id=page_id or "", result_id=result_id,
+                    kind="page", title=item["title"] or None, snippet=item["snippet"] or None,
+                    source_page_url=item["page_url"], search_tool=tool_name,
+                    search_query=str(output.get("query") or "") or None, rank=item["rank"],
+                    url_keywords=hints.get(item["page_url"]) or None,
+                )
+            )
+        if item["image_url"]:
+            resources.append(
+                UrlResource(
+                    primary_url=item["image_url"], resource_id=image_id or "", result_id=result_id,
+                    kind="image", title=item["title"] or None, snippet=item["snippet"] or None,
+                    image_url=item["image_url"], thumbnail_url=item["thumbnail_url"] or None,
+                    source_page_url=item["page_url"] or None, search_tool=tool_name,
+                    search_query=str(output.get("query") or "") or None, rank=item["rank"],
+                    url_keywords=hints.get(item["image_url"]) or None,
+                    fallback_urls=[item["thumbnail_url"]] if item["thumbnail_url"] else [],
+                )
+            )
+        agent_item: dict[str, Any] = {
+            "title": item["title"],
+        }
+        if item["source"]:
+            agent_item["source"] = item["source"]
+        if item["snippet"]:
+            agent_item["snippet"] = item["snippet"]
+        if image_id:
+            agent_item["image_id"] = image_id
+            if hints.get(item["image_url"]):
+                agent_item["image_url_keywords"] = hints[item["image_url"]]
+        if page_id:
+            agent_item["source_page_id"] = page_id
+            if hints.get(item["page_url"]):
+                agent_item["source_page_url_keywords"] = hints[item["page_url"]]
+        agent_results.append(agent_item)
+    compact: dict[str, Any] = {
+        "ok": bool(output.get("ok", True)),
+        "results": agent_results,
+    }
+    if tool_name != "i2i_search":
+        compact["query"] = output.get("query")
+    return compact, resources
 
 
 def summarize_with_qwen(
