@@ -228,7 +228,9 @@ def _build_responses_instructions(base_system_prompt: str) -> str:
     # default SFT prompt. If the caller explicitly supplies another system prompt,
     # keep it and append only the tool-use tips.
     if base_system_prompt.strip() == DEFAULT_SYSTEM_PROMPT.strip():
-        return RESPONSES_SYSTEM_PROMPT
+        return "\n\n".join(
+            part for part in (RESPONSES_SYSTEM_PROMPT, RESPONSES_TOOL_USE_TIPS) if part
+        ).strip()
     return "\n\n".join(
         part for part in (base_system_prompt.strip(), RESPONSES_TOOL_USE_TIPS) if part
     ).strip()
@@ -2238,16 +2240,14 @@ class OpenAIToolAgent:
         base_system_prompt = system_prompt or self.config.system_prompt
         uses_default_system_prompt = base_system_prompt.strip() == DEFAULT_SYSTEM_PROMPT.strip()
         public_reasoning_enabled = bool(self.config.responses_prompt_public_reasoning)
-        uses_tool_use_tips_directly = (
-            public_reasoning_enabled and not uses_default_system_prompt
-        )
+        uses_tool_use_tips_directly = public_reasoning_enabled
         print(
             "[responses-prompt-debug] "
             "api_mode=responses "
             f"responses_prompt_public_reasoning={public_reasoning_enabled} "
             f"uses_default_system_prompt={uses_default_system_prompt} "
             f"uses_responses_tool_use_tips_directly={uses_tool_use_tips_directly} "
-            f"instructions_source={('responses_system_prompt' if public_reasoning_enabled and uses_default_system_prompt else ('custom_system_plus_tool_use_tips' if uses_tool_use_tips_directly else 'base_system_prompt_only'))}",
+            f"instructions_source={('responses_system_prompt_plus_tool_use_tips' if public_reasoning_enabled and uses_default_system_prompt else ('custom_system_plus_tool_use_tips' if uses_tool_use_tips_directly else 'base_system_prompt_only'))}",
             file=sys.stderr,
             flush=True,
         )
