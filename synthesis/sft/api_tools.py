@@ -160,7 +160,7 @@ Tool-use tips:
 2. t2i_search returns compact image-search records with image_id and source_page_id. The images are not visible yet. Use read_url with image_id to inspect an image or source_page_id to inspect its page before making visual claims.
 3. i2i_search returns compact reverse-image-search records with image_id and source_page_id. Matches may be noisy. Use titles, sources, and URL-derived keyword hints to select the most appropriate image_id or source_page_id for the next read_url call; verify the selected resource before making factual claims.
 4. After i2i_search or t2i_search, do not claim that you have seen a returned image unless a successful read_url call with its image_id has downloaded/read that image. Search metadata and URL-derived keyword hints help select which resource ID to read, but a successful read_url inspection is still required before making visual claims.
-5. Use search tools flexibly. If you still cannot find a specific detail after multiple search attempts, try searching indirectly for related pages that may contain the information. For example, if repeated searches for a certain Olympic delegation with 108 athletes yield no results, you can instead search for statistics on delegation sizes by country, or for participation statistics from that edition of the Olympics.
+5. Use search tools **flexibly**. If you still cannot find a specific detail after multiple search attempts, try searching indirectly for related pages that may contain the information. For example, if repeated searches for a certain Olympic delegation with 108 athletes yield no results, you can instead search for statistics on delegation sizes by country, or for participation statistics from that edition of the Olympics.
 6. For i2i_search, region coordinates are x-first normalized coordinates on a 0-1000 scale in the order [x1, y1, x2, y2]. x increases left-to-right and y increases top-to-bottom. Use [0, 0, 1000, 1000] for the full image.
 """.strip()
 
@@ -2236,9 +2236,24 @@ class OpenAIToolAgent:
         # #### START Response 0720 ####
         responses_turn_traces: list[dict[str, Any]] = []
         base_system_prompt = system_prompt or self.config.system_prompt
+        uses_default_system_prompt = base_system_prompt.strip() == DEFAULT_SYSTEM_PROMPT.strip()
+        public_reasoning_enabled = bool(self.config.responses_prompt_public_reasoning)
+        uses_tool_use_tips_directly = (
+            public_reasoning_enabled and not uses_default_system_prompt
+        )
+        print(
+            "[responses-prompt-debug] "
+            "api_mode=responses "
+            f"responses_prompt_public_reasoning={public_reasoning_enabled} "
+            f"uses_default_system_prompt={uses_default_system_prompt} "
+            f"uses_responses_tool_use_tips_directly={uses_tool_use_tips_directly} "
+            f"instructions_source={('responses_system_prompt' if public_reasoning_enabled and uses_default_system_prompt else ('custom_system_plus_tool_use_tips' if uses_tool_use_tips_directly else 'base_system_prompt_only'))}",
+            file=sys.stderr,
+            flush=True,
+        )
         responses_instructions = (
             _build_responses_instructions(base_system_prompt)
-            if self.config.responses_prompt_public_reasoning
+            if public_reasoning_enabled
             else base_system_prompt
         )
         # Responses receives system behavior through instructions. Remove the
