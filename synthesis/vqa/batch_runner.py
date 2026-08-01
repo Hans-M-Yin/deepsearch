@@ -868,6 +868,26 @@ class VqaBatchRunner:
                 sample,
                 field_name="image_target_terminal_normalization",
             ),
+            "compose": {
+                "payload": VqaBatchRunner._extract_stage_metadata_value(
+                    sample,
+                    field_name="compose_payload",
+                ),
+                "result": VqaBatchRunner._extract_stage_metadata_value(
+                    sample,
+                    field_name="compose_result",
+                ),
+            },
+            "difficulty_enhancement": {
+                "payload": VqaBatchRunner._extract_stage_metadata_value(
+                    sample,
+                    field_name="difficulty_enhancement_payload",
+                ),
+                "result": VqaBatchRunner._extract_stage_metadata_value(
+                    sample,
+                    field_name="difficulty_enhancement_result",
+                ),
+            },
             "polish": {
                 "payload": VqaBatchRunner._extract_stage_metadata_value(
                     sample,

@@ -329,6 +329,7 @@ Requirements:
 3. The factual information you select must not be revealed in the question, and the question must not tell students that any material exists.
 4. Do not fabricate or add any information. Everything mentioned in your answer must appear in the original text.
 5. If the content of your question contains highly distinctive markers that could reveal the target entity, you should make the question more ambiguous. For example, in the question “When was a certain politician’s slogan ‘Make America Great Again’ introduced?”, the highly distinctive slogan should be blurred. It can be rewritten as: “When was a certain politician’s own campaign slogan introduced?”
+6. NOTICE: Try to avoid asking highly distinctive questions that would easily reveal the target’s identity, or wrap the content of the question in a way that ensures the subject being asked about cannot be inferred from the question itself.
 
 Generate exactly 5 diverse candidate questions. Do not generate several near-duplicates
 that ask about the same fact in slightly different wording.
@@ -1070,6 +1071,7 @@ It is compact and preserves the same dependency and reasoning order as the hop c
 Now compose the question for the provided input.
 Return valid JSON with exactly these fields:
 {
+  "analysis": "brief explanation of how the hops were merged without exposing intermediate targets or creating shortcuts",
   "question": "..."
 }
 """
@@ -1259,61 +1261,88 @@ Please return valid JSON with exactly the following field:
 }
 """
 
-PROMPT_DIFFICULTY_ENHANCEMENT = """You are a difficulty-enhancement editor for multi-hop retrieval questions. You will be given a multi-hop question together with its underlying reasoning chain. Your task is to lightly revise the question so that the descriptions of intermediate entities or clues become subtler and less directly recognizable to strong models, while keeping the original answer, factual relations, and core reasoning chain unchanged. The rewritten question must still have the same answer, remain uniquely solvable, and be verifiable.
-Goal: The purpose is not to make the question longer, nor to blindly make all clues vaguer. Instead, based on the provided `reasoning_chain`, you should analyze which intermediate entities and clues need to be obfuscated, and to what extent. You should reduce the direct exposure of intermediate entities, remove strong clues or redundant clues that would let someone jump to the answer through common sense without following the reasoning path, and at the same time keep the whole question fluent, natural, and benchmark-like.
+PROMPT_DIFFICULTY_ENHANCEMENT = """You are a difficulty-enhancement editor for multi-hop retrieval questions. You will be given a multi-hop question together with its underlying reasoning chain. Your task is to revise the question so that the descriptions of intermediate entities and clues become subtler and harder for strong models to short-circuit, while keeping the original answer, factual relations, and core reasoning chain unchanged. Revise as much as is needed to close every shortcut — do NOT under-edit — but never so much that the question loses unique solvability. The rewritten question must have the same answer, remain uniquely solvable, and be verifiable.
 
-##Requirements:
+Goal: The purpose is not to make the question longer, nor to blindly make all clues vaguer. Based on the provided `reasoning_chain`, analyze which entities and clues let a strong model reach an entity (including the final answer) WITHOUT traversing the earlier hops, and neutralize exactly those. Keep the question fluent, natural, and benchmark-like.
+
+### Core verification test (apply this to EVERY hop — it is your single most important check)
+
+Model the chain as a sequence of hops of the form **"entity A + description D → next entity B"**. For each hop, the wording is correct only if BOTH hold:
+
+- **(Forward safety)** When A is still unknown, D on its own must be too underspecified to reveal A or to jump directly to B. If D alone already pins down A or B, it is a shortcut — blur it.
+- **(Backward sufficiency)** Once A is known, D must lead to B **uniquely and unambiguously**. If D could point to several candidates given A, it is too vague — add a neutral relational qualifier until B is unique.
+
+In short: a well-tuned description is **useless without its predecessor, and decisive with it.** Every keep/blur decision you make should be justified by this test.
+
+### Shortcut taxonomy — scan the draft for every one of these
+
+Treat each of the following as a **shortcut candidate**, whether it sits on an intermediate bridge entity, the final entity, or the answer itself:
+
+- **Explicit years and precise dates** ("in 1958", "since 2007", "the 1966 Uniform Time Act").
+- **Unique official titles or positions** ("head of government", "president of country X").
+- **Distinctive, near-unique career or life events** ("was forced to resign", "was stripped of", "the only person to ...").
+- **Superlative / "the last / first / only" phrasing** ("the last crewed Moon landing", "the highest peak").
+- **Signature slogans, signature works, iconic named titles, acts, or awards.**
+- **Evaluative or reputation modifiers that fingerprint an entity** ("highly prestigious", "world-famous", "landmark").
+- **Precise numeric specifications** that pin a single entity.
+
+**Policy:** For each candidate, keep it ONLY if it is (a) the deliberate entry point at the *head of the reasoning chain*, or (b) strictly required to keep the question uniquely solvable or to define the final answer. Otherwise blur it via the verification test above (e.g., "in 1958" → "that same year, later on"; "after being forced to resign as head of government" → "after leaving his government post"; "the last crewed Moon landing" → "a crewed lunar mission of that era").
+
+### Requirements
 
 1. Do not change the core question, and do not change the final answer.
-2. Reduce the salience of intermediate entities according to the reasoning process of the question. Make sure that after revision, each intermediate entity can only be inferred after reasoning through the previous one. This means you must choose an appropriate degree of obfuscation and avoid any shortcut that allows the solver to skip earlier reasoning steps. For example:
-Example: In Jacques-Louis David’s painting of the Tennis Court Oath at Versailles (the previous target) on June 20, 1789, the man standing on a table at the center of the crowd with his arm raised is Jean Sylvain Bailly.
-    Good revision: In Jacques-Louis David’s painting of the event that took place there, the man standing on a table at the center of the crowd with his arm raised is Jean Sylvain Bailly.
-    Bad revision: In a painting by a famous artist of an event that took place there, the man standing on a table at the center of the crowd with his arm raised is Jean Sylvain Bailly.
-    Reason: The former removes the date and the specific content of the painting, preventing the solver from inferring the painting directly from the date and event without first identifying Versailles; but once Versailles is inferred, the painter’s name and the location still allow the painting to be identified smoothly. The latter removes both the painter and the date entirely, making the clue too vague: even after inferring the location, multiple painters could have depicted events there, so the question becomes ambiguous.
-3. A replacement expression must satisfy this condition: on its own, it should not directly identify the target entity, but within the full question context, it should still help uniquely constrain the correct path.
-4. The question may include an image, so you need to preserve the connection between the question and the image content. In addition, descriptions of the image or scene should only be appropriately blurred, not deleted outright. If a statement in a given reasoning_chain item refers to a specific scene or image, that item will be marked as `"image"`. In the rewritten question, preserve the description of that scene or image—especially the visual details—and only apply slight obfuscation to the entities within it.
-5. Do not fabricate any extra information. If an entity is not explicitly revealed in the current wording of the question, there is no need to revise it.
-6. Retain some explicit clues that may appear at the beginning of the reasoning chain so that the question still has an entry point. Note: this refers to the beginning of the reasoning chain, not necessarily the beginning of the surface wording of the question.
+2. Reduce the salience of intermediate entities according to the reasoning chain. After revision, each intermediate entity must be inferable only after reasoning through the previous one — enforce this with the Core verification test above.
+3. **Preserve the entry point.** The clue(s) at the *beginning of the reasoning chain* (not necessarily the surface start of the sentence) are the question's only foothold and should be kept relatively explicit — do NOT apply heavy obfuscation to them. Blur only when a later hop can re-establish the same entity; the head of the chain has no predecessor to lean on.
+4. **Shortcuts are not confined to intermediate bridge entities.** Also scan the FINAL hop and the clues attached to the answer: if a dense terminal clue (e.g., a unique title + a specific year + a distinctive event) lets a strong model jump straight to the answer, that bypasses the chain — blur or thin it out just as aggressively.
+5. A replacement expression must satisfy the Core verification test: on its own it should not directly identify the target entity, but within the full question context it should still uniquely constrain the correct path.
+6. If obfuscation introduces ambiguity, add a context-appropriate modifier that rules out wrong candidates rather than reintroducing a salient signal (e.g., "the club he played for" → "the club he played for at age 20", NOT the club's famous name).
+7. Do not repeat the same qualifier for one entity. Introduce a description once, then refer back with a short anaphor; delete redundant restatements.
+8. The question may include an image. Preserve the connection between the question and the image; descriptions of a scene/image marked `"image"` in the reasoning_chain should be preserved (especially visual details) and only lightly obfuscated at the entity level, never deleted.
+9. Do not fabricate information. If an entity is not explicitly revealed in the current wording, do not invent a way to reveal it.
 
-Output format:
+### Self-check (before finalizing)
+
+Enumerate every explicit year, date, unique title, superlative, signature term, and proper noun remaining in your draft. For each, state in the analysis whether you **keep or blur** it, and justify with the Core verification test (entry point / uniqueness anchor → keep; otherwise → blur). Only declare "no revision needed" if this scan leaves nothing removable AND no unjustified year/title/superlative remains.
+
+### Output format
 {
-  "analysis": "analysis of the original question and the revision plan",
+  "analysis": "hop-by-hop application of the Core verification test, the shortcut scan, and the revision plan",
   "question": "the improved question"
 }
 
-##Techniques:
+### Techniques
+1. Prefer relational, structural, or contextual constraints over highly salient signals (famous titles, person names, signature works, unique achievements, explicit years, reputation adjectives, iconic named acts/papers).
+2. When blurring creates ambiguity, disambiguate with a neutral relational qualifier, not with a fresh salient hint.
+3. Keep the question natural, concise, and compact — not a pile of stitched-together hints.
 
-1. Prefer relational, structural, or contextual constraints rather than highly salient signals such as famous titles, person names, signature works, unique achievements, explicit year markers, or iconic paper titles.
-2. If obfuscation introduces ambiguity, add a context-appropriate modifier or qualifier for the target object to rule out wrong candidates. For example: Messi -> FC Barcelona.
-    Overly vague relation: The team Messi played for was FCB. (ambiguous)
-    Appropriate relation: The club Messi played for at age 20 was FCB.
-3. Keep the question natural, concise, compact, and benchmark-like, rather than turning it into a pile of stitched-together hints.
+### Examples
 
-##Examples
-
-Example 1:
-question: The man shown in this image later became nationally prominent for his handling of the devastating 1927 flood, a development that helped lead to his 1928 presidential nomination by the political party that narrowly carried three long-Democratic “blue wall” states in 2016. Which three states were they, and what broader effect did that victory have on that party?
+**Example 1**
+question: The man shown in this image later became nationally prominent for his handling of the devastating 1927 flood, a development that helped lead to his 1928 presidential nomination by the political party that narrowly carried three long-Democratic "blue wall" states in 2016. Which three states were they, and what broader effect did that victory have on that party?
 {
-  "analysis": "This question has problems of redundant reasoning steps, overly strong shortcut cues, and imprecise phrasing. First, based on the input hop chain, the question should first identify the man in the image and then proceed along the path “man -> the party that nominated him -> the ‘blue wall’ states in 2016.” Therefore, the clause about the flood can in fact be removed. Second, the question includes shortcut cues such as “Democratic Party” and “blue wall,” which can function as hints without requiring the earlier reasoning steps. These can be blurred into a phrase like “the opposing party” in light of the surrounding context, so that the reader must first infer the party that nominated the man before determining the identity of the “opposing party.” In addition, several short clauses can be merged to make the sentence more compact and fluent.",
+  "analysis": "Chain: [image man] → [the party that nominated him for president in 1928] → [the three states that party flipped in 2016]. Entry point = the man in the image, which must stay explicit (Requirement 3) — it has no predecessor to lean on. Hop test on each clue: (1) The '1927 flood → 1928 nomination' clause is a redundant biographical hop that is not on the path to the answer and acts as a strong fingerprint of the man; by the forward-safety test it lets a solver identify him without the image, so remove it. (2) Terminal shortcut: explicitly naming the 'Democratic Party' and 'blue wall' fails the forward-safety test — D alone reveals the 2016 states with no need to identify the man or his party first. Blur to a relational description ('three states that had long supported its rival party'). Backward-sufficiency check: once the man and his 1928 nominating party are fixed, that relational phrase still resolves to exactly Michigan, Wisconsin, and Pennsylvania — unique. Also merge the fragmented clauses for compactness.",
   "question": "The political party that nominated the man shown in this image as its 1928 presidential candidate narrowly carried three states that had long supported its rival party in 2016. Which three states were they, and what broader effect did that victory have on that party?"
 }
-Example 2:
-question: The 2015 Copa Libertadores champion was an Argentine giant whose home ground is the Estadio Monumental. In River Plate’s 2024–25 squad list, the player wearing number 29 took the final penalty in the 2022 World Cup final. The provided photo shows Montiel taking that last penalty. Which side of the goal did he send the ball to?
+
+**Example 2**
+question: The 2015 Copa Libertadores champion was an Argentine giant whose home ground is the Estadio Monumental. In River Plate's 2024–25 squad list, the player wearing number 29 took the final penalty in the 2022 World Cup final. The provided photo shows Montiel taking that last penalty. Which side of the goal did he send the ball to?
 {
-  "analysis": "The question contains multiple overly revealing clues, as well as some redundancy. First, to ensure that the question remains solvable, we keep the Copa Libertadores as the entry point. Since the 2015 Copa Libertadores champion is already sufficient to identify the team as Argentina’s River Plate, the clue \"Estadio Monumental\" is redundant and makes the question easier. In addition, the team’s name is explicitly exposed in the second hop and should be removed. The description of the World Cup year can also be made vaguer; even after doing so, the relevant World Cup can still be identified through Montiel and the penalty he took. In the final sentence, Montiel is named directly, and because the image does not appear at the beginning of the question—that is, it is not actually provided to the user and must instead be located online by the user—this image cue should be hidden. The question should not explicitly mention the image, while still requiring the visual information from that specific image in order to answer correctly. In addition, the order of the clues can be adjusted and compressed to some extent.",
+  "analysis": "Chain: [2015 Copa Libertadores champion] → [its number-29 player in 2024–25] → [that player's kick in a World Cup final] → [the direction, read from the image]. Entry point = '2015 Copa Libertadores champion', kept (Requirement 3): it already resolves uniquely to River Plate, so the added 'Estadio Monumental' is a redundant reinforcing clue — remove it. Hop test: (2) the club's name 'River Plate' is restated in hop 2, re-exposing an entity the solver was supposed to derive — delete the name and refer back relationally ('that club'). (3) '2022 World Cup final' is an explicit-year shortcut; by forward safety it over-specifies, yet backward sufficiency still holds because 'the player who took the final penalty in a World Cup final' plus the player's identity resolves the event uniquely — so blur the year to 'a World Cup final'. (4) The photo is not shown at the top of the question (the user must locate it), and 'Montiel' names the target directly; hide both — require the visual answer without mentioning the image or the name. Finally reorder and compress the clues.",
   "question": "The number 29 player who was with the 2015 Copa Libertadores-winning club in 2024–25 once took the final penalty in a World Cup final. Which side of the goal did he aim at for that kick?"
 }
-Example 3:
+
+**Example 3**
 question: A 20th-century Romanian sculptor who created a war memorial ensemble in Targu Jiu was photographed in his Paris studio by Edward Steichen in the 1920s. Where did the 1938-56 director of the museum that holds both marble and bronze versions of the slender sculpture at the center of that studio photograph earn his professional degree, and in what field?
 {
-  "analysis": "This question first points, through a vague description, to Constantin Brâncuşi and the photograph of his studio. It then moves through consecutive hops to the slender sculpture in the photograph and to the director of the museum that holds it. In this question, although a specific personal name and place name appear, that name, the phrase “Paris studio,” and the description of the photograph still do not explicitly expose Constantin Brâncuşi, who is the main entity in the reasoning chain, so these bridging statements can be retained. The sentence structure is fairly compact, the hop logic follows the order of the hop chain, and there is no obvious shortcut. Therefore, this is a high-quality question and does not need to be revised.",
+  "analysis": "Chain: [Romanian sculptor with the Targu Jiu memorial, via a vague description] → [the studio photograph] → [the slender sculpture at its center] → [the museum holding both marble and bronze versions] → [that museum's 1938–56 director] → [his degree]. This is a deliberate case where NO revision is needed. Entry point: the sculptor is referenced only relationally (Targu Jiu memorial + 'photographed in his Paris studio by Edward Steichen'); crucially, neither the name Brâncuși nor his signature works are stated, so even though a proper name (Steichen) and place (Paris) appear, the main bridge entity stays unexposed — the forward-safety test passes. Backward sufficiency also passes at every hop: sculptor → photo → central sculpture → holding museum → dated director are each uniquely determined by their predecessor. The structure is compact and hop order matches the chain, with no shortcut on the terminal clue. Leave as is.",
   "question": "A 20th-century Romanian sculptor who created a war memorial ensemble in Targu Jiu was photographed in his Paris studio by Edward Steichen in the 1920s. Where did the 1938-56 director of the museum that holds both marble and bronze versions of the slender sculpture at the center of that studio photograph earn his professional degree, and in what field?"
 }
-Example 4:
-question: In Jacques-Louis David’s painting of the Tennis Court Oath, the man standing on a table at the center of the crowd with his arm raised later wrote a eulogy for an astronomer; that oath took place in the city that hosted the 8th summit of an intergovernmental forum in 1982. While conducting an arc measurement at the Cape of Good Hope, that astronomer incorrectly concluded that the Earth was prolate. Decades later, who first proposed that this error was caused by the gravitational pull of nearby mountains, and who later confirmed the theory through new measurements?
+
+**Example 4**
+question: In Jacques-Louis David's painting of the Tennis Court Oath, the man standing on a table at the center of the crowd with his arm raised later wrote a eulogy for an astronomer; that oath took place in the city that hosted the 8th summit of an intergovernmental forum in 1982. While conducting an arc measurement at the Cape of Good Hope, that astronomer incorrectly concluded that the Earth was prolate. Decades later, who first proposed that this error was caused by the gravitational pull of nearby mountains, and who later confirmed the theory through new measurements?
 {
-  "analysis": "This question has a clear reasoning chain. However, the opening description of the painting is too explicit, and the later clue that ‘the astronomer conducted measurements at the Cape of Good Hope and concluded that the Earth was prolate’ makes it easy to jump directly to Jean Sylvain Bailly, which creates an obvious shortcut. So the question should keep the beginning of the reasoning chain—namely, the description involving the Group of Seven—while moderately obfuscating the intermediate entities.",
-  "question": "In Jacques-Louis David’s painting of an event that took place in the city that hosted the 8th summit of an intergovernmental forum in 1982, the man standing on a table at the center of the crowd with his arm raised later wrote a eulogy for an astronomer, who reached an incorrect conclusion about the Earth’s shape during an arc measurement carried out somewhere. Decades later, who first proposed that the error in shape was caused by nearby mountains, and who later confirmed the theory through new measurements?"
+  "analysis": "Chain: [the city that hosted the 8th summit of an intergovernmental forum in 1982] → [the historical event that occurred there] → [David's painting of that event] → [the raised-arm man at the center] → [the astronomer he eulogized] → [the shape error] → [who proposed the mountain cause and who confirmed it]. Entry point = the 1982-summit city clue, kept explicit (Requirement 3). Shortcut scan: (1) naming 'the Tennis Court Oath' fails forward safety — it exposes the event and location before the solver derives them from the summit clue; replace with 'an event that took place in [that city]'. (2) Terminal-region shortcut (Requirement 4): 'arc measurement at the Cape of Good Hope' + 'concluded the Earth was prolate' together let a strong model jump straight to the astronomer, skipping the painting-and-eulogy hops; by the hop test D here is decisive on its own, so blur the location ('an arc measurement carried out somewhere') and soften 'prolate' to 'an incorrect conclusion about the Earth's shape'. Backward sufficiency still holds: once the man in the painting is identified, 'the astronomer he eulogized' resolves uniquely. Keep the painter and the raised-arm visual detail, since after the location is inferred they are needed to fix the painting and the man.",
+  "question": "In Jacques-Louis David's painting of an event that took place in the city that hosted the 8th summit of an intergovernmental forum in 1982, the man standing on a table at the center of the crowd with his arm raised later wrote a eulogy for an astronomer, who reached an incorrect conclusion about the Earth's shape during an arc measurement carried out somewhere. Decades later, who first proposed that the error in shape was caused by nearby mountains, and who later confirmed the theory through new measurements?"
 }
 """
 
@@ -2306,6 +2335,11 @@ class QuestionWriter:
                     "path_id": path.path_id,
                     "entry_hop": entry_hop,
                     "compose_payload": compose_payload,
+                    "compose_result": {
+                        "raw_response": parsed,
+                        "analysis": str(parsed.get("analysis") or "").strip(),
+                        "question": question,
+                    },
                     "raw_hop_summaries": raw_hop_summaries,
                     "image_bridge_normalization": image_bridge_normalization,
                     "starting_image_url": starting_image_url,

@@ -336,6 +336,45 @@ class ImageTargetCandidateSelectionTests(unittest.TestCase):
         )
         self.assertEqual(text_candidate_record["text_target_candidate_verification"]["decision"], "filter")
 
+    def test_compact_record_persists_compose_and_difficulty_analyses(self) -> None:
+        sample = {
+            "sample_id": "sample-1",
+            "path": {},
+            "draft": {
+                "question": "Draft question?",
+                "answer": "Answer",
+                "metadata": {
+                    "compose_payload": {"hops": [{"statement": "A leads to B."}]},
+                    "compose_result": {
+                        "analysis": "Merged the hops while hiding the intermediate target.",
+                        "question": "Draft question?",
+                    },
+                },
+            },
+            "obfuscated": {
+                "question": "Enhanced question?",
+                "answer": "Answer",
+                "metadata": {
+                    "difficulty_enhancement_payload": {"question": "Draft question?"},
+                    "difficulty_enhancement_result": {
+                        "analysis": "Blurred the identifying clue.",
+                        "question": "Enhanced question?",
+                    },
+                },
+            },
+        }
+
+        record = VqaBatchRunner._compact_sample_record(sample)
+
+        self.assertEqual(
+            record["compose"]["result"]["analysis"],
+            "Merged the hops while hiding the intermediate target.",
+        )
+        self.assertEqual(
+            record["difficulty_enhancement"]["result"]["analysis"],
+            "Blurred the identifying clue.",
+        )
+
 
 class DifficultyEnhancementImageMarkTests(unittest.TestCase):
     def test_image_entry_hop_is_marked(self) -> None:
