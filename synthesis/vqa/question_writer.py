@@ -2329,6 +2329,21 @@ class QuestionWriter:
                         if context.target_node.get("node_type") == "image"
                         else {}
                     ),
+                    **(
+                        {
+                            "text_target_candidates": list(
+                                raw_target_ask.get("text_target_candidates") or []
+                            ),
+                            "text_target_candidate_verification": dict(
+                                raw_target_ask.get("text_target_candidate_verification") or {}
+                            ),
+                            "text_target_candidate_evaluation": dict(
+                                raw_target_ask.get("text_target_candidate_evaluation") or {}
+                            ),
+                        }
+                        if context.target_node.get("node_type") == "text"
+                        else {}
+                    ),
                 },
             ),
             warnings=draft_warnings,
@@ -3034,8 +3049,12 @@ class QuestionWriter:
     ) -> tuple[dict[str, Any], dict[str, Any] | None, dict[str, Any]]:
         image_content = final_hop.dst_content or {}
         image_label = self._compress_hop_prompt_label(image_content, fallback=final_hop.dst_node_id)
-        model_client = self.image_target_ask_model_client or self.image_bridge_model_client or self.model_client
-        model = self.image_target_ask_model or self.image_bridge_model or self.model
+        model_client = (
+            self.ask_target_verify_model_client
+            or self.image_bridge_model_client
+            or self.model_client
+        )
+        model = self.ask_target_verify_model or self.image_bridge_model or self.model
         question_target_ask = dict(raw_target_ask)
         target_value = str(raw_target_ask.get("answer") or final_hop_summary.get("target") or "").strip()
         diagnostic: dict[str, Any] = {
@@ -3044,7 +3063,7 @@ class QuestionWriter:
             "image_label": image_label,
             "model_alias": model,
             "decision": "keep_image",
-            "reason": "no_image_target_ask_model_available",
+            "reason": "no_ask_target_verify_model_available",
             "applied": False,
             "raw_ask_target": str(raw_target_ask.get("ask_target") or "").strip(),
             "raw_answer": target_value,
@@ -3898,6 +3917,16 @@ class QuestionWriter:
         if "image_target_candidate_evaluation" in raw_target_ask:
             metadata["image_target_candidate_evaluation"] = dict(
                 raw_target_ask.get("image_target_candidate_evaluation") or {}
+            )
+        if "text_target_candidates" in raw_target_ask:
+            metadata["text_target_candidates"] = list(raw_target_ask.get("text_target_candidates") or [])
+        if "text_target_candidate_verification" in raw_target_ask:
+            metadata["text_target_candidate_verification"] = dict(
+                raw_target_ask.get("text_target_candidate_verification") or {}
+            )
+        if "text_target_candidate_evaluation" in raw_target_ask:
+            metadata["text_target_candidate_evaluation"] = dict(
+                raw_target_ask.get("text_target_candidate_evaluation") or {}
             )
         if raw_hop_summaries is not None:
             metadata["raw_hop_summaries"] = raw_hop_summaries
