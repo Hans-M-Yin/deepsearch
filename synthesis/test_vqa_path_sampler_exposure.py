@@ -239,6 +239,17 @@ class EdgeQualityFilterTests(unittest.TestCase):
         self.assertFalse(rejected["wiki_bad"]["evaluation"]["keep"])
         self.assertEqual(len(client.requests), 1)
         self.assertEqual(client.requests[0].model, "overlap-model")
+        self.assertEqual(
+            client.requests[0].metadata,
+            {
+                "trace_label": "sampler_edge_quality",
+                "session_id": "3200636808",
+                "prompt_cache_key": "3200636808",
+                "user_cache_key": "3200636808",
+                "user_id": "3200636808",
+                "x_tt_logid": "3200636808",
+            },
+        )
         payload = json.loads(client.requests[0].messages[1].content)
         self.assertEqual([item["edge_kind"] for item in payload["candidates"]], ["text_to_text", "text_to_image"])
 

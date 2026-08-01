@@ -3,6 +3,7 @@
 Examples:
   python debug/debug_vqa_question_writing.py --vqa-dir synthesis/runs/my_graph/vqa/0716_123456
   python debug/debug_vqa_question_writing.py --vqa-dir synthesis/runs/my_graph/vqa/0716_123456 --limit 3
+  python debug/debug_vqa_question_writing.py --vqa-dir synthesis/runs/my_graph/vqa/0716_123456 --offset 10 --limit 3
   python debug/debug_vqa_question_writing.py --vqa-dir synthesis/runs/my_graph/vqa/0716_123456 --sample-id sample_path_000123
 """
 
@@ -29,6 +30,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Only print the given sample_id. Repeatable.",
     )
     parser.add_argument("--limit", type=int, default=None, help="Optional max number of samples to print.")
+    parser.add_argument(
+        "--offset",
+        type=int,
+        default=0,
+        help="Number of matched samples to skip before printing.",
+    )
     parser.add_argument("--width", type=int, default=108, help="Wrap width for long text fields.")
     return parser
 
@@ -79,6 +86,7 @@ def _iter_filtered_samples(
     records: Iterable[dict[str, Any]],
     *,
     sample_ids: set[str],
+    offset: int,
     limit: int | None,
 ) -> list[dict[str, Any]]:
     matched: list[dict[str, Any]] = []
@@ -87,9 +95,10 @@ def _iter_filtered_samples(
         if sample_ids and sample_id not in sample_ids:
             continue
         matched.append(record)
-        if limit is not None and len(matched) >= limit:
-            break
-    return matched
+    selected = matched[offset:]
+    if limit is not None:
+        selected = selected[:limit]
+    return selected
 
 
 def _first_non_empty(*values: Any) -> str:
@@ -532,11 +541,18 @@ def _format_sample(
 def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
+    if args.offset < 0:
+        parser.error("--offset must be non-negative.")
     samples_path = _resolve_samples_path(args.vqa_dir)
     records = _load_jsonl(samples_path)
     nodes_by_id = _load_graph_nodes(args.vqa_dir)
     sample_ids = {str(item).strip() for item in args.sample_id if str(item).strip()}
-    selected = _iter_filtered_samples(records, sample_ids=sample_ids, limit=args.limit)
+    selected = _iter_filtered_samples(
+        records,
+        sample_ids=sample_ids,
+        offset=args.offset,
+        limit=args.limit,
+    )
 
     if not selected:
         if sample_ids:
@@ -547,7 +563,7 @@ def main(argv: list[str] | None = None) -> int:
 
     rendered = [
         _format_sample(sample, ordinal=index, width=args.width, nodes_by_id=nodes_by_id)
-        for index, sample in enumerate(selected, start=1)
+        for index, sample in enumerate(selected, start=args.offset + 1)
     ]
     print("\n\n".join(rendered))
     print(SEPARATOR)

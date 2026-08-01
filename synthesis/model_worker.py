@@ -193,7 +193,7 @@ def _request_extra_headers(metadata: dict[str, Any] | None) -> dict[str, str] | 
     metadata = dict(metadata or {})
     headers: dict[str, str] = {}
     extra_payload: dict[str, str] = {}
-    for key in ("session_id", "prompt_cache_key", "user_id"):
+    for key in ("session_id", "prompt_cache_key", "user_cache_key", "user_id"):
         value_text = str(metadata.get(key) or "").strip()
         if value_text:
             extra_payload[key] = value_text

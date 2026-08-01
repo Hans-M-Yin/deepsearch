@@ -27,6 +27,20 @@ from .schemas import PathCandidate, TrajectoryStats
 
 SAMPLER_STATE_VERSION = 1
 DEFAULT_HISTORY_EXPOSURE_MODEL = "multimodal_process"
+_VQA_FIXED_REQUEST_ID = "3200636808"
+
+
+def _sampler_worker_metadata(trace_label: str) -> dict[str, str]:
+    """Attach stable gateway routing fields for sampler model-worker calls."""
+
+    return {
+        "trace_label": trace_label,
+        "session_id": _VQA_FIXED_REQUEST_ID,
+        "prompt_cache_key": _VQA_FIXED_REQUEST_ID,
+        "user_cache_key": _VQA_FIXED_REQUEST_ID,
+        "user_id": _VQA_FIXED_REQUEST_ID,
+        "x_tt_logid": _VQA_FIXED_REQUEST_ID,
+    }
 
 
 PROMPT_LLM_NEXT_HOP_SELECTION = """You are reviewing candidate next hops for graph trajectory sampling in a multi-hop question-generation pipeline.
@@ -1467,7 +1481,7 @@ class RandomPathSampler(PathSampler):
                     ModelMessage(role="system", content=system),
                     ModelMessage(role="user", content=json.dumps(user_payload, ensure_ascii=False, indent=2)),
                 ],
-                metadata={"trace_label": trace_label},
+                metadata=_sampler_worker_metadata(trace_label),
             )
         )
         try:
