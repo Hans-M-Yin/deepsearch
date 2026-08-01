@@ -27,16 +27,19 @@ class ResponsesPromptDebugTests(unittest.TestCase):
         output = stderr.getvalue()
         self.assertIn("responses_prompt_public_reasoning=True", output)
         self.assertIn("uses_default_system_prompt=True", output)
-        self.assertIn("uses_responses_tool_use_tips_directly=True", output)
-        self.assertIn("instructions_source=responses_system_prompt_plus_tool_use_tips", output)
+        self.assertIn("uses_responses_system_prompt=True", output)
+        self.assertIn("instructions_source=responses_system_prompt", output)
 
 
 if __name__ == "__main__":
     unittest.main()
 
 class ResponsesInstructionsTests(unittest.TestCase):
-    def test_default_responses_instructions_append_tool_use_tips(self) -> None:
-        from synthesis.sft.api_tools import RESPONSES_TOOL_USE_TIPS, _build_responses_instructions
+    def test_default_responses_instructions_embed_tool_use_tips_once(self) -> None:
+        from synthesis.sft.api_tools import RESPONSES_SYSTEM_PROMPT, _build_responses_instructions
 
         instructions = _build_responses_instructions(DEFAULT_SYSTEM_PROMPT)
-        self.assertIn(RESPONSES_TOOL_USE_TIPS, instructions)
+        self.assertEqual(instructions, RESPONSES_SYSTEM_PROMPT)
+        self.assertEqual(instructions.count("Tool-use tips:"), 1)
+        self.assertIn("1. t2t_search returns compact records", instructions)
+        self.assertIn("7. For read_url", instructions)

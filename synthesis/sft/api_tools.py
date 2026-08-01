@@ -154,17 +154,6 @@ Rules:
 """
 
 # #### START Response 0720 ####
-RESPONSES_TOOL_USE_TIPS = """
-Tool-use tips:
-1. t2t_search returns compact records with title, snippet, and source_page_id. Use read_url with source_page_id to inspect a promising page before treating page content as verified evidence.
-2. t2i_search returns compact image-search records with image_id and source_page_id. The images are not visible yet. Use read_url with image_id to inspect an image or source_page_id to inspect its page before making visual claims.
-3. i2i_search returns compact reverse-image-search records with image_id and source_page_id. Matches may be noisy. Use titles, sources, and URL-derived keyword hints to select the most appropriate image_id or source_page_id for the next read_url call; verify the selected resource before making factual claims.
-4. After i2i_search or t2i_search, do not claim that you have seen a returned image unless a successful read_url call with its image_id has downloaded/read that image. Search metadata and URL-derived keyword hints help select which resource ID to read, but a successful read_url inspection is still required before making visual claims.
-5. Use search tools **flexibly**. If you still cannot find a specific detail after multiple search attempts, try searching indirectly for related pages that may contain the information. For example, if repeated searches for a certain Olympic delegation with 108 athletes yield no results, you can instead search for statistics on delegation sizes by country, or for participation statistics from that edition of the Olympics.
-6. For i2i_search, region coordinates are x-first normalized coordinates on a 0-1000 scale in the order [x1, y1, x2, y2]. x increases left-to-right and y increases top-to-bottom. Use [0, 0, 1000, 1000] for the full image.
-""".strip()
-
-
 RESPONSES_SYSTEM_PROMPT = """
 You are writing a complete solution for a multi-hop knowledge question. Specifically, based on the question provided to you, you need to produce a full problem-solving process that includes scientifically rigorous and logically coherent reasoning steps. This solution process should include analysis and reasoning about the question, native tool calls, analysis and reflection on tool results, replanning of the solution steps, multiple search attempts when necessary, and a final accurate answer.
 
@@ -183,11 +172,13 @@ Requirements:
 Note: the solution must not mention any of the above writing requirements. In every round of solution writing, you must check one by one that the above requirements are satisfied.
 
 Tool-use tips:
-1. t2t_search returns title, snippet, and source_page_id. Use read_url with source_page_id when you need to inspect the page.
-2. t2i_search returns title, snippet, image_id, and source_page_id. Use read_url with image_id to download the image, or source_page_id to inspect the source page.
-3. i2i_search returns title, source, image_id, and source_page_id. The returned images may differ from the queried crop. Use read_url with image_id to inspect an image or source_page_id to inspect its original page. URL-derived keywords expose relevant information from the original URLs and can help select an appropriate image_id or source_page_id to inspect; verify that resource before using it as factual evidence.
-4. For i2i_search, region coordinates use x-first normalized coordinates on a 0–1000 scale, in the order [x1, y1, x2, y2]. The x-axis increases from left to right, and the y-axis increases from top to bottom. To search the full image, use [0, 0, 1000, 1000].
-5. For read_url, use a source_page_id or image_id returned by search whenever available. A source_page_id reads the webpage; an image_id downloads the image. Legacy raw URLs are supported only for direct links already available in the conversation. The tool cannot see your prior reasoning history, so clearly state what evidence you need in goal.
+1. t2t_search returns compact records with title, snippet, and source_page_id. Use read_url with source_page_id to inspect a promising page before treating page content as verified evidence.
+2. t2i_search returns compact image-search records with image_id and source_page_id. The images are not visible yet. Use read_url with image_id to inspect an image or source_page_id to inspect its page before making visual claims.
+3. i2i_search returns compact reverse-image-search records with image_id and source_page_id. Matches may be noisy. Use titles, sources, and URL-derived keyword hints to select the most appropriate image_id or source_page_id for the next read_url call; verify the selected resource before making factual claims.
+4. After i2i_search or t2i_search, do not claim that you have seen a returned image unless a successful read_url call with its image_id has downloaded/read that image. Search metadata and URL-derived keyword hints help select which resource ID to read, but a successful read_url inspection is still required before making visual claims.
+5. Use search tools **flexibly**. If you still cannot find a specific detail after multiple search attempts, try searching indirectly for related pages that may contain the information. For example, if repeated searches for a certain Olympic delegation with 108 athletes yield no results, you can instead search for statistics on delegation sizes by country, or for participation statistics from that edition of the Olympics.
+6. For i2i_search, region coordinates are x-first normalized coordinates on a 0-1000 scale in the order [x1, y1, x2, y2]. x increases left-to-right and y increases top-to-bottom. Use [0, 0, 1000, 1000] for the full image.
+7. For read_url, use a source_page_id or image_id returned by search whenever available. A source_page_id reads the webpage; an image_id downloads the image. Legacy raw URLs are supported only for direct links already available in the conversation. The tool cannot see your prior reasoning history, so clearly state what evidence you need in goal.
 
 Next, I will provide some excerpted examples, and you can learn from them how to write a high-quality answer process. The examples use native function calls, so the written text shows the public progress update before the call and then names the intended native function call.
 
@@ -221,20 +212,12 @@ Discuss: In the example above, the solution first analyzes the question and then
 """.strip()
 
 
-RESPONSES_PUBLIC_REASONING_PROMPT = RESPONSES_TOOL_USE_TIPS
-
-
 def _build_responses_instructions(base_system_prompt: str) -> str:
-    # Use a clean Responses-specific system prompt when the caller uses the
-    # default SFT prompt. If the caller explicitly supplies another system prompt,
-    # keep it and append only the tool-use tips.
+    # Use the Responses-specific system prompt only for the default SFT prompt.
+    # Its complete tool-use guidance is embedded exactly once in that prompt.
     if base_system_prompt.strip() == DEFAULT_SYSTEM_PROMPT.strip():
-        return "\n\n".join(
-            part for part in (RESPONSES_SYSTEM_PROMPT, RESPONSES_TOOL_USE_TIPS) if part
-        ).strip()
-    return "\n\n".join(
-        part for part in (base_system_prompt.strip(), RESPONSES_TOOL_USE_TIPS) if part
-    ).strip()
+        return RESPONSES_SYSTEM_PROMPT
+    return base_system_prompt.strip()
 
 
 _MANUAL_REACT_ACTIONS = {"t2t_search", "t2i_search", "i2i_search", "read_url", "finish"}
@@ -2241,14 +2224,14 @@ class OpenAIToolAgent:
         base_system_prompt = system_prompt or self.config.system_prompt
         uses_default_system_prompt = base_system_prompt.strip() == DEFAULT_SYSTEM_PROMPT.strip()
         public_reasoning_enabled = bool(self.config.responses_prompt_public_reasoning)
-        uses_tool_use_tips_directly = public_reasoning_enabled
+        uses_responses_system_prompt = public_reasoning_enabled and uses_default_system_prompt
         print(
             "[responses-prompt-debug] "
             "api_mode=responses "
             f"responses_prompt_public_reasoning={public_reasoning_enabled} "
             f"uses_default_system_prompt={uses_default_system_prompt} "
-            f"uses_responses_tool_use_tips_directly={uses_tool_use_tips_directly} "
-            f"instructions_source={('responses_system_prompt_plus_tool_use_tips' if public_reasoning_enabled and uses_default_system_prompt else ('custom_system_plus_tool_use_tips' if uses_tool_use_tips_directly else 'base_system_prompt_only'))}",
+            f"uses_responses_system_prompt={uses_responses_system_prompt} "
+            f"instructions_source={('responses_system_prompt' if public_reasoning_enabled and uses_default_system_prompt else 'base_system_prompt_only')}",
             file=sys.stderr,
             flush=True,
         )
