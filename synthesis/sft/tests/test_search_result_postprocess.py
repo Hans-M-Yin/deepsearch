@@ -1,4 +1,5 @@
 import unittest
+from io import StringIO
 from unittest.mock import patch
 
 from synthesis.sft.api_tools import ToolRuntimeContext, execute_tool_call
@@ -50,7 +51,10 @@ class SearchResultPostprocessTests(unittest.TestCase):
             compact = context.postprocess_search_output("t2t_search", raw)
         resource_id = compact["results"][0]["source_page_id"]
 
-        with patch("synthesis.sft.api_tools.tools.read_url", return_value={"ok": True, "kind": "text"}) as read:
+        with (
+            patch("synthesis.sft.api_tools.tools.read_url", return_value={"ok": True, "kind": "text"}) as read,
+            patch("sys.stderr", new_callable=StringIO) as stderr,
+        ):
             result = execute_tool_call(
                 "read_url",
                 {"resource_id": resource_id, "goal": "inspect"},
@@ -59,6 +63,8 @@ class SearchResultPostprocessTests(unittest.TestCase):
         self.assertTrue(result.output["ok"])
         self.assertEqual(result.output["resource_id"], resource_id)
         self.assertEqual(read.call_args.kwargs["url"], "https://page.example/story")
+        self.assertIn(f"resource_id={resource_id}", stderr.getvalue())
+        self.assertIn("url=https://page.example/story", stderr.getvalue())
 
     def test_i2i_compact_output_omits_query_fields(self) -> None:
         raw = {

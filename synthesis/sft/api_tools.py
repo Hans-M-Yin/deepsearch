@@ -1720,6 +1720,13 @@ def execute_tool_call(
         if not url:
             output = {"ok": False, "error": "url or resource_id is required for read_url"}
             return ToolExecutionResult(name=name, arguments=params, output=output, output_text=_json_text(output))
+        print(
+            "[read_url debug] "
+            f"resource_id={resource_id or '-'} "
+            f"url={url}",
+            file=sys.stderr,
+            flush=True,
+        )
         effective_goal = str(params.get("goal") or tool_goal or "").strip()
         output = tools.read_url(
             url=url,
