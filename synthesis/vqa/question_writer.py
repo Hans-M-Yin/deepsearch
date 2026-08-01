@@ -1295,13 +1295,13 @@ Treat each of the following as a **shortcut candidate**, whether it sits on an i
 3. **Preserve the entry point.** The clue(s) at the *beginning of the reasoning chain* (not necessarily the surface start of the sentence) are the question's only foothold and should be kept relatively explicit — do NOT apply heavy obfuscation to them. Blur only when a later hop can re-establish the same entity; the head of the chain has no predecessor to lean on.
 4. Carefully analyze every piece of information in the question, remove information that is unrelated to the main reasoning chain, and, while ensuring the reasoning can still proceed smoothly, delete redundant information within the main reasoning chain as well.
 5. Do not repeat the same qualifier for one entity. Introduce a description once, then refer back with a short anaphor; delete redundant restatements.
-6. The question may include an image. Preserve the connection between the question and the image; descriptions of a scene/image marked `"image"` in the reasoning_chain should be preserved (especially visual details) and only lightly obfuscated at the entity level, never deleted.
+6. The question may include an input image, which will be provided to you. You should preserve the connection between the question and the image; for scenes or visual descriptions marked as "image" in the reasoning_chain (these images themselves will not be shown to the respondent, so do not say "this image" in the question), especially visual details of the scene, they should be retained and may only be lightly obfuscated at the entity level, not deleted.
 7. Do not fabricate information. If an entity is not explicitly revealed in the current wording, do not invent a way to reveal it.
 8. Delete any redundant information that is only weakly related to the main reasoning chain.
 
 ### Self-check (before finalizing)
 
-Enumerate every explicit year, date, unique title, superlative, signature term, and proper noun remaining in your draft. For each, state in the analysis whether you **keep or blur** it, and justify with the Core verification test (entry point / uniqueness anchor → keep; otherwise → blur). Only declare "no revision needed" if this scan leaves nothing removable AND no unjustified year/title/superlative remains.
+Enumerate every explicit year, date, unique title, superlative, signature term, and proper noun remaining in your draft (except tne entry). For each, state in the analysis whether you **keep or blur** it, and justify with the Core verification test (entry point / uniqueness anchor → keep; otherwise → blur). Only declare "no revision needed" if this scan leaves nothing removable AND no unjustified year/title/superlative remains.
 
 ### JSON output format
 Return exactly one valid JSON object and no other text.
@@ -1310,8 +1310,7 @@ Return exactly one valid JSON object and no other text.
   "question": "the improved question"
 }
 
-### Techniques
-1. Based on the provided reasoning chain, analyze whether each piece of information is redundant and, given the previous entity, whether deleting it would introduce ambiguity. If not, delete it. Ideally, a well-formed question should be highly ambiguous when the previous entity is still unknown, but once that previous entity has been inferred, the ambiguity should disappear completely.
+### TeBased on the provided reasoning chain, analyze whether each piece of information is redundant and, given the previous entity, whether deleting it would introduce ambiguity. If not, delete it. Ideally, a well-formed question should be highly ambiguous when the previous entity is still unknown, but once that previous entity has been inferred, the ambiguity should disappear completely.
 2. When blurring creates ambiguity, disambiguate with a neutral relational qualifier, not with a fresh salient hint.
 3. Keep the question natural, concise, and compact — not a pile of stitched-together hints.
 
@@ -1321,7 +1320,8 @@ Return exactly one valid JSON object and no other text.
 question: The man shown in this image later became nationally prominent for his handling of the devastating 1927 flood, a development that helped lead to his 1928 presidential nomination by the political party that narrowly carried three long-Democratic "blue wall" states in 2016. Which three states were they, and what broader effect did that victory have on that party?
 {
   "analysis": "Chain: [the man in the image] → [the political party that nominated him for president] → [the three states that party flipped in 2016]. Entry point = the man in the image, which must stay explicit (Requirement 3), because it has no predecessor to rely on. Apply the hop test to each clue: (1) The biographical clue ‘1927 flood → 1928 nomination’ is redundant and not part of the path to the answer; instead, it acts as a strong fingerprint of the man. Under the forward-safety test, it allows the solver to identify him without using the image, so it should be removed. (2) Terminal shortcut: explicitly naming the ‘Democratic Party’ and the ‘blue wall’ fails forward safety — those phrases alone let the solver infer the three 2016 states directly, without identifying the man or his party. They should be replaced with a relational description (‘three states that had long supported its rival party’). Backward sufficiency still holds: once the man and his nominating party are identified, that relational phrase still resolves uniquely to Michigan, Wisconsin, and Pennsylvania. The fragmented clauses should also be merged to make the question more compact. (3) Redundant information deletion: once the man is identified, his party can be found directly, so the year in the description linking the man to the party via ‘its presidential candidate in 1928’ can also be removed. Deleting it makes the question more compact.",
-  "question": "The political party that nominated the man shown in this image as its presidential candidate narrowly carried three states that had long supported its rival party in 2016. Which three states were they, and what broader effect did that victory have on that party?"
+  "questiochniques
+1. n": "The political party that nominated the man shown in this image as its presidential candidate narrowly carried three states that had long supported its rival party in 2016. Which three states were they, and what broader effect did that victory have on that party?"
 }
 
 **Example 2**
