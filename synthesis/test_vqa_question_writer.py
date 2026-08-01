@@ -147,8 +147,8 @@ class ImageTargetCandidateSelectionTests(unittest.TestCase):
         writer = QuestionWriter(
             model_client=client,
             model="writer",
-            image_target_ask_model_client=verification_client,
-            image_target_ask_model="visual-verifier",
+            ask_target_verify_model_client=verification_client,
+            ask_target_verify_model="visual-verifier",
         )
         context = WriterContext(
             path_id="path-image",
@@ -203,8 +203,8 @@ class ImageTargetCandidateSelectionTests(unittest.TestCase):
         writer = QuestionWriter(
             model_client=client,
             model="visual-verifier",
-            image_target_ask_model_client=client,
-            image_target_ask_model="visual-verifier",
+            ask_target_verify_model_client=client,
+            ask_target_verify_model="visual-verifier",
         )
 
         kept, verification = writer._verify_image_target_candidates(
@@ -217,19 +217,49 @@ class ImageTargetCandidateSelectionTests(unittest.TestCase):
         self.assertEqual(verification["kept_candidate_ids"], ["candidate_1", "candidate_2"])
         self.assertEqual(verification["filtered_candidate_ids"], ["candidate_1", "candidate_2"])
 
-    def test_text_target_does_not_add_image_candidate_metadata(self) -> None:
-        client = _QueuedModelClient(
+    def test_text_target_filters_closed_book_solvable_candidates_and_selects_best(self) -> None:
+        candidates = [
+            {
+                "candidate_id": "candidate_1",
+                "ask_target": "Where was the target born?",
+                "answer": "Example City",
+                "supporting_facts": ["Born in Example City."],
+            },
+            {
+                "candidate_id": "candidate_2",
+                "ask_target": "Which obscure institution granted the target a fellowship?",
+                "answer": "Example Institute",
+                "supporting_facts": ["The target received a fellowship from Example Institute."],
+            },
+        ]
+        verification_client = _QueuedModelClient(
             [
                 {
-                    "ask_target": "Where was the target born?",
-                    "answer": "Example City",
-                    "supporting_facts": ["Born in Example City."],
-                    "reasoning": "The profile states the birthplace.",
-                    "support": "The answer is explicit.",
+                    "answers": [
+                        {"candidate_id": "candidate_1", "answer": "Example City", "answerable": True},
+                        {"candidate_id": "candidate_2", "answer": "", "answerable": False},
+                    ]
+                },
+                {
+                    "evaluations": [
+                        {"candidate_id": "candidate_1", "correct": True},
+                        {"candidate_id": "candidate_2", "correct": False},
+                    ]
                 }
             ]
         )
-        writer = QuestionWriter(model_client=client, model="writer")
+        evaluation = {
+            "decision": "select",
+            "selected_candidate_id": "candidate_2",
+            "evaluations": [{"candidate_id": "candidate_2", "valid": True}],
+        }
+        client = _QueuedModelClient([{"candidates": candidates}, evaluation])
+        writer = QuestionWriter(
+            model_client=client,
+            model="writer",
+            ask_target_verify_model_client=verification_client,
+            ask_target_verify_model="ask-target-verifier",
+        )
         context = WriterContext(
             path_id="path-text",
             trajectory={},
@@ -239,11 +269,20 @@ class ImageTargetCandidateSelectionTests(unittest.TestCase):
 
         selected = writer.select_target_ask(context=context)
 
+        self.assertEqual(selected["ask_target"], "Which obscure institution granted the target a fellowship?")
+        self.assertEqual(selected["answer"], "Example Institute")
+        self.assertEqual(
+            selected["text_target_candidate_verification"]["filtered_candidate_ids"],
+            ["candidate_1"],
+        )
+        self.assertEqual(selected["text_target_candidate_evaluation"], evaluation)
         self.assertNotIn("image_target_candidates", selected)
         self.assertNotIn("image_target_candidate_evaluation", selected)
-        self.assertEqual(len(client.requests), 1)
+        self.assertEqual(len(client.requests), 2)
+        self.assertEqual(len(verification_client.requests), 2)
+        self.assertTrue(all(request.model == "ask-target-verifier" for request in verification_client.requests))
 
-    def test_compact_record_only_persists_image_candidate_fields_when_present(self) -> None:
+    def test_compact_record_persists_target_candidate_fields_when_present(self) -> None:
         base_sample = {
             "sample_id": "sample-1",
             "path": {},
@@ -256,6 +295,8 @@ class ImageTargetCandidateSelectionTests(unittest.TestCase):
         text_record = VqaBatchRunner._compact_sample_record(base_sample)
         self.assertNotIn("image_target_candidates", text_record)
         self.assertNotIn("image_target_candidate_evaluation", text_record)
+        self.assertNotIn("text_target_candidates", text_record)
+        self.assertNotIn("text_target_candidate_evaluation", text_record)
 
         base_sample["draft"]["metadata"] = {
             "image_target_candidates": [{"candidate_id": "candidate_1"}],
@@ -275,6 +316,25 @@ class ImageTargetCandidateSelectionTests(unittest.TestCase):
             "candidate_1",
         )
         self.assertEqual(image_record["image_target_candidate_verification"]["decision"], "filter")
+
+        base_sample["draft"]["metadata"] = {
+            "text_target_candidates": [{"candidate_id": "candidate_2"}],
+            "text_target_candidate_evaluation": {
+                "decision": "select",
+                "selected_candidate_id": "candidate_2",
+            },
+            "text_target_candidate_verification": {
+                "decision": "filter",
+                "kept_candidate_ids": ["candidate_2"],
+            },
+        }
+        text_candidate_record = VqaBatchRunner._compact_sample_record(base_sample)
+        self.assertEqual(len(text_candidate_record["text_target_candidates"]), 1)
+        self.assertEqual(
+            text_candidate_record["text_target_candidate_evaluation"]["selected_candidate_id"],
+            "candidate_2",
+        )
+        self.assertEqual(text_candidate_record["text_target_candidate_verification"]["decision"], "filter")
 
 
 class DifficultyEnhancementImageMarkTests(unittest.TestCase):

@@ -330,14 +330,83 @@ Requirements:
 4. Do not fabricate or add any information. Everything mentioned in your answer must appear in the original text.
 5. If the content of your question contains highly distinctive markers that could reveal the target entity, you should make the question more ambiguous. For example, in the question “When was a certain politician’s slogan ‘Make America Great Again’ introduced?”, the highly distinctive slogan should be blurred. It can be rewritten as: “When was a certain politician’s own campaign slogan introduced?”
 
+Generate exactly 5 diverse candidate questions. Do not generate several near-duplicates
+that ask about the same fact in slightly different wording.
+
 Output format: JSON, containing the following fields:
 
 {
-  "ask_target": "A complete question about the target node",
-  "answer": "A standard answer that fully answers every part of ask_target",
-  "supporting_facts": ["The exact original facts needed to answer the question"],
-  "reasoning": "A concise derivation from supporting_facts to the answer",
-  "support": "A brief explanation of why the question is evidence-supported and unambiguous"
+  "candidates": [
+    {
+      "candidate_id": "candidate_1",
+      "ask_target": "A complete question about the target node",
+      "answer": "A standard answer that fully answers every part of ask_target",
+      "supporting_facts": ["The exact original facts needed to answer the question"],
+      "reasoning": "A concise derivation from supporting_facts to the answer",
+      "support": "A brief explanation of why the question is evidence-supported and unambiguous"
+    }
+  ]
+}
+"""
+
+
+PROMPT_ANSWER_TEXT_TARGET_CANDIDATES = """Answer every candidate question using only your own pre-existing knowledge.
+
+You are not given a target profile, a predecessor chain, search results, images, or any other
+reference material. Do not browse, retrieve, or infer hidden context. If you cannot answer a
+question reliably from ordinary background knowledge, return an empty answer rather than guessing.
+
+Return valid JSON with exactly this structure:
+{
+  "answers": [
+    {
+      "candidate_id": "candidate_1",
+      "answer": "concise answer, or empty string when not answerable",
+      "reason": "brief reason",
+      "answerable": true
+    }
+  ]
+}
+"""
+
+
+PROMPT_JUDGE_TEXT_TARGET_ANSWERS = """Judge whether each closed-book model answer is semantically correct relative to its gold answer.
+
+Minor wording differences, synonyms, and equivalent formatting count as correct. Empty, uncertain,
+contradictory, incomplete, or materially different answers count as incorrect.
+
+Return valid JSON with exactly this structure:
+{
+  "evaluations": [
+    {
+      "candidate_id": "candidate_1",
+      "correct": false,
+      "reason": "brief comparison against the gold answer"
+    }
+  ]
+}
+"""
+
+
+PROMPT_EVALUATE_TEXT_TARGET_CANDIDATES = """Select the highest-quality final knowledge question from the supplied candidates.
+
+All supplied candidates have already failed a closed-book answer attempt, so do not reject a
+candidate merely because it is not common knowledge. Select the one that is most natural, precise,
+objectively answerable, and clearly supported by its supporting facts. Prefer a question that fits
+the predecessor chain naturally and needs ordinary information retrieval after the target has been
+identified. Do not rewrite candidates. If no candidate is acceptable, return reject_all.
+
+Return valid JSON with exactly this structure:
+{
+  "decision": "select | reject_all",
+  "selected_candidate_id": "candidate_id or null",
+  "evaluations": [
+    {
+      "candidate_id": "candidate_1",
+      "valid": true,
+      "reason": "brief assessment"
+    }
+  ]
 }
 """
 
@@ -1306,8 +1375,8 @@ class QuestionWriter:
     compress_hop_model: str | None = None
     image_bridge_model_client: ModelWorkerClient | None = None
     image_bridge_model: str | None = None
-    image_target_ask_model_client: ModelWorkerClient | None = None
-    image_target_ask_model: str | None = None
+    ask_target_verify_model_client: ModelWorkerClient | None = None
+    ask_target_verify_model: str | None = None
     temperature: float | None = None
     max_tokens: int = 800
     json_retry_attempts: int = 2
@@ -1437,42 +1506,101 @@ class QuestionWriter:
         if target_node_type == "image":
             return self._select_image_target_ask(context=context)
 
-        system_prompt = PROMPT_SELECT_IMAGE_TARGET if target_node_type == "image" else PROMPT_SELECT_TEXT_TARGET
-        target_image_url = self._target_image_url(context.target_node)
-        user_payload: dict[str, Any] = {"target_node": context.target_node}
-        if target_node_type != "image":
-            user_payload["predecessor_chain"] = self._format_predecessor_chain(context)
+        return self._select_text_target_ask(context=context)
+
+    def _select_text_target_ask(self, *, context: WriterContext) -> dict[str, Any]:
+        user_payload = {
+            "target_node": context.target_node,
+            "predecessor_chain": self._format_predecessor_chain(context),
+        }
         try:
             parsed = self._generate_json(
-                system=system_prompt,
+                system=PROMPT_SELECT_TEXT_TARGET,
                 user_payload=user_payload,
-                trace_label=f"select_target_ask_{target_node_type or 'unknown'}",
-                image_url=target_image_url,
+                trace_label="select_target_ask_text_candidates",
+                max_tokens=max(self.max_tokens, 2400),
             )
         except Exception as exc:
             fallback = self._fallback_select_target(context.target_node)
             fallback["writer_warning"] = self._writer_warning_entry(
-                stage=f"select_target_ask_{target_node_type or 'unknown'}",
+                stage="select_target_ask_text_candidates",
                 error=exc,
             )
             return fallback
-        ask_target = self._ensure_question(str(parsed.get("ask_target") or "").strip())
-        answer = str(parsed.get("answer") or "").strip()
-        supporting_facts = parsed.get("supporting_facts") or []
-        if not isinstance(supporting_facts, list):
-            supporting_facts = []
-        supporting_facts = [str(item).strip() for item in supporting_facts if str(item).strip()]
-        reasoning = str(parsed.get("reasoning") or "").strip()
-        support = str(parsed.get("support") or "").strip()
-        if not ask_target or not answer:
-            return self._fallback_select_target(context.target_node)
-        return {
-            "ask_target": ask_target,
-            "answer": answer,
-            "supporting_facts": supporting_facts,
-            "reasoning": reasoning,
-            "support": support,
+
+        candidates = self._normalize_text_target_candidates(parsed.get("candidates"))
+        if not candidates:
+            fallback = self._fallback_select_target(context.target_node)
+            fallback["text_target_candidates"] = []
+            fallback["text_target_candidate_verification"] = {
+                "decision": "fallback",
+                "reason": "no_valid_generated_candidates",
+                "kept_candidate_ids": [],
+                "evaluations": [],
+            }
+            return fallback
+
+        verified_candidates, verification = self._verify_text_target_candidates(candidates=candidates)
+        if not verified_candidates:
+            fallback = self._fallback_select_target(context.target_node)
+            fallback["text_target_candidates"] = candidates
+            fallback["text_target_candidate_verification"] = verification
+            fallback["text_target_candidate_evaluation"] = {
+                "decision": "fallback",
+                "selected_candidate_id": None,
+                "evaluations": [],
+                "reason": "all_candidates_closed_book_solvable",
+            }
+            return fallback
+
+        evaluation_payload = {
+            "target_node": context.target_node,
+            "predecessor_chain": self._format_predecessor_chain(context),
+            "candidates": verified_candidates,
         }
+        try:
+            evaluation = self._generate_json(
+                system=PROMPT_EVALUATE_TEXT_TARGET_CANDIDATES,
+                user_payload=evaluation_payload,
+                trace_label="evaluate_text_target_candidates",
+                max_tokens=max(self.max_tokens, 1800),
+            )
+        except Exception as exc:
+            fallback = self._fallback_select_target(context.target_node)
+            fallback["text_target_candidates"] = candidates
+            fallback["text_target_candidate_verification"] = verification
+            fallback["text_target_candidate_evaluation"] = {
+                "decision": "fallback",
+                "selected_candidate_id": None,
+                "evaluations": [],
+                "reason": "candidate_evaluation_error",
+            }
+            fallback["writer_warning"] = self._writer_warning_entry(
+                stage="evaluate_text_target_candidates",
+                error=exc,
+            )
+            return fallback
+
+        selected_candidate = self._selected_target_candidate(
+            candidates=verified_candidates,
+            evaluation=evaluation,
+        )
+        if selected_candidate is None:
+            fallback = self._fallback_select_target(context.target_node)
+            fallback["text_target_candidates"] = candidates
+            fallback["text_target_candidate_verification"] = verification
+            fallback["text_target_candidate_evaluation"] = evaluation
+            fallback["writer_warning"] = self._writer_warning_entry(
+                stage="evaluate_text_target_candidates_selection",
+                error=ValueError("Text target evaluator did not select a valid generated candidate."),
+            )
+            return fallback
+
+        result = dict(selected_candidate)
+        result["text_target_candidates"] = candidates
+        result["text_target_candidate_verification"] = verification
+        result["text_target_candidate_evaluation"] = evaluation
+        return result
 
     def _select_image_target_ask(self, *, context: WriterContext) -> dict[str, Any]:
         target_image_url = self._target_image_url(context.target_node)
@@ -1553,7 +1681,7 @@ class QuestionWriter:
             )
             return fallback
 
-        selected_candidate = self._selected_image_target_candidate(
+        selected_candidate = self._selected_target_candidate(
             candidates=verified_candidates,
             evaluation=evaluation,
         )
@@ -1581,8 +1709,8 @@ class QuestionWriter:
         image_url: str | None,
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         """Keep questions that require the image and are answerable from it."""
-        model_client = self.image_target_ask_model_client or self.model_client
-        model = self.image_target_ask_model or self.model
+        model_client = self.ask_target_verify_model_client
+        model = self.ask_target_verify_model
         if model_client is None or not image_url:
             return candidates, {
                 "decision": "skip",
@@ -1676,6 +1804,88 @@ class QuestionWriter:
             "evaluations": evaluations,
         }
 
+    def _verify_text_target_candidates(
+        self,
+        *,
+        candidates: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        """Remove final-text questions answerable by the configured closed-book model."""
+
+        model_client = self.ask_target_verify_model_client
+        model = self.ask_target_verify_model
+        if model_client is None or not model:
+            return candidates, {
+                "decision": "skip",
+                "reason": "no_verification_model",
+                "kept_candidate_ids": [item["candidate_id"] for item in candidates],
+                "filtered_candidate_ids": [],
+                "answers": [],
+                "evaluations": [],
+            }
+
+        questions = [
+            {
+                "candidate_id": item["candidate_id"],
+                "question": item["ask_target"],
+            }
+            for item in candidates
+        ]
+        try:
+            answers = self._generate_json(
+                system=PROMPT_ANSWER_TEXT_TARGET_CANDIDATES,
+                user_payload={"candidates": questions},
+                trace_label="verify_text_target_answers_closed_book",
+                model_client=model_client,
+                model=model,
+                max_tokens=max(self.max_tokens, 1600),
+            )
+            judgment = self._generate_json(
+                system=PROMPT_JUDGE_TEXT_TARGET_ANSWERS,
+                user_payload={
+                    "candidates": [
+                        {
+                            "candidate_id": item["candidate_id"],
+                            "question": item["ask_target"],
+                            "gold_answer": item["answer"],
+                        }
+                        for item in candidates
+                    ],
+                    "closed_book_answers": answers.get("answers") or [],
+                },
+                trace_label="judge_text_target_closed_book_answers",
+                model_client=model_client,
+                model=model,
+                max_tokens=max(self.max_tokens, 1600),
+            )
+        except Exception as exc:
+            return candidates, {
+                "decision": "skip",
+                "reason": "verification_error",
+                "error": f"{exc.__class__.__name__}: {exc}",
+                "kept_candidate_ids": [item["candidate_id"] for item in candidates],
+                "filtered_candidate_ids": [],
+                "answers": [],
+                "evaluations": [],
+            }
+
+        evaluations = judgment.get("evaluations") or []
+        if not isinstance(evaluations, list):
+            evaluations = []
+        solved_ids = {
+            str(item.get("candidate_id") or "").strip()
+            for item in evaluations
+            if isinstance(item, dict) and item.get("correct") is True
+        }
+        kept = [item for item in candidates if item["candidate_id"] not in solved_ids]
+        return kept, {
+            "decision": "filter",
+            "reason": "closed_book_shortcut_filter",
+            "kept_candidate_ids": [item["candidate_id"] for item in kept],
+            "filtered_candidate_ids": [item["candidate_id"] for item in candidates if item["candidate_id"] in solved_ids],
+            "answers": answers.get("answers") or [],
+            "evaluations": evaluations,
+        }
+
     @classmethod
     def _normalize_image_target_candidates(cls, raw_candidates: Any) -> list[dict[str, Any]]:
         if not isinstance(raw_candidates, list):
@@ -1720,8 +1930,79 @@ class QuestionWriter:
             candidates.append(candidate)
         return candidates
 
+    @classmethod
+    def _normalize_text_target_candidates(cls, raw_candidates: Any) -> list[dict[str, Any]]:
+        if not isinstance(raw_candidates, list):
+            return []
+        candidates: list[dict[str, Any]] = []
+        used_ids: set[str] = set()
+        for index, raw_candidate in enumerate(raw_candidates, start=1):
+            if not isinstance(raw_candidate, dict):
+                continue
+            ask_target = cls._ensure_question(str(raw_candidate.get("ask_target") or "").strip())
+            answer = str(raw_candidate.get("answer") or "").strip()
+            if not ask_target or not answer:
+                continue
+            candidate_id = str(raw_candidate.get("candidate_id") or f"candidate_{index}").strip()
+            if not candidate_id or candidate_id in used_ids:
+                candidate_id = f"candidate_{index}"
+            used_ids.add(candidate_id)
+            supporting_facts = raw_candidate.get("supporting_facts") or []
+            if not isinstance(supporting_facts, list):
+                supporting_facts = []
+            candidate = dict(raw_candidate)
+            candidate.update(
+                {
+                    "candidate_id": candidate_id,
+                    "ask_target": ask_target,
+                    "answer": answer,
+                    "supporting_facts": [
+                        str(item).strip()
+                        for item in supporting_facts
+                        if str(item).strip()
+                    ],
+                    "reasoning": str(raw_candidate.get("reasoning") or "").strip(),
+                    "support": str(raw_candidate.get("support") or "").strip(),
+                }
+            )
+            candidates.append(candidate)
+        return candidates
+
     @staticmethod
     def _selected_image_target_candidate(
+        *,
+        candidates: list[dict[str, Any]],
+        evaluation: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        if str(evaluation.get("decision") or "").strip().lower() != "select":
+            return None
+        selected_id = str(evaluation.get("selected_candidate_id") or "").strip()
+        if not selected_id:
+            return None
+        evaluations = evaluation.get("evaluations") or []
+        if isinstance(evaluations, list):
+            selected_evaluation = next(
+                (
+                    item
+                    for item in evaluations
+                    if isinstance(item, dict)
+                    and str(item.get("candidate_id") or "").strip() == selected_id
+                ),
+                None,
+            )
+            if selected_evaluation is not None and selected_evaluation.get("valid") is not True:
+                return None
+        return next(
+            (
+                dict(candidate)
+                for candidate in candidates
+                if str(candidate.get("candidate_id") or "").strip() == selected_id
+            ),
+            None,
+        )
+
+    @staticmethod
+    def _selected_target_candidate(
         *,
         candidates: list[dict[str, Any]],
         evaluation: dict[str, Any],
@@ -3744,9 +4025,9 @@ def _debug_main() -> None:
         help="Optional model alias registered in synthesis/models.json for hidden image-bridge normalization.",
     )
     parser.add_argument(
-        "--image-target-ask-model-alias",
+        "--ask-target-verify-model-alias",
         default=None,
-        help="Optional model alias registered in synthesis/models.json for hidden final-image target-ask normalization.",
+        help="Optional model alias registered in synthesis/models.json for image/text target-ask verification.",
     )
     parser.add_argument(
         "--hop-sampling-strategy",
@@ -3798,8 +4079,8 @@ def _debug_main() -> None:
         compress_hop_model=args.compress_hop_model_alias,
         image_bridge_model_client=LLM_WORKER if args.image_bridge_model_alias else None,
         image_bridge_model=args.image_bridge_model_alias,
-        image_target_ask_model_client=LLM_WORKER if args.image_target_ask_model_alias else None,
-        image_target_ask_model=args.image_target_ask_model_alias,
+        ask_target_verify_model_client=LLM_WORKER if args.ask_target_verify_model_alias else None,
+        ask_target_verify_model=args.ask_target_verify_model_alias,
     )
     context = writer.build_writer_context(path=path, graph=graph)
     raw_hop_summaries = [writer.compress_hop(hop=hop) for hop in context.hops]
@@ -3854,8 +4135,8 @@ def _debug_main() -> None:
     print(f"sampler_model: {args.sampler_model_alias or 'fallback(no llm)'}")
     print(f"image_bridge_model: {args.image_bridge_model_alias or args.model_alias or 'fallback(no llm)'}")
     print(
-        f"image_target_ask_model: "
-        f"{args.image_target_ask_model_alias or args.image_bridge_model_alias or args.model_alias or 'fallback(no llm)'}"
+        f"ask_target_verify_model: "
+        f"{args.ask_target_verify_model_alias or 'not configured (verification skipped)'}"
     )
     print(f"neighbor_selection_strategy: {args.neighbor_selection_strategy}")
     print("raw_hop_summaries:")
