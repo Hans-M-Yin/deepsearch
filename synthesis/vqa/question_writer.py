@@ -937,6 +937,8 @@ Do not use a restriction such as "the club that won the 2011 UEFA Champions Leag
 
 7. Please ensure that the reasoning order in the question follows the order of the hops.
 
+8. Ensure that the first hop remains unambiguous, because it is the starting point for solving the question and comes with no prior context. For example, an opening like “At a road cycling championship, a German rider won gold in the women’s road race and silver in the women’s time trial...” is ambiguous and does not allow the championship to be uniquely identified. A better phrasing would be: “In the women’s road race at the Road World Championships in Verona, Judith Arndt took the title.”
+
 ## Tips
 
 1. Merge multiple statements so that the question is compact and natural.
