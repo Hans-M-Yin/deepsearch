@@ -116,19 +116,24 @@ def _format_sample(sample: dict[str, Any], *, ordinal: int, width: int) -> str:
     status = _first_non_empty(sample.get("status"), "unknown")
     path = sample.get("path") or {}
     path_id = _first_non_empty(path.get("path_id"))
-    draft_question = _first_non_empty(
+    drafted_question = _first_non_empty(
         _get_stage_question(sample, "draft"),
+        _get_stage_question(sample, "drafted"),
+        sample.get("drafted_question"),
         sample.get("draft_question"),
     )
-    polished_question = _first_non_empty(
+    enhanced_question = _first_non_empty(
         _get_stage_question(sample, "polished"),
+        _get_stage_question(sample, "enhanced"),
+        sample.get("enhanced_question"),
         sample.get("polished_question"),
     )
     final_question = _first_non_empty(
         _get_stage_question(sample, "obfuscated"),
+        _get_stage_question(sample, "final"),
         sample.get("final_question"),
-        polished_question,
-        draft_question,
+        enhanced_question,
+        drafted_question,
     )
     hop_chain = list(sample.get("hop_chain") or [])
 
@@ -150,8 +155,8 @@ def _format_sample(sample: dict[str, Any], *, ordinal: int, width: int) -> str:
 
     lines.append(SUB_SEPARATOR)
     lines.append("Question Versions")
-    lines.extend(_format_wrapped_block("drafted_question", draft_question, width=width, indent=2))
-    lines.extend(_format_wrapped_block("polished_question", polished_question, width=width, indent=2))
+    lines.extend(_format_wrapped_block("drafted_question", drafted_question, width=width, indent=2))
+    lines.extend(_format_wrapped_block("enhanced_question", enhanced_question, width=width, indent=2))
     lines.extend(_format_wrapped_block("final_question", final_question, width=width, indent=2))
     return "\n".join(lines)
 

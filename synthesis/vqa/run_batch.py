@@ -72,6 +72,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Optional model alias for image/text target-ask verification. Defaults to ASK_TARGET_VERIFY_MODEL.",
     )
     parser.add_argument(
+        "--shortcut-audit-model-alias",
+        default=None,
+        help="Optional model alias that audits final wording for exposed objects. Defaults to VQA_SHORTCUT_AUDIT_MODEL.",
+    )
+    parser.add_argument(
         "--neighbor-selection-strategy",
         choices=("random", "llm_guided"),
         default="random",
@@ -106,6 +111,7 @@ def main(argv: list[str] | None = None) -> int:
     compress_hop_model_alias = args.compress_hop_model_alias or os.environ.get("VQA_COMPRESS_HOP_MODEL")
     image_bridge_model_alias = args.image_bridge_model_alias or os.environ.get("VQA_IMAGE_BRIDGE_MODEL")
     ask_target_verify_model_alias = args.ask_target_verify_model_alias or os.environ.get("ASK_TARGET_VERIFY_MODEL")
+    shortcut_audit_model_alias = args.shortcut_audit_model_alias or os.environ.get("VQA_SHORTCUT_AUDIT_MODEL")
     config = SamplerConfiguration(
         min_hops=args.min_hops,
         max_hops=args.max_hops,
@@ -137,6 +143,8 @@ def main(argv: list[str] | None = None) -> int:
         image_bridge_model=image_bridge_model_alias,
         ask_target_verify_model_client=LLM_WORKER if ask_target_verify_model_alias else None,
         ask_target_verify_model=ask_target_verify_model_alias,
+        shortcut_audit_model_client=LLM_WORKER if shortcut_audit_model_alias else None,
+        shortcut_audit_model=shortcut_audit_model_alias,
     )
     pipeline = VqaGenerationPipeline(
         store=store,
@@ -178,6 +186,7 @@ def main(argv: list[str] | None = None) -> int:
                 "compress_hop_model_alias": compress_hop_model_alias,
                 "image_bridge_model_alias": image_bridge_model_alias,
                 "ask_target_verify_model_alias": ask_target_verify_model_alias,
+                "shortcut_audit_model_alias": shortcut_audit_model_alias,
             },
             "sampler_state_request": {
                 "input_path": str(sampler_state_input_path) if sampler_state_input_path else None,

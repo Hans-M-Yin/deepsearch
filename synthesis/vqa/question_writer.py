@@ -10,6 +10,7 @@ separate evidence-builder stage. Internally it follows a seven-step process:
 5. normalize a hidden final image terminal step when needed
 6. compose and polish the final multi-hop question
 7. obfuscate shortcut clues while preserving the reasoning path
+8. audit the final wording for independently identifiable objects, then repair exposed relations
 """
 
 from __future__ import annotations
@@ -1348,6 +1349,52 @@ question: In Jacques-Louis David's painting of the Tennis Court Oath, the man st
 }
 """
 
+PROMPT_SHORTCUT_OBJECT_AUDIT = """Analyze the following question on its own. Identify every object, person, organization, place, event, work, policy, award, role, or other concrete thing that the wording explicitly mentions or implicitly points to.
+
+For each identification, explain the exact words or combination of clues that support it. Include entities that are not named but can be inferred from a distinctive description. Also identify any description that lets a reader infer a later object without first resolving an earlier reference.
+
+Do not assume access to an image, external context, an answer, or any hidden reasoning chain. Do not try to improve or rewrite the question. Return exactly one valid JSON object:
+{
+  "analysis": "a detailed plain-language analysis of the identifiable objects, clue combinations, and any direct inferences",
+  "objects": [
+    {
+      "object": "object or inferred entity",
+      "object_type": "person/place/event/organization/etc.",
+      "evidence": ["verbatim clue or clue combination"],
+      "inference": "why the wording identifies it",
+      "bypasses_earlier_reasoning": true
+    }
+  ]
+}
+"""
+
+PROMPT_SHORTCUT_REPAIR = """
+You are a difficulty-enhancement editor for multi-hop retrieval questions. You will receive an original question, its underlying reasoning chain, and an independent analysis indicating which objects a reader may be able to identify from the question alone.
+
+Your task is to judge whether the reader’s analysis has correctly inferred any objects in the reasoning chain. For any object the reader inferred incorrectly, explain that the question is sufficiently difficult at that point. For any object the reader inferred correctly, identify which description enabled that inference, and then blur that description—or delete it entirely if the corresponding reasoning relation is redundant—to reduce its “fingerprint-like” distinctiveness. Ensure that after you revise these descriptions, the reasoning chain remains unambiguous and the question does not become unsolvable.
+
+Requirements:
+- Preserve the final answer, factual relations, reasoning direction, and image connection.
+- Do not introduce new facts, new entities, or a new shortcut.
+- Keep the entry point usable; do not make the question impossible to start.
+- Remove redundant information when doing so does not make a hop ambiguous.
+- After revision, the kinds of standalone wording flagged by the audit must no longer be sufficient to identify a later object without first resolving its predecessor.
+- Keep the result natural, concise, uniquely solvable, and verifiable.
+
+### Core verification test (apply this to EVERY hop — it is your single most important check)
+
+Model the chain as a sequence of hops of the form **“entity A + description D → next entity B.”** For each hop, the wording is correct only if BOTH of the following hold:
+
+- **(Forward safety)** When A is still unknown, D on its own must be too underspecified to reveal A or to jump directly to B. If D alone already pins down A or B, it is a shortcut — blur it.
+- **(Backward sufficiency)** Once A is known, D must lead to B **uniquely and unambiguously**. If D could point to several candidates given A, it is too vague — add a neutral relational qualifier until B is unique.
+
+Return exactly one valid JSON object:
+{
+  "analysis": "explain which audited clues were changed, why the revised wording no longer exposes the later object, and why each affected hop remains unambiguous once its predecessor is known",
+  "question": "the revised question"
+}
+"""
+
 @dataclass(slots=True)
 class HopContext:
     """Compact readable representation of one trajectory hop."""
@@ -1408,6 +1455,8 @@ class QuestionWriter:
     image_bridge_model: str | None = None
     ask_target_verify_model_client: ModelWorkerClient | None = None
     ask_target_verify_model: str | None = None
+    shortcut_audit_model_client: ModelWorkerClient | None = None
+    shortcut_audit_model: str | None = None
     temperature: float | None = None
     max_tokens: int = 800
     json_retry_attempts: int = 2
@@ -2591,6 +2640,66 @@ class QuestionWriter:
             return draft
         return self._enhance_difficulty_with_image(draft=draft, starting_image_url=starting_image_url)
 
+    def repair_shortcuts(self, *, draft: QuestionDraft, path: PathCandidate, graph: GraphView) -> QuestionDraft:
+        """Audit the final wording without chain context, then repair only exposed clues."""
+        if self.model_client is None or self.shortcut_audit_model_client is None:
+            return draft
+        try:
+            audit = self._generate_json(
+                system=PROMPT_SHORTCUT_OBJECT_AUDIT,
+                user_payload={"question": draft.question},
+                trace_label="shortcut_object_audit",
+                model_client=self.shortcut_audit_model_client,
+                model=self.shortcut_audit_model,
+                max_tokens=max(self.max_tokens, 1600),
+            )
+        except Exception as exc:
+            return self._record_writer_warning(draft, stage="shortcut_object_audit", error=exc)
+
+        payload = self._shortcut_repair_payload(
+            question=draft.question,
+            answer=draft.answer,
+            hops=draft.reasoning_steps,
+            audit=audit,
+        )
+        try:
+            repaired = self._generate_json(
+                system=PROMPT_SHORTCUT_REPAIR,
+                user_payload=payload,
+                trace_label="shortcut_repair",
+                image_url=self._starting_image_url(path=path, graph=graph),
+                max_tokens=max(self.max_tokens, 1600),
+            )
+        except Exception as exc:
+            return self._record_writer_warning(draft, stage="shortcut_repair", error=exc)
+
+        repaired_question = self._clean_composed_question(str(repaired.get("question") or "").strip())
+        if not repaired_question:
+            return self._record_writer_warning(
+                draft,
+                stage="shortcut_repair_parse",
+                error=ValueError("Model returned an empty shortcut-repaired question."),
+            )
+        metadata = dict(draft.metadata)
+        metadata["shortcut_repair"] = {
+            "audit_model": self.shortcut_audit_model,
+            "audit": audit,
+            "payload": payload,
+            "result": {
+                "raw_response": repaired,
+                "analysis": str(repaired.get("analysis") or "").strip(),
+                "question": repaired_question,
+            },
+        }
+        return QuestionDraft(
+            question=repaired_question,
+            answer=draft.answer,
+            answer_type=draft.answer_type,
+            reasoning_steps=list(draft.reasoning_steps),
+            used_evidence_ids=list(draft.used_evidence_ids),
+            metadata=metadata,
+        )
+
     def _enhance_difficulty_with_image(
         self,
         *,
@@ -3687,6 +3796,32 @@ class QuestionWriter:
             "question": question,
             "answer": answer,
             "reasoning_chain": reasoning_chain,
+        }
+
+    @staticmethod
+    def _shortcut_repair_payload(
+        *,
+        question: str,
+        answer: str,
+        hops: list[dict[str, Any]],
+        audit: dict[str, Any],
+    ) -> dict[str, Any]:
+        return {
+            "original_question": question,
+            "final_answer": answer,
+            "reasoning_chain": [
+                {
+                    "hop_index": item.get("hop_index"),
+                    "source": item.get("source"),
+                    "target": item.get("target"),
+                    "statement": item.get("statement"),
+                    "relation": item.get("relation"),
+                    "retrieval_query": item.get("retrieval_query"),
+                    "mark": item.get("mark"),
+                }
+                for item in hops
+            ],
+            "standalone_question_audit": audit,
         }
 
 

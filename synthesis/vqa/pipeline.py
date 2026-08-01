@@ -61,6 +61,7 @@ class VqaGenerationPipeline:
         compress_hop_model = os.environ.get("VQA_COMPRESS_HOP_MODEL")
         image_bridge_model = os.environ.get("VQA_IMAGE_BRIDGE_MODEL")
         ask_target_verify_model = os.environ.get("ASK_TARGET_VERIFY_MODEL")
+        shortcut_audit_model = os.environ.get("VQA_SHORTCUT_AUDIT_MODEL")
         self.writer = self.writer or QuestionWriter(
             model_client=LLM_WORKER if writer_model else None,
             model=writer_model,
@@ -70,6 +71,8 @@ class VqaGenerationPipeline:
             image_bridge_model=image_bridge_model,
             ask_target_verify_model_client=LLM_WORKER if ask_target_verify_model else None,
             ask_target_verify_model=ask_target_verify_model,
+            shortcut_audit_model_client=LLM_WORKER if shortcut_audit_model else None,
+            shortcut_audit_model=shortcut_audit_model,
         )
         self.verifier = self.verifier or SampleVerifier()
 
@@ -113,16 +116,21 @@ class VqaGenerationPipeline:
         polished = draft
         polish_elapsed_s = 0.0
         progress.polished_at = _utc_now()
-        obfuscated, difficulty_elapsed_s = self._run_timed_stage(
+        enhanced, difficulty_elapsed_s = self._run_timed_stage(
             path=path,
             stage="difficulty_enhancement",
             operation=lambda: self.writer.enhance_difficulty(draft=polished, path=path, graph=self.graph),
+        )
+        shortcut_repaired, shortcut_repair_elapsed_s = self._run_timed_stage(
+            path=path,
+            stage="shortcut_repair",
+            operation=lambda: self.writer.repair_shortcuts(draft=enhanced, path=path, graph=self.graph),
         )
         progress.post_obfuscated_at = _utc_now()
         verification, verification_elapsed_s = self._run_timed_stage(
             path=path,
             stage="verification",
-            operation=lambda: self.verifier.verify(question=obfuscated),
+            operation=lambda: self.verifier.verify(question=shortcut_repaired),
         )
         progress.verified_at = _utc_now()
         status = SampleStatus.VERIFIED if verification.final_keep else SampleStatus.REJECTED
@@ -131,6 +139,7 @@ class VqaGenerationPipeline:
             "draft_seconds": draft_elapsed_s,
             "polish_seconds": polish_elapsed_s,
             "difficulty_enhancement_seconds": difficulty_elapsed_s,
+            "shortcut_repair_seconds": shortcut_repair_elapsed_s,
             "verification_seconds": verification_elapsed_s,
             "total_generation_seconds": time.perf_counter() - total_started_at,
         }
@@ -140,8 +149,10 @@ class VqaGenerationPipeline:
             path=path,
             evidence=evidence,
             draft=draft,
-            polished=polished,
-            obfuscated=obfuscated,
+            # ``polished`` is retained as the on-disk compatibility slot, but
+            # represents the difficulty-enhanced question while aggregate polish is disabled.
+            polished=enhanced,
+            obfuscated=shortcut_repaired,
             verification=verification,
             progress=progress,
             metadata={

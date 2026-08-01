@@ -752,13 +752,24 @@ class VqaBatchRunner:
         question_number: int,
     ) -> dict[str, Any]:
         writer_outputs = sample.get("writer_outputs") or {}
-        draft_question = sample.get("draft") or writer_outputs.get("draft") or {}
-        polished_question = sample.get("polished") or writer_outputs.get("polished") or {}
+        drafted_question = (
+            sample.get("draft")
+            or writer_outputs.get("drafted")
+            or writer_outputs.get("draft")
+            or {}
+        )
+        enhanced_question = (
+            sample.get("polished")
+            or writer_outputs.get("enhanced")
+            or writer_outputs.get("polished")
+            or {}
+        )
         final_question = (
             sample.get("obfuscated")
             or writer_outputs.get("obfuscated")
-            or polished_question
-            or draft_question
+            or writer_outputs.get("final")
+            or enhanced_question
+            or drafted_question
             or {}
         )
         path = sample.get("path") or {}
@@ -768,8 +779,8 @@ class VqaBatchRunner:
             "path_id": path.get("path_id"),
             "status": sample.get("status"),
             "question": final_question.get("question"),
-            "draft_question": draft_question.get("question"),
-            "polished_question": polished_question.get("question"),
+            "drafted_question": drafted_question.get("question"),
+            "enhanced_question": enhanced_question.get("question"),
             "final_question": final_question.get("question"),
             "answer": final_question.get("answer"),
         }
@@ -840,9 +851,9 @@ class VqaBatchRunner:
                 if isinstance(item, dict)
             ],
             "writer_outputs": {
-                "draft": VqaBatchRunner._compact_writer_stage(sample.get("draft") or {}),
-                "polished": VqaBatchRunner._compact_writer_stage(sample.get("polished") or {}),
-                "obfuscated": VqaBatchRunner._compact_writer_stage(sample.get("obfuscated") or {}),
+                "drafted": VqaBatchRunner._compact_writer_stage(sample.get("draft") or {}),
+                "enhanced": VqaBatchRunner._compact_writer_stage(sample.get("polished") or {}),
+                "final": VqaBatchRunner._compact_writer_stage(sample.get("obfuscated") or {}),
             },
             "entry_hop": VqaBatchRunner._extract_stage_metadata_value(
                 sample,
@@ -888,6 +899,10 @@ class VqaBatchRunner:
                     field_name="difficulty_enhancement_result",
                 ),
             },
+            "shortcut_repair": VqaBatchRunner._extract_stage_metadata_value(
+                sample,
+                field_name="shortcut_repair",
+            ),
             "polish": {
                 "payload": VqaBatchRunner._extract_stage_metadata_value(
                     sample,
