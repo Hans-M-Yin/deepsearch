@@ -1304,7 +1304,8 @@ Treat each of the following as a **shortcut candidate**, whether it sits on an i
 
 Enumerate every explicit year, date, unique title, superlative, signature term, and proper noun remaining in your draft. For each, state in the analysis whether you **keep or blur** it, and justify with the Core verification test (entry point / uniqueness anchor → keep; otherwise → blur). Only declare "no revision needed" if this scan leaves nothing removable AND no unjustified year/title/superlative remains.
 
-### Output format
+### JSON output format
+Return exactly one valid JSON object and no other text.
 {
   "analysis": "hop-by-hop application of the Core verification test, the shortcut scan, and the revision plan",
   "question": "the improved question"

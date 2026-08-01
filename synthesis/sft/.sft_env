@@ -74,7 +74,7 @@ export SFT_SUMMARIZER_API_KEY="EMPTY"
 
 # Gemini-style box order uses [y1, x1, y2, x2]. Enable pairwise x/y swap
 # before i2i_search denormalizes 0-1000 region coordinates into pixels.
-export REVERSE_IMAGE_CROP_COORDS="true"
+# export REVERSE_IMAGE_CROP_COORDS="true"
 
 
 export SERPER_API_KEY="65c83034889f9d2d2a9f0c2afa9eb470f346f9b8"

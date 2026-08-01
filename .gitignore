@@ -51,6 +51,8 @@ wandb/
 outputs/
 logs/
 *.log
+*.pid
+*_log
 *.pt
 *.bin
 *.safetensors
@@ -81,3 +83,9 @@ synthesis/.serper_pool_state.json
 synthesis/.serper_pool_state.json.lock
 data/*
 opensearch_infer/*
+
+# --- Local debugging / verification runtime artifacts ---
+/--results-jsonl
+/debug/image_download_resolver_cache/
+/debug/image_download_resolver_report.json
+/verification_sample_*.json
