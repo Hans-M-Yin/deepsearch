@@ -1349,20 +1349,21 @@ question: In Jacques-Louis David's painting of the Tennis Court Oath, the man st
 }
 """
 
-PROMPT_SHORTCUT_OBJECT_AUDIT = """Analyze the following question on its own. Identify every object, person, organization, place, event, work, policy, award, role, or other concrete thing that the wording explicitly mentions or implicitly points to.
+PROMPT_SHORTCUT_OBJECT_AUDIT = """
+You will receive a multi-hop knowledge question. Based on the descriptions in the question, analyze which object each description most likely refers to. List all objects that you can identify from the description in the question, and for each one, provide the original textual clue you used and your reasoning.
 
-For each identification, explain the exact words or combination of clues that support it. Include entities that are not named but can be inferred from a distinctive description. Also identify any description that lets a reader infer a later object without first resolving an earlier reference.
+Requirements:
+1. Do not perform multi-step reasoning. For each description in the question, judge which object that description refers to only based on the description itself and its relation to the previous object, while assuming that the previous object has not been identified with certainty.
+2. Make judgments based on salient identifying features of the object. For example, in the phrase "his opponent was the Republican who used the slogan 'Make America Great Again'," even without knowing who "he" is, you can still infer that the next object refers to Donald Trump from the famous slogan and party identity alone.
+3. You may use only the descriptions given in the question as evidence, and must not introduce any additional clues. If a description cannot be inferred from the given text or is ambiguous, simply skip it.
+4. Return only one valid JSON object. Because the response must be a JSON object, put the requested list under the `objects` field. Each item in the list must contain exactly these three fields:
 
-Do not assume access to an image, external context, an answer, or any hidden reasoning chain. Do not try to improve or rewrite the question. Return exactly one valid JSON object:
 {
-  "analysis": "a detailed plain-language analysis of the identifiable objects, clue combinations, and any direct inferences",
   "objects": [
     {
-      "object": "object or inferred entity",
-      "object_type": "person/place/event/organization/etc.",
-      "evidence": ["verbatim clue or clue combination"],
-      "inference": "why the wording identifies it",
-      "bypasses_earlier_reasoning": true
+      "object": "the specific inferred object or candidate entity",
+      "evidence": "one or more verbatim quotations copied from the question",
+      "analysis": "explain why the quoted evidence is sufficient to identify this specific real-world object even when the predecessor remains unknown"
     }
   ]
 }
@@ -1380,6 +1381,7 @@ Requirements:
 - Remove redundant information when doing so does not make a hop ambiguous.
 - After revision, the kinds of standalone wording flagged by the audit must no longer be sufficient to identify a later object without first resolving its predecessor.
 - Keep the result natural, concise, uniquely solvable, and verifiable.
+- Only blur or delete descriptions; DO NOT alter the original meaning of the question. For example, in the phrase “at an induction ceremony where this military branch delivered the first of a new multi-role helicopter model to an allied navy, a framed picture was displayed on an easel,” an incorrect revision would be: “a multi-role naval helicopter primarily operated by this military branch was the subject of a painting presented at a ceremony marking its delivery to an allied navy.” The former means that a painting appeared in the background at the ceremony, whereas the incorrect revision mistakenly implies that the ceremony itself featured the painting as its subject.
 
 ### Core verification test (apply this to EVERY hop — it is your single most important check)
 
@@ -1387,6 +1389,44 @@ Model the chain as a sequence of hops of the form **“entity A + description D 
 
 - **(Forward safety)** When A is still unknown, D on its own must be too underspecified to reveal A or to jump directly to B. If D alone already pins down A or B, it is a shortcut — blur it.
 - **(Backward sufficiency)** Once A is known, D must lead to B **uniquely and unambiguously**. If D could point to several candidates given A, it is too vague — add a neutral relational qualifier until B is unique.
+
+### Example: trust only correct audit findings
+
+Input:
+```json
+{
+  "original_question": "The building in this image was used by university departments while a nearby palace was being renovated; it had formerly been the headquarters of an insurance company. That company later acquired another insurance company based in a U.S. city whose extensive park and boulevard system was a notable project of an early twentieth-century urban-beautification movement. In what year did the system's principal planner die?",
+  "final_answer": "1923",
+  "reasoning_chain": "[building in the image] → Zurich Insurance Group → Universal Underwriters Insurance Company → Kansas City, Missouri → George Kessler → 1923",
+  "audit": {
+    "objects": [
+      {
+        "object": "Zurich Insurance Group",
+        "evidence": "used by university departments while a nearby palace was being renovated; it had formerly been the headquarters of an insurance company",
+        "analysis": "A building used by university departments during renovation of Bonn's Electoral Palace and formerly serving as an insurance headquarters plausibly points to the former Zurich Insurance headquarters at Rabinstraße 8, so the company may be Zurich Insurance Group."
+      },
+      {
+        "object": "Kansas City, Missouri",
+        "evidence": "extensive park and boulevard system ... a notable project of an early twentieth-century urban-beautification movement",
+        "analysis": "The combination of an extensive park-and-boulevard system and an early twentieth-century urban-beautification movement plausibly suggests Kansas City's well-known park and boulevard system."
+      },
+      {
+        "object": "Daniel Burnham",
+        "evidence": "extensive park and boulevard system ... a notable project of an early twentieth-century urban-beautification movement; the system's principal planner",
+        "analysis": "The urban-beautification movement is often associated with Daniel Burnham, and an extensive system of parks and boulevards resembles his vision of monumental public spaces, so he may have been the principal planner."
+      }
+    ]
+  }
+}
+```
+
+Output:
+```json
+{
+  "analysis": "The first audit finding is plausible and exposes Zurich Insurance Group through a redundant combination of the palace-renovation and university-use details. Those details are not needed to move from the pictured building to its former insurance-company headquarters, so they are removed. The second finding is also correct: the City Beautiful wording and the description of the park-and-boulevard system can identify Kansas City before the acquired insurer has been resolved. The country reference and urban-beautification context are therefore removed; after the acquired insurer is found, its headquarters city still leads uniquely to the relevant park-and-boulevard system. The third audit finding is incorrect: the chain's planner is George Kessler, not Daniel Burnham, so no revision is based on that claim. The revised question retains the required path from the image to the insurer, the acquired insurer, its city, the city's system, and its planner, while removing only the confirmed redundant shortcut clues.",
+  "question": "The building in this image was formerly the headquarters of an insurance company. That company later acquired another insurance company; the extensive park and boulevard system in the city where the latter was headquartered was designed by a principal planner. In what year did that planner die?"
+}
+```
 
 Return exactly one valid JSON object:
 {
@@ -1460,6 +1500,7 @@ class QuestionWriter:
     temperature: float | None = None
     max_tokens: int = 800
     json_retry_attempts: int = 2
+    image_target_verify_trials: int = 3
 
     def build_writer_context(self, *, path: PathCandidate, graph: GraphView) -> WriterContext:
         hops: list[HopContext] = []
@@ -1761,9 +1802,10 @@ class QuestionWriter:
             )
             return fallback
 
-        selected_candidate = self._selected_target_candidate(
+        selected_candidate = self._selected_image_target_candidate(
             candidates=verified_candidates,
             evaluation=evaluation,
+            verification=visual_verification,
         )
         if selected_candidate is None:
             fallback = self._fallback_select_target(context.target_node)
@@ -1806,46 +1848,66 @@ class QuestionWriter:
             }
             for item in candidates
         ]
+        trial_count = max(1, int(self.image_target_verify_trials))
+        trials: list[dict[str, Any]] = []
         try:
-            with_image = self._generate_json(
-                system=PROMPT_ANSWER_VISUAL_TARGET_CANDIDATES,
-                user_payload={"candidates": questions},
-                trace_label="verify_image_target_answers_with_image",
-                image_url=image_url,
-                model_client=model_client,
-                model=model,
-                max_tokens=max(self.max_tokens, 1600),
-            )
-            without_image = self._generate_json(
-                system=PROMPT_ANSWER_TEXT_ONLY_TARGET_CANDIDATES,
-                user_payload={
-                    "instruction": "图片未提供，请根据常识作答。",
-                    "candidates": questions,
-                },
-                trace_label="verify_image_target_answers_without_image",
-                model_client=model_client,
-                model=model,
-                max_tokens=max(self.max_tokens, 1600),
-            )
-            judgment = self._generate_json(
-                system=PROMPT_JUDGE_VISUAL_TARGET_ANSWERS,
-                user_payload={
-                    "candidates": [
-                        {
-                            "candidate_id": item["candidate_id"],
-                            "question": item["ask_target"],
-                            "gold_answer": item["answer"],
-                        }
-                        for item in candidates
-                    ],
-                    "with_image_answers": with_image.get("answers") or [],
-                    "without_image_answers": without_image.get("answers") or [],
-                },
-                trace_label="judge_image_target_answerability",
-                model_client=model_client,
-                model=model,
-                max_tokens=max(self.max_tokens, 1800),
-            )
+            for trial_index in range(trial_count):
+                # Keep the semantic task identical while making each trial explicit in
+                # the payload. This prevents a transport/cache layer from treating the
+                # repeated verification calls as one request.
+                with_image = self._generate_json(
+                    system=PROMPT_ANSWER_VISUAL_TARGET_CANDIDATES,
+                    user_payload={
+                        "verification_trial": trial_index + 1,
+                        "candidates": questions,
+                    },
+                    trace_label=f"verify_image_target_answers_with_image_{trial_index + 1}",
+                    image_url=image_url,
+                    model_client=model_client,
+                    model=model,
+                    max_tokens=max(self.max_tokens, 1600),
+                )
+                without_image = self._generate_json(
+                    system=PROMPT_ANSWER_TEXT_ONLY_TARGET_CANDIDATES,
+                    user_payload={
+                        "verification_trial": trial_index + 1,
+                        "instruction": "图片未提供，请根据常识作答。",
+                        "candidates": questions,
+                    },
+                    trace_label=f"verify_image_target_answers_without_image_{trial_index + 1}",
+                    model_client=model_client,
+                    model=model,
+                    max_tokens=max(self.max_tokens, 1600),
+                )
+                judgment = self._generate_json(
+                    system=PROMPT_JUDGE_VISUAL_TARGET_ANSWERS,
+                    user_payload={
+                        "verification_trial": trial_index + 1,
+                        "candidates": [
+                            {
+                                "candidate_id": item["candidate_id"],
+                                "question": item["ask_target"],
+                                "gold_answer": item["answer"],
+                            }
+                            for item in candidates
+                        ],
+                        "with_image_answers": with_image.get("answers") or [],
+                        "without_image_answers": without_image.get("answers") or [],
+                    },
+                    trace_label=f"judge_image_target_answerability_{trial_index + 1}",
+                    model_client=model_client,
+                    model=model,
+                    max_tokens=max(self.max_tokens, 1800),
+                )
+                trial_evaluations = judgment.get("evaluations") or []
+                trials.append(
+                    {
+                        "trial_index": trial_index + 1,
+                        "with_image_answers": with_image.get("answers") or [],
+                        "without_image_answers": without_image.get("answers") or [],
+                        "evaluations": trial_evaluations if isinstance(trial_evaluations, list) else [],
+                    }
+                )
         except Exception as exc:
             return candidates, {
                 "decision": "skip",
@@ -1855,18 +1917,44 @@ class QuestionWriter:
                 "evaluations": [],
             }
 
-        evaluations = judgment.get("evaluations") or []
-        if not isinstance(evaluations, list):
-            evaluations = []
+        candidate_scores: dict[str, dict[str, Any]] = {
+            item["candidate_id"]: {
+                "candidate_id": item["candidate_id"],
+                "with_image_correct_count": 0,
+                "without_image_correct_count": 0,
+                "pass_count": 0,
+            }
+            for item in candidates
+        }
+        for trial in trials:
+            for item in trial["evaluations"]:
+                if not isinstance(item, dict):
+                    continue
+                candidate_id = str(item.get("candidate_id") or "").strip()
+                score = candidate_scores.get(candidate_id)
+                if score is None:
+                    continue
+                score["with_image_correct_count"] += int(item.get("with_image_correct") is True)
+                score["without_image_correct_count"] += int(item.get("without_image_correct") is True)
+                score["pass_count"] += int(item.get("pass") is True)
+
+        # A hard visual-answerability requirement prevents a candidate from winning
+        # merely because it is also hard with the image. Among visually reliable
+        # candidates, prefer the one least often solved without the image.
         passed_ids = {
-            str(item.get("candidate_id") or "").strip()
-            for item in evaluations
-            if isinstance(item, dict)
-            and item.get("with_image_correct") is True
-            and item.get("without_image_correct") is False
-            and item.get("pass") is True
+            candidate_id
+            for candidate_id, score in candidate_scores.items()
+            if score["with_image_correct_count"] == trial_count
+            and score["without_image_correct_count"] < trial_count
         }
         filtered = [item for item in candidates if item["candidate_id"] in passed_ids]
+        filtered.sort(
+            key=lambda item: (
+                candidate_scores[item["candidate_id"]]["without_image_correct_count"],
+                -candidate_scores[item["candidate_id"]]["with_image_correct_count"],
+                item["candidate_id"],
+            )
+        )
         filtered_candidate_ids = [
             item["candidate_id"]
             for item in candidates
@@ -1876,12 +1964,12 @@ class QuestionWriter:
         kept = candidates if skipped else filtered
         return kept, {
             "decision": "skip_all_filtered" if skipped else "filter",
-            "reason": "all_candidates_filtered; original candidates retained" if skipped else "visual_answerability_filter",
+            "reason": "all_candidates_failed_three_trial_visual_check; original candidates retained" if skipped else "three_trial_visual_answerability_filter",
+            "trial_count": trial_count,
             "kept_candidate_ids": [item["candidate_id"] for item in kept],
             "filtered_candidate_ids": filtered_candidate_ids,
-            "with_image_answers": with_image.get("answers") or [],
-            "without_image_answers": without_image.get("answers") or [],
-            "evaluations": evaluations,
+            "candidate_scores": list(candidate_scores.values()),
+            "trials": trials,
         }
 
     def _verify_text_target_candidates(
@@ -2049,39 +2137,6 @@ class QuestionWriter:
         return candidates
 
     @staticmethod
-    def _selected_image_target_candidate(
-        *,
-        candidates: list[dict[str, Any]],
-        evaluation: dict[str, Any],
-    ) -> dict[str, Any] | None:
-        if str(evaluation.get("decision") or "").strip().lower() != "select":
-            return None
-        selected_id = str(evaluation.get("selected_candidate_id") or "").strip()
-        if not selected_id:
-            return None
-        evaluations = evaluation.get("evaluations") or []
-        if isinstance(evaluations, list):
-            selected_evaluation = next(
-                (
-                    item
-                    for item in evaluations
-                    if isinstance(item, dict)
-                    and str(item.get("candidate_id") or "").strip() == selected_id
-                ),
-                None,
-            )
-            if selected_evaluation is not None and selected_evaluation.get("valid") is not True:
-                return None
-        return next(
-            (
-                dict(candidate)
-                for candidate in candidates
-                if str(candidate.get("candidate_id") or "").strip() == selected_id
-            ),
-            None,
-        )
-
-    @staticmethod
     def _selected_target_candidate(
         *,
         candidates: list[dict[str, Any]],
@@ -2113,6 +2168,70 @@ class QuestionWriter:
             ),
             None,
         )
+
+    @classmethod
+    def _selected_image_target_candidate(
+        cls,
+        *,
+        candidates: list[dict[str, Any]],
+        evaluation: dict[str, Any],
+        verification: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Select a visually valid candidate, preferring fewer no-image successes."""
+        evaluator_choice = cls._selected_target_candidate(
+            candidates=candidates,
+            evaluation=evaluation,
+        )
+        if evaluator_choice is None:
+            return None
+
+        if verification.get("decision") != "filter":
+            return evaluator_choice
+        scores = verification.get("candidate_scores") or []
+        if not isinstance(scores, list):
+            return evaluator_choice
+        score_by_id = {
+            str(item.get("candidate_id") or "").strip(): item
+            for item in scores
+            if isinstance(item, dict) and str(item.get("candidate_id") or "").strip()
+        }
+        if not score_by_id:
+            return evaluator_choice
+
+        evaluation_items = evaluation.get("evaluations") or []
+        valid_ids = {
+            str(item.get("candidate_id") or "").strip()
+            for item in evaluation_items
+            if isinstance(item, dict) and item.get("valid") is True
+        }
+        ranked = [
+            candidate
+            for candidate in candidates
+            if str(candidate.get("candidate_id") or "").strip() in valid_ids
+            and str(candidate.get("candidate_id") or "").strip() in score_by_id
+        ]
+        if not ranked:
+            return evaluator_choice
+        ranked.sort(
+            key=lambda candidate: (
+                int(
+                    score_by_id[str(candidate.get("candidate_id") or "").strip()].get(
+                        "without_image_correct_count", 0
+                    )
+                ),
+                -int(
+                    score_by_id[str(candidate.get("candidate_id") or "").strip()].get(
+                        "with_image_correct_count", 0
+                    )
+                ),
+                str(candidate.get("candidate_id") or ""),
+            )
+        )
+        selected = dict(ranked[0])
+        verification["selection_policy"] = "minimize_without_image_correct_count"
+        verification["evaluator_selected_candidate_id"] = evaluator_choice.get("candidate_id")
+        verification["selected_candidate_id"] = selected.get("candidate_id")
+        return selected
 
     @classmethod
     def _format_predecessor_chain(cls, context: WriterContext) -> str:

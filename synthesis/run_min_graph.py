@@ -409,8 +409,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--store-flush-record-threshold",
         type=int,
-        default=100,
-        help="Flush graph tables after at least this many record upserts have accumulated.",
+        default=600,
+        help="Flush graph tables after at least this many record upserts have accumulated (about 300 new nodes).",
     )
     parser.add_argument(
         "--store-flush-interval-s",
