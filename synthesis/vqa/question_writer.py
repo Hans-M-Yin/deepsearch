@@ -1120,9 +1120,9 @@ Requirements:
 10. The input may contain `entry_hop_notice`, which means the current statement is the first hop of the full reasoning chain. In that case, preserve the reasoning entry: only apply light obfuscation, and keep the necessary identifying clue. If it is an image hop, preserve the visual anchor and scene details needed to identify the entry from the attached image.
 
 CHCEKLIST:
-1. Does the rewritten question contain specific names, times, places, or events, and do they help advance the reasoning chain? If not, delete them; if they are necessary, obfuscate them.
-2. Does the rewritten question contain any descriptions that can be removed? Analyze every description in detail and ensure that each one either connects objects on the reasoning chain or is necessary for disambiguation.
-3. Has the meaning been changed? Check whether the meaning of the relationship between the source and target in the rewritten question is consistent with the provided statement, and whether what the question asks has changed.
+1. Check sentence by sentence: Does the rewritten question contain any other specific name, time, place, or event besides the current source? If they do not help advance the reasoning chain, delete them; if they are necessary, they must be obfuscated.
+2. Check sentence by sentence: Are there any remaining descriptions in the rewritten question that can be removed, such as time, place, events, or content not directly related to the reasoning chain? If so, delete them.
+3. Check sentence by sentence: Has the meaning changed? Please check whether the relationship between the source object and the target object in the rewritten question is consistent with the given statement, and whether what the question itself asks has changed.
 
 Example 1
 statement: Cho Yang-ho served as chairman of Pyeongchang’s bid for the 2018 Winter Olympics from September 14, 2009 to October 5, 2011.
