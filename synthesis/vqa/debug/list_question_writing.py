@@ -25,6 +25,7 @@ def _build_parser() -> argparse.ArgumentParser:
     group.add_argument("--vqa-dir", type=Path, help="Directory containing samples.jsonl.")
     group.add_argument("--samples-file", type=Path, help="Path to samples.jsonl.")
     parser.add_argument("--sample-id", action="append", default=[], help="Only print the given sample_id. Repeatable.")
+    parser.add_argument("--offset", type=int, default=0, help="Skip this many matched samples before printing.")
     parser.add_argument("--limit", type=int, default=None, help="Optional max number of samples to print.")
     parser.add_argument("--width", type=int, default=100, help="Wrap width for long text fields.")
     return parser
@@ -56,11 +57,23 @@ def _load_jsonl(path: Path) -> list[dict[str, Any]]:
     return records
 
 
-def _iter_filtered_samples(records: Iterable[dict[str, Any]], *, sample_ids: set[str], limit: int | None) -> list[dict[str, Any]]:
+def _iter_filtered_samples(
+    records: Iterable[dict[str, Any]],
+    *,
+    sample_ids: set[str],
+    offset: int,
+    limit: int | None,
+) -> list[dict[str, Any]]:
+    if limit == 0:
+        return []
     matched: list[dict[str, Any]] = []
+    skipped = 0
     for record in records:
         sample_id = str(record.get("sample_id") or "")
         if sample_ids and sample_id not in sample_ids:
+            continue
+        if skipped < offset:
+            skipped += 1
             continue
         matched.append(record)
         if limit is not None and len(matched) >= limit:
@@ -245,10 +258,17 @@ def _format_sample(sample: dict[str, Any], *, ordinal: int, width: int) -> str:
 def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
+    if args.offset < 0 or (args.limit is not None and args.limit < 0):
+        parser.error("--offset and --limit must be non-negative.")
     samples_path = _resolve_samples_path(args)
     records = _load_jsonl(samples_path)
     sample_ids = {str(item) for item in args.sample_id if str(item).strip()}
-    selected = _iter_filtered_samples(records, sample_ids=sample_ids, limit=args.limit)
+    selected = _iter_filtered_samples(
+        records,
+        sample_ids=sample_ids,
+        offset=args.offset,
+        limit=args.limit,
+    )
 
     if not selected:
         if sample_ids:
@@ -259,7 +279,7 @@ def main(argv: list[str] | None = None) -> int:
 
     rendered = [
         _format_sample(sample, ordinal=index, width=args.width)
-        for index, sample in enumerate(selected, start=1)
+        for index, sample in enumerate(selected, start=args.offset + 1)
     ]
     print("\n\n".join(rendered))
     print(SEPARATOR)

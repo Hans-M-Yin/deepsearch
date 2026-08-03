@@ -220,6 +220,11 @@ def _print_record(record: dict[str, Any], *, ordinal: int) -> None:
             print(f"tool_call_id: {message['tool_call_id']}")
         if message.get("arguments") is not None:
             print(f"tool_arguments: {message['arguments']}")
+        # Tool outputs frequently contain long retrieved pages or image-search
+        # payloads.  The trajectory debug view intentionally keeps the call
+        # specification but omits those result bodies.
+        if str(message.get("role") or "") == "tool":
+            continue
         content = _content_text(message.get("content"))
         if content:
             print(content)
