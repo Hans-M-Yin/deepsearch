@@ -26,8 +26,8 @@ export SFT_OPENAI_API_MODE=manual_react
 # Fill in a real logid before running if needed.
 export SFT_OPENAI_HEADERS_JSON='{"X-TT-LOGID":"${your_logid}"}'
 export SFT_OPENAI_EXTRA_BODY_JSON='{"thinking":{"include_thoughts":true,"budget_tokens":8192}}'
-export SFT_OPENAI_MAX_TOKENS=16000
-export SFT_OPENAI_MAX_TURNS=16
+export SFT_OPENAI_MAX_TOKENS=30000
+export SFT_OPENAI_MAX_TURNS=30
 
 # ---------------------------------------------------------------------------
 # GPT-5.4 chat.completions branch

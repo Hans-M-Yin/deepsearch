@@ -11,6 +11,31 @@ Inspired by Zhilin Lu, even the coding agent is capable of leading the implement
 
 Node在设计上确保大数据不放进Node，而是放到OSS，或者根本不下载到本地，只保留饮用的URL。
 
+### Firecrawl standalone backend
+
+`firecrawl_client.py` is intentionally independent from the current readers. Copy
+`firecrawl_keys.txt.example` to the ignored `firecrawl_keys.txt` and put one
+Firecrawl key on each line. Each `FirecrawlClient.scrape(url)` call reads the
+shared `firecrawl_state.json`, selects the next active key in round-robin order,
+then records the Firecrawl result. Every key begins with 10,000 credits and the
+actual `data.metadata.creditsUsed` value is deducted after each response.
+Explicit invalid-key or exhausted-credit
+errors disable only that key; normal page failures remain recorded without
+removing the key from rotation.
+
+```python
+from synthesis.firecrawl_client import FirecrawlClient
+
+client = FirecrawlClient()
+result = client.scrape(
+    "https://sanmames.athletic-club.eus/en/blog/why-san-mames-called-that/",
+    only_main_content=True,
+    max_age=172800000,
+    parsers=["pdf"],
+    formats=["markdown"],
+)
+```
+
 
 除了以上节点类以外，我们定义`Edge`类来描述节点之间的关系，
 

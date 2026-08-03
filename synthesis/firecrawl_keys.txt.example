@@ -1,0 +1,6 @@
+# One Firecrawl API key per line.
+# Copy this file to firecrawl_keys.txt, then replace the placeholder values.
+# Blank lines and lines starting with # are ignored.
+#
+# fc-your-first-key
+# fc-your-second-key

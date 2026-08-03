@@ -798,8 +798,9 @@ f"""
 	3. Remove obvious noise: navigation text, menus, repeated headers, footer text, social buttons, login or subscription prompts, unrelated recommendations, boilerplate, tracking text, and raw URL lists.
 	4. Preserve image-related evidence when relevant: captions, alt text, file titles, figure labels, surrounding paragraph text, metadata, and positional relationships between an image and nearby captions/headings. Do not detach a caption from the image/title it describes.
 	5. Perform content extraction only. Do not add extra content, and do not use or introduce any world knowledge. If the raw content does not contain the requested field or cannot substantiate the goal, explicitly write "Insufficient evidence: <brief reason>" inside <result>.
-	6. If multiple parts of the raw text may be related, you may extract them in separate segments.
-	6. Output format must be exactly:
+	6. If the webpage content is only an access-control/interstitial page rather than actual page content (for example verification, CAPTCHA/reCAPTCHA, Forbidden, access denied, bot checks, or a similar block page), output exactly <result>BLOCKED</result>. Do not include an explanation or any other text in <result>.
+	7. If multiple parts of the raw text may be related, you may extract them in separate segments.
+	8. Output format must be exactly:
 	<thinking>your analysis</thinking>
 	<result>the complete extracted content</result>
 	The final extracted content that will be used downstream is only the content inside the <result> tag. Therefore, all content that should be preserved must appear inside <result>. Do not put meta-comments such as "the content is already minimal" in <result> unless those words are in the source.
@@ -1211,6 +1212,73 @@ def _read_document(url: str) -> dict[str, Any]:
     }
 
 
+def _read_via_firecrawl(url: str) -> dict[str, Any]:
+    """Fetch markdown through Firecrawl only after the primary reader is blocked."""
+    from synthesis.firecrawl_client import FirecrawlClient
+
+    response = FirecrawlClient().scrape(
+        url,
+        only_main_content=True,
+        max_age=172800000,
+        parsers=["pdf"],
+        formats=["markdown"],
+    )
+    if response.get("error"):
+        raise RuntimeError(str(response["error"]))
+    payload = response.get("data") if isinstance(response.get("data"), dict) else response
+    markdown = str(payload.get("markdown") or "").strip()
+    if not markdown:
+        raise RuntimeError("Firecrawl returned no markdown content.")
+    metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+    return {
+        "url": str(metadata.get("sourceURL") or metadata.get("source_url") or metadata.get("url") or url),
+        "title": str(metadata.get("title") or "").strip(),
+        "content": markdown,
+        "metadata": metadata,
+    }
+
+
+def _is_blocked_summary(content: str) -> bool:
+    return "BLOCKED" in str(content or "").upper()
+
+
+def _read_url_with_firecrawl_fallback(
+    *,
+    url: str,
+    goal: str,
+    assistant_output: str,
+    original_title: str = "",
+    trigger: str,
+) -> dict[str, Any]:
+    """Read through Firecrawl and summarize after Enhanced Reader is unavailable/blocked."""
+    try:
+        firecrawl_document = _read_via_firecrawl(url)
+        content = firecrawl_document["content"]
+        summarized = summarize_with_qwen(
+            content=content,
+            goal=goal,
+            assistant_output=assistant_output,
+        )
+    except Exception as exc:  # pragma: no cover - network bound
+        _record_read_url_call(branch="text", success=False)
+        return {
+            "ok": False,
+            "error": f"{trigger}; Firecrawl fallback failed for {url}: {exc}",
+        }
+
+    _read_url_debug("firecrawl_fallback_done", url=url, content_chars=len(content))
+    _record_read_url_call(branch="text", success=True)
+    return {
+        "ok": True,
+        "kind": "text",
+        "url": firecrawl_document["url"],
+        "title": firecrawl_document["title"] or original_title,
+        "content": summarized if goal or assistant_output else content[:500],
+        "resolved_via": "firecrawl_fallback",
+        "firecrawl_metadata": firecrawl_document["metadata"],
+    }
+
+
 def read_url(
     url: str,
     goal: str = "",
@@ -1411,28 +1479,48 @@ def read_url(
         document = _read_document(normalized_url)
         # print(f"############ {document} ##############")
     except Exception as exc:  # pragma: no cover - network bound
-        _record_read_url_call(branch="text", success=False)
-        return {"ok": False, "error": f"read_url failed for {normalized_url}: {exc}"}
+        trigger = f"Enhanced Reader failed for {normalized_url}: {exc}"
+        _read_url_debug(
+            "enhanced_reader_failed",
+            url=normalized_url,
+            error_type=exc.__class__.__name__,
+            error=str(exc),
+        )
+        return _read_url_with_firecrawl_fallback(
+            url=normalized_url,
+            goal=goal,
+            assistant_output=assistant_output,
+            trigger=trigger,
+        )
 
     content = document.get("content", "") or ""
     title = document.get("title", "") or ""
-    summarized_content = (
-        summarize_with_qwen(
-            content=content,
+    should_return_summary = bool(goal or assistant_output)
+    reader_summary = summarize_with_qwen(
+        content=content,
+        goal=goal,
+        assistant_output=assistant_output,
+    )
+    summarized_content = reader_summary if should_return_summary else content[:500]
+    if _is_blocked_summary(reader_summary):
+        _read_url_debug("enhanced_reader_blocked", url=normalized_url)
+        return _read_url_with_firecrawl_fallback(
+            url=normalized_url,
             goal=goal,
             assistant_output=assistant_output,
+            original_title=title,
+            trigger=f"Enhanced Reader returned BLOCKED for {normalized_url}",
         )
-        if goal or assistant_output
-        else content[:500]
-    )
     _record_read_url_call(branch="text", success=True)
-    return {
+    result = {
         "ok": True,
         "kind": "text",
         "url": document.get("url") or normalized_url,
         "title": title,
         "content": summarized_content,
+        "resolved_via": "enhanced_reader",
     }
+    return result
 
 
 def t2t_search(query: str, lang: str = "en", top_k: int = DEFAULT_SEARCH_TOP_K) -> dict[str, Any]:

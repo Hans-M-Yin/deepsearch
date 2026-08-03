@@ -6,6 +6,8 @@ from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 import json
+import logging
+import os
 from pathlib import Path
 import time
 import traceback
@@ -28,6 +30,10 @@ _MAX_EDGE_OVERLAP_RATIO = 0.75
 _MAX_NODE_OVERLAP_RATIO = 0.80
 _MIN_STALLED_PROPOSALS_PER_VERSION = 8
 _STALLED_PROPOSALS_MULTIPLIER = 4
+_JSONL_PUBLISH_BATCH_SIZE = 50
+_FSYNC_WARNING_PATHS: set[str] = set()
+
+logger = logging.getLogger(__name__)
 
 
 def _utc_now() -> str:
@@ -84,6 +90,38 @@ class _AcceptorState:
     core_buckets: dict[str, list[_AcceptedPathFingerprint]] = field(default_factory=dict)
     prefix_buckets: dict[str, list[_AcceptedPathFingerprint]] = field(default_factory=dict)
     target_buckets: dict[str, list[_AcceptedPathFingerprint]] = field(default_factory=dict)
+
+
+class _JsonlBatchWriter:
+    """Publish JSONL records to HDFS-FUSE in bounded, closed-file batches."""
+
+    def __init__(self, path: Path, *, batch_size: int = _JSONL_PUBLISH_BATCH_SIZE) -> None:
+        self.path = path
+        self.batch_size = max(1, int(batch_size))
+        self._records: list[dict[str, Any]] = []
+
+    def __enter__(self) -> "_JsonlBatchWriter":
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback_value) -> None:
+        del exc_type, exc_value, traceback_value
+        self.flush()
+
+    def append(self, record: dict[str, Any]) -> None:
+        self._records.append(record)
+        if len(self._records) >= self.batch_size:
+            self.flush()
+
+    def flush(self) -> None:
+        if not self._records:
+            return
+        records = self._records
+        self._records = []
+        with self.path.open("a", encoding="utf-8") as handle:
+            for record in records:
+                VqaBatchRunner._append_jsonl(handle, record, flush=False)
+            handle.flush()
+            VqaBatchRunner._fsync_handle(handle)
 
 
 @dataclass(slots=True)
@@ -192,7 +230,6 @@ class VqaBatchRunner:
             )
             return summary
 
-        mode = "a" if self.resume else "w"
         inflight_limit = max(
             self.workers,
             self.max_inflight or self.workers * 2,
@@ -202,10 +239,8 @@ class VqaBatchRunner:
             sampler_workers * _STALLED_PROPOSALS_MULTIPLIER,
         )
         with (
-            self.samples_path.open(mode, encoding="utf-8") as samples_file,
-            self.questions_path.open("a", encoding="utf-8") as questions_file,
-            self.errors_path.open(mode, encoding="utf-8") as errors_file,
-            self.warnings_path.open(mode, encoding="utf-8") as warnings_file,
+            _JsonlBatchWriter(self.samples_path) as samples_file,
+            _JsonlBatchWriter(self.questions_path) as questions_file,
             ThreadPoolExecutor(max_workers=sampler_workers) as sampler_executor,
             ThreadPoolExecutor(max_workers=self.workers) as writer_executor,
         ):
@@ -266,10 +301,10 @@ class VqaBatchRunner:
                             future=future,
                             path=path,
                             summary=summary,
-                            samples_file=samples_file,
-                            questions_file=questions_file,
-                            errors_file=errors_file,
-                            warnings_file=warnings_file,
+                            samples_file=self.samples_path,
+                            questions_file=self.questions_path,
+                            errors_file=self.errors_path,
+                            warnings_file=self.warnings_path,
                             persisted_signatures=persisted_signatures,
                             persisted_edge_usage_counts=persisted_edge_usage_counts,
                             progress=progress,
@@ -289,7 +324,7 @@ class VqaBatchRunner:
                         self._record_sampler_failure(
                             exc=exc,
                             context=context,
-                            errors_file=errors_file,
+                            errors_file=self.errors_path,
                         )
                         continue
 
@@ -505,6 +540,8 @@ class VqaBatchRunner:
             model=template.model,
             history_exposure_model_client=template.history_exposure_model_client,
             history_exposure_model=template.history_exposure_model,
+            edge_quality_model_client=template.edge_quality_model_client,
+            edge_quality_model=template.edge_quality_model,
             llm_max_tokens=template.llm_max_tokens,
         )
         sampler.load_state(sampler_state, replace=True)
@@ -1340,10 +1377,34 @@ class VqaBatchRunner:
 
     @staticmethod
     def _append_jsonl(handle, record: dict[str, Any], *, flush: bool = False) -> None:
+        """Append one record and close path-backed writers to publish through HDFS-FUSE."""
+        if isinstance(handle, _JsonlBatchWriter):
+            handle.append(record)
+            return
+        if isinstance(handle, (str, Path)):
+            path = Path(handle)
+            with path.open("a", encoding="utf-8") as opened_handle:
+                VqaBatchRunner._append_jsonl(opened_handle, record, flush=flush)
+            return
         handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True))
         handle.write("\n")
         if flush:
             handle.flush()
+            VqaBatchRunner._fsync_handle(handle)
+
+    @staticmethod
+    def _fsync_handle(handle) -> None:
+        try:
+            os.fsync(handle.fileno())
+        except OSError as exc:  # Some network/FUSE filesystems do not implement fsync.
+            path = str(getattr(handle, "name", "<unknown>"))
+            if path not in _FSYNC_WARNING_PATHS:
+                _FSYNC_WARNING_PATHS.add(path)
+                logger.warning(
+                    "VQA JSONL fsync is unavailable for %s; readers may not see updates immediately: %s",
+                    path,
+                    exc,
+                )
 
     @staticmethod
     def _print_sample_timing(sample: VqaSample) -> None:
