@@ -287,6 +287,7 @@ def process_single_case(
 
     intermediate_dir = os.path.join(output_dir, "intermediate")
     cfg = inference_cfg or InferenceConfig()
+    completed = False
 
     for turn_num in range(config.MAX_TURNS):
         try:
@@ -297,8 +298,7 @@ def process_single_case(
             )
         except Exception as exc:
             logger.error("Inference failed on turn %d: %s", turn_num, exc, exc_info=True)
-            trajectory["turns"].append({"turn": turn_num, "error": str(exc)})
-            break
+            raise RuntimeError(f"Inference failed on turn {turn_num}: {exc}") from exc
 
         response_text = ""
         for cand in response.get("candidates", []) or []:
@@ -323,12 +323,14 @@ def process_single_case(
             )
 
         if tools.has_response_tag(response_text):
+            completed = True
             break
 
         tool_call_json = tools.extract_tool_call(response_text)
         if not tool_call_json:
-            logger.info("Turn %d ended without tool call or response tag.", turn_num)
-            break
+            raise RuntimeError(
+                f"Inference ended on turn {turn_num} without a complete <answer> response."
+            )
 
         os.makedirs(intermediate_dir, exist_ok=True)
         tool_message, new_images = tools.execute_tool(
@@ -413,7 +415,12 @@ def process_single_case(
                 {"role": "user", "parts": [{"text": observation_text}]}
             )
 
-    # Trajectory writeout
+    if not completed:
+        raise RuntimeError(
+            f"Inference reached the {config.MAX_TURNS}-turn limit without a complete <answer> response."
+        )
+
+    # Only completed trajectories are persisted.
     trajectory["final_response_text"] = "\n\n".join(
         turn.get("response_text", "")
         for turn in trajectory["turns"]

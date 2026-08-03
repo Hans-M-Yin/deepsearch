@@ -27,6 +27,7 @@ from .schemas import PathCandidate, TrajectoryStats
 
 SAMPLER_STATE_VERSION = 1
 DEFAULT_HISTORY_EXPOSURE_MODEL = "multimodal_process"
+DEFAULT_EDGE_QUALITY_MODEL = "multimodal_process"
 _VQA_FIXED_REQUEST_ID = "3200636808"
 
 
@@ -63,8 +64,8 @@ Important evaluation principles:
 5. If an image hop is involved, prefer it only when the image is likely to provide necessary evidence rather than decorative context.
 6. Avoid near-duplicate entities that are too close to entities already present in the trajectory. For example, if the trajectory already contains "iPhone 4S", then "iPhone 5" is usually too similar and should be penalized unless the relation creates a genuinely necessary contrast.
 7. Avoid a candidate whose target has already been explicitly named in the relation text of an earlier hop, even when that target has not yet appeared as a trajectory node. Such a candidate repeats information that the chain has already exposed instead of adding a new inference step. For example, if an earlier hop reads "A -- is associated with C --> B", then a later candidate "B --> C" should receive a very low score, because C has already been revealed by the earlier relation.
-8. Give a low score when the candidate TARGET NODE ITSELF is a broad, non-unique concept page rather than a specific entity. Examples include category/concept nodes such as "Company" or "City", occupation nodes such as "Actor" or "Scientist", generic role nodes such as "Captain" or "Founder", and entity-type nodes such as "Film" or "University". This penalty is about landing on the generic concept node, not about the profession, role, or type of a specific target entity. A hop to a particular person who is an actor or scientist (for example, "Tom Hanks" or "Marie Curie"), a particular company or city (for example, "Apple Inc." or "Paris"), or another specific named entity should NOT be penalized for belonging to one of these classes; such concrete entity transitions are often desirable.
-9. Set `is_generic_category_target=true` exactly when principle 8 applies. This flag activates a hard score cap in the sampler, so do not use it merely because a specific entity belongs to a category.
+8. A candidate TARGET NODE that is itself a broad, non-unique concept page must be rejected. Examples include category/concept nodes such as "Company" or "City", occupation nodes such as "Actor" or "Scientist", generic role nodes such as "Captain" or "Founder", and entity-type nodes such as "Film" or "University". This rule is about landing on the generic concept node, not about the profession, role, or type of a specific target entity. A hop to a particular person who is an actor or scientist (for example, "Tom Hanks" or "Marie Curie"), a particular company or city (for example, "Apple Inc." or "Paris"), or another specific named entity should NOT be rejected for belonging to one of these classes; such concrete entity transitions are often desirable.
+9. Set `is_generic_category_target=true` exactly when principle 8 applies, give it score 0, and do not include it as a viable candidate.
 
 Common bad candidates:
 - generic links that could connect to many entities
@@ -109,7 +110,7 @@ PROMPT_HISTORY_EXPOSURE_JUDGE = """You are reviewing whether a candidate next TE
 Your job is narrow: decide whether the history has already identified the SAME entity as the candidate, so that adding the candidate would be only a repeated name, alias expansion, or trivial type expansion. You are NOT judging whether the candidate is easy to infer, strongly related, topically similar, or naturally suggested by the history. A useful clue toward a new entity is valid multi-hop reasoning and should be allowed.
 
 BLOCK only when at least one of the following is true:
-- the exact candidate entity is explicitly named in an earlier text-node title or edge relation;
+- the candidate entity is named in an earlier text-node title or edge relation;
 - an obvious alias, abbreviation, common name, formal name, spelling variant, or parenthetical/disambiguated form of the same entity was already exposed;
 - the candidate is only a trivial name expansion or type wrapper around the same exposed entity, such as a common event name becoming its formal event title;
 - an earlier image/relation already states the defining named anchor and the candidate merely converts that same anchor into an obvious label visible in the image, without adding a genuinely new entity. Example: an image description already says `New Zealand captain`, and the candidate is `New Zealand national rugby union team` obtained only by reading the New Zealand logo in that same image;
@@ -199,10 +200,11 @@ PROMPT_EDGE_QUALITY_JUDGE = """You are filtering candidate graph edges before th
 
 Evaluate each candidate independently, using only its supplied source, target, relation, and evidence. Return one result for every candidate edge_id.
 
-For a text_to_text wiki_link, make three separate judgments:
+For a text_to_text wiki_link, make four separate judgments:
 1. relevance: indirect relationships are allowed, but the relation must explicitly identify the source (including an unambiguous alias or reference). The target may be described by the relation. Reject a mere co-occurrence, a relation about an unrelated third entity, or a relation that only shares a place, date, or keyword.
 2. correctness: the relation must be supported by the evidence, and the entity described by that evidence must actually be the supplied target.
 3. unambiguous: given the relation and evidence, the target must be the only reasonable referent. Reject descriptions that could equally identify multiple entities, events, results, or links.
+4. generic_category_target: reject when the target node itself is a broad, non-unique category, occupation, role, or entity-type page (for example, `Company`, `City`, `Actor`, `Scientist`, `Captain`, `Founder`, `Film`, or `University`). Do not reject a concrete named entity merely because it belongs to one of these types.
 
 For text_to_image, judge only relevance: the image/query/visual subject must genuinely concern the source text entity. Reject an image that merely shares a location, period, name fragment, or background event with the source. A unique image is not enough.
 
@@ -219,12 +221,13 @@ Return valid JSON exactly in this shape:
       "correctness_ok": true,
       "unambiguous_analysis": "...",
       "unambiguous_ok": true,
+      "is_generic_category_target": false,
       "keep": true
     }
   ]
 }
 
-For text_to_image, set correctness_analysis and unambiguous_analysis to an empty string and their booleans to true.
+For text_to_image, set correctness_analysis and unambiguous_analysis to an empty string, their booleans to true, and is_generic_category_target to false.
 """
 
 _GENERIC_EXPOSURE_LABELS = {
@@ -255,6 +258,20 @@ _GENERIC_EXPOSURE_LABELS = {
     "woman",
 }
 
+_GENERIC_CATEGORY_TARGET_LABELS = _GENERIC_EXPOSURE_LABELS | {
+    "actor",
+    "association",
+    "captain",
+    "company",
+    "director",
+    "founder",
+    "museum",
+    "organization",
+    "organisation",
+    "scientist",
+    "university",
+}
+
 
 def _stable_hash(*parts: object, length: int = 16) -> str:
     payload = "||".join("" if part is None else str(part) for part in parts)
@@ -282,7 +299,9 @@ class SamplerConfiguration:
     neighbor_selection_strategy: str = "random"
     llm_candidate_count: int = 6
     llm_score_temperature: float = 0.35
-    llm_generic_category_score_cap: float = 0.15
+    # Retained only for invocation/config compatibility. Generic category
+    # targets are now rejected before selection rather than score-capped.
+    llm_generic_category_score_cap: float = 0.0
     allowed_edge_types: tuple[str, ...] = (
         "wiki_link",
         "wiki_attribute",
@@ -373,6 +392,8 @@ class RandomPathSampler(PathSampler):
     model: str | None = None
     history_exposure_model_client: ModelWorkerClient | None = None
     history_exposure_model: str | None = None
+    edge_quality_model_client: ModelWorkerClient | None = None
+    edge_quality_model: str | None = None
     llm_max_tokens: int = 800
     edge_quality_cache: dict[str, dict[str, Any]] = field(default_factory=dict)
     _rng: random.Random = field(init=False, repr=False)
@@ -558,6 +579,8 @@ class RandomPathSampler(PathSampler):
                 rng=rng,
                 selection_trace=selection_trace,
             )
+            if edge is None:
+                return None, "no_viable_llm_candidate"
             current = edge["dst_node_id"]
             if self.config.require_simple_path and current in node_ids:
                 return None, "cycle"
@@ -653,6 +676,10 @@ class RandomPathSampler(PathSampler):
         rejected: list[dict[str, Any]] = []
         exposure_parts: list[dict[str, Any]] | None = None
         for edge in neighbors:
+            generic_category_reject = self._generic_category_target_reject_reason(edge)
+            if generic_category_reject is not None:
+                rejected.append(generic_category_reject)
+                continue
             quality_reject = quality_rejections.get(str(edge.get("edge_id") or ""))
             if quality_reject is not None:
                 rejected.append(quality_reject)
@@ -685,6 +712,31 @@ class RandomPathSampler(PathSampler):
                 }
             )
         return kept
+
+    def _generic_category_target_reject_reason(self, edge: dict[str, Any]) -> dict[str, Any] | None:
+        """Hard-filter obvious generic text pages before any sampling strategy."""
+        dst_node_id = str(edge.get("dst_node_id") or "").strip()
+        if not dst_node_id or self.graph.node_type(dst_node_id) != "text":
+            return None
+        target = self.graph.get_node(dst_node_id) or {}
+        normalized_title = self._normalize_exposure_text(target.get("title") or "")
+        singular_title = normalized_title[:-1] if normalized_title.endswith("s") else normalized_title
+        is_category_namespace = normalized_title.startswith(("category ", "list of "))
+        if not is_category_namespace and normalized_title not in _GENERIC_CATEGORY_TARGET_LABELS and singular_title not in _GENERIC_CATEGORY_TARGET_LABELS:
+            return None
+        reject = {
+            "filter_reason": "generic_category_target_hard_filter",
+            "edge_id": edge.get("edge_id"),
+            "edge_type": edge.get("edge_type"),
+            "src_node_id": edge.get("src_node_id"),
+            "dst_node_id": dst_node_id,
+            "source": self._node_label(self.graph.get_node(str(edge.get("src_node_id") or "")) or {}),
+            "target": self._node_label(target),
+            "relation": edge.get("relation") or "",
+            "reason": "candidate target is an obvious generic category/concept page",
+        }
+        self._emit_edge_quality_debug(reject)
+        return reject
 
     def _edge_quality_rejections(self, neighbors: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
         """Return sampler-local quality rejections without mutating graph edges."""
@@ -732,9 +784,16 @@ class RandomPathSampler(PathSampler):
         return src_type == "text" and dst_type == "image"
 
     def _llm_edge_quality_judge(self, edges: list[dict[str, Any]]) -> dict[str, dict[str, Any]] | None:
-        model_client = self.history_exposure_model_client or self.model_client
+        model_client = (
+            self.edge_quality_model_client
+            or self.history_exposure_model_client
+            or self.model_client
+        )
         model_alias = (
-            self.history_exposure_model
+            self.edge_quality_model
+            or os.environ.get("VQA_EDGE_QUALITY_MODEL")
+            or DEFAULT_EDGE_QUALITY_MODEL
+            or self.history_exposure_model
             or os.environ.get("VQA_HISTORY_EXPOSURE_MODEL")
             or DEFAULT_HISTORY_EXPOSURE_MODEL
         )
@@ -776,14 +835,18 @@ class RandomPathSampler(PathSampler):
             keep = self._coerce_optional_bool(raw.get("keep"))
             if None in {relevance_ok, correctness_ok, unambiguous_ok, keep}:
                 continue
+            is_generic_category_target = self._coerce_optional_bool(raw.get("is_generic_category_target"))
+            if is_generic_category_target is None:
+                is_generic_category_target = False
             evaluations[edge_id] = {
-                "keep": bool(keep and relevance_ok and correctness_ok and unambiguous_ok),
+                "keep": bool(keep and relevance_ok and correctness_ok and unambiguous_ok and not is_generic_category_target),
                 "relevance_analysis": str(raw.get("relevance_analysis") or "").strip(),
                 "relevance_ok": relevance_ok,
                 "correctness_analysis": str(raw.get("correctness_analysis") or "").strip(),
                 "correctness_ok": correctness_ok,
                 "unambiguous_analysis": str(raw.get("unambiguous_analysis") or "").strip(),
                 "unambiguous_ok": unambiguous_ok,
+                "is_generic_category_target": is_generic_category_target,
                 "model_alias": model_alias,
                 "raw": raw,
             }
@@ -843,7 +906,7 @@ class RandomPathSampler(PathSampler):
             key: evaluation.get(key)
             for key in (
                 "relevance_ok", "relevance_analysis", "correctness_ok", "correctness_analysis",
-                "unambiguous_ok", "unambiguous_analysis", "model_alias",
+                "unambiguous_ok", "unambiguous_analysis", "is_generic_category_target", "model_alias",
             )
         }
         print("[vqa-edge-quality-filter] " + json.dumps(payload, ensure_ascii=False), file=sys.stderr, flush=True)
@@ -1292,7 +1355,7 @@ class RandomPathSampler(PathSampler):
         node_ids: list[str],
         rng: random.Random,
         selection_trace: list[dict[str, Any]] | None = None,
-    ) -> dict[str, Any]:
+    ) -> dict[str, Any] | None:
         if len(neighbors) == 1:
             return neighbors[0]
         if self._use_llm_guidance():
@@ -1302,8 +1365,9 @@ class RandomPathSampler(PathSampler):
                 rng=rng,
                 selection_trace=selection_trace,
             )
-            if llm_choice is not None:
-                return llm_choice
+            # LLM-guided mode is fail-closed: a candidate filtered as a generic
+            # category must not re-enter via the random fallback.
+            return llm_choice
         if self.config.edge_penalty_alpha == 0:
             return rng.choice(neighbors)
         weights = [self._candidate_weight(edge, node_ids=node_ids) for edge in neighbors]
@@ -1361,6 +1425,18 @@ class RandomPathSampler(PathSampler):
             if not edge_id or edge_id not in candidate_by_id:
                 continue
             raw_score, score, is_generic_category_target = self._capped_llm_candidate_score(item)
+            if is_generic_category_target:
+                trace_candidates.append(
+                    {
+                        "edge_id": edge_id,
+                        "raw_score": raw_score,
+                        "score": 0.0,
+                        "is_generic_category_target": True,
+                        "status": "filtered_generic_category_target",
+                        "reason": str(item.get("reason") or "").strip(),
+                    }
+                )
+                continue
             if score <= 0:
                 score = 0.01
             weight = self._score_to_weight(score)
@@ -1407,11 +1483,7 @@ class RandomPathSampler(PathSampler):
     def _capped_llm_candidate_score(self, item: dict[str, Any]) -> tuple[float, float, bool]:
         raw_score = self._coerce_score(item.get("score"), default=0.0)
         is_generic_category_target = item.get("is_generic_category_target") is True
-        score = (
-            min(raw_score, self.config.llm_generic_category_score_cap)
-            if is_generic_category_target
-            else raw_score
-        )
+        score = 0.0 if is_generic_category_target else raw_score
         return raw_score, score, is_generic_category_target
 
     def _select_llm_candidates(
@@ -1705,8 +1777,8 @@ def _debug_main() -> None:
     parser.add_argument(
         "--llm-generic-category-score-cap",
         type=float,
-        default=0.15,
-        help="Hard maximum LLM score for targets classified as generic category/concept nodes.",
+        default=0.0,
+        help="Deprecated compatibility option; generic category/concept targets are hard-filtered.",
     )
     parser.add_argument(
         "--sampler-model-alias",
@@ -1717,6 +1789,11 @@ def _debug_main() -> None:
         "--history-exposure-model-alias",
         default=os.environ.get("VQA_HISTORY_EXPOSURE_MODEL") or DEFAULT_HISTORY_EXPOSURE_MODEL,
         help="Model alias for history-exposure filtering. Defaults to VQA_HISTORY_EXPOSURE_MODEL or multimodal_process.",
+    )
+    parser.add_argument(
+        "--edge-quality-model-alias",
+        default=os.environ.get("VQA_EDGE_QUALITY_MODEL") or DEFAULT_EDGE_QUALITY_MODEL,
+        help="Model alias for edge-quality filtering. Defaults to VQA_EDGE_QUALITY_MODEL or multimodal_process.",
     )
     args = parser.parse_args()
 
@@ -1742,6 +1819,8 @@ def _debug_main() -> None:
         model=args.sampler_model_alias,
         history_exposure_model_client=LLM_WORKER,
         history_exposure_model=args.history_exposure_model_alias,
+        edge_quality_model_client=LLM_WORKER,
+        edge_quality_model=args.edge_quality_model_alias,
     )
     candidate = sampler.generate_one(start_node_id=args.start_node_id)
     print(f"graph_dir: {args.graph_dir}")

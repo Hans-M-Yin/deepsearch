@@ -30,6 +30,7 @@ _FIXED_SERPER_POOL_STATE_FILE = (
 )
 _FIXED_SERPER_POOL_MIN_REMAINING = 10
 _FIXED_SERPER_POOL_DEFAULT_CREDITS = 2500
+_FIXED_SERPER_KEY_POOL: "SerperApiKeyPool | None" = None
 
 
 def _jsonify(value: Any) -> Any:
@@ -178,6 +179,24 @@ def _serper_dns_debug(url: str) -> dict[str, Any] | None:
     }
 
 
+def _is_serper_credit_exhausted(*, status_code: int, response_body: str) -> bool:
+    """Recognize Serper's credit-exhaustion errors without treating QPM as exhaustion."""
+    if status_code == 429:
+        return False
+    message = response_body.lower()
+    return any(
+        marker in message
+        for marker in (
+            "insufficient credits",
+            "not enough credits",
+            "credit balance",
+            "credits exhausted",
+            "credit limit exceeded",
+            "quota exhausted",
+        )
+    )
+
+
 def _log_serper_raw_response(*, url: str, status_code: int, raw: dict[str, Any]) -> None:
     """Log Serper's unmodified parsed JSON response before result parsing."""
 
@@ -218,7 +237,7 @@ class SerperApiKeyPool:
         default_credits: int = 2500,
         min_remaining: int = 10,
     ) -> None:
-        cleaned = [key.strip() for key in keys if key and key.strip()]
+        cleaned = list(dict.fromkeys(key.strip() for key in keys if key and key.strip()))
         if not cleaned:
             raise ValueError("Serper API key pool requires at least one key.")
         self.keys = cleaned
@@ -252,12 +271,17 @@ class SerperApiKeyPool:
 
     @classmethod
     def from_fixed_pool(cls) -> "SerperApiKeyPool":
-        return cls(
+        """Return the process-wide fixed pool, loading its key file once."""
+        global _FIXED_SERPER_KEY_POOL
+        if _FIXED_SERPER_KEY_POOL is not None:
+            return _FIXED_SERPER_KEY_POOL
+        _FIXED_SERPER_KEY_POOL = cls(
             keys=cls._load_keys_from_file(_FIXED_SERPER_KEYS_FILE),
             state_path=_FIXED_SERPER_POOL_STATE_FILE,
             default_credits=_FIXED_SERPER_POOL_DEFAULT_CREDITS,
             min_remaining=_FIXED_SERPER_POOL_MIN_REMAINING,
         )
+        return _FIXED_SERPER_KEY_POOL
 
     @staticmethod
     def _load_keys_from_env() -> list[str]:
@@ -300,8 +324,28 @@ class SerperApiKeyPool:
         metadata = state.pop("_selected_metadata")
         return key, metadata
 
-    def _acquire_from_state(self, state: dict[str, Any]) -> dict[str, Any]:
-        now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    def status(self) -> dict[str, Any]:
+        """Return the shared pool's currently usable keys and estimated credits."""
+        state = self._with_locked_state(self._initialize_state)
+        return self._pool_status(state)
+
+    def mark_credits_exhausted(self, key_id: str, *, reason: str | None = None) -> dict[str, Any]:
+        """Disable a key after Serper explicitly reports that its credits are gone."""
+        def update(state: dict[str, Any]) -> dict[str, Any]:
+            state = self._initialize_state(state)
+            record = dict((state.get("keys") or {}).get(key_id) or {})
+            if record:
+                record["remaining_credits"] = 0
+                record["disabled"] = True
+                record["disabled_reason"] = reason or "credits_exhausted"
+                record["disabled_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                state["keys"][key_id] = record
+            self._store_pool_status(state)
+            return state
+
+        return self._pool_status(self._with_locked_state(update))
+
+    def _initialize_state(self, state: dict[str, Any]) -> dict[str, Any]:
         pool = dict(state.get("keys") or {})
         ordered_ids = []
         for key in self.keys:
@@ -313,11 +357,44 @@ class SerperApiKeyPool:
             record.setdefault("disabled", False)
             record.setdefault("masked_key", self._mask_key(key))
             pool[key_id] = record
+        state["keys"] = pool
+        state["key_order"] = ordered_ids
+        state["default_credits"] = self.default_credits
+        state["min_remaining"] = self.min_remaining
+        self._store_pool_status(state)
+        return state
+
+    def _pool_status(self, state: dict[str, Any]) -> dict[str, Any]:
+        pool = dict(state.get("keys") or {})
+        records = [dict(pool.get(self.key_id(key)) or {}) for key in self.keys]
+        available = [
+            record
+            for record in records
+            if not bool(record.get("disabled"))
+            and int(record.get("remaining_credits") or 0) > self.min_remaining
+        ]
+        return {
+            "remaining_credits_total": sum(max(0, int(record.get("remaining_credits") or 0)) for record in records),
+            "available_key_count": len(available),
+            "total_key_count": len(records),
+            "min_remaining": self.min_remaining,
+        }
+
+    def _store_pool_status(self, state: dict[str, Any]) -> None:
+        state["pool_status"] = self._pool_status(state)
+
+    def _acquire_from_state(self, state: dict[str, Any]) -> dict[str, Any]:
+        now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        state = self._initialize_state(state)
+        pool = dict(state["keys"])
+        ordered_ids = list(state["key_order"])
 
         selected_key: str | None = None
         selected_id: str | None = None
-        for key in self.keys:
-            key_id = self.key_id(key)
+        previous_id = str(state.get("last_selected_key_id") or "")
+        start_index = (ordered_ids.index(previous_id) + 1) % len(ordered_ids) if previous_id in ordered_ids else 0
+        for offset in range(len(ordered_ids)):
+            key_id = ordered_ids[(start_index + offset) % len(ordered_ids)]
             record = pool[key_id]
             remaining = int(record.get("remaining_credits") or 0)
             disabled = bool(record.get("disabled"))
@@ -325,7 +402,7 @@ class SerperApiKeyPool:
                 continue
             if remaining <= self.min_remaining:
                 continue
-            selected_key = key
+            selected_key = self.keys[ordered_ids.index(key_id)]
             selected_id = key_id
             break
 
@@ -340,16 +417,16 @@ class SerperApiKeyPool:
         selected["last_used_at"] = now
         pool[selected_id] = selected
         state["keys"] = pool
-        state["key_order"] = ordered_ids
+        state["last_selected_key_id"] = selected_id
         state["updated_at"] = now
-        state["default_credits"] = self.default_credits
-        state["min_remaining"] = self.min_remaining
+        self._store_pool_status(state)
         state["_selected_key"] = selected_key
         state["_selected_metadata"] = {
             "key_id": selected_id,
             "masked_key": selected.get("masked_key"),
             "remaining_credits": selected.get("remaining_credits"),
             "initial_credits": selected.get("initial_credits"),
+            **self._pool_status(state),
         }
         return state
 
@@ -586,7 +663,7 @@ class SerperAdapterSearchClient:
         base_url: str = "http://127.0.0.1:7001",
         *,
         api_key: str = "local-openserp",
-        timeout_s: float = 60.0,
+        timeout_s: float = 120.0,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
@@ -676,7 +753,7 @@ class SerperSearchClient:
         api_keys: list[str] | None = None,
         search_url: str | None = None,
         images_url: str | None = None,
-        timeout_s: float = 60.0,
+        timeout_s: float = 120.0,
         pool_state_path: str | Path | None = None,
         pool_default_credits: int | None = None,
         pool_min_remaining: int | None = None,
@@ -775,6 +852,20 @@ class SerperSearchClient:
                 error_payload = exc.read().decode("utf-8", errors="replace")
             except Exception:
                 error_payload = ""
+            if self.key_pool is not None and _is_serper_credit_exhausted(
+                status_code=exc.code,
+                response_body=error_payload,
+            ):
+                pool_status = self.key_pool.mark_credits_exhausted(
+                    str(pool_metadata.get("key_id") or ""),
+                    reason=f"serper_http_{exc.code}_credits_exhausted",
+                )
+                _serper_debug(
+                    "key_credits_exhausted",
+                    key_id=pool_metadata.get("key_id"),
+                    status_code=exc.code,
+                    key_pool=pool_status,
+                )
             _serper_debug(
                 "http_error",
                 url=url,

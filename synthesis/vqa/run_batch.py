@@ -15,7 +15,7 @@ from synthesis.store import JsonlGraphStore
 
 from .batch_runner import VqaBatchRunner
 from .graph_view import GraphView
-from .path_sampler import DEFAULT_HISTORY_EXPOSURE_MODEL, RandomPathSampler, SamplerConfiguration
+from .path_sampler import DEFAULT_EDGE_QUALITY_MODEL, DEFAULT_HISTORY_EXPOSURE_MODEL, RandomPathSampler, SamplerConfiguration
 from .pipeline import VqaGenerationPipeline
 from .question_writer import QuestionWriter
 
@@ -57,6 +57,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Model alias for sampler history-exposure filtering. Defaults to VQA_HISTORY_EXPOSURE_MODEL or multimodal_process.",
     )
     parser.add_argument(
+        "--edge-quality-model-alias",
+        default=os.environ.get("VQA_EDGE_QUALITY_MODEL") or DEFAULT_EDGE_QUALITY_MODEL,
+        help="Model alias for sampler edge-quality filtering. Defaults to VQA_EDGE_QUALITY_MODEL or multimodal_process.",
+    )
+    parser.add_argument(
         "--compress-hop-model-alias",
         default=None,
         help="Optional model alias for compress_hop. Defaults to VQA_COMPRESS_HOP_MODEL.",
@@ -86,8 +91,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--llm-generic-category-score-cap",
         type=float,
-        default=0.15,
-        help="Hard maximum LLM score for targets classified as generic category/concept nodes.",
+        default=0.0,
+        help="Deprecated compatibility option; generic category/concept targets are hard-filtered.",
     )
     parser.add_argument(
         "--sampler-state",
@@ -108,6 +113,7 @@ def main(argv: list[str] | None = None) -> int:
     model_alias = args.model_alias or os.environ.get("VQA_WRITER_MODEL")
     sampler_model_alias = args.sampler_model_alias or os.environ.get("VQA_SAMPLER_MODEL")
     history_exposure_model_alias = args.history_exposure_model_alias
+    edge_quality_model_alias = args.edge_quality_model_alias or DEFAULT_EDGE_QUALITY_MODEL
     compress_hop_model_alias = args.compress_hop_model_alias or os.environ.get("VQA_COMPRESS_HOP_MODEL")
     image_bridge_model_alias = args.image_bridge_model_alias or os.environ.get("VQA_IMAGE_BRIDGE_MODEL")
     ask_target_verify_model_alias = args.ask_target_verify_model_alias or os.environ.get("ASK_TARGET_VERIFY_MODEL")
@@ -133,6 +139,8 @@ def main(argv: list[str] | None = None) -> int:
         model=sampler_model_alias,
         history_exposure_model_client=LLM_WORKER,
         history_exposure_model=history_exposure_model_alias,
+        edge_quality_model_client=LLM_WORKER,
+        edge_quality_model=edge_quality_model_alias,
     )
     writer = QuestionWriter(
         model_client=LLM_WORKER if model_alias else None,
@@ -183,6 +191,7 @@ def main(argv: list[str] | None = None) -> int:
                 "writer_model_alias": model_alias,
                 "sampler_model_alias": sampler_model_alias,
                 "history_exposure_model_alias": history_exposure_model_alias,
+                "edge_quality_model_alias": edge_quality_model_alias,
                 "compress_hop_model_alias": compress_hop_model_alias,
                 "image_bridge_model_alias": image_bridge_model_alias,
                 "ask_target_verify_model_alias": ask_target_verify_model_alias,

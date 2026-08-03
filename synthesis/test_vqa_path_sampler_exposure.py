@@ -61,17 +61,17 @@ class HistoryExposureMatchTests(unittest.TestCase):
         self.assertTrue(result["allow"])
 
 
-class GenericCategoryScoreCapTests(unittest.TestCase):
+class GenericCategoryHardFilterTests(unittest.TestCase):
     def setUp(self) -> None:
         self.sampler = object.__new__(RandomPathSampler)
-        self.sampler.config = SamplerConfiguration(llm_generic_category_score_cap=0.15)
+        self.sampler.config = SamplerConfiguration()
 
-    def test_caps_generic_category_score(self) -> None:
+    def test_sets_generic_category_score_to_zero(self) -> None:
         raw, effective, classified = self.sampler._capped_llm_candidate_score(
             {"score": 0.92, "is_generic_category_target": True}
         )
         self.assertEqual(raw, 0.92)
-        self.assertEqual(effective, 0.15)
+        self.assertEqual(effective, 0.0)
         self.assertTrue(classified)
 
     def test_does_not_cap_specific_entity_score(self) -> None:
@@ -238,7 +238,7 @@ class EdgeQualityFilterTests(unittest.TestCase):
         self.assertEqual(set(rejected), {"wiki_bad", "image_bad"})
         self.assertFalse(rejected["wiki_bad"]["evaluation"]["keep"])
         self.assertEqual(len(client.requests), 1)
-        self.assertEqual(client.requests[0].model, "overlap-model")
+        self.assertEqual(client.requests[0].model, "multimodal_process")
         self.assertEqual(
             client.requests[0].metadata,
             {

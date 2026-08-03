@@ -11,7 +11,7 @@ from synthesis.model_worker import LLM_WORKER
 from synthesis.store import JsonlGraphStore
 
 from .graph_view import GraphView
-from .path_sampler import DEFAULT_HISTORY_EXPOSURE_MODEL, RandomPathSampler, SamplerConfiguration
+from .path_sampler import DEFAULT_EDGE_QUALITY_MODEL, DEFAULT_HISTORY_EXPOSURE_MODEL, RandomPathSampler, SamplerConfiguration
 from .question_writer import QuestionWriter
 from .schemas import EvidenceBundle, PathCandidate, SampleProgress, SampleStatus, VqaSample
 from .verifier import SampleVerifier
@@ -47,6 +47,7 @@ class VqaGenerationPipeline:
         self.graph = graph
         sampler_model = os.environ.get("VQA_SAMPLER_MODEL")
         history_exposure_model = os.environ.get("VQA_HISTORY_EXPOSURE_MODEL") or DEFAULT_HISTORY_EXPOSURE_MODEL
+        edge_quality_model = os.environ.get("VQA_EDGE_QUALITY_MODEL") or DEFAULT_EDGE_QUALITY_MODEL
         self.sampler = self.sampler or RandomPathSampler(
             graph=graph,
             config=self.config,
@@ -54,6 +55,8 @@ class VqaGenerationPipeline:
             model=sampler_model,
             history_exposure_model_client=LLM_WORKER,
             history_exposure_model=history_exposure_model,
+            edge_quality_model_client=LLM_WORKER,
+            edge_quality_model=edge_quality_model,
         )
         self.sampler.graph = graph
         self.sampler.config = self.config
@@ -116,16 +119,23 @@ class VqaGenerationPipeline:
         polished = draft
         polish_elapsed_s = 0.0
         progress.polished_at = _utc_now()
-        enhanced, difficulty_elapsed_s = self._run_timed_stage(
-            path=path,
-            stage="difficulty_enhancement",
-            operation=lambda: self.writer.enhance_difficulty(draft=polished, path=path, graph=self.graph),
-        )
-        shortcut_repaired, shortcut_repair_elapsed_s = self._run_timed_stage(
-            path=path,
-            stage="shortcut_repair",
-            operation=lambda: self.writer.repair_shortcuts(draft=enhanced, path=path, graph=self.graph),
-        )
+        # Temporary experiment: recursive compose is now responsible for
+        # obfuscation and compactness. Keep the post-compose stages disabled
+        # so they cannot globally rewrite a valid hop-by-hop draft.
+        # enhanced, difficulty_elapsed_s = self._run_timed_stage(
+        #     path=path,
+        #     stage="difficulty_enhancement",
+        #     operation=lambda: self.writer.enhance_difficulty(draft=polished, path=path, graph=self.graph),
+        # )
+        enhanced = polished
+        difficulty_elapsed_s = 0.0
+        # shortcut_repaired, shortcut_repair_elapsed_s = self._run_timed_stage(
+        #     path=path,
+        #     stage="shortcut_repair",
+        #     operation=lambda: self.writer.repair_shortcuts(draft=enhanced, path=path, graph=self.graph),
+        # )
+        shortcut_repaired = enhanced
+        shortcut_repair_elapsed_s = 0.0
         progress.post_obfuscated_at = _utc_now()
         verification, verification_elapsed_s = self._run_timed_stage(
             path=path,
@@ -156,7 +166,7 @@ class VqaGenerationPipeline:
             verification=verification,
             progress=progress,
             metadata={
-                "writer_warnings": list(obfuscated.metadata.get("writer_warnings") or []),
+                "writer_warnings": list(shortcut_repaired.metadata.get("writer_warnings") or []),
                 "timings": timing_summary,
             },
         )

@@ -519,7 +519,7 @@ def _serper_client() -> SerperSearchClient:
     return SerperSearchClient(
         search_url=os.environ.get("SERPER_SEARCH_URL") or "https://google.serper.dev/search",
         images_url=os.environ.get("SERPER_IMAGES_URL") or "https://google.serper.dev/images",
-        timeout_s=float(os.environ.get("SFT_SERPER_TIMEOUT_S", "60")),
+        timeout_s=float(os.environ.get("SFT_SERPER_TIMEOUT_S", "120")),
     )
 
 
@@ -1441,7 +1441,26 @@ def t2t_search(query: str, lang: str = "en", top_k: int = DEFAULT_SEARCH_TOP_K) 
         top_k = max(1, min(int(top_k), MAX_SEARCH_RESULTS))
         fetch_limit = _search_fetch_limit(top_k, tool_name="t2t_search")
         effective_query = _sanitize_search_query(query)
-        response = _serper_client().search_text(effective_query, limit=fetch_limit, hl=lang)
+        response = None
+        for attempt in range(1, 3):
+            try:
+                response = _serper_client().search_text(
+                    effective_query,
+                    limit=fetch_limit,
+                    hl=lang,
+                )
+                break
+            except Exception as exc:
+                if attempt >= 2:
+                    raise
+                logger.warning(
+                    "t2t_search failed (attempt %d/2); retrying in 5 seconds: %s",
+                    attempt,
+                    exc,
+                )
+                time.sleep(5)
+        if response is None:  # Defensive guard; the loop either returns or raises.
+            raise RuntimeError("t2t_search did not receive a response after retry")
         results: list[dict[str, Any]] = []
         for item in response.results:
             if _url_matches_blocked_domain(item.url or "", T2T_BLOCKED_SEARCH_DOMAINS):

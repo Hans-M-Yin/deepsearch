@@ -111,6 +111,61 @@ def _format_hop(hop: dict[str, Any], *, width: int) -> list[str]:
     return lines
 
 
+def _compose_steps(sample: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return recursive compose traces when the sample was written stepwise."""
+    compose = sample.get("compose") or {}
+    result = compose.get("result") if isinstance(compose, dict) else {}
+    steps = result.get("steps") if isinstance(result, dict) else []
+    payload = compose.get("payload") if isinstance(compose, dict) else {}
+    merged_hops = payload.get("merged_hops") if isinstance(payload, dict) else []
+    if not isinstance(steps, list):
+        return []
+
+    # Steps written before statement/relation/mark were persisted in their own
+    # records can still be displayed faithfully from compose_payload.merged_hops.
+    hop_by_identity = {
+        (
+            hop.get("hop_index"),
+            str(hop.get("source") or ""),
+            str(hop.get("target") or ""),
+        ): hop
+        for hop in merged_hops
+        if isinstance(hop, dict)
+    }
+    enriched: list[dict[str, Any]] = []
+    for step in steps:
+        if not isinstance(step, dict):
+            continue
+        item = dict(step)
+        matching_hop = hop_by_identity.get(
+            (item.get("hop_index"), str(item.get("source") or ""), str(item.get("target") or ""))
+        )
+        if isinstance(matching_hop, dict):
+            for field in ("statement", "relation", "mark"):
+                if not item.get(field):
+                    item[field] = matching_hop.get(field)
+        enriched.append(item)
+    return enriched
+
+
+def _format_compose_step(step: dict[str, Any], *, ordinal: int, width: int) -> list[str]:
+    hop_index = step.get("hop_index")
+    title = f"Step {ordinal} (prepend hop {hop_index})" if hop_index is not None else f"Step {ordinal}"
+    raw_response = step.get("raw_response") or {}
+    analysis = raw_response.get("analysis") if isinstance(raw_response, dict) else ""
+    lines = [f"  {title}"]
+    lines.extend(_format_wrapped_block("source", _first_non_empty(step.get("source")), width=width, indent=4))
+    lines.extend(_format_wrapped_block("target", _first_non_empty(step.get("target")), width=width, indent=4))
+    lines.extend(_format_wrapped_block("relation", _first_non_empty(step.get("relation")), width=width, indent=4))
+    lines.extend(_format_wrapped_block("mark", _first_non_empty(step.get("mark")), width=width, indent=4))
+    lines.extend(_format_wrapped_block("image_attached", str(bool(step.get("image_attached"))), width=width, indent=4))
+    lines.extend(_format_wrapped_block("statement", _first_non_empty(step.get("statement")), width=width, indent=4))
+    lines.extend(_format_wrapped_block("input_question", _first_non_empty(step.get("input_question")), width=width, indent=4))
+    lines.extend(_format_wrapped_block("analysis", _first_non_empty(analysis), width=width, indent=4))
+    lines.extend(_format_wrapped_block("output_question", _first_non_empty(step.get("question")), width=width, indent=4))
+    return lines
+
+
 def _format_sample(sample: dict[str, Any], *, ordinal: int, width: int) -> str:
     sample_id = _first_non_empty(sample.get("sample_id"), f"sample_{ordinal:06d}")
     status = _first_non_empty(sample.get("status"), "unknown")
@@ -136,6 +191,9 @@ def _format_sample(sample: dict[str, Any], *, ordinal: int, width: int) -> str:
         drafted_question,
     )
     hop_chain = list(sample.get("hop_chain") or [])
+    compose_steps = _compose_steps(sample)
+    target_ask = sample.get("target_ask") or {}
+    question_target_ask = sample.get("question_target_ask") or {}
 
     lines: list[str] = [SEPARATOR]
     header = f"Sample {ordinal} | sample_id={sample_id} | status={status}"
@@ -152,6 +210,29 @@ def _format_sample(sample: dict[str, Any], *, ordinal: int, width: int) -> str:
             lines.pop()
     else:
         lines.append("  - No hop_chain found.")
+
+    lines.append(SUB_SEPARATOR)
+    lines.append("Target Ask")
+    raw_ask = _first_non_empty(
+        target_ask.get("ask_target") if isinstance(target_ask, dict) else "",
+    )
+    compose_ask = _first_non_empty(
+        question_target_ask.get("ask_target") if isinstance(question_target_ask, dict) else "",
+    )
+    lines.extend(_format_wrapped_block("selected_target_ask", raw_ask, width=width, indent=2))
+    if compose_ask and compose_ask != raw_ask:
+        lines.extend(_format_wrapped_block("compose_target_ask", compose_ask, width=width, indent=2))
+
+    lines.append(SUB_SEPARATOR)
+    lines.append("Recursive Compose Steps")
+    if compose_steps:
+        for ordinal, step in enumerate(compose_steps, start=1):
+            lines.extend(_format_compose_step(step, ordinal=ordinal, width=width))
+            lines.append("")
+        if lines[-1] == "":
+            lines.pop()
+    else:
+        lines.append("  - No recursive compose steps found (this may be a legacy single-pass sample).")
 
     lines.append(SUB_SEPARATOR)
     lines.append("Question Versions")

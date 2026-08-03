@@ -330,10 +330,30 @@ Requirements:
 3. The factual information you select must not be revealed in the question, and the question must not tell students that any material exists.
 4. Do not fabricate or add any information. Everything mentioned in your answer must appear in the original text.
 5. If the content of your question contains highly distinctive markers that could reveal the target entity, you should make the question more ambiguous. For example, in the question “When was a certain politician’s slogan ‘Make America Great Again’ introduced?”, the highly distinctive slogan should be blurred. It can be rewritten as: “When was a certain politician’s own campaign slogan introduced?”
-6. NOTICE: Try to avoid asking highly distinctive questions that would easily reveal the target’s identity, or wrap the content of the question in a way that ensures the subject being asked about cannot be inferred from the question itself.
+6. Note: Avoid asking highly distinctive questions that would easily reveal the target’s identity. Any salient description in the question other than the subject object itself should be obfuscated or removed, so that, aside from the subject object, the identity of the asked-about object cannot be directly inferred from the question alone. For example, “When and where did Trump first introduce his campaign slogan ‘Make America Great Again’?” should be revised to “When and where was Trump’s signature campaign slogan first introduced?”
+7. Ensure that the question is concise, and do not introduce content that is not directly relevant or is redundant (that is, content whose removal would still leave the referent uniquely identifiable) to what is being asked. The predecessor objects provided to you are only for selecting what to ask about; they must not be mentioned in the question, and you must not choose a question that is directly related to the historical predecessor objects.
 
-Generate exactly 5 diverse candidate questions. Do not generate several near-duplicates
+Generate exactly 5 diverse candidate questions. The questions should range from direct to indirect, and cover all kinds of details, from the object’s basic characteristics to events associated with it. Do not generate several near-duplicate questions that differ only slightly in wording but in fact ask about the same underlying fact.
 that ask about the same fact in slightly different wording.
+
+**Example 1**
+target: Chat Hedley
+Bad question: Before co-founding his famous video-sharing platform, what was one of Chad Hurley's design contributions while working at eBay's PayPal division?
+Good question: What was one of Chad Hurley’s design contributions while working in the division of an online payment service provider?
+Explanation: Compared with the bad question, the good question removes the phrase “video-sharing platform,” which is not directly relevant to what is being asked, and that description, when linked to a PayPal employee, could also reveal Chad Hurley. The good question also obfuscates “PayPal.” Together, these revisions ensure that the service provider can only be identified if Chad Hurley is already known, which in turn makes it possible to determine Chad Hurley’s contribution.
+
+**Example 2**
+target: CJ Group
+Bad question: What is the literal English translation of 'CheilJedang', the original name of the company from which CJ Group was formed?
+Good question:  What is the literal English translation of the original name of the company from which CJ Group was formed?
+Explanation: In the good question, only the target entity name, CJ Group, is exposed, so the user must first identify CJ Group, then search for its original company, and finally search for the meaning. In the bad question, however, “CheilJedang” is exposed directly, so the user can search for its translation immediately without first identifying CJ Group.
+
+**Example 3**
+target: Bretton Hall, West Yorkshire
+Bad question: What became of the historic panelling from an older version of Bretton Hall, which was preserved from a room once occupied by a 16th-century English monarch, prior to the estate's sale in 1947?
+Good question: What became of the historic panelling from an older version of Bretton Hall, which was preserved from a room once occupied by a monarch, prior to the estate's sale?
+Explanation: Compared with the bad question, the good question removes the redundant time reference and obfuscates the identity of the English monarch. This does not introduce ambiguity, because once the respondent has identified Bretton Hall, they can match “the monarch” to the relevant English monarch based on historical facts and can also identify the corresponding events. Removing these details further eliminates shortcuts to the answer and ensures that the respondent must first identify Bretton Hall before answering the question, rather than bypassing Bretton Hall directly from the wording of the question.
+
 
 Output format: JSON, containing the following fields:
 
@@ -419,19 +439,23 @@ PROMPT_SELECT_IMAGE_TARGET = """You are a professional designer of visual search
 2. Because the images found by the solver may differ from the reference image in shooting angle, timing, composition, and so on, the reference image is only one possible search result and may not be the one the solver ultimately finds. Therefore, the questions you write must ensure that the answer derived from images matching the search description is unique or stable.
 
 ** Goals
-1. Every question must genuinely require inspection of visual information. Avoid choosing facts that can be answered reliably using only ordinary background knowledge or directly from the search query itself. For example, if a person in the image has a white pocket square in the breast pocket of a suit, you should not ask about the object in the pocket, because that answer matches common real-world expectations and could be answered correctly without inspecting the image.
+1.Every question must genuinely require inspection of visual information. Do not choose facts that can be reliably answered using only common sense, background knowledge, scene-related knowledge, or directly from the search query itself. For example, if a person in the image has a white pocket square in the breast pocket of a suit, you should not ask what object is in the pocket, because that answer matches common real-world expectations and could be answered correctly without inspecting the image. Another bad example: ask for the character of helipad (from common-sense, character 'H').
+CHECK: The question must not be answerable by common sense or habitual inference; its answer must not be documented in text on the internet and must be obtainable only by looking at the image.
+
 2. Prefer concrete visual details centered on the described scene or event (and the reference image). This includes not only low-level visual features but also higher-level semantic information, as long as the answer must still come from observing the image. Examples include:
     - actions, interactions, and object states;
     - clothing, equipment, accessories, signs, logos, labels, numbers, and visible text;
     - event-environment details, such as advertising boards, stage displays, or nearby equipment;
     - architectural, geographic, physical, or functional relations;
     - multi-step details that require first locating one entity and then inspecting something associated with it.
+  But ensure that the visual information is definite and unambiguous.
 3. Use qualifiers to ensure answer uniqueness. Since image search from a text description can be ambiguous, use necessary qualifiers to constrain what the question refers to and avoid referential ambiguity. For example, when asking about an advertising board in a stadium, if multiple brands are present, you should specify which advertising board you mean.
 4. Avoid vague expressions such as “that advertising board,” “that person,” or “that building,” especially when multiple instances may exist.
 5. Avoid choosing details that are obviously incidental to a single photograph, such as unrelated bystanders, random vehicles, temporary objects, or arbitrary camera-relative positions.
 6. If the query points to a fixed visual work—such as a particular album cover, poster, painting, logo, manuscript page, or iconic photograph—then composition-related locators such as “the upper-left corner” or “the second person from the left” are allowed.
 7. Prioritize diversity. Do not generate multiple similar questions that differ only in the object or color being asked about. Explore different kinds of visual information and question types.
 8. Use only details supported by the provided image evidence. Do not invent facts.
+9. The answer to the question must be definite and must not depend on the viewing angle.
 
 Please generate 5 candidate questions. Each candidate question must have an objective and concise gold answer. Return valid JSON, and you must follow exactly this structure:
 
@@ -544,7 +568,7 @@ Now inspect the reference image. Check whether the referent is visible and uniqu
 
 ## Final selection
 
-A candidate is valid only if it passes both stages. Among valid candidates, prefer stronger visual dependence, deeper reasoning, precise wording, interesting details, and lower text-only answerability. Do not automatically prefer simple color, count, or identity questions. Do not rewrite candidates. If none pass, return reject_all.
+A candidate is valid only if it passes both stages. Among valid candidates, prefer stronger visual dependence, deeper reasoning, precise wording, interesting details, and lower text-only answerability. Strongly prefer candidates whose answer remains uncertain even if the solver already knows the depicted event, work, person, or artifact and has read a standard title or caption; resolving the answer must require inspecting a uniquely localized, non-iconic visual detail in the image. When otherwise valid candidates have comparable visual-verification quality, prefer the candidate whose answer is least predictable from ordinary background knowledge, common conventions, or stereotypical associations, and is therefore most likely to be answered incorrectly without careful image inspection. Do not prefer generic or standardized markers (for example, conventional helipad symbols) merely because they are easy to see. Do not automatically prefer simple color, count, or identity questions. Do not rewrite candidates. If none pass, return reject_all.
 
 Return valid JSON with exactly this structure:
 {
@@ -598,17 +622,18 @@ Requirements:
 1. The output must be a complete statement, not only a noun phrase.
 2. The exact `target` must appear once as the entity being identified.
 3. The descriptive portion before the identification must not contain the target name, an alias, abbreviation, initialism, canonical id, or near-copy surface form.
-4. Prefer a set of facts that is concise, not so famous as to make the target obvious, supports web retrieval, and is semantically relevant to the downstream path.
+4. Prefer a set of facts that is concise, not so famous that it makes the target too obvious, and semantically relevant to the downstream path.
 5. Use only facts from `source_description`.
 6. Do not mention that a profile, description, prompt, or source material was provided.
 7. Do not write a question.
+8. The opening description you provide must not be directly related to the later-hop statements—for example, it must not directly mention content that appears only in later hops. It may be related only at the thematic level.
 
 Good example:
-`A 20th-century Romanian sculptor who created a war memorial ensemble in Targu Jiu was Constantin Brâncuși.`
+`A 20th-century sculptor who created the Târgu Jiu war memorial ensemble was Constantin Brâncuși.`
 
 Bad example:
-`A 20th-century Romanian sculptor who created a war memorial ensemble in Targu Jiu.`
-Reason: this is only a clue, not a complete identification hop.
+`A 20th-century Romanian sculptor who created the Târgu Jiu war memorial ensemble.`
+Reason: this is only a clue, not a complete identification hop. In addition, adding the nationality makes the target overly explicit and narrows the search space too much; without the nationality, the sculptor can still be identified through the memorial ensemble without creating ambiguity, while making retrieval more challenging.
 
 Bad example:
 `Constantin Brâncuși, a Romanian sculptor, created a war memorial ensemble in Targu Jiu.`
@@ -899,9 +924,9 @@ Output:
 """
 
 
-# Legacy compose prompt retained for comparison and rollback. Runtime question
-# composition uses the revised PROMPT_COMPOSE_QUESTION defined after this block.
-PROMPT_COMPOSE_QUESTION = """You are an expert at composing multi-hop retrieval questions. Below, I will provide you with the specific structure of each hop in the data, and your task is to merge these scattered pieces of information into a deep reasoning question. This question should hide the intermediate reasoning steps and be presented to the user for them to answer.
+# Legacy single-pass prompt retained only for comparison and rollback. Runtime
+# composition uses the recursive prompt defined immediately after this block.
+PROMPT_COMPOSE_QUESTION_LEGACY = """You are an expert at composing multi-hop retrieval questions. Below, I will provide you with the specific structure of each hop in the data, and your task is to merge these scattered pieces of information into a deep reasoning question. This question should hide the intermediate reasoning steps and be presented to the user for them to answer.
 
 The input includes:
 	1. each hop in the reasoning chain, including:
@@ -1075,6 +1100,59 @@ Now compose the question for the provided input.
 Return valid JSON with exactly these fields:
 {
   "analysis": "brief explanation of how the hops were merged without exposing intermediate targets or creating shortcuts",
+  "question": "..."
+}
+"""
+
+
+PROMPT_COMPOSE_QUESTION = """You are an expert question writer. You will receive a statement, a question, and the intended reasoning chain for that question. The statement describes a relationship between a source object A and a target object B. The question asks about a final attribute reached by starting from the target object B and following the reasoning chain to the end. Your task is to use the relationship described in the statement to replace the mention of target object B in the question with a description based on source object A, so that the question can only be answered by first inferring B from A and the stated relationship, and then continuing along the rest of the reasoning chain. In other words, you should prepend source object A from the statement to the beginning of the reasoning chain.
+
+Requirements:
+1. Do not change what the question ultimately asks. Do not change the corresponding answer, and do not alter the meaning of the question.
+2. When using A and the corresponding relationship to refer to B, keep it concise and do not introduce redundant information. Ensure that, in the revised question, B can be inferred from the description if A is known, but cannot be directly inferred from the description if A is unknown. In other words, knowing A must be a necessary condition for inferring B. This means you must not simply copy the relationship from the provided statement verbatim; instead, you should **obfuscate** or **partially delete** parts of the relationship.
+3. Check the revised question and verify that all clues required for reasoning along the main chain are present (that is, every description connecting adjacent objects is present), while no clues unrelated to the main reasoning chain remain.
+4. When the question contains explicit unique entities such as specific times, people, events, or places, you must judge from the reasoning chain and the inter-object relationships whether they are necessary. For necessary entity terms, apply **obfuscated rewriting**. For unnecessary entity terms, **delete them all directly**.
+5. Obfuscated rewriting means replacing an overly specific term with a vaguer description. You should pay special attention to whether the new description introduced when using A and the corresponding relationship to replace B contains explicit terms, and obfuscate them where possible without creating ambiguity. Every explicit entity term in the question should be replaced to some extent, but you must ensure that no ambiguity is introduced. For example, suppose the statement is: Messi (A) was promoted to Barcelona’s first team (B) at age 19 and stayed there until leaving for PSG at age 34. Then the revised question should not say: “the team Messi played for ...”, because that is ambiguous (PSG, Inter Miami, the Argentina national team). A better description would be: “the team Messi played for at age 20 ...”. This version removes redundant information from the original statement while avoiding ambiguity.
+6. Delete overly specific or highly salient terms, such as distinctive slogans, taglines, and names, whenever their presence would allow A or B to be inferred directly from association alone even if both A and B are unknown. In such cases, those terms, phrases, or statements must be removed. For example: “Trump (A) first introduced the slogan ‘Make America Great Again’ in a speech at Trump Tower in New York (B) on June 16, 2015.” Then the revised question should delete the iconic slogan, the extra date, and the speech event, yielding something like: “the place where Trump first introduced his signature slogan ...”.
+7. If the statement points to a specific scene or image, that hop will be marked as "image". In the rewritten question, preserve the description of that scene or image — especially visual details related to target B. You may only obfuscate the entities within it.
+8. If the description remains somewhat long even after obfuscation and removal of redundancy, you should add a new clause to make the question more natural and concise.
+9. Do not introduce ambiguity, and use pronouns correctly.
+10. The input may contain `entry_hop_notice`, which means the current statement is the first hop of the full reasoning chain. In that case, preserve the reasoning entry: only apply light obfuscation, and keep the necessary identifying clue. If it is an image hop, preserve the visual anchor and scene details needed to identify the entry from the attached image.
+
+CHCEKLIST:
+1. Does the rewritten question contain specific names, times, places, or events, and do they help advance the reasoning chain? If not, delete them; if they are necessary, obfuscate them.
+2. Does the rewritten question contain any descriptions that can be removed? Analyze every description in detail and ensure that each one either connects objects on the reasoning chain or is necessary for disambiguation.
+3. Has the meaning been changed? Check whether the meaning of the relationship between the source and target in the rewritten question is consistent with the provided statement, and whether what the question asks has changed.
+
+Example 1
+statement: Cho Yang-ho served as chairman of Pyeongchang’s bid for the 2018 Winter Olympics from September 14, 2009 to October 5, 2011.
+source (A): Cho Yang-ho
+target (B): the 2018 Pyeongchang Winter Olympics
+question: In the celebration scene after Pyeongchang’s bid delegation won the host-city vote for the Winter Olympics in Durban in 2011, the flags displaying the year included a symbol from that country’s national flag at the upper right of the number. What symbol was it?
+rewritten question: In the celebration scene after the Olympic bid delegation chaired by Cho Yang-ho won the host-city vote for the Winter Olympics, what symbol from that country’s national flag appears at the upper right of the number on the flags displaying the year?
+explanation: It removes terms such as the time, place, and “South Korea,” which would allow the reader to directly infer “the 2018 Pyeongchang Winter Olympics.” It preserves the source object and the content on the main reasoning chain.
+
+Example 2
+statement: In the group photo of Microsoft’s first 11 employees taken in Albuquerque, New Mexico in 1978, the person at the far right of the front row is Paul Allen.
+source (A): Microsoft
+target (B): Paul Allen
+mark: image
+question: Paul Allen later bought two different professional sports teams in 1988 and 1997: the Portland Trail Blazers and the Seattle Seahawks. How much did he pay for each acquisition?
+rewritten question: In the group photo of Microsoft’s first 11 employees taken in New Mexico, the employee at the far right of the front row later bought two professional sports teams. How much did he pay for those two acquisitions?
+explanation: It uses Microsoft to replace Paul Allen. Because the statement is marked as an image hop, the rewritten version preserves most of the image description, making only light obfuscation and redundancy removal, so that the image can still be found when Microsoft is known. It also keeps Paul Allen’s position in the image to avoid ambiguity. At the same time, it removes the dates and team names from the question, because the question asks about the prices, not the years, and deleting the years does not create ambiguity. This also prevents the reader from inferring Paul Allen directly from the team names, ensuring that Paul Allen must first be inferred before the question can be answered.
+
+Example 3
+statement: Peter Thiel appears in a 2007 group photograph of the "PayPal Mafia," and the man seated in the middle row wearing sunglasses is Chad Hurley.
+source (A): Peter Thiel
+target (B): Chad Hurley
+question: Before co-founding his famous video-sharing platform, what was one of Chad Hurley's design contributions while working at eBay's PayPal division?
+rewritten question: In a 2007 group photograph of employees from an online payment service provider that also included Peter Thiel, what was one of the later design contributions made by the man seated in the middle row wearing sunglasses to payment service provider?
+explanation: Chad Hurley is identified through his specific position and appearance in the photo, namely “the man seated in the middle row wearing sunglasses.” Salient terms such as “PayPal Mafia,” “Fortune magazine,” and the PayPal company are obfuscated to prevent direct lookup: PayPal is generalized as “an online payment service provider,” and “PayPal Mafia” is replaced with a 2007 group photograph. Once Peter Thiel is inferred, the online payment company can in turn be inferred as PayPal, which then makes it possible to identify the early group photograph as the “PayPal Mafia” photo from Fortune magazine. Therefore, to avoid providing extra clues, “Fortune” can be removed. This ensures that the respondent must first infer Chad Hurley’s identity from the description involving Peter Thiel before proceeding to answer the question about his work contribution. At the same time, the retained year 2007 helps disambiguate the specific group photograph without exposing the employee or company information. As for the original work-contribution question, the final target is Chad Hurley’s contribution at work, which is unrelated to his founding of a video-sharing platform, so that clue should also be deleted to avoid allowing the user to infer Chad Hurley directly from the combination of PayPal and the video platform.
+
+
+Return valid JSON with exactly these fields:
+{
+  "analysis": "brief explanation of how target B was replaced by a description grounded in source A",
   "question": "..."
 }
 """
@@ -1587,6 +1665,7 @@ class QuestionWriter:
             "edge_id": hop.edge_id,
             "src_node_id": hop.src_node_id,
             "dst_node_id": hop.dst_node_id,
+            **({"mark": "image"} if "image" in {hop.src_modality, hop.dst_modality} else {}),
         }
 
     @staticmethod
@@ -2432,15 +2511,22 @@ class QuestionWriter:
                 ),
                 warnings=draft_warnings,
             )
-        compose_payload = self._compose_question_payload(
-            hop_summaries=compose_hops,
-            target_ask=question_target_ask,
-        )
+        # `compose_hops` has already passed image-bridge normalization, so every
+        # item here is a merge-ready hop.  Build the question backwards: start
+        # from the terminal ask, then use one hop at a time to hide its target
+        # behind a description grounded in that hop's source.
+        compose_payload = {
+            "composition_mode": "reverse_recursive",
+            "merged_hops": compose_hops,
+            "target_ask": {
+                "ask_target": question_target_ask.get("ask_target"),
+                "mark": question_target_ask.get("mark"),
+            },
+        }
         try:
-            parsed = self._generate_json(
-                system=PROMPT_COMPOSE_QUESTION,
-                user_payload=compose_payload,
-                trace_label="compose_question",
+            question, compose_steps = self._compose_question_recursively(
+                merged_hops=compose_hops,
+                target_ask=question_target_ask,
                 image_url=starting_image_url,
             )
         except Exception as exc:
@@ -2462,20 +2548,31 @@ class QuestionWriter:
                 ),
                 warnings=draft_warnings,
             )
-        question = self._clean_composed_question(str(parsed.get("question") or "").strip())
         answer = str(raw_target_ask.get("answer") or "").strip()
         if not question or not answer or self._looks_like_chain_narration(question):
-            try:
-                rewritten = self._rewrite_chain_narration(
+            draft_warnings.append(
+                self._writer_warning_entry(
+                    stage="compose_question",
+                    error=ValueError("recursive composition produced an empty or chain-narration question"),
+                )
+            )
+            return self._draft_with_writer_warnings(
+                self._fallback_compose_question(
+                    path=path,
                     hop_summaries=compose_hops,
                     target_ask=question_target_ask,
-                    image_url=starting_image_url,
-                )
-            except Exception as exc:
-                draft_warnings.append(self._writer_warning_entry(stage="rewrite_chain_narration", error=exc))
-                rewritten = None
-            if rewritten is not None:
-                question = rewritten
+                    answer_type=answer_type,
+                    raw_target_ask=raw_target_ask,
+                    raw_hop_summaries=raw_hop_summaries,
+                    image_bridge_normalization=image_bridge_normalization,
+                    image_target_terminal_normalization=image_target_terminal_normalization,
+                    question_terminal_bridge=question_terminal_bridge,
+                    entry_hop=entry_hop,
+                    starting_image_url=starting_image_url,
+                    writer_context=context.to_dict(),
+                ),
+                warnings=draft_warnings,
+            )
         if not question or not answer:
             return self._draft_with_writer_warnings(
                 self._fallback_compose_question(
@@ -2506,8 +2603,8 @@ class QuestionWriter:
                     "entry_hop": entry_hop,
                     "compose_payload": compose_payload,
                     "compose_result": {
-                        "raw_response": parsed,
-                        "analysis": str(parsed.get("analysis") or "").strip(),
+                        "composition_mode": "reverse_recursive",
+                        "steps": compose_steps,
                         "question": question,
                     },
                     "raw_hop_summaries": raw_hop_summaries,
@@ -3833,6 +3930,106 @@ class QuestionWriter:
         }
 
     @staticmethod
+    def _compose_question_step_payload(
+        *,
+        merged_hop: dict[str, Any],
+        question: str,
+    ) -> dict[str, Any]:
+        """Payload for one reverse-composition step.
+
+        Deliberately omit all other hop statements.  The already-composed
+        question carries the downstream chain; exposing future raw statements
+        here would reintroduce the single-pass shortcut surface.
+        """
+        hop = {
+            "hop_index": merged_hop.get("hop_index"),
+            "source_A": merged_hop.get("source"),
+            "target_B": merged_hop.get("target"),
+            "statement": merged_hop.get("statement"),
+            "relation": merged_hop.get("relation"),
+            "mark": merged_hop.get("mark"),
+        }
+        is_entry_hop = str(merged_hop.get("source") or "").strip() == "-"
+        direction = (
+            "This is the entry hop and has no predecessor. Replace target_B with a concise opening "
+            "description derived from the statement; do not expose target_B by name."
+            if is_entry_hop
+            else "Infer target_B from source_A using this statement, then continue with the existing question."
+        )
+        return {
+            "statement": hop,
+            "question": question,
+            "entry_hop_notice": (
+                "CURRENT HOP IS THE FIRST HOP. Preserve the reasoning entry; only apply light "
+                "obfuscation and retain the necessary identifying clue. If this is an image hop, retain "
+                "the visual anchor and required scene details. (当前是第一跳，注意保留推理 entry。)"
+                if is_entry_hop
+                else ""
+            ),
+            "intended_reasoning_chain": {
+                "current_hop": hop,
+                "is_entry_hop": is_entry_hop,
+                "direction": direction,
+            },
+        }
+
+    def _compose_question_recursively(
+        self,
+        *,
+        merged_hops: list[dict[str, Any]],
+        target_ask: dict[str, Any],
+        image_url: str | None = None,
+    ) -> tuple[str, list[dict[str, Any]]]:
+        """Compose a question from its terminal ask by prepending one hop at a time."""
+        current_question = self._clean_composed_question(
+            str(target_ask.get("ask_target") or "").strip()
+        )
+        if not current_question:
+            raise ValueError("target_ask.ask_target is empty")
+
+        compose_steps: list[dict[str, Any]] = []
+        for reverse_index, merged_hop in enumerate(reversed(merged_hops)):
+            hop_index = merged_hop.get("hop_index")
+            is_entry_hop = str(merged_hop.get("source") or "").strip() == "-"
+            # The first chronological hop is composed last.  Its input image is
+            # essential for image-start paths even if a normalization branch
+            # ever omits the image mark, so attach it explicitly for the entry
+            # hop as well as for every marked image hop.
+            attach_image = bool(image_url) and (
+                merged_hop.get("mark") == "image" or is_entry_hop
+            )
+            parsed = self._generate_json(
+                system=PROMPT_COMPOSE_QUESTION,
+                user_payload=self._compose_question_step_payload(
+                    merged_hop=merged_hop,
+                    question=current_question,
+                ),
+                trace_label=f"compose_question_hop_{hop_index}_{reverse_index}",
+                image_url=image_url if attach_image else None,
+            )
+            revised_question = self._clean_composed_question(
+                str(parsed.get("question") or "").strip()
+            )
+            if not revised_question:
+                raise ValueError(f"reverse composition returned an empty question for hop {hop_index}")
+            compose_steps.append(
+                {
+                    "hop_index": hop_index,
+                    "source": merged_hop.get("source"),
+                    "target": merged_hop.get("target"),
+                    "statement": merged_hop.get("statement"),
+                    "relation": merged_hop.get("relation"),
+                    "mark": merged_hop.get("mark"),
+                    "image_attached": attach_image,
+                    "input_question": current_question,
+                    "raw_response": parsed,
+                    "question": revised_question,
+                }
+            )
+            current_question = revised_question
+        return current_question, compose_steps
+
+    @staticmethod
     def _polish_question_payload(*, question: str, hops: list[dict[str, Any]]) -> dict[str, Any]:
         return {
             "question": question,
@@ -4108,6 +4305,7 @@ class QuestionWriter:
             "edge_id": hop.edge_id,
             "src_node_id": hop.src_node_id,
             "dst_node_id": hop.dst_node_id,
+            **({"mark": "image"} if "image" in {hop.src_modality, hop.dst_modality} else {}),
         }
 
     @staticmethod
