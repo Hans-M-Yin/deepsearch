@@ -26,6 +26,22 @@ VALID_REASONING_EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh", 
 FIXED_TT_LOGID = "3200636808"
 # A request is attempted once initially, then retried at most this many times.
 LLM_RETRY_COUNT = 1000
+_ADAPTIVE_QPM_ENV = "SYNTHESIS_ADAPTIVE_QPM_ENABLED"
+_ADAPTIVE_QPM_ERROR_WINDOW_S = 60.0
+_ADAPTIVE_QPM_RECOVERY_INTERVAL_S = 60.0
+_ADAPTIVE_QPM_RECOVERY_UTILIZATION = 0.8
+_ADAPTIVE_QPM_COOLDOWN_S = 30.0
+
+
+def _adaptive_qpm_enabled() -> bool:
+    """Return whether process-local adaptive QPM limiting is enabled."""
+
+    return str(os.environ.get(_ADAPTIVE_QPM_ENV) or "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
 
 def _jsonify(value: Any) -> Any:
@@ -106,6 +122,16 @@ class ResponsesModelResponse:
     def to_dict(self) -> dict[str, Any]:
         return _jsonify(asdict(self))
 # #### END Response 0720 ####
+
+
+@dataclass(slots=True)
+class _AdaptiveQpmState:
+    """Per-alias process-local state for adaptive QPM limiting."""
+
+    effective_qpm: int
+    rate_limit_times: deque[float] = field(default_factory=deque)
+    cooldown_until: float = 0.0
+    last_recovery_at: float = 0.0
 
 
 class ModelWorkerClient(Protocol):
@@ -627,6 +653,7 @@ class ModelRouterWorkerClient:
         self._clients: dict[str, Any] = {}
         self._qpm_lock = threading.Lock()
         self._qpm_windows: dict[str, deque[float]] = {}
+        self._adaptive_qpm_states: dict[str, _AdaptiveQpmState] = {}
         self._token_totals_lock = threading.Lock()
         self._token_totals: dict[str, dict[str, int]] = {}
         if self.config_path is not None and self.config_path.exists():
@@ -706,6 +733,7 @@ class ModelRouterWorkerClient:
         self._clients.clear()
         with self._qpm_lock:
             self._qpm_windows.clear()
+            self._adaptive_qpm_states.clear()
 
     def reload(self) -> None:
         self.load_config(self.config_path)
@@ -722,6 +750,7 @@ class ModelRouterWorkerClient:
         self._clients.clear()
         with self._qpm_lock:
             self._qpm_windows.clear()
+            self._adaptive_qpm_states.clear()
 
     def generate(self, request: ModelRequest) -> ModelResponse:
         alias = request.model
@@ -914,9 +943,17 @@ class ModelRouterWorkerClient:
             try:
                 response = client.generate(request)
                 response.metadata["dispatch_qpm"] = dispatch_qpm
+                self._record_success_and_maybe_recover_qpm(alias=alias, config=config, served_model=served_model)
+                response.metadata["adaptive_qpm_limit"] = self._effective_qpm_limit(alias=alias, config=config)
                 return response
             except Exception as exc:
                 last_error = exc
+                self._record_capacity_rate_limit(
+                    alias=alias,
+                    config=config,
+                    served_model=served_model,
+                    error=exc,
+                )
                 # print(request)
                 if attempt_index >= LLM_RETRY_COUNT:
                     break
@@ -952,9 +989,17 @@ class ModelRouterWorkerClient:
             try:
                 response = client.responses_generate(request)
                 response.metadata["dispatch_qpm"] = dispatch_qpm
+                self._record_success_and_maybe_recover_qpm(alias=alias, config=config, served_model=served_model)
+                response.metadata["adaptive_qpm_limit"] = self._effective_qpm_limit(alias=alias, config=config)
                 return response
             except Exception as exc:
                 last_error = exc
+                self._record_capacity_rate_limit(
+                    alias=alias,
+                    config=config,
+                    served_model=served_model,
+                    error=exc,
+                )
                 if attempt_index >= LLM_RETRY_COUNT:
                     break
                 print(
@@ -979,10 +1024,10 @@ class ModelRouterWorkerClient:
         qpm = config.get("qpm")
         if qpm is None:
             return self._record_qpm_dispatch(alias=alias)
-        qpm_limit = int(qpm)
         while True:
             now = time.monotonic()
             with self._qpm_lock:
+                qpm_limit = self._effective_qpm_limit_locked(alias=alias, config=config)
                 window = self._qpm_windows.setdefault(alias, deque())
                 cutoff = now - 60.0
                 while window and window[0] <= cutoff:
@@ -1002,6 +1047,143 @@ class ModelRouterWorkerClient:
                 flush=True,
             )
             time.sleep(30)
+
+    def _effective_qpm_limit(self, *, alias: str, config: dict[str, Any]) -> int | None:
+        """Return the currently active QPM cap, never exceeding configured qpm."""
+
+        if config.get("qpm") is None:
+            return None
+        with self._qpm_lock:
+            return self._effective_qpm_limit_locked(alias=alias, config=config)
+
+    def _effective_qpm_limit_locked(self, *, alias: str, config: dict[str, Any]) -> int:
+        configured_qpm = int(config["qpm"])
+        if not _adaptive_qpm_enabled():
+            return configured_qpm
+        state = self._adaptive_qpm_states.get(alias)
+        if state is None:
+            state = _AdaptiveQpmState(effective_qpm=configured_qpm)
+            self._adaptive_qpm_states[alias] = state
+        state.effective_qpm = min(configured_qpm, max(1, state.effective_qpm))
+        return state.effective_qpm
+
+    @staticmethod
+    def _is_capacity_rate_limit(error: Exception) -> bool:
+        """Recognize rate-limit errors that indicate dynamically reduced capacity."""
+
+        message = str(error).lower()
+        return (
+            error.__class__.__name__ == "RateLimitError"
+            or "error code: 429" in message
+            or "http 429" in message
+            or "too many requests" in message
+            or "'code': '-2004'" in message
+            or '"code": "-2004"' in message
+            or "资源不足" in str(error)
+        )
+
+    def _record_capacity_rate_limit(
+        self,
+        *,
+        alias: str,
+        config: dict[str, Any],
+        served_model: str,
+        error: Exception,
+    ) -> None:
+        """Decrease the local QPM cap quickly when the upstream reports capacity pressure."""
+
+        if not _adaptive_qpm_enabled() or config.get("qpm") is None or not self._is_capacity_rate_limit(error):
+            return
+        now = time.monotonic()
+        configured_qpm = int(config["qpm"])
+        with self._qpm_lock:
+            state = self._adaptive_qpm_states.setdefault(
+                alias,
+                _AdaptiveQpmState(effective_qpm=configured_qpm),
+            )
+            cutoff = now - _ADAPTIVE_QPM_ERROR_WINDOW_S
+            while state.rate_limit_times and state.rate_limit_times[0] <= cutoff:
+                state.rate_limit_times.popleft()
+            state.rate_limit_times.append(now)
+            error_count = len(state.rate_limit_times)
+            before = state.effective_qpm
+            if error_count == 1:
+                # A lone 429 may be transient. Reduce only one slot instead of
+                # collapsing the cap to the current instantaneous traffic rate.
+                after = before - 1
+            elif error_count == 2:
+                after = int(before * 0.8)
+            else:
+                after = int(before * 0.65)
+                state.cooldown_until = max(state.cooldown_until, now + _ADAPTIVE_QPM_COOLDOWN_S)
+            state.effective_qpm = min(configured_qpm, max(1, after))
+            state.last_recovery_at = now
+            cooldown_s = max(0.0, state.cooldown_until - now)
+        print(
+            "[llm-adaptive-qpm]"
+            f" alias={alias}"
+            f" served_model={served_model}"
+            " event=capacity_rate_limit"
+            f" effective_qpm_before={before}"
+            f" effective_qpm_after={state.effective_qpm}"
+            f" configured_qpm={configured_qpm}"
+            f" rate_limit_errors_60s={error_count}"
+            f" cooldown_seconds={cooldown_s:.0f}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+    def _record_success_and_maybe_recover_qpm(self, *, alias: str, config: dict[str, Any], served_model: str) -> None:
+        """Slowly probe upward after a saturated, error-free recovery interval."""
+
+        if not _adaptive_qpm_enabled() or config.get("qpm") is None:
+            return
+        now = time.monotonic()
+        configured_qpm = int(config["qpm"])
+        with self._qpm_lock:
+            state = self._adaptive_qpm_states.setdefault(
+                alias,
+                _AdaptiveQpmState(effective_qpm=configured_qpm),
+            )
+            cutoff = now - _ADAPTIVE_QPM_ERROR_WINDOW_S
+            while state.rate_limit_times and state.rate_limit_times[0] <= cutoff:
+                state.rate_limit_times.popleft()
+            if (
+                state.effective_qpm >= configured_qpm
+                or state.rate_limit_times
+                or now < state.cooldown_until
+                or now < state.last_recovery_at + _ADAPTIVE_QPM_RECOVERY_INTERVAL_S
+            ):
+                return
+            current_qpm = self._current_qpm_locked(alias=alias, now=now)
+            required_qpm = int(state.effective_qpm * _ADAPTIVE_QPM_RECOVERY_UTILIZATION + 0.999)
+            if current_qpm < required_qpm:
+                return
+            before = state.effective_qpm
+            state.effective_qpm = min(configured_qpm, before + 1)
+            state.last_recovery_at = now
+            after = state.effective_qpm
+        print(
+            "[llm-adaptive-qpm]"
+            f" alias={alias}"
+            f" served_model={served_model}"
+            " event=healthy_recovery"
+            f" effective_qpm_before={before}"
+            f" effective_qpm_after={after}"
+            f" configured_qpm={configured_qpm}"
+            f" current_window_calls={current_qpm}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+    def _current_qpm_locked(self, *, alias: str, now: float) -> int:
+        window = self._qpm_windows.get(alias)
+        if window is None:
+            return 0
+        cutoff = now - 60.0
+        while window and window[0] <= cutoff:
+            window.popleft()
+        return len(window)
 
     def _record_qpm_dispatch(self, *, alias: str) -> int:
         """Record every outbound request, including aliases without a QPM limit."""
@@ -1068,6 +1250,7 @@ class ModelRouterWorkerClient:
             f" served_model={response.metadata.get('served_model') or response.model}"
             f" current_qpm={response.metadata.get('dispatch_qpm', self._current_qpm(alias=alias))}"
             f" qpm_limit={response.metadata.get('qpm')}"
+            f" adaptive_qpm_limit={response.metadata.get('adaptive_qpm_limit', self._effective_qpm_limit(alias=alias, config=self._configs.get(alias) or {}))}"
             f" call_prompt_tokens={prompt_tokens}"
             f" call_completion_tokens={completion_tokens}"
             f" call_total_tokens={total_tokens}"
