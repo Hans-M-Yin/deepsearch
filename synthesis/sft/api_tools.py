@@ -1695,6 +1695,53 @@ def _is_previous_response_not_found_error(exc: Exception) -> bool:
     return "previous_response_not_found" in message or "Previous response with id" in message
 
 
+def _read_url_page_id(
+    *,
+    resource_id: str,
+    resource: tools.UrlResource | None,
+    url: str,
+    context: ToolRuntimeContext,
+) -> str:
+    """Return a stable opaque page ID, registering direct legacy URLs privately."""
+
+    page_id = resource_id or (resource.resource_id if resource is not None else "")
+    if not page_id:
+        page_id = tools._resource_id("page", url)
+        context.register_url_resource(
+            tools.UrlResource(primary_url=url, resource_id=page_id, kind="page")
+        )
+    return page_id
+
+
+def _public_read_url_text_observation(
+    *,
+    output: dict[str, Any],
+    page_id: str,
+    goal: str,
+) -> dict[str, str]:
+    """Expose text-page reads without URL/backend metadata to the model.
+
+    The underlying reader result retains provenance for runtime diagnostics, but
+    tool observations must not reveal raw URLs or Firecrawl metadata.  Keep the
+    public schema identical for Enhanced Reader, Firecrawl, PDFs, and failures.
+    """
+
+    if output.get("ok"):
+        content = str(output.get("content") or "")
+        title = str(output.get("title") or "")
+    else:
+        # Reader errors commonly interpolate the requested URL (and sometimes
+        # redirect URLs).  Do not forward any such diagnostic text to the model.
+        content = "Unable to read the requested page."
+        title = ""
+    return {
+        "page_id": page_id,
+        "title": title,
+        "goal": goal,
+        "content": content,
+    }
+
+
 def execute_tool_call(
     name: str,
     arguments: dict[str, Any],
@@ -1739,12 +1786,21 @@ def execute_tool_call(
         resource_id = str(params.get("resource_id") or "").strip()
         direct_url = str(params.get("url") or params.get("URL") or "").strip()
         resource = context.resolve_resource_id(resource_id) if resource_id else None
+        effective_goal = str(params.get("goal") or tool_goal or "").strip()
         if resource_id and resource is None and not direct_url:
-            output = {"ok": False, "error": f"Unknown resource_id: {resource_id}"}
+            output = _public_read_url_text_observation(
+                output={"ok": False},
+                page_id=resource_id,
+                goal=effective_goal,
+            )
             return ToolExecutionResult(name=name, arguments=params, output=output, output_text=_json_text(output))
         url = resource.primary_url if resource is not None else direct_url
         if not url:
-            output = {"ok": False, "error": "url or resource_id is required for read_url"}
+            output = _public_read_url_text_observation(
+                output={"ok": False},
+                page_id=resource_id,
+                goal=effective_goal,
+            )
             return ToolExecutionResult(name=name, arguments=params, output=output, output_text=_json_text(output))
         print(
             "[read_url debug] "
@@ -1753,7 +1809,6 @@ def execute_tool_call(
             file=sys.stderr,
             flush=True,
         )
-        effective_goal = str(params.get("goal") or tool_goal or "").strip()
         output = tools.read_url(
             url=url,
             goal=effective_goal,
@@ -1765,9 +1820,18 @@ def execute_tool_call(
             image_id = context.register_image(output["local_path"])
             new_images[image_id] = output["local_path"]
             output = {"image_id": image_id}
-        elif resource_id:
-            output = dict(output)
-            output["resource_id"] = resource_id
+        else:
+            page_id = _read_url_page_id(
+                resource_id=resource_id,
+                resource=resource,
+                url=url,
+                context=context,
+            )
+            output = _public_read_url_text_observation(
+                output=output,
+                page_id=page_id,
+                goal=effective_goal,
+            )
         return ToolExecutionResult(name=name, arguments=params, output=output, output_text=_json_text(output), new_images=new_images)
 
     if name == "i2i_search":

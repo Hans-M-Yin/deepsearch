@@ -52,7 +52,17 @@ class SearchResultPostprocessTests(unittest.TestCase):
         resource_id = compact["results"][0]["source_page_id"]
 
         with (
-            patch("synthesis.sft.api_tools.tools.read_url", return_value={"ok": True, "kind": "text"}) as read,
+            patch(
+                "synthesis.sft.api_tools.tools.read_url",
+                return_value={
+                    "ok": True,
+                    "kind": "text",
+                    "url": "https://redirect.example/private",
+                    "title": "Example page",
+                    "content": "Relevant evidence",
+                    "firecrawl_metadata": {"url": "https://redirect.example/private"},
+                },
+            ) as read,
             patch("sys.stderr", new_callable=StringIO) as stderr,
         ):
             result = execute_tool_call(
@@ -60,8 +70,17 @@ class SearchResultPostprocessTests(unittest.TestCase):
                 {"resource_id": resource_id, "goal": "inspect"},
                 context,
             )
-        self.assertTrue(result.output["ok"])
-        self.assertEqual(result.output["resource_id"], resource_id)
+        self.assertEqual(
+            result.output,
+            {
+                "page_id": resource_id,
+                "title": "Example page",
+                "goal": "inspect",
+                "content": "Relevant evidence",
+            },
+        )
+        self.assertNotIn("url", result.output_text)
+        self.assertNotIn("firecrawl_metadata", result.output)
         self.assertEqual(read.call_args.kwargs["url"], "https://page.example/story")
         self.assertIn(f"resource_id={resource_id}", stderr.getvalue())
         self.assertIn("url=https://page.example/story", stderr.getvalue())
@@ -105,14 +124,26 @@ class SearchResultPostprocessTests(unittest.TestCase):
     def test_unknown_resource_id_does_not_attempt_direct_read(self) -> None:
         context = ToolRuntimeContext(working_dir="/tmp/sft_resource_test")
         result = execute_tool_call("read_url", {"resource_id": "page_deadbeef"}, context)
-        self.assertFalse(result.output["ok"])
-        self.assertIn("Unknown resource_id", result.output["error"])
+        self.assertEqual(
+            result.output,
+            {
+                "page_id": "page_deadbeef",
+                "title": "",
+                "goal": "",
+                "content": "Unable to read the requested page.",
+            },
+        )
 
     def test_legacy_url_still_reads_directly_when_not_registered(self) -> None:
         context = ToolRuntimeContext(working_dir="/tmp/sft_resource_test")
-        with patch("synthesis.sft.api_tools.tools.read_url", return_value={"ok": True, "kind": "text"}) as read:
+        with patch(
+            "synthesis.sft.api_tools.tools.read_url",
+            return_value={"ok": True, "kind": "text", "title": "Direct", "content": "Text"},
+        ) as read:
             result = execute_tool_call("read_url", {"url": "https://unknown.example/page"}, context)
-        self.assertTrue(result.output["ok"])
+        self.assertEqual(set(result.output), {"page_id", "title", "goal", "content"})
+        self.assertTrue(result.output["page_id"].startswith("page_"))
+        self.assertNotIn("unknown.example", result.output_text)
         self.assertEqual(read.call_args.kwargs["url"], "https://unknown.example/page")
 
 
