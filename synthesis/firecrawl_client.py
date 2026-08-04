@@ -11,6 +11,7 @@ import json
 import os
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -26,10 +27,31 @@ _FIXED_FIRECRAWL_KEYS_FILE = _MODULE_DIR / "firecrawl_keys.txt"
 _FIXED_FIRECRAWL_POOL_STATE_FILE = _MODULE_DIR / "firecrawl_state.json"
 _FIXED_FIRECRAWL_POOL_DEFAULT_CREDITS = 10000
 _FIXED_FIRECRAWL_KEY_POOL: "FirecrawlApiKeyPool | None" = None
+_PROCESS_USAGE_LOCK = threading.Lock()
+_PROCESS_USAGE: dict[str, int] = {
+    "requests": 0,
+    "successful_requests": 0,
+    "failed_requests": 0,
+    "credits_used": 0,
+}
 
 
 def _utc_now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _record_process_usage(*, success: bool, credits_used: int = 0) -> None:
+    """Track Firecrawl usage for this Python process, independently of the key pool."""
+    with _PROCESS_USAGE_LOCK:
+        _PROCESS_USAGE["requests"] += 1
+        _PROCESS_USAGE["successful_requests" if success else "failed_requests"] += 1
+        _PROCESS_USAGE["credits_used"] += max(0, int(credits_used))
+
+
+def get_firecrawl_usage_snapshot() -> dict[str, int]:
+    """Return a thread-safe snapshot of Firecrawl calls made by this process."""
+    with _PROCESS_USAGE_LOCK:
+        return dict(_PROCESS_USAGE)
 
 
 def _local_lock_path_for_state(state_path: Path) -> Path:
@@ -332,6 +354,7 @@ class FirecrawlClient:
             raw = self._response_as_dict(result)
         except Exception as exc:  # SDK transport and provider exceptions are recorded identically.
             self.key_pool.record_result(pool_metadata["key_id"], success=False, error=str(exc))
+            _record_process_usage(success=False)
             raise RuntimeError(f"Firecrawl scrape failed for {url}: {exc}") from exc
         response_metadata = self._response_metadata(raw)
         credits_used = self._non_negative_int(
@@ -355,6 +378,7 @@ class FirecrawlClient:
                 credits_used=credits_used,
                 status_code=status_code,
             )
+            _record_process_usage(success=False, credits_used=credits_used)
             return {"error": error}
         if raw.get("success") is True or (
             "success" not in raw and self._is_direct_success_response(raw)
@@ -365,6 +389,7 @@ class FirecrawlClient:
                 credits_used=credits_used,
                 status_code=status_code,
             )
+            _record_process_usage(success=True, credits_used=credits_used)
             return raw
         error = str(raw.get("error") or "Firecrawl returned an unsuccessful response")
         self.key_pool.record_result(
@@ -374,6 +399,7 @@ class FirecrawlClient:
             credits_used=credits_used,
             status_code=status_code,
         )
+        _record_process_usage(success=False, credits_used=credits_used)
         return raw
 
     def _app(self, api_key: str) -> Any:

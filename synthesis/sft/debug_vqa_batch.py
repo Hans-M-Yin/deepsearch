@@ -10,8 +10,16 @@ import json
 import os
 from pathlib import Path
 import re
+import sys
 import traceback
 from typing import Any
+
+from synthesis.firecrawl_client import get_firecrawl_usage_snapshot
+
+try:
+    from tqdm.auto import tqdm
+except ImportError:  # pragma: no cover - optional progress dependency
+    tqdm = None
 
 from .pipeline import (
     build_agent_config,
@@ -180,9 +188,69 @@ def _print_record_result(result: dict[str, Any]) -> None:
     print((result.get("formatted_trajectory") or {}).get("text") or "")
 
 
+_SFT_FSYNC_WARNING_EMITTED = False
+
+
 def _write_jsonl_record(handle: Any, record: dict[str, Any]) -> None:
+    """Append one record and close path-backed writers for HDFS-FUSE visibility."""
+    if isinstance(handle, (str, Path)):
+        with Path(handle).open("a", encoding="utf-8") as opened_handle:
+            _write_jsonl_record(opened_handle, record)
+        return
     handle.write(json.dumps(record, ensure_ascii=False) + "\n")
     handle.flush()
+    try:
+        os.fsync(handle.fileno())
+    except OSError as exc:
+        global _SFT_FSYNC_WARNING_EMITTED
+        if not _SFT_FSYNC_WARNING_EMITTED:
+            _SFT_FSYNC_WARNING_EMITTED = True
+            print(
+                f"[sft-output] fsync is unavailable; relying on file close for publication: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+
+
+def _usage_delta(after: dict[str, int], before: dict[str, int]) -> dict[str, int]:
+    return {
+        key: max(0, int(after.get(key, 0)) - int(before.get(key, 0)))
+        for key in sorted(set(before) | set(after))
+    }
+
+
+def _resume_record_key(record: dict[str, Any]) -> tuple[str, str, str]:
+    """Return the stable VQA identity used to avoid duplicate trajectories."""
+    return tuple(
+        str(record.get(field) or "").strip()
+        for field in ("question_id", "sample_id", "path_id")
+    )
+
+
+def _load_completed_resume_keys(path: Path) -> set[tuple[str, str, str]]:
+    """Read completed trajectory identities, tolerating a partial final JSONL line."""
+    completed: set[tuple[str, str, str]] = set()
+    with path.open("r", encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                parsed = json.loads(line)
+            except json.JSONDecodeError as exc:
+                print(
+                    f"[sft-resume] ignoring malformed existing JSONL record "
+                    f"at {path}:{line_number}: {exc}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                continue
+            if not isinstance(parsed, dict):
+                continue
+            key = _resume_record_key(parsed)
+            if any(key):
+                completed.add(key)
+    return completed
 
 
 def _message_content_to_text(content: Any) -> str:
@@ -482,6 +550,36 @@ def _build_source_metadata(
     }
 
 
+def _serialize_runtime(context: Any) -> dict[str, Any]:
+    """Return the JSON-safe, provenance-relevant part of a tool runtime."""
+    resources: list[dict[str, Any]] = []
+    for resource_id, resource in sorted((context.resource_registry or {}).items()):
+        resources.append(
+            {
+                "resource_id": resource.resource_id or resource_id,
+                "result_id": resource.result_id,
+                "kind": resource.kind,
+                "primary_url": resource.primary_url,
+                "image_url": resource.image_url,
+                "thumbnail_url": resource.thumbnail_url,
+                "source_page_url": resource.source_page_url,
+                "fallback_urls": list(resource.fallback_urls or []),
+                "title": resource.title,
+                "snippet": resource.snippet,
+                "search_tool": resource.search_tool,
+                "search_query": resource.search_query,
+                "rank": resource.rank,
+                "url_keywords": resource.url_keywords,
+            }
+        )
+    return {
+        "session_id": context.session_id,
+        "case_id": context.case_id,
+        "working_dir": context.working_dir,
+        "url_resources": resources,
+    }
+
+
 def _build_raw_trajectory_record(
     *,
     record: dict[str, Any],
@@ -493,6 +591,7 @@ def _build_raw_trajectory_record(
     hop_chain_coverage: dict[str, Any] | None,
     vqa_dir: str | None,
     source_metadata_mode: str,
+    runtime: dict[str, Any],
 ) -> dict[str, Any]:
     return {
         "question_id": record.get("question_id"),
@@ -502,6 +601,7 @@ def _build_raw_trajectory_record(
         "gold_answer": record.get("gold_answer"),
         "input_images": input_images,
         "source_metadata": _build_source_metadata(record, vqa_dir=vqa_dir, mode=source_metadata_mode),
+        "runtime": runtime,
         "raw_messages": messages,
         "extracted_answer": extracted_answer,
         "answer_judge": answer_judge,
@@ -527,6 +627,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--raw-trajectories-jsonl",
         help="Optional path to save raw formatted trajectories.",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help=(
+            "Resume an existing batch output: skip source records already present in the explicit "
+            "--output-jsonl / --raw-trajectories-jsonl file, then append new trajectories."
+        ),
     )
     parser.add_argument(
         "--source-metadata-mode",
@@ -833,6 +941,7 @@ def _process_record(
         hop_chain_coverage=hop_chain_coverage,
         vqa_dir=vqa_dir,
         source_metadata_mode=source_metadata_mode,
+        runtime=_serialize_runtime(context),
     )
     is_correct = bool((answer_judge or {}).get("is_correct"))
     return {
@@ -847,6 +956,7 @@ def _process_record(
 def main(argv: list[str] | None = None) -> int:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
+    firecrawl_usage_before = get_firecrawl_usage_snapshot()
 
     if bool(args.vqa_dir) == bool(args.question):
         parser.error("Use exactly one of --vqa-dir or --question.")
@@ -944,10 +1054,29 @@ def main(argv: list[str] | None = None) -> int:
         timestamp = datetime.now().strftime("%m%d_%H%M%S")
         raw_output_path = Path(args.vqa_dir) / f"sft_{timestamp}.jsonl"
 
-    raw_output_handle = None
+    if args.resume and not (args.raw_trajectories_jsonl or args.output_jsonl):
+        parser.error("--resume requires an explicit --output-jsonl or --raw-trajectories-jsonl path.")
+
+    resumed_count = 0
+    if args.resume and raw_output_path is not None and raw_output_path.exists():
+        completed_keys = _load_completed_resume_keys(raw_output_path)
+        original_count = len(records)
+        records = [
+            record
+            for record in records
+            if _resume_record_key(record) not in completed_keys
+        ]
+        resumed_count = original_count - len(records)
+        print(
+            f"[sft-resume] existing_records={len(completed_keys)} "
+            f"skipped={resumed_count} remaining={len(records)}"
+        )
+
     if raw_output_path is not None:
         raw_output_path.parent.mkdir(parents=True, exist_ok=True)
-        raw_output_handle = raw_output_path.open("w", encoding="utf-8")
+        if not args.resume:
+            with raw_output_path.open("w", encoding="utf-8"):
+                pass
         print(f"raw_trajectories_jsonl: {raw_output_path}")
     total_count = 0
     correct_count = 0
@@ -962,6 +1091,16 @@ def main(argv: list[str] | None = None) -> int:
         "tool_error_reasons": Counter(),
         "record_exceptions": Counter(),
     }
+    progress = (
+        tqdm(
+            total=len(records),
+            desc="SFT trajectories",
+            unit="sample",
+            dynamic_ncols=True,
+        )
+        if tqdm is not None
+        else None
+    )
 
     try:
         resolved_vqa_dir = str(Path(args.vqa_dir).resolve()) if args.vqa_dir else None
@@ -1001,6 +1140,13 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"error: {exc.__class__.__name__}: {exc}")
                     print("traceback:")
                     print("".join(traceback.format_exception(exc)).rstrip())
+                    if progress is not None:
+                        progress.update(1)
+                        progress.set_postfix(
+                            correct=correct_count,
+                            incorrect=incorrect_count,
+                            failed=failed_count,
+                        )
                     _print_generation_stats(generation_stats)
                     continue
 
@@ -1010,18 +1156,25 @@ def main(argv: list[str] | None = None) -> int:
                 generation_summary = payload.get("generation_summary") or {}
                 _merge_generation_stats(generation_stats, generation_summary)
                 _print_record_result(result_record)
-                if raw_output_handle is not None:
-                    _write_jsonl_record(raw_output_handle, raw_record)
+                if raw_output_path is not None:
+                    _write_jsonl_record(raw_output_path, raw_record)
 
                 total_count += 1
                 if is_correct:
                     correct_count += 1
                 else:
                     incorrect_count += 1
+                if progress is not None:
+                    progress.update(1)
+                    progress.set_postfix(
+                        correct=correct_count,
+                        incorrect=incorrect_count,
+                        failed=failed_count,
+                    )
                 _print_generation_stats(generation_stats)
     finally:
-        if raw_output_handle is not None:
-            raw_output_handle.close()
+        if progress is not None:
+            progress.close()
 
     print("\n" + "=" * 100)
     print("Trajectory Judge Summary")
@@ -1029,6 +1182,14 @@ def main(argv: list[str] | None = None) -> int:
     print(f"correct: {correct_count}")
     print(f"incorrect: {incorrect_count}")
     print(f"failed: {failed_count}")
+    firecrawl_usage = _usage_delta(get_firecrawl_usage_snapshot(), firecrawl_usage_before)
+    print(
+        "firecrawl: "
+        f"requests={firecrawl_usage.get('requests', 0)} "
+        f"successful_requests={firecrawl_usage.get('successful_requests', 0)} "
+        f"failed_requests={firecrawl_usage.get('failed_requests', 0)} "
+        f"credits_used={firecrawl_usage.get('credits_used', 0)}"
+    )
     _print_generation_stats(generation_stats)
 
     return 0
