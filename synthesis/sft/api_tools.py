@@ -496,6 +496,31 @@ class ToolExecutionResult:
     new_images: dict[str, Any] = field(default_factory=dict)
 
 
+def _read_url_image_attachment(
+    result: ToolExecutionResult,
+    context: ToolRuntimeContext,
+) -> dict[str, Any] | None:
+    """Build a multimodal follow-up message for an image downloaded by read_url."""
+    if result.name != "read_url" or not result.new_images:
+        return None
+    image_id, _local_path = next(iter(result.new_images.items()))
+    try:
+        model_url = _image_source_to_model_url(image_id, context)
+    except Exception as exc:
+        logger.warning("Unable to attach read_url image %s to the next model turn: %s", image_id, exc)
+        return None
+    return {
+        "role": "user",
+        "content": [
+            {
+                "type": "text",
+                "text": f"image_id={image_id}",
+            },
+            {"type": "image_url", "image_url": {"url": model_url, "detail": "auto"}},
+        ],
+    }
+
+
 @dataclass(slots=True)
 class OpenAIToolAgentConfig:
     """Configuration for OpenAI-compatible chat-completions tool calling."""
@@ -1735,15 +1760,14 @@ def execute_tool_call(
             assistant_output=assistant_text,
             resource=resource or context.resolve_url_resource(url),
         )
-        if resource_id:
-            output = dict(output)
-            output["resource_id"] = resource_id
         new_images: dict[str, Any] = {}
         if output.get("ok") and output.get("local_path"):
             image_id = context.register_image(output["local_path"])
-            output = dict(output)
-            output["image_id"] = image_id
             new_images[image_id] = output["local_path"]
+            output = {"image_id": image_id}
+        elif resource_id:
+            output = dict(output)
+            output["resource_id"] = resource_id
         return ToolExecutionResult(name=name, arguments=params, output=output, output_text=_json_text(output), new_images=new_images)
 
     if name == "i2i_search":
@@ -2047,6 +2071,8 @@ class OpenAIToolAgent:
                     "type": "manual_react_tool",
                 }
             )
+            if attachment := _read_url_image_attachment(result, context):
+                conversation_messages.append(attachment)
         else:
             final_text = "Max ReAct turns reached before the model produced a final answer."
             generation_status = "max_turns_reached"
@@ -2184,6 +2210,8 @@ class OpenAIToolAgent:
                         "type": "function",
                     }
                 )
+                if attachment := _read_url_image_attachment(result, context):
+                    conversation_messages.append(attachment)
         else:
             final_text = "Max tool-calling turns reached before the model produced a final answer."
             generation_status = "max_turns_reached"
@@ -2412,6 +2440,9 @@ class OpenAIToolAgent:
                         "output": result.output_text,
                     }
                 )
+                if attachment := _read_url_image_attachment(result, context):
+                    conversation_messages.append(attachment)
+                    current_input.extend(_conversation_messages_to_responses_input([attachment]))
             if not use_previous_response_id:
                 current_input = _conversation_messages_to_responses_input(conversation_messages)
         else:
