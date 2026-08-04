@@ -29,7 +29,7 @@ from synthesis.firecrawl_client import FirecrawlClient
 
 
 DEFAULT_URLS = [
-    "https://whitmanarchive.org/item/loc.01278",
+    "https://www.reddit.com/r/todayilearned/comments/187sbo9/til_that_at_the_height_of_the_napoleonic_wars_the/",
     "https://www.jstor.org/stable/10.1525/phr.2008.77.4.553",
     "https://whitmanarchive.org/item/loc.05013",
     "https://whitmanarchive.org/item/loc.01278",

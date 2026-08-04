@@ -11,6 +11,8 @@ import os
 from pathlib import Path
 import re
 import sys
+import threading
+import time
 import traceback
 from typing import Any
 
@@ -43,6 +45,28 @@ def _load_jsonl(path: Path) -> list[dict[str, Any]]:
             if isinstance(parsed, dict):
                 records.append(parsed)
     return records
+
+
+class _InitialWorkerStartGate:
+    """Stagger only the first wave of worker tasks before they can call an LLM."""
+
+    def __init__(self, *, worker_count: int, interval_s: float) -> None:
+        self._initial_slots = max(0, int(worker_count))
+        self._interval_s = max(0.0, float(interval_s))
+        self._started_at = time.monotonic()
+        self._issued_slots = 0
+        self._lock = threading.Lock()
+
+    def wait(self) -> None:
+        with self._lock:
+            if self._issued_slots >= self._initial_slots:
+                return
+            slot = self._issued_slots
+            self._issued_slots += 1
+            release_at = self._started_at + slot * self._interval_s
+        delay_s = release_at - time.monotonic()
+        if delay_s > 0:
+            time.sleep(delay_s)
 
 
 def _extract_image_urls_from_vqa_records(
@@ -622,6 +646,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--limit", type=int, default=5, help="How many questions to run in batch mode.")
     parser.add_argument("--offset", type=int, default=0, help="Start offset in batch mode.")
     parser.add_argument("--workers", type=int, default=1, help="How many records to process concurrently.")
+    parser.add_argument(
+        "--worker-start-stagger-s",
+        type=float,
+        default=10.0,
+        help=(
+            "Delay only the initial worker wave by this many seconds per task before its first "
+            "LLM call. Defaults to 10; set to 0 to disable."
+        ),
+    )
     parser.add_argument("--workdir", default=os.path.join(os.getcwd(), "synthesis_sft_runs"))
     parser.add_argument("--output-jsonl", help="Optional path to save raw trajectory records.")
     parser.add_argument(
@@ -953,6 +986,15 @@ def _process_record(
     }
 
 
+def _process_record_after_initial_start_gate(
+    *,
+    start_gate: _InitialWorkerStartGate,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    start_gate.wait()
+    return _process_record(**kwargs)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
@@ -966,6 +1008,8 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--model-alias is required in batch mode unless SFT_OPENAI_MODEL / OPENAI_MODEL is set.")
     if args.workers <= 0:
         parser.error("--workers must be positive.")
+    if args.worker_start_stagger_s < 0:
+        parser.error("--worker-start-stagger-s must be non-negative.")
 
     if args.vqa_dir:
         all_records = _load_vqa_records(Path(args.vqa_dir))
@@ -1082,6 +1126,9 @@ def main(argv: list[str] | None = None) -> int:
     correct_count = 0
     incorrect_count = 0
     failed_count = 0
+    max_turns_reached_count = 0
+    total_turn_count = 0
+    turn_count_samples = 0
     generation_stats: dict[str, Counter[str]] = {
         "generation_status": Counter(),
         "incomplete": Counter(),
@@ -1102,12 +1149,30 @@ def main(argv: list[str] | None = None) -> int:
         else None
     )
 
+    def advance_progress() -> None:
+        if progress is None:
+            return
+        progress.update(1)
+        average_turns = total_turn_count / turn_count_samples if turn_count_samples else None
+        progress.set_postfix(
+            correct=correct_count,
+            incorrect=incorrect_count,
+            failed=failed_count,
+            max_turns=max_turns_reached_count,
+            avg_turns=f"{average_turns:.2f}" if average_turns is not None else "n/a",
+        )
+
     try:
         resolved_vqa_dir = str(Path(args.vqa_dir).resolve()) if args.vqa_dir else None
+        start_gate = _InitialWorkerStartGate(
+            worker_count=min(args.workers, len(records)),
+            interval_s=args.worker_start_stagger_s,
+        )
         with ThreadPoolExecutor(max_workers=args.workers) as executor:
             future_to_context = {
                 executor.submit(
-                    _process_record,
+                    _process_record_after_initial_start_gate,
+                    start_gate=start_gate,
                     index=index,
                     record=record,
                     agent_config=agent_config,
@@ -1140,13 +1205,7 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"error: {exc.__class__.__name__}: {exc}")
                     print("traceback:")
                     print("".join(traceback.format_exception(exc)).rstrip())
-                    if progress is not None:
-                        progress.update(1)
-                        progress.set_postfix(
-                            correct=correct_count,
-                            incorrect=incorrect_count,
-                            failed=failed_count,
-                        )
+                    advance_progress()
                     _print_generation_stats(generation_stats)
                     continue
 
@@ -1155,6 +1214,15 @@ def main(argv: list[str] | None = None) -> int:
                 is_correct = bool(payload["is_correct"])
                 generation_summary = payload.get("generation_summary") or {}
                 _merge_generation_stats(generation_stats, generation_summary)
+                if str(generation_summary.get("generation_status") or "") == "max_turns_reached":
+                    max_turns_reached_count += 1
+                try:
+                    turn_count = int(generation_summary.get("turn_count"))
+                except (TypeError, ValueError):
+                    turn_count = None
+                if turn_count is not None and turn_count >= 0:
+                    total_turn_count += turn_count
+                    turn_count_samples += 1
                 _print_record_result(result_record)
                 if raw_output_path is not None:
                     _write_jsonl_record(raw_output_path, raw_record)
@@ -1164,13 +1232,7 @@ def main(argv: list[str] | None = None) -> int:
                     correct_count += 1
                 else:
                     incorrect_count += 1
-                if progress is not None:
-                    progress.update(1)
-                    progress.set_postfix(
-                        correct=correct_count,
-                        incorrect=incorrect_count,
-                        failed=failed_count,
-                    )
+                advance_progress()
                 _print_generation_stats(generation_stats)
     finally:
         if progress is not None:

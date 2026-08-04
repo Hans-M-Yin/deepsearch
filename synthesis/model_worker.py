@@ -910,9 +910,11 @@ class ModelRouterWorkerClient:
         served_model = str(config.get("served_model") or request.model or alias)
         last_error: Exception | None = None
         for attempt_index in range(LLM_RETRY_COUNT + 1):
-            self._wait_for_qpm_slot(alias=alias, config=config, served_model=served_model)
+            dispatch_qpm = self._wait_for_qpm_slot(alias=alias, config=config, served_model=served_model)
             try:
-                return client.generate(request)
+                response = client.generate(request)
+                response.metadata["dispatch_qpm"] = dispatch_qpm
+                return response
             except Exception as exc:
                 last_error = exc
                 # print(request)
@@ -946,9 +948,11 @@ class ModelRouterWorkerClient:
         served_model = str(config.get("served_model") or request.model or alias)
         last_error: Exception | None = None
         for attempt_index in range(LLM_RETRY_COUNT + 1):
-            self._wait_for_qpm_slot(alias=alias, config=config, served_model=served_model)
+            dispatch_qpm = self._wait_for_qpm_slot(alias=alias, config=config, served_model=served_model)
             try:
-                return client.responses_generate(request)
+                response = client.responses_generate(request)
+                response.metadata["dispatch_qpm"] = dispatch_qpm
+                return response
             except Exception as exc:
                 last_error = exc
                 if attempt_index >= LLM_RETRY_COUNT:
@@ -971,10 +975,10 @@ class ModelRouterWorkerClient:
         raise last_error
     # #### END Response 0720 ####
 
-    def _wait_for_qpm_slot(self, *, alias: str, config: dict[str, Any], served_model: str) -> None:
+    def _wait_for_qpm_slot(self, *, alias: str, config: dict[str, Any], served_model: str) -> int:
         qpm = config.get("qpm")
         if qpm is None:
-            return
+            return self._record_qpm_dispatch(alias=alias)
         qpm_limit = int(qpm)
         while True:
             now = time.monotonic()
@@ -985,7 +989,7 @@ class ModelRouterWorkerClient:
                     window.popleft()
                 if len(window) < qpm_limit:
                     window.append(now)
-                    return
+                    return len(window)
                 current_qpm = len(window)
             print(
                 "[llm-qpm]"
@@ -998,6 +1002,29 @@ class ModelRouterWorkerClient:
                 flush=True,
             )
             time.sleep(30)
+
+    def _record_qpm_dispatch(self, *, alias: str) -> int:
+        """Record every outbound request, including aliases without a QPM limit."""
+        now = time.monotonic()
+        with self._qpm_lock:
+            window = self._qpm_windows.setdefault(alias, deque())
+            cutoff = now - 60.0
+            while window and window[0] <= cutoff:
+                window.popleft()
+            window.append(now)
+            return len(window)
+
+    def _current_qpm(self, *, alias: str) -> int:
+        """Return requests dispatched for one alias in the rolling 60-second window."""
+        now = time.monotonic()
+        with self._qpm_lock:
+            window = self._qpm_windows.get(alias)
+            if window is None:
+                return 0
+            cutoff = now - 60.0
+            while window and window[0] <= cutoff:
+                window.popleft()
+            return len(window)
 
     def _update_and_print_token_totals(self, *, alias: str, response: ModelResponse) -> None:
         usage = dict(response.usage or {})
@@ -1035,8 +1062,26 @@ class ModelRouterWorkerClient:
             totals["reasoning_tokens"] += reasoning_tokens
             totals["cached_tokens"] += cached_tokens
             snapshot = dict(totals)
-        # LLM token-usage diagnostic output is intentionally disabled.
-        del snapshot
+        print(
+            "[llm-usage]"
+            f" alias={alias}"
+            f" served_model={response.metadata.get('served_model') or response.model}"
+            f" current_qpm={response.metadata.get('dispatch_qpm', self._current_qpm(alias=alias))}"
+            f" qpm_limit={response.metadata.get('qpm')}"
+            f" call_prompt_tokens={prompt_tokens}"
+            f" call_completion_tokens={completion_tokens}"
+            f" call_total_tokens={total_tokens}"
+            f" call_reasoning_tokens={reasoning_tokens}"
+            f" call_cached_tokens={cached_tokens}"
+            f" cumulative_calls={snapshot['calls']}"
+            f" cumulative_prompt_tokens={snapshot['prompt_tokens']}"
+            f" cumulative_completion_tokens={snapshot['completion_tokens']}"
+            f" cumulative_total_tokens={snapshot['total_tokens']}"
+            f" cumulative_reasoning_tokens={snapshot['reasoning_tokens']}"
+            f" cumulative_cached_tokens={snapshot['cached_tokens']}",
+            file=sys.stderr,
+            flush=True,
+        )
 
 
 LLM_WORKER = ModelRouterWorkerClient.from_env()
