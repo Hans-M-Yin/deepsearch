@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 import json
 import math
@@ -682,6 +683,7 @@ def _format_cli_report(report: dict[str, Any]) -> str:
         "=" * 72,
         f"Output directory : {report.get('output_dir', '')}",
         f"Processed records: {report.get('processed_records', 0)} / {report.get('total_available_records', 0)}",
+        f"Workers         : {report.get('workers', 1)}",
         f"Accepted records : {decision_counts.get('keep', 0)}",
         f"Filtered records : {decision_counts.get('reject', 0)}",
         "",
@@ -731,6 +733,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--temperature", type=float, default=None)
     parser.add_argument("--offset", type=int, default=0, help="Skip this many non-empty input records.")
     parser.add_argument("--limit", type=int, default=0, help="Process at most this many records; <=0 means all.")
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Number of samples to evaluate concurrently; each sample's stages remain serial.",
+    )
     return parser
 
 
@@ -747,6 +755,7 @@ def filter_jsonl(
     temperature: float | None = None,
     offset: int = 0,
     limit: int = 0,
+    workers: int = 1,
     model_client: ModelWorkerClient | None = None,
 ) -> dict[str, Any]:
     input_path = Path(input_jsonl).expanduser().resolve()
@@ -757,6 +766,8 @@ def filter_jsonl(
         raise FileExistsError(f"output directory already exists; choose a new path: {final_dir}")
     if offset < 0 or limit < 0:
         raise ValueError("offset and limit must be non-negative")
+    if workers <= 0:
+        raise ValueError("workers must be a positive integer")
     final_dir.parent.mkdir(parents=True, exist_ok=True)
     stage_dir = Path(tempfile.mkdtemp(prefix=f".{final_dir.name}.tmp-", dir=str(final_dir.parent)))
     try:
@@ -774,20 +785,61 @@ def filter_jsonl(
         filtered_path = stage_dir / "filtered_trajectories.jsonl"
         results_path = stage_dir / "judge_results.jsonl"
         results: list[dict[str, Any]] = []
+        records_to_process: list[tuple[int, int, dict[str, Any]]] = []
         total_available = 0
         selected = 0
-        with accepted_path.open("w", encoding="utf-8") as accepted_handle, filtered_path.open("w", encoding="utf-8") as filtered_handle, results_path.open("w", encoding="utf-8") as results_handle:
-            for source_index, source_line, record in _load_jsonl(input_path):
-                total_available += 1
-                if source_index < offset or (limit > 0 and selected >= limit):
-                    continue
-                selected += 1
-                result = judge.evaluate_record(record, source_index=source_index, source_line=source_line)
-                results.append(result)
-                enriched = dict(record)
-                enriched["sft_trajectory_filter"] = result
-                _write_jsonl(results_handle, result)
-                _write_jsonl(accepted_handle if result["decision"] == "keep" else filtered_handle, enriched)
+        for source_index, source_line, record in _load_jsonl(input_path):
+            total_available += 1
+            if source_index < offset or (limit > 0 and selected >= limit):
+                continue
+            selected += 1
+            records_to_process.append((source_index, source_line, record))
+
+        def _evaluate(item: tuple[int, int, dict[str, Any]]) -> tuple[dict[str, Any], dict[str, Any]]:
+            source_index, source_line, record = item
+            return record, judge.evaluate_record(record, source_index=source_index, source_line=source_line)
+
+        def _write_result(
+            record: dict[str, Any],
+            result: dict[str, Any],
+            *,
+            accepted_handle: Any,
+            filtered_handle: Any,
+            results_handle: Any,
+        ) -> None:
+            results.append(result)
+            enriched = dict(record)
+            enriched["sft_trajectory_filter"] = result
+            _write_jsonl(results_handle, result)
+            _write_jsonl(accepted_handle if result["decision"] == "keep" else filtered_handle, enriched)
+
+        with (
+            accepted_path.open("w", encoding="utf-8") as accepted_handle,
+            filtered_path.open("w", encoding="utf-8") as filtered_handle,
+            results_path.open("w", encoding="utf-8") as results_handle,
+        ):
+            # map preserves input order, so all output files remain aligned
+            # with source_index even though model calls run concurrently.
+            if workers == 1:
+                evaluated_records = map(_evaluate, records_to_process)
+                for record, result in evaluated_records:
+                    _write_result(
+                        record,
+                        result,
+                        accepted_handle=accepted_handle,
+                        filtered_handle=filtered_handle,
+                        results_handle=results_handle,
+                    )
+            else:
+                with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="sft-filter") as executor:
+                    for record, result in executor.map(_evaluate, records_to_process):
+                        _write_result(
+                            record,
+                            result,
+                            accepted_handle=accepted_handle,
+                            filtered_handle=filtered_handle,
+                            results_handle=results_handle,
+                        )
         category = _category_report(results)
         decision_counts = Counter(str(item.get("decision") or "unknown") for item in results)
         report = {
@@ -797,6 +849,7 @@ def filter_jsonl(
             "simple_model_alias": simple_model_alias,
             "offset": offset,
             "limit": limit,
+            "workers": workers,
             "total_available_records": total_available,
             "processed_records": selected,
             "decision_counts": dict(sorted(decision_counts.items())),
@@ -825,6 +878,7 @@ def main(argv: list[str] | None = None) -> int:
             temperature=args.temperature,
             offset=args.offset,
             limit=args.limit,
+            workers=args.workers,
         )
     except Exception as exc:  # noqa: BLE001
         raise SystemExit(str(exc)) from exc

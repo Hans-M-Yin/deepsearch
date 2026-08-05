@@ -20,6 +20,20 @@ class FakeJudge:
         return ModelResponse(content=json.dumps(self.responses.pop(0), ensure_ascii=False))
 
 
+class RoutingFakeJudge:
+    def __init__(self) -> None:
+        self.requests: list[Any] = []
+
+    def generate(self, request: Any) -> ModelResponse:
+        self.requests.append(request)
+        label = str(request.metadata.get("trace_label") or "")
+        if "simple_correctness" in label:
+            response = {"predict": "pass"}
+        else:
+            response = {"logic_coherence": 8, "answer_exposure": 8, "tool_use": 8}
+        return ModelResponse(content=json.dumps(response))
+
+
 def _record(sample_id: str, *, max_turns: bool = False) -> dict[str, Any]:
     return {
         "question_id": sample_id.replace("sample", "q"),
@@ -229,6 +243,46 @@ class FilterSftTrajectoriesTest(unittest.TestCase):
         self.assertIn("Logic coherence mean       : 7.0000", rendered)
         self.assertNotIn('"stage_statistics"', rendered)
         self.assertFalse(rendered.lstrip().startswith("{"))
+
+    def test_workers_parallelize_samples_and_preserve_output_order(self) -> None:
+        records = [_record("sample_1"), _record("sample_2"), _record("sample_3")]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            input_path = root / "raw.jsonl"
+            output_dir = root / "filtered"
+            input_path.write_text("".join(json.dumps(item) + "\n" for item in records), encoding="utf-8")
+            fake = RoutingFakeJudge()
+            report = filter_jsonl(
+                input_path,
+                output_dir,
+                quality_model_alias="quality",
+                simple_model_alias="simple",
+                workers=2,
+                model_client=fake,
+            )
+
+            self.assertEqual(report["workers"], 2)
+            self.assertEqual(report["decision_counts"], {"keep": 3})
+            result_lines = (output_dir / "judge_results.jsonl").read_text(encoding="utf-8").splitlines()
+            self.assertEqual([json.loads(line)["source_index"] for line in result_lines], [0, 1, 2])
+            accepted_lines = (output_dir / "accepted_trajectories.jsonl").read_text(encoding="utf-8").splitlines()
+            self.assertEqual([json.loads(line)["sample_id"] for line in accepted_lines], ["sample_1", "sample_2", "sample_3"])
+
+    def test_workers_must_be_positive(self) -> None:
+        record = _record("sample_workers")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            input_path = root / "raw.jsonl"
+            input_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "workers"):
+                filter_jsonl(
+                    input_path,
+                    root / "filtered",
+                    quality_model_alias="quality",
+                    simple_model_alias="simple",
+                    workers=0,
+                    model_client=FakeJudge([]),
+                )
 
 
 if __name__ == "__main__":
