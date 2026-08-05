@@ -16,7 +16,9 @@ stage:
 The output directory contains ``accepted_trajectories.jsonl`` for the next
 conversion step, ``filtered_trajectories.jsonl`` for auditability,
 ``judge_results.jsonl`` with one compact decision per source row, and
-``filter_report.json`` with category-specific source IDs and indices.
+``filter_report.json`` with category-specific source IDs and indices.  The
+report and the command-line output also contain per-stage counts and the mean
+quality scores among records that survived answer-correctness filtering.
 """
 
 from __future__ import annotations
@@ -481,6 +483,97 @@ def _write_jsonl(handle: Any, value: Any) -> None:
     handle.write(json.dumps(value, ensure_ascii=False) + "\n")
 
 
+def _mean_quality_scores(results: list[dict[str, Any]]) -> dict[str, Any]:
+    """Summarize quality scores after the correctness stage.
+
+    Max-turn and answer-correctness rejects never receive a quality request.
+    Therefore the denominator is the number of post-correctness records for
+    which the quality judge returned valid numeric scores.  Judge errors are
+    reported explicitly instead of being silently treated as zero scores.
+    """
+
+    post_correctness = [
+        result
+        for result in results
+        if result.get("filter_stage") not in {"max_turn", "answer_correctness"}
+    ]
+    scored = [
+        result.get("quality_scores")
+        for result in post_correctness
+        if isinstance(result.get("quality_scores"), dict)
+    ]
+    score_names = ("logic_coherence", "answer_exposure", "tool_use")
+    means: dict[str, float | None] = {}
+    for name in score_names:
+        values = [float(scores[name]) for scores in scored if name in scores]
+        means[name] = round(sum(values) / len(values), 4) if values else None
+    return {
+        "candidate_count_after_answer_correctness": len(post_correctness),
+        "scored_count": len(scored),
+        "quality_judge_error_count": sum(
+            1
+            for result in post_correctness
+            if (result.get("quality_judge") or {}).get("status") != "ok"
+        ),
+        "mean_scores": means,
+    }
+
+
+def _stage_statistics(results: list[dict[str, Any]]) -> dict[str, dict[str, int]]:
+    """Return input, rejected, and surviving counts for every pipeline stage."""
+
+    total = len(results)
+    after_max = sum(1 for result in results if result.get("filter_stage") != "max_turn")
+    after_correctness = sum(
+        1
+        for result in results
+        if result.get("filter_stage") not in {"max_turn", "answer_correctness"}
+    )
+    quality_scored = sum(
+        1
+        for result in results
+        if (result.get("quality_judge") or {}).get("status") == "ok"
+    )
+    after_dimensions = sum(
+        1
+        for result in results
+        if result.get("filter_stage") in {"quality_average", "accepted", None, ""}
+    )
+    accepted = sum(1 for result in results if result.get("decision") == "keep")
+    return {
+        "max_turn": {
+            "input_count": total,
+            "filtered_count": total - after_max,
+            "survivor_count": after_max,
+        },
+        "answer_correctness": {
+            "input_count": after_max,
+            "filtered_count": after_max - after_correctness,
+            "survivor_count": after_correctness,
+        },
+        "quality_dimensions": {
+            "input_count": after_correctness,
+            "quality_scored_count": quality_scored,
+            "quality_judge_error_count": after_correctness - quality_scored,
+            # A judge error is also removed from the SFT candidate set, so the
+            # stage's total filtered count includes both score failures and
+            # invalid/error responses.
+            "dimension_low_score_count": sum(
+                1 for result in results if result.get("filter_stage") == "quality_dimensions"
+            ),
+            "filtered_count": after_correctness - after_dimensions,
+            "survivor_count": after_dimensions,
+        },
+        "quality_average": {
+            "input_count": after_dimensions,
+            "filtered_count": sum(
+                1 for result in results if result.get("filter_stage") == "quality_average"
+            ),
+            "survivor_count": accepted,
+        },
+    }
+
+
 def _category_report(results: list[dict[str, Any]]) -> dict[str, Any]:
     ids: dict[str, list[str]] = {name: [] for name in _CATEGORY_NAMES}
     source_indices: dict[str, list[int]] = {name: [] for name in _CATEGORY_NAMES}
@@ -546,6 +639,8 @@ def _category_report(results: list[dict[str, Any]]) -> dict[str, Any]:
         for result in results
         if result.get("filter_stage") not in {"max_turn", "answer_correctness", "quality_judge", "quality_dimensions"}
     )
+    stage_statistics = _stage_statistics(results)
+    quality_score_averages = _mean_quality_scores(results)
     return {
         "pipeline_order": ["max_turn", "answer_correctness", "quality_dimensions", "quality_average"],
         "categories_are_nonexclusive": True,
@@ -556,6 +651,8 @@ def _category_report(results: list[dict[str, Any]]) -> dict[str, Any]:
             "after_quality_dimensions": after_dimensions,
             "after_quality_average": stage_counts.get("accepted", 0),
         },
+        "stage_statistics": stage_statistics,
+        "quality_score_averages_after_answer_correctness": quality_score_averages,
         "filtered_ids": ids,
         "filtered_source_indices": source_indices,
         "filtered_source_positions": source_positions,
@@ -563,6 +660,62 @@ def _category_report(results: list[dict[str, Any]]) -> dict[str, Any]:
         "correctness_disagreements": correctness_disagreements,
         "additional_review_ids": extra,
     }
+
+
+def _format_cli_report(report: dict[str, Any]) -> str:
+    """Render a human-readable terminal summary without JSON syntax."""
+
+    decision_counts = report.get("decision_counts") or {}
+    stage_statistics = report.get("stage_statistics") or {}
+    quality_summary = report.get("quality_score_averages_after_answer_correctness") or {}
+    means = quality_summary.get("mean_scores") or {}
+
+    stage_labels = {
+        "max_turn": "Max-turn",
+        "answer_correctness": "Answer correctness",
+        "quality_dimensions": "Quality dimensions",
+        "quality_average": "Quality average",
+    }
+    lines = [
+        "=" * 72,
+        "SFT trajectory filtering completed",
+        "=" * 72,
+        f"Output directory : {report.get('output_dir', '')}",
+        f"Processed records: {report.get('processed_records', 0)} / {report.get('total_available_records', 0)}",
+        f"Accepted records : {decision_counts.get('keep', 0)}",
+        f"Filtered records : {decision_counts.get('reject', 0)}",
+        "",
+        "Filtering stages",
+        "-" * 72,
+        f"{'Stage':<24} {'Input':>10} {'Filtered':>10} {'Survived':>10}",
+    ]
+    for key, label in stage_labels.items():
+        stats = stage_statistics.get(key) or {}
+        lines.append(
+            f"{label:<24} {int(stats.get('input_count', 0)):>10} "
+            f"{int(stats.get('filtered_count', 0)):>10} "
+            f"{int(stats.get('survivor_count', 0)):>10}"
+        )
+
+    def _score_text(name: str) -> str:
+        value = means.get(name)
+        return "N/A" if value is None else f"{float(value):.4f}"
+
+    lines.extend(
+        [
+            "",
+            "Mean quality scores after answer-correctness filtering",
+            "-" * 72,
+            f"Candidates after correctness: {quality_summary.get('candidate_count_after_answer_correctness', 0)}",
+            f"Successfully scored        : {quality_summary.get('scored_count', 0)}",
+            f"Quality-judge errors       : {quality_summary.get('quality_judge_error_count', 0)}",
+            f"Logic coherence mean       : {_score_text('logic_coherence')}",
+            f"Answer exposure mean       : {_score_text('answer_exposure')}",
+            f"Tool use mean              : {_score_text('tool_use')}",
+            "=" * 72,
+        ]
+    )
+    return "\n".join(lines)
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -675,7 +828,7 @@ def main(argv: list[str] | None = None) -> int:
         )
     except Exception as exc:  # noqa: BLE001
         raise SystemExit(str(exc)) from exc
-    print(json.dumps({"decision_counts": report["decision_counts"], "output_dir": report["output_dir"]}, ensure_ascii=False))
+    print(_format_cli_report(report))
     return 0
 
 

@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from synthesis.model_worker import ModelResponse
-from synthesis.sft.filter_sft_trajectories import filter_jsonl
+from synthesis.sft.filter_sft_trajectories import _format_cli_report, filter_jsonl
 
 
 class FakeJudge:
@@ -78,6 +78,32 @@ class FilterSftTrajectoriesTest(unittest.TestCase):
                 "after_quality_dimensions": 1,
                 "after_quality_average": 1,
             })
+            self.assertEqual(report["stage_statistics"], {
+                "max_turn": {"input_count": 4, "filtered_count": 1, "survivor_count": 3},
+                "answer_correctness": {"input_count": 3, "filtered_count": 1, "survivor_count": 2},
+                "quality_dimensions": {
+                    "input_count": 2,
+                    "quality_scored_count": 2,
+                    "quality_judge_error_count": 0,
+                    "dimension_low_score_count": 1,
+                    "filtered_count": 1,
+                    "survivor_count": 1,
+                },
+                "quality_average": {"input_count": 1, "filtered_count": 0, "survivor_count": 1},
+            })
+            self.assertEqual(
+                report["quality_score_averages_after_answer_correctness"],
+                {
+                    "candidate_count_after_answer_correctness": 2,
+                    "scored_count": 2,
+                    "quality_judge_error_count": 0,
+                    "mean_scores": {
+                        "logic_coherence": 7.0,
+                        "answer_exposure": 8.5,
+                        "tool_use": 8.0,
+                    },
+                },
+            )
             accepted = (output_dir / "accepted_trajectories.jsonl").read_text(encoding="utf-8").strip().splitlines()
             self.assertEqual(len(accepted), 1)
             self.assertEqual(json.loads(accepted[0])["sample_id"], "sample_good")
@@ -107,6 +133,10 @@ class FilterSftTrajectoriesTest(unittest.TestCase):
             )
             self.assertEqual(report["filtered_ids"]["average_score_low_ids"], ["sample_average"])
             self.assertEqual(report["filtered_ids"]["logic_coherence_low_score_ids"], [])
+            self.assertEqual(
+                report["quality_score_averages_after_answer_correctness"]["mean_scores"],
+                {"logic_coherence": 6.5, "answer_exposure": 6.5, "tool_use": 6.8},
+            )
 
     def test_prompt_field_names_are_used_without_legacy_verdict_fallback(self) -> None:
         record = _record("sample_legacy")
@@ -168,6 +198,37 @@ class FilterSftTrajectoriesTest(unittest.TestCase):
             accepted = [json.loads(line) for line in (output_dir / "accepted_trajectories.jsonl").read_text(encoding="utf-8").splitlines()]
             self.assertEqual(accepted[0]["sft_trajectory_filter"]["simple_judge"]["predict"], "pass")
             self.assertEqual(accepted[0]["sft_trajectory_filter"]["simple_judge"]["verdict"], "pass")
+
+    def test_cli_report_is_human_readable_and_not_json(self) -> None:
+        report = {
+            "output_dir": "/tmp/filtered",
+            "processed_records": 4,
+            "total_available_records": 4,
+            "decision_counts": {"keep": 1, "reject": 3},
+            "stage_statistics": {
+                "max_turn": {"input_count": 4, "filtered_count": 1, "survivor_count": 3},
+                "answer_correctness": {"input_count": 3, "filtered_count": 1, "survivor_count": 2},
+                "quality_dimensions": {"input_count": 2, "filtered_count": 1, "survivor_count": 1},
+                "quality_average": {"input_count": 1, "filtered_count": 0, "survivor_count": 1},
+            },
+            "quality_score_averages_after_answer_correctness": {
+                "candidate_count_after_answer_correctness": 2,
+                "scored_count": 2,
+                "quality_judge_error_count": 0,
+                "mean_scores": {
+                    "logic_coherence": 7.0,
+                    "answer_exposure": 8.5,
+                    "tool_use": 8.0,
+                },
+            },
+        }
+        rendered = _format_cli_report(report)
+        self.assertIn("SFT trajectory filtering completed", rendered)
+        self.assertIn("Filtering stages", rendered)
+        self.assertIn("Max-turn", rendered)
+        self.assertIn("Logic coherence mean       : 7.0000", rendered)
+        self.assertNotIn('"stage_statistics"', rendered)
+        self.assertFalse(rendered.lstrip().startswith("{"))
 
 
 if __name__ == "__main__":
