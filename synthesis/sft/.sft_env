@@ -76,6 +76,7 @@ export SFT_SUMMARIZER_API_KEY="EMPTY"
 # before i2i_search denormalizes 0-1000 region coordinates into pixels.
 # export REVERSE_IMAGE_CROP_COORDS="true"
 
+export SYNTHESIS_ADAPTIVE_QPM_ENABLED=1
 
 export SERPER_API_KEY="65c83034889f9d2d2a9f0c2afa9eb470f346f9b8"
 export SERPER_SEARCH_URL="https://google.serper.dev/search"

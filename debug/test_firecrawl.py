@@ -8,6 +8,7 @@ Wikipedia pages.  This script performs real, credit-consuming Firecrawl calls.
 Examples:
   python debug/test_firecrawl.py
   python debug/test_firecrawl.py --workers 8 --requests 12
+  python debug/test_firecrawl.py --failed-read-url-jsonl runs/.../0804_test_2_0_to_500.jsonl --requests 61
   python debug/test_firecrawl.py --output /tmp/firecrawl_report.json
 """
 
@@ -77,8 +78,62 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Print the complete raw Firecrawl response for every completed request.",
     )
+    parser.add_argument(
+        "--failed-read-url-jsonl",
+        type=Path,
+        help=(
+            "Extract unique failed text-page URLs from a debug_vqa_batch JSONL file, "
+            "using its saved runtime.url_resources."
+        ),
+    )
+    parser.add_argument(
+        "--include-failed-image-resources",
+        action="store_true",
+        help=(
+            "Also test failed image resources from --failed-read-url-jsonl. Disabled by default because "
+            "read_url downloads images directly and does not use the Firecrawl fallback for them."
+        ),
+    )
     parser.add_argument("--output", type=Path, help="Optional JSON report path.")
     return parser
+
+
+def _failed_read_urls_from_jsonl(path: Path, *, include_images: bool = False) -> list[str]:
+    """Recover original URLs for failed read_url calls from persisted runtime provenance."""
+
+    urls: list[str] = []
+    seen: set[str] = set()
+    with path.open("r", encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            if not line.strip():
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError as exc:
+                print(f"[failed-read-url extraction] skip malformed JSONL at {path}:{line_number}: {exc}", file=sys.stderr)
+                continue
+            resources = {
+                str(item.get("resource_id") or ""): item
+                for item in ((record.get("runtime") or {}).get("url_resources") or [])
+                if isinstance(item, dict)
+            }
+            for message in record.get("raw_messages") or []:
+                if not isinstance(message, dict) or message.get("role") != "tool" or message.get("name") != "read_url":
+                    continue
+                try:
+                    observation = json.loads(message.get("content") or "{}")
+                except (TypeError, json.JSONDecodeError):
+                    continue
+                if not isinstance(observation, dict) or observation.get("content") != "Unable to read the requested page.":
+                    continue
+                resource = resources.get(str(observation.get("page_id") or "")) or {}
+                if not include_images and str(resource.get("kind") or "") == "image":
+                    continue
+                url = str(resource.get("primary_url") or "").strip()
+                if url and url not in seen:
+                    seen.add(url)
+                    urls.append(url)
+    return urls
 
 
 def _metadata(response: dict[str, Any]) -> dict[str, Any]:
@@ -174,14 +229,23 @@ def _print_report(report: dict[str, Any]) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
-    if not 1 <= args.requests <= len(DEFAULT_URLS):
-        raise SystemExit(f"--requests must be between 1 and {len(DEFAULT_URLS)}")
+    urls = DEFAULT_URLS
+    if args.failed_read_url_jsonl:
+        urls = _failed_read_urls_from_jsonl(
+            args.failed_read_url_jsonl,
+            include_images=args.include_failed_image_resources,
+        )
+        if not urls:
+            raise SystemExit(f"No failed read_url URLs found in {args.failed_read_url_jsonl}")
+        print(f"[failed-read-url extraction] extracted_unique_urls={len(urls)} source={args.failed_read_url_jsonl}")
+    if not 1 <= args.requests <= len(urls):
+        raise SystemExit(f"--requests must be between 1 and {len(urls)}")
     if args.workers <= 0:
         raise SystemExit("--workers must be positive")
     if args.max_age < 0:
         raise SystemExit("--max-age must be non-negative")
 
-    report = run_test(DEFAULT_URLS[: args.requests], args)
+    report = run_test(urls[: args.requests], args)
     _print_report(report)
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)

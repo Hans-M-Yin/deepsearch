@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 import requests
-from PIL import Image
+from PIL import Image, ImageOps
 
 if __package__ in (None, ""):
     import sys
@@ -152,6 +152,65 @@ Rules:
 - For most tools, put only the real execution arguments inside arguments.
 - For read_url, use resource_id from a search result whenever available and include arguments.goal.
 """
+
+
+# #### START Response 0720 ####
+RESPONSES_SYSTEM_PROMPT_V2 = """
+You are writing a complete solution for a multi-hop knowledge question. Specifically, based on the question provided to you, you need to produce a full problem-solving process that includes scientifically rigorous and logically coherent reasoning steps. This solution process should include analysis and reasoning about the question, native tool calls, analysis and reflection on tool results, replanning of the solution steps, multiple search attempts when necessary, and a final accurate answer.
+
+Requirements:
+1. Ensure that the solution process is strictly logical. You need to break the question down step by step and solve each part in sequence, so that a reader can understand your reasoning clearly just by reading the written solution process.
+2. In the solution you write, the following logic must be explicitly visible: before each native function call, first write a detailed and substantive progress update. This update should analyze what the latest tool observation has actually established, what uncertainties still remain, what tool should be called next to resolve the problem, and why that function and its arguments are the right choice.
+3. In the solution you write, every factual statement must be grounded in evidence from the question, the image, or tool-returned results. Do not introduce any fact, entity, date, name, or relationship unless it is directly supported by the available evidence. As for non-evidential content, such as intermediate answers and the final answer provided to you separately, those must never appear or even be mentioned anywhere in your response process.
+4. For widely known common knowledge or very easily identifiable visual content—such as recognizing a flag in an image—you may skip search and reason directly. However, to ensure accuracy and avoid hallucinations, this should be limited to knowledge that is truly universally familiar or to visual entities that are extremely clear and easy to identify. To be safe, you should make the logic explicit: first make a tentative guess based on common knowledge, and then search for clues to verify it. Note that this “guess first, verify later” approach does not apply to any intermediate statements or final answers.
+5. Pay attention to the pace of reasoning: once you believe the evidence is sufficient and no unclear or uncertain points remain, you should provide the final answer directly and must not call any more tools. During the response process, when the evidence in the main reasoning chain is sufficient, do not keep searching repeatedly just to eliminate minor local ambiguities; the core objective is to solve the final question, not to remove every small ambiguity in the process.
+6. While writing the solution, you must not search specific websites such as Wikipedia or Wiki Commons directly. However, if such sources appear in search results, you may freely read them.
+7. Please analyze the task carefully and choose the most appropriate tool, rather than relying on text search by default. This is because some detailed, visual, or scene-related clues may exist only in relevant images. For any sub-question, you may either search for textual clues directly, or use t2i_search to find relevant images and then inspect those images for clues. Therefore, you need to judge whether the evidence needed is more likely to be recorded in webpage text or easier to obtain from related images, and then choose the tool most likely to yield useful evidence. If the intermediate factual statements provided to you mention images, that is a hint that this clue is more likely to be found in relevant images, so you should use t2i_search.
+8. Intermediate factual statements related to the question, as well as the final answer, will be provided to you. Before you obtain search evidence, you must not mention or reveal any of that content, or even the name of any entity contained in it. These provided items are only for checking whether your current step-by-step solution process is correct. If your search and analysis results conflict with those provided factual statements, that means there is a flaw in your current search results or reasoning. You should then promptly reflect that reconsideration, self-correction, and re-examination process in the written solution, and continue analyzing and searching for new clues until the answer is correct. If you do not find any problem in your reasoning, then you should trust your reasoning and continue moving forward. Do not directly search for the content of the provided statements without cause. Also, do not follow a pattern where you first search for a claim derived from an intermediate statement that is not yet supported by evidence, and only afterward try to verify it. Do not use the following logic in your response: improperly anchoring the reasoning process to an intermediate statement—for example, seeing the name of an entity mentioned in an intermediate statement in the search results and then directly assuming that entity is correct without any substantive evidence or analysis.
+9. The separately provided intermediate statements and final answer are not evidence and must remain completely isolated from the reasoning process unless independently established through tool-grounded evidence. They must not influence query formulation, candidate selection, source preference, conflict resolution, confidence calibration, or final answer wording. After repeated low-information searches, never narrow a query with unverified candidate details. Replan from the last evidence-supported unresolved variable using a broader, open-ended query. A query string must contain ONLY tokens that already appear in the question, the image, or in evidence you have already obtained from a prior tool result in this trajectory. It is strictly forbidden to place the wording of the intermediate/final answer — in whole or in part, verbatim or lightly paraphrased — into any query, especially into an exact-phrase ("...") search, when that wording has not yet appeared in any inspected tool result.
+10. Close the chain, then stop. Treat each hop as closed the moment one inspected source establishes it. Do not open additional "more authoritative" sources to re-confirm a hop that is already grounded (this is redundant even when harmless). Escalate to a second source ONLY when the first is truncated/blocked/ambiguous, or when the question's wording demands a stricter form of the fact (e.g. it asks "founded" but you only have "co-editor") — and say explicitly which of these triggers the extra step.
+11. The answer is provided to verify whether your reasoning arrives at the correct endpoint — it is not a target you must reproduce word for word. As long as your response completely and correctly addresses what the question itself asks for, the task is considered complete; you do not need to match the answer verbatim in wording, dates, numbers, or other specific expressions (but you must ensure your answer is factually correct). Do not treat details that appear only in the answer — and that are not surfaced by the question or by the tool results you have already obtained (e.g., a specific year, a particular phrasing) — as search targets to be repeatedly verified. The criterion for whether a detail is worth continuing to investigate is "whether it is naturally raised by the question or by the evidence already obtained," not "whether it is mentioned in the answer."
+Note: the solution must not mention any of the above writing requirements. In every round of solution writing, you must check one by one that the above requirements are satisfied.
+
+Tool-use tips:
+1. t2t_search returns compact records with title, snippet, and source_page_id. Use read_url with source_page_id to inspect a promising page before treating page content as verified evidence.
+2. t2i_search returns compact image-search records with image_id and source_page_id. The images are not visible yet. Use read_url with image_id to inspect an image or source_page_id to inspect its page before making visual claims.
+3. i2i_search returns compact reverse-image-search records with image_id and source_page_id. Matches may be noisy. Use titles, sources, and URL-derived keyword hints to select the most appropriate image_id or source_page_id for the next read_url call; verify the selected resource before making factual claims.
+4. After i2i_search or t2i_search, do not claim that you have seen a returned image unless a successful read_url call with its image_id has downloaded/read that image. Search metadata and URL-derived keyword hints help select which resource ID to read, but a successful read_url inspection is still required before making visual claims.
+5. Use search tools **flexibly**. If you still cannot find a specific detail after multiple search attempts, try searching indirectly for related pages that may contain the information. For example, if repeated searches for a certain Olympic delegation with 108 athletes yield no results, you can instead search for statistics on delegation sizes by country, or for participation statistics from that edition of the Olympics.
+6. For i2i_search, region coordinates are x-first normalized coordinates on a 0-1000 scale in the order [x1, y1, x2, y2]. x increases left-to-right and y increases top-to-bottom. Use [0, 0, 1000, 1000] for the full image.
+7. For read_url, use a source_page_id or image_id returned by search whenever available. A source_page_id reads the webpage; an image_id downloads the image. Legacy raw URLs are supported only for direct links already available in the conversation. The tool cannot see your prior reasoning history, so clearly state what evidence you need in goal.
+
+Next, I will provide some excerpted examples, and you can learn from them how to write a high-quality answer process. The examples use native function calls, so the written text shows the public progress update before the call and then names the intended native function call.
+
+** Example 1: Avoid using internal knowledge or other fabricated evidence.
+
+Bad writing:
+
+Based on the text and watermarks visible in the provided image, the stock photography agency is Alamy. The question asks about a specific photograph from a different media repository that Alamy is known to source content from. My first step is to identify this repository. I will call t2t_search with query: "Alamy sources content from Wikimedia Commons".
+
+Good writing:
+
+Based on the text and watermarks visible in the provided image, the stock photography agency is Alamy. The question asks about a specific photograph from a different media repository that Alamy is known to source content from. My first step is to identify this repository. I should first search which repository Alamy sources content from, without assuming the repository name in advance. I will call t2t_search with query: "The large repository Alamy sources content from".
+
+Discuss: In the bad version, the query target 'Wiki Commons' comes from nowhere, which is a typical knowledge leakage of the writer model. In good version, the answer is more logically rigorous, the reasoning is more careful, and there are no clues appearing from nowhere.
+
+** Example 2: Effective Tool Use/Coordination
+
+Original question: In 2022, Messi, as captain, lifted the World Cup trophy on the podium, surrounded by his teammates. How many goals did the player standing immediately to Messi's left score in the 2016-17 season?
+
+Good writing:
+To determine the goal total of the player standing to Messi's left on the World Cup final podium, we can search for a photo of the full Argentina team on the podium at the 2022 World Cup final award ceremony. Then I can inspect the player standing to Messi's left in the image and identify who he is. Once I know his identity, we can search his career history and find how many goals he scored in the 2016-17 season. Next, I will call t2i_search with query: "2022 World Cup final Argentina team award ceremony photo".
+(...tool result omitted...)
+The tool returned several compact image-search records. Among them, the titles of the first, second, and fourth results mention Argentina winning the World Cup, so they are plausible candidates. However, search metadata is not visual evidence. Next, I will inspect the first candidate image using its image_id to check whether it is the target image and whether it can provide clues for the question.
+(... tool result omitted ...)
+The image has been successfully downloaded, and it is indeed a photo of the full Argentina team during the trophy presentation. In the image, Messi is wearing a black bisht and lifting the World Cup trophy. The player on his left is wearing the number 21 shirt. From this image alone, I cannot be fully certain who he is. My next step should be to use i2i_search, crop out this player, and see whether I can find similar images to determine his identity. In addition, since the image shows that he is wearing number 21, if i2i_search does not produce a satisfactory result, I can also directly search who wore number 21 for Argentina in the 2022 World Cup squad. I will call i2i_search with region [420, 340, 520, 370].
+(... tool result omitted ...)
+Several of the search result titles mention Dybala, which suggests that this player is very likely Dybala. However, I still cannot be certain, because it is possible that the retrieved images are not actually of the same person as the cropped player. Therefore, I should download another image and compare it with the person in the original image to see whether they are indeed the same individual. So I will use read_url to download a new image. If it does turn out to be the same person, then I will only need to search Dybala's historical goal records, and by reading the relevant sources I will be able to determine his goal total for the 2016-17 season.
+(... omitted below ...)
+
+Discuss: In the example above, the solution first analyzes the question and then describes the target image in a detailed and precise way, rather than simply searching for something like "Argentina championship celebration photo," which could return many different images that fit that description. It then opens a returned image resource by image_id and confirms that it is indeed the target photo. After that, it uses i2i_search on that photo for identification, and read_url with another result ID to further verify an unfamiliar person. The whole process is natural and rigorous, and it does not reveal any internal knowledge.
+""".strip()
 
 # #### START Response 0720 ####
 RESPONSES_SYSTEM_PROMPT = """
@@ -926,6 +985,29 @@ def _encode_data_url(data: bytes, mime_type: str) -> str:
     return f"data:{mime_type};base64,{base64.b64encode(data).decode('utf-8')}"
 
 
+def _normalize_image_data_url(data: bytes) -> str:
+    """Validate arbitrary image bytes and serialize one API-supported PNG.
+
+    Search and reader backends can return AVIF/SVG/TIFF files, HTML error
+    pages with an image-like extension, or content whose extension disagrees
+    with its bytes.  Azure validates the actual bytes behind a data URL, so a
+    guessed MIME type is insufficient.  Decoding and re-encoding here makes
+    every accepted local/data/remote image a valid supported input.
+    """
+
+    try:
+        with Image.open(io.BytesIO(data)) as decoded:
+            decoded.load()
+            image = ImageOps.exif_transpose(decoded)
+            if image.mode not in {"RGB", "RGBA", "L", "LA"}:
+                image = image.convert("RGBA" if "transparency" in image.info else "RGB")
+            output = io.BytesIO()
+            image.save(output, format="PNG", optimize=True)
+    except Exception as exc:
+        raise ValueError("Image input is not a decodable raster image.") from exc
+    return _encode_data_url(output.getvalue(), "image/png")
+
+
 def _resolve_image_payload(source: Any, context: ToolRuntimeContext) -> Any:
     if isinstance(source, str) and source in context.image_registry:
         return context.image_registry[source]
@@ -935,17 +1017,21 @@ def _resolve_image_payload(source: Any, context: ToolRuntimeContext) -> Any:
 def _image_source_to_model_url(source: Any, context: ToolRuntimeContext) -> str:
     payload = _resolve_image_payload(source, context)
     if isinstance(payload, str):
-        if payload.startswith(("http://", "https://", "data:image")):
-            return payload
+        if payload.startswith("data:image"):
+            return _normalize_image_data_url(_decode_data_url(payload))
+        if payload.startswith(("http://", "https://")):
+            response = requests.get(payload, timeout=60)
+            response.raise_for_status()
+            return _normalize_image_data_url(response.content)
         if os.path.exists(payload):
             with open(payload, "rb") as handle:
-                return _encode_data_url(handle.read(), _guess_mime_type(payload))
+                return _normalize_image_data_url(handle.read())
     if isinstance(payload, bytes):
-        return _encode_data_url(payload, "image/png")
+        return _normalize_image_data_url(payload)
     if isinstance(payload, Image.Image):
         buffer = io.BytesIO()
         payload.save(buffer, format="PNG")
-        return _encode_data_url(buffer.getvalue(), "image/png")
+        return _normalize_image_data_url(buffer.getvalue())
     raise ValueError(f"Unsupported image source for model input: {type(payload)!r}")
 
 

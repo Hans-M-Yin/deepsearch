@@ -67,6 +67,27 @@ class UrlResourceFallbackTests(unittest.TestCase):
         self.assertEqual(result["resolved_url"], resource.thumbnail_url)
         self.assertEqual(calls[0][1], resource.source_page_url)
 
+    def test_extensionless_image_resource_never_uses_text_reader_or_firecrawl(self) -> None:
+        resource = tools.UrlResource(
+            primary_url="https://lookaside.instagram.example/crawler/?media_id=123",
+            kind="image",
+            image_url="https://lookaside.instagram.example/crawler/?media_id=123",
+        )
+        jpeg = b"\xff\xd8\xff" + b"x" * 20
+        with (
+            mock.patch.object(tools, "_probe_content_type", return_value="text/html"),
+            mock.patch.object(tools, "_download_binary", return_value=(jpeg, "image/jpeg")) as download,
+            mock.patch.object(tools, "_maybe_resize_downloaded_image", return_value=(jpeg, "image/jpeg")),
+            mock.patch.object(tools, "_read_document") as reader,
+            mock.patch.object(tools, "_read_via_firecrawl") as firecrawl,
+        ):
+            result = tools.read_url(resource.primary_url, resource=resource)
+
+        self.assertTrue(result["ok"])
+        download.assert_called_once()
+        reader.assert_not_called()
+        firecrawl.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

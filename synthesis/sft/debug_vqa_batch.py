@@ -18,6 +18,8 @@ from typing import Any
 
 from synthesis.firecrawl_client import get_firecrawl_usage_snapshot
 
+from .api_tools import RESPONSES_SYSTEM_PROMPT_V2
+
 try:
     from tqdm.auto import tqdm
 except ImportError:  # pragma: no cover - optional progress dependency
@@ -726,6 +728,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--responses-reasoning-context", default=os.environ.get("SFT_RESPONSES_REASONING_CONTEXT", "all_turns"))
     parser.add_argument("--responses-store", choices=("true", "false"), default=os.environ.get("SFT_RESPONSES_STORE"))
     parser.add_argument("--no-responses-public-reasoning", action="store_true", help="Do not append the Responses public-reasoning prompt.")
+    parser.add_argument(
+        "--responses-system-prompt-v2",
+        action="store_true",
+        help=(
+            "Use api_tools.RESPONSES_SYSTEM_PROMPT_V2 for the primary agent. "
+            "Only valid with --api-mode responses and cannot be combined with --system-prompt."
+        ),
+    )
     parser.add_argument("--responses-parallel-tool-calls", action="store_true", help="Allow parallel Responses tool calls. Defaults to false.")
     parser.add_argument("--responses-i2i-wrapper", action="store_true", help="Enable the legacy i2i wrapper rewrite in Responses mode.")
     # #### END Response 0720 ####
@@ -1004,6 +1014,10 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("Use exactly one of --vqa-dir or --question.")
     if args.question and not args.model_alias:
         parser.error("--model-alias is required in single-question mode unless SFT_OPENAI_MODEL / OPENAI_MODEL is set.")
+    if args.responses_system_prompt_v2 and args.api_mode != "responses":
+        parser.error("--responses-system-prompt-v2 requires --api-mode responses.")
+    if args.responses_system_prompt_v2 and args.system_prompt:
+        parser.error("--responses-system-prompt-v2 cannot be combined with --system-prompt.")
     if args.vqa_dir and not args.model_alias:
         parser.error("--model-alias is required in batch mode unless SFT_OPENAI_MODEL / OPENAI_MODEL is set.")
     if args.workers <= 0:
@@ -1028,6 +1042,9 @@ def main(argv: list[str] | None = None) -> int:
             record["image_paths"] = list(args.image or [])
             record["image_urls"] = list(args.image_url or [])
 
+    primary_system_prompt = (
+        RESPONSES_SYSTEM_PROMPT_V2 if args.responses_system_prompt_v2 else args.system_prompt
+    )
     agent_config = _config_from_model_arg(
         model_arg=args.model_alias,
         api_key=args.api_key,
@@ -1043,7 +1060,7 @@ def main(argv: list[str] | None = None) -> int:
         max_tokens=args.max_tokens,
         temperature=args.temperature,
         timeout_s=args.timeout_s,
-        system_prompt=args.system_prompt,
+        system_prompt=primary_system_prompt,
         headers_json=args.headers_json,
         extra_body_json=args.extra_body_json,
         max_turns=args.max_turns,

@@ -25,7 +25,7 @@ VALID_REASONING_EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh", 
 # #### END Response 0720 ####
 FIXED_TT_LOGID = "3200636808"
 # A request is attempted once initially, then retried at most this many times.
-LLM_RETRY_COUNT = 1000
+LLM_RETRY_COUNT = 50
 _ADAPTIVE_QPM_ENV = "SYNTHESIS_ADAPTIVE_QPM_ENABLED"
 _ADAPTIVE_QPM_ERROR_WINDOW_S = 60.0
 _ADAPTIVE_QPM_RECOVERY_INTERVAL_S = 60.0
@@ -954,6 +954,14 @@ class ModelRouterWorkerClient:
                     served_model=served_model,
                     error=exc,
                 )
+                if self._is_non_retryable_request_error(exc):
+                    self._print_non_retryable_error(
+                        alias=alias,
+                        served_model=served_model,
+                        attempt=attempt_index + 1,
+                        error=exc,
+                    )
+                    break
                 # print(request)
                 if attempt_index >= LLM_RETRY_COUNT:
                     break
@@ -1000,6 +1008,15 @@ class ModelRouterWorkerClient:
                     served_model=served_model,
                     error=exc,
                 )
+                if self._is_non_retryable_request_error(exc):
+                    self._print_non_retryable_error(
+                        alias=alias,
+                        served_model=served_model,
+                        attempt=attempt_index + 1,
+                        error=exc,
+                        api_mode="responses",
+                    )
+                    break
                 if attempt_index >= LLM_RETRY_COUNT:
                     break
                 print(
@@ -1066,6 +1083,42 @@ class ModelRouterWorkerClient:
             self._adaptive_qpm_states[alias] = state
         state.effective_qpm = min(configured_qpm, max(1, state.effective_qpm))
         return state.effective_qpm
+
+    @staticmethod
+    def _is_non_retryable_request_error(error: Exception) -> bool:
+        """Return true for deterministic client-side/request-validation failures."""
+
+        message = str(error).lower()
+        return (
+            error.__class__.__name__ == "BadRequestError"
+            or "error code: 400" in message
+            or "invalid_request_error" in message
+            or "invalid_value" in message
+        )
+
+    @staticmethod
+    def _print_non_retryable_error(
+        *,
+        alias: str,
+        served_model: str,
+        attempt: int,
+        error: Exception,
+        api_mode: str | None = None,
+    ) -> None:
+        """Log a rejected request once instead of sleeping through retry budget."""
+
+        mode = f" api_mode={api_mode}" if api_mode else ""
+        print(
+            "[llm-non-retryable]"
+            f" alias={alias}"
+            f" served_model={served_model}"
+            f"{mode}"
+            f" attempt={attempt}"
+            f" error_type={error.__class__.__name__}"
+            f" error={str(error)!r}",
+            file=sys.stderr,
+            flush=True,
+        )
 
     @staticmethod
     def _is_capacity_rate_limit(error: Exception) -> bool:

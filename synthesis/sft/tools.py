@@ -8,6 +8,7 @@ import mimetypes
 import os
 import random
 import re
+import socket
 import sys
 import tempfile
 import threading
@@ -41,6 +42,13 @@ from synthesis.model_worker import ModelRequest
 
 logger = logging.getLogger(__name__)
 MAX_SEARCH_RESULTS = 5
+TOOL_NETWORK_TIMEOUT_S = 120
+# A request is attempted once initially, then at most this many additional
+# times when the failure is a transport timeout.  Keep this distinction
+# explicit: retrying authentication, validation, or quota errors only delays
+# the trajectory and cannot make them succeed.
+TOOL_TIMEOUT_RETRIES = 5
+TOOL_RETRY_SLEEP_S = 5
 MAX_DOWNLOADED_IMAGE_LONG_EDGE = 1920
 MAX_DOWNLOADED_IMAGE_SHORT_EDGE = 1080
 RESIZED_IMAGE_LONG_EDGE = 1200
@@ -321,11 +329,11 @@ def _source_page_image_candidates(resource: UrlResource | None) -> list[str]:
         response = _request_with_retry(
             "GET",
             resource.source_page_url,
-            timeout=30,
+            timeout=TOOL_NETWORK_TIMEOUT_S,
             allow_redirects=True,
             headers=_web_request_headers(referer_url=resource.source_page_url),
-            max_retries=2,
-            retry_sleep_s=5,
+            max_retries=TOOL_TIMEOUT_RETRIES,
+            retry_sleep_s=TOOL_RETRY_SLEEP_S,
         )
         html = response.text
         response.close()
@@ -519,7 +527,7 @@ def _serper_client() -> SerperSearchClient:
     return SerperSearchClient(
         search_url=os.environ.get("SERPER_SEARCH_URL") or "https://google.serper.dev/search",
         images_url=os.environ.get("SERPER_IMAGES_URL") or "https://google.serper.dev/images",
-        timeout_s=float(os.environ.get("SFT_SERPER_TIMEOUT_S", "120")),
+        timeout_s=TOOL_NETWORK_TIMEOUT_S,
     )
 
 
@@ -920,17 +928,34 @@ def _should_retry_http_status(status_code: int) -> bool:
     return status_code in {429, 500, 502, 503, 504}
 
 
+def _is_timeout_error(exc: BaseException) -> bool:
+    """Return whether an exception represents a transport timeout.
+
+    Serper wraps ``urlopen`` failures in a RuntimeError, while requests and
+    urllib expose different exception types.  Cover both forms without
+    treating ordinary HTTP/API errors as retryable timeouts.
+    """
+
+    if isinstance(exc, (TimeoutError, socket.timeout, requests.Timeout)):
+        return True
+    reason = getattr(exc, "reason", None)
+    if reason is not None and reason is not exc and _is_timeout_error(reason):
+        return True
+    message = str(exc).lower()
+    return "timeout" in message or "timed out" in message
+
+
 def _request_with_retry(
     method: str,
     url: str,
     *,
     timeout: int,
-    max_retries: int = 3,
-    retry_sleep_s: int = 20,
+    max_retries: int = TOOL_TIMEOUT_RETRIES,
+    retry_sleep_s: int = TOOL_RETRY_SLEEP_S,
     **kwargs: Any,
 ) -> requests.Response:
     last_error: Exception | None = None
-    attempts = max(1, int(max_retries))
+    attempts = 1 + max(0, int(max_retries))
     for attempt in range(1, attempts + 1):
         response: requests.Response | None = None
         try:
@@ -1041,7 +1066,7 @@ def _probe_content_type(url: str) -> str:
             "HEAD",
             url,
             allow_redirects=True,
-            timeout=20,
+            timeout=TOOL_NETWORK_TIMEOUT_S,
             headers=_web_request_headers(referer_url=url),
         )
         content_type = response.headers.get("Content-Type", "")
@@ -1059,7 +1084,7 @@ def _probe_content_type(url: str) -> str:
             url,
             allow_redirects=True,
             stream=True,
-            timeout=20,
+            timeout=TOOL_NETWORK_TIMEOUT_S,
             headers=_web_request_headers(referer_url=url),
         )
         content_type = response.headers.get("Content-Type", "")
@@ -1081,7 +1106,7 @@ def _probe_content_type(url: str) -> str:
 def _download_binary(
     url: str,
     *,
-    timeout: int = 60,
+    timeout: int = TOOL_NETWORK_TIMEOUT_S,
     referer_url: str | None = None,
 ) -> tuple[bytes, str]:
     response = _request_with_retry(
@@ -1168,7 +1193,11 @@ def _read_via_jina(url: str) -> str:
     jina_api_key = os.environ.get("JINA_API_KEY")
     if jina_api_key:
         headers["Authorization"] = f"Bearer {jina_api_key}"
-    response = requests.get(f"{reader_url}/{url}", headers=headers, timeout=30)
+    response = requests.get(
+        f"{reader_url}/{url}",
+        headers=headers,
+        timeout=TOOL_NETWORK_TIMEOUT_S,
+    )
     if response.status_code != 200:
         return ""
     try:
@@ -1200,7 +1229,7 @@ def _read_document(url: str) -> dict[str, Any]:
 
     reader = EnhancedReaderClient(
         base_url=reader_base,
-        timeout_s=float(os.environ.get("ENHANCED_READER_TIMEOUT_S", "180")),
+        timeout_s=TOOL_NETWORK_TIMEOUT_S,
     )
     document = reader.read(url)
     return {
@@ -1210,6 +1239,31 @@ def _read_document(url: str) -> dict[str, Any]:
         "raw_markdown": document.raw_markdown or "",
         "raw": document.raw,
     }
+
+
+def _read_document_with_timeout_retry(url: str) -> dict[str, Any]:
+    """Read via Enhanced Reader, retrying only transport timeouts.
+
+    A blocked-page response is a valid reader response and must proceed to the
+    normal Firecrawl fallback; only a timeout benefits from retrying the same
+    backend.
+    """
+
+    for attempt in range(1, TOOL_TIMEOUT_RETRIES + 2):
+        try:
+            return _read_document(url)
+        except Exception as exc:
+            if not _is_timeout_error(exc) or attempt > TOOL_TIMEOUT_RETRIES:
+                raise
+            _read_url_debug(
+                "enhanced_reader_timeout_retry",
+                url=url,
+                attempt=attempt,
+                max_retries=TOOL_TIMEOUT_RETRIES,
+                error=str(exc),
+            )
+            time.sleep(TOOL_RETRY_SLEEP_S * attempt)
+    raise AssertionError("unreachable")
 
 
 def _read_via_firecrawl(url: str) -> dict[str, Any]:
@@ -1238,6 +1292,26 @@ def _read_via_firecrawl(url: str) -> dict[str, Any]:
     }
 
 
+def _read_via_firecrawl_with_timeout_retry(url: str) -> dict[str, Any]:
+    """Use the fallback reader with the same timeout retry budget as read_url."""
+
+    for attempt in range(1, TOOL_TIMEOUT_RETRIES + 2):
+        try:
+            return _read_via_firecrawl(url)
+        except Exception as exc:
+            if not _is_timeout_error(exc) or attempt > TOOL_TIMEOUT_RETRIES:
+                raise
+            _read_url_debug(
+                "firecrawl_timeout_retry",
+                url=url,
+                attempt=attempt,
+                max_retries=TOOL_TIMEOUT_RETRIES,
+                error=str(exc),
+            )
+            time.sleep(TOOL_RETRY_SLEEP_S * attempt)
+    raise AssertionError("unreachable")
+
+
 def _is_blocked_summary(content: str) -> bool:
     return "BLOCKED" in str(content or "").upper()
 
@@ -1252,7 +1326,7 @@ def _read_url_with_firecrawl_fallback(
 ) -> dict[str, Any]:
     """Read through Firecrawl and summarize after Enhanced Reader is unavailable/blocked."""
     try:
-        firecrawl_document = _read_via_firecrawl(url)
+        firecrawl_document = _read_via_firecrawl_with_timeout_retry(url)
         content = firecrawl_document["content"]
         summarized = summarize_with_qwen(
             content=content,
@@ -1295,7 +1369,13 @@ def read_url(
 
     content_type = _probe_content_type(normalized_url)
     _read_url_debug("probed_content_type", url=normalized_url, content_type=content_type)
-    if content_type.startswith("image/"):
+    # Search results already carry an authoritative resource kind.  Some image
+    # CDNs (notably Instagram's crawler endpoint) have no image extension and
+    # can return an anti-bot HTML response to a probe.  Do not reinterpret an
+    # image resource as a webpage in that case: keep it on the binary-download
+    # path and never invoke the text reader / Firecrawl fallback for it.
+    is_image_resource = resource is not None and resource.kind == "image"
+    if is_image_resource or content_type.startswith("image/"):
         failures: list[str] = []
         candidates = _resource_candidate_urls(resource, normalized_url)
         source_page_checked = False
@@ -1308,7 +1388,7 @@ def read_url(
                 filename = os.path.basename(urlparse(candidate_url).path) or "downloaded_image"
                 response_content, downloaded_type = _download_binary(
                     candidate_url,
-                    timeout=60,
+                    timeout=TOOL_NETWORK_TIMEOUT_S,
                     referer_url=referer_url,
                 )
                 candidate_content_type = (
@@ -1378,7 +1458,7 @@ def read_url(
             _read_url_debug("pdf_download_start", url=normalized_url, save_path=save_path)
             pdf_bytes, _ = _download_binary(
                 normalized_url,
-                timeout=int(os.environ.get("SFT_PDF_DOWNLOAD_TIMEOUT_S", "120")),
+                timeout=TOOL_NETWORK_TIMEOUT_S,
                 referer_url=resource.source_page_url if resource is not None else None,
             )
             _read_url_debug(
@@ -1435,7 +1515,7 @@ def read_url(
             # different network path and can return extracted text directly.
             try:
                 _read_url_debug("pdf_reader_fallback_start", url=normalized_url)
-                document = _read_document(normalized_url)
+                document = _read_document_with_timeout_retry(normalized_url)
                 content = str(document.get("content") or "").strip()
                 _read_url_debug(
                     "pdf_reader_fallback_done",
@@ -1476,7 +1556,7 @@ def read_url(
 
     try:
         # print(f"############ {normalized_url} ##############")
-        document = _read_document(normalized_url)
+        document = _read_document_with_timeout_retry(normalized_url)
         # print(f"############ {document} ##############")
     except Exception as exc:  # pragma: no cover - network bound
         trigger = f"Enhanced Reader failed for {normalized_url}: {exc}"
@@ -1523,32 +1603,44 @@ def read_url(
     return result
 
 
+def _run_search_with_timeout_retry(
+    tool_name: str,
+    request: Callable[[], Any],
+) -> Any:
+    """Run a search backend request with bounded timeout-only retries."""
+
+    for attempt in range(1, TOOL_TIMEOUT_RETRIES + 2):
+        try:
+            return request()
+        except Exception as exc:
+            if not _is_timeout_error(exc) or attempt > TOOL_TIMEOUT_RETRIES:
+                raise
+            logger.warning(
+                "%s timed out (attempt %d/%d); retrying in %d seconds: %s",
+                tool_name,
+                attempt,
+                TOOL_TIMEOUT_RETRIES + 1,
+                TOOL_RETRY_SLEEP_S * attempt,
+                exc,
+            )
+            time.sleep(TOOL_RETRY_SLEEP_S * attempt)
+    raise AssertionError("unreachable")
+
+
 def t2t_search(query: str, lang: str = "en", top_k: int = DEFAULT_SEARCH_TOP_K) -> dict[str, Any]:
     """Search text pages and return search results only."""
     try:
         top_k = max(1, min(int(top_k), MAX_SEARCH_RESULTS))
         fetch_limit = _search_fetch_limit(top_k, tool_name="t2t_search")
         effective_query = _sanitize_search_query(query)
-        response = None
-        for attempt in range(1, 3):
-            try:
-                response = _serper_client().search_text(
-                    effective_query,
-                    limit=fetch_limit,
-                    hl=lang,
-                )
-                break
-            except Exception as exc:
-                if attempt >= 2:
-                    raise
-                logger.warning(
-                    "t2t_search failed (attempt %d/2); retrying in 5 seconds: %s",
-                    attempt,
-                    exc,
-                )
-                time.sleep(5)
-        if response is None:  # Defensive guard; the loop either returns or raises.
-            raise RuntimeError("t2t_search did not receive a response after retry")
+        response = _run_search_with_timeout_retry(
+            "t2t_search",
+            lambda: _serper_client().search_text(
+                effective_query,
+                limit=fetch_limit,
+                hl=lang,
+            ),
+        )
         results: list[dict[str, Any]] = []
         for item in response.results:
             if _url_matches_blocked_domain(item.url or "", T2T_BLOCKED_SEARCH_DOMAINS):
@@ -1580,7 +1672,14 @@ def t2i_search(query: str, lang: str = "en", top_k: int = DEFAULT_SEARCH_TOP_K) 
         top_k = max(1, min(int(top_k), MAX_SEARCH_RESULTS))
         fetch_limit = _search_fetch_limit(top_k, tool_name="t2i_search")
         effective_query = _sanitize_search_query(query)
-        response = _serper_client().search_image(effective_query, limit=fetch_limit, hl=lang)
+        response = _run_search_with_timeout_retry(
+            "t2i_search",
+            lambda: _serper_client().search_image(
+                effective_query,
+                limit=fetch_limit,
+                hl=lang,
+            ),
+        )
         results: list[dict[str, Any]] = []
         for item in response.results:
             if _url_matches_blocked_domain(item.image_url or "", T2I_BLOCKED_IMAGE_SEARCH_DOMAINS):
@@ -1621,7 +1720,7 @@ def _image_search_via_serper(image_url: str, top_k: int = MAX_SEARCH_RESULTS) ->
             "Content-Type": "application/json",
         },
         json={"url": image_url},
-        timeout=60,
+        timeout=TOOL_NETWORK_TIMEOUT_S,
     )
     response.raise_for_status()
     data = response.json()
@@ -1647,15 +1746,16 @@ def i2i_search(
     image_url: str,
     visual_lookup: Callable[..., object] | None = None,
     top_k: int = DEFAULT_SEARCH_TOP_K,
-    max_retries: int = 3,
-    base_delay: int = 2,
+    max_retries: int = TOOL_TIMEOUT_RETRIES,
+    base_delay: int = TOOL_RETRY_SLEEP_S,
 ) -> dict[str, Any]:
     """Reverse-image search using a provided backend or Serper Lens.
 
     A successful Lens response with no matches can be transient when the
     remote image URL is temporarily inaccessible to the search backend.  Retry
     that specific case once after a short fixed delay, while retaining the
-    existing exponential retry policy for actual request errors.
+    timeouts are retried at most ``max_retries`` times after the initial
+    request.  Other backend errors are returned immediately.
     """
 
     visual_lookup = visual_lookup or _image_search_via_serper
@@ -1663,12 +1763,15 @@ def i2i_search(
     last_error: Exception | None = None
     retried_empty_result = False
     attempt = 1
-    while attempt <= max_retries:
+    attempts_made = 0
+    max_attempts = 1 + max(0, int(max_retries))
+    while attempt <= max_attempts:
+        attempts_made = attempt
         try:
             print(
                 "[i2i_search debug] backend_search_start "
                 f"attempt={attempt} image_url={image_url!r} top_k={top_k} "
-                f"max_retries={max_retries} base_delay={base_delay} "
+                f"max_retries={max_retries} max_attempts={max_attempts} base_delay={base_delay} "
                 f"visual_lookup={getattr(visual_lookup, '__name__', type(visual_lookup).__name__)}",
                 file=sys.stderr,
                 flush=True,
@@ -1723,12 +1826,17 @@ def i2i_search(
                 file=sys.stderr,
                 flush=True,
             )
-            if attempt < max_retries:
+            if _is_timeout_error(exc) and attempt < max_attempts:
                 time.sleep(base_delay * (2 ** (attempt - 1)))
+            elif not _is_timeout_error(exc):
+                break
             attempt += 1
     _record_search_tool_call("i2i_search", success=False, result_count=0)
     return {
         "ok": False,
         "top_k": top_k,
-        "error": f"i2i_search failed after {max_retries} retries: {last_error}",
+        "error": (
+            f"i2i_search failed after {attempts_made} attempt(s) "
+            f"with at most {max_retries} timeout retries: {last_error}"
+        ),
     }
