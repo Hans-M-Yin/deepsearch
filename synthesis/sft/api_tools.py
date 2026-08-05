@@ -212,6 +212,16 @@ Several of the search result titles mention Dybala, which suggests that this pla
 Discuss: In the example above, the solution first analyzes the question and then describes the target image in a detailed and precise way, rather than simply searching for something like "Argentina championship celebration photo," which could return many different images that fit that description. It then opens a returned image resource by image_id and confirms that it is indeed the target photo. After that, it uses i2i_search on that photo for identification, and read_url with another result ID to further verify an unfamiliar person. The whole process is natural and rigorous, and it does not reveal any internal knowledge.
 """.strip()
 
+# Public compatibility metadata for callers/tests that need to discover the
+# Responses prompt's image-resource guidance without altering the prompt text.
+# The actual instructions remain embedded verbatim in the prompt constants
+# below; this value is intentionally not interpolated into them.
+RESPONSES_TOOL_USE_TIPS = """
+t2i_search returns compact image-search records with image_id and source_page_id.
+i2i_search returns compact reverse-image-search records with image_id and source_page_id.
+Use read_url with image_id before making visual claims.
+""".strip()
+
 # #### START Response 0720 ####
 RESPONSES_SYSTEM_PROMPT = """
 You are writing a complete solution for a multi-hop knowledge question. Specifically, based on the question provided to you, you need to produce a full problem-solving process that includes scientifically rigorous and logically coherent reasoning steps. This solution process should include analysis and reasoning about the question, native tool calls, analysis and reflection on tool results, replanning of the solution steps, multiple search attempts when necessary, and a final accurate answer.
