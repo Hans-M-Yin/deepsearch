@@ -1,4 +1,4 @@
-# WANDB_DISABLED=true USE_RAY=1 python -m llamafactory.cli train examples/agentic_full/qwen3_vl_full_sft_8b_ray_2node16gpu.yaml
+# USE_RAY=1 python -m llamafactory.cli train examples/agentic_full/qwen3_vl_full_sft_8b_ray_2node16gpu.yaml
 ### model
 model_name_or_path: /mnt/hdfs/byte_ai_sales/user/user/yinzhihan/models/qwen3-vl-8b
 image_max_pixels: 262144
@@ -14,25 +14,27 @@ freeze_multi_modal_projector: false
 deepspeed: /mnt/hdfs/byte_ai_sales/user/user/yinzhihan/agent/OpenSearch-VL/SFT/examples/deepspeed/ds_z3_config.json
 
 ### dataset
-dataset: new_fvqa_agent_sft,palace_agent_sft,webqa_agent_sft,livevqa_agent_sft,wikiart_agent_sft,wiki_zh_agent_sft,wiki_en_agent_sft
-dataset_dir: /mnt/hdfs/byte_ai_sales/user/user/yinzhihan/data/OpenSearch-VL-SFT-36K
+dataset: opensearch_vl_sft
+dataset_dir: /mnt/hdfs/byte_ai_sales/user/user/yinzhihan/agent/OpenSearch-VL/data/sharegpt_dataset_test_1
 template: qwen3_vl
 cutoff_len: 28672
 max_samples: 1000
 overwrite_cache: true
 preprocessing_num_workers: 16
 dataloader_num_workers: 4
-tokenized_path: /mnt/hdfs/byte_ai_sales/user/user/yinzhihan/cache/opensearch_sft_tokenized_8b
+tokenized_path: /mnt/hdfs/byte_ai_sales/user/user/yinzhihan/cache/opensearch_sft_tokenized_smoke
 data_shared_file_system: true
 
 ### output
-output_dir: saves/qwen3_vl_8b/full/sft_data_v1_2node16gpu
+output_dir: saves/qwen3_vl_8b/full/smoke_test_2node16gpu
 logging_steps: 5
 save_steps: 400
 plot_loss: true
 overwrite_output_dir: true
 save_only_model: false
-report_to: none
+report_to: wandb
+project: mmdeepsearch
+run_name: 0805_8b_2node_16gpus_data_test
 
 ### ray
 ray_num_workers: 16
@@ -60,6 +62,8 @@ ray_init_kwargs:
       TOKENIZERS_PARALLELISM: "false"
       HF_DATASETS_OFFLINE: "1"
       TRANSFORMERS_OFFLINE: "1"
+      PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION: "python"
+      WANDB_PROJECT: "mmdeepsearch"
 
 ### train
 per_device_train_batch_size: 1

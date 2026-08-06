@@ -85,6 +85,7 @@ synthesis/firecrawl_keys.txt
 synthesis/firecrawl_state.json
 synthesis/firecrawl_state.json.lock
 data/*
+data
 opensearch_infer/*
 
 # --- Local debugging / verification runtime artifacts ---

@@ -215,15 +215,19 @@ def _print_record_result(result: dict[str, Any]) -> None:
 
 
 _SFT_FSYNC_WARNING_EMITTED = False
+_SFT_JSONL_FLUSH_EVERY = 50
 
 
-def _write_jsonl_record(handle: Any, record: dict[str, Any]) -> None:
-    """Append one record and close path-backed writers for HDFS-FUSE visibility."""
+def _write_jsonl_records(handle: Any, records: list[dict[str, Any]]) -> None:
+    """Append a batch of records and publish it for HDFS-FUSE visibility."""
+    if not records:
+        return
     if isinstance(handle, (str, Path)):
         with Path(handle).open("a", encoding="utf-8") as opened_handle:
-            _write_jsonl_record(opened_handle, record)
+            _write_jsonl_records(opened_handle, records)
         return
-    handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+    for record in records:
+        handle.write(json.dumps(record, ensure_ascii=False) + "\n")
     handle.flush()
     try:
         os.fsync(handle.fileno())
@@ -236,6 +240,11 @@ def _write_jsonl_record(handle: Any, record: dict[str, Any]) -> None:
                 file=sys.stderr,
                 flush=True,
             )
+
+
+def _write_jsonl_record(handle: Any, record: dict[str, Any]) -> None:
+    """Append one record while keeping the single-record helper API."""
+    _write_jsonl_records(handle, [record])
 
 
 def _usage_delta(after: dict[str, int], before: dict[str, int]) -> dict[str, int]:
@@ -1139,6 +1148,14 @@ def main(argv: list[str] | None = None) -> int:
             with raw_output_path.open("w", encoding="utf-8"):
                 pass
         print(f"raw_trajectories_jsonl: {raw_output_path}")
+    pending_raw_records: list[dict[str, Any]] = []
+
+    def flush_pending_raw_records() -> None:
+        if raw_output_path is None or not pending_raw_records:
+            return
+        _write_jsonl_records(raw_output_path, pending_raw_records)
+        pending_raw_records.clear()
+
     total_count = 0
     correct_count = 0
     incorrect_count = 0
@@ -1242,7 +1259,9 @@ def main(argv: list[str] | None = None) -> int:
                     turn_count_samples += 1
                 _print_record_result(result_record)
                 if raw_output_path is not None:
-                    _write_jsonl_record(raw_output_path, raw_record)
+                    pending_raw_records.append(raw_record)
+                    if len(pending_raw_records) >= _SFT_JSONL_FLUSH_EVERY:
+                        flush_pending_raw_records()
 
                 total_count += 1
                 if is_correct:
@@ -1252,6 +1271,9 @@ def main(argv: list[str] | None = None) -> int:
                 advance_progress()
                 _print_generation_stats(generation_stats)
     finally:
+        # Publish the final partial batch as well, so a short run or shutdown
+        # does not leave completed trajectories only in memory.
+        flush_pending_raw_records()
         if progress is not None:
             progress.close()
 

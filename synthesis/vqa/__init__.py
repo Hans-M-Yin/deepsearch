@@ -29,7 +29,7 @@ from .schemas import (
 from .graph_view import GraphView
 from .path_sampler import PathSampler, RandomPathSampler, SamplerConfiguration, SamplerGenerationStats
 from .evidence_builder import EvidenceBuilder
-from .question_writer import QuestionWriter
+from .question_writer import QuestionWriter, TargetAskGenerationError
 from .verifier import SampleVerifier
 from .repository_verifier import (
     OfflineGraphRepositoryVerifier,
@@ -60,6 +60,7 @@ __all__ = [
     "SamplerGenerationStats",
     "EvidenceBuilder",
     "QuestionWriter",
+    "TargetAskGenerationError",
     "SampleVerifier",
     "RepositoryVerificationConfig",
     "RepositoryItem",

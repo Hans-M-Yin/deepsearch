@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import re
+import time
 import uuid
 import urllib.parse
 from dataclasses import dataclass, field
@@ -37,6 +38,13 @@ from . import tools
 import sys
 
 logger = logging.getLogger(__name__)
+
+# COS uploads are external network operations.  Keep the initial attempt plus
+# a bounded retry budget so a transient upload failure does not discard an
+# otherwise valid crop, while permanent uploader/configuration errors still
+# fall back to the local cache promptly.
+_COS_UPLOAD_RETRIES = 5
+_COS_UPLOAD_RETRY_DELAY_S = 5
 
 
 DEFAULT_SYSTEM_PROMPT = """
@@ -995,6 +1003,14 @@ def _encode_data_url(data: bytes, mime_type: str) -> str:
     return f"data:{mime_type};base64,{base64.b64encode(data).decode('utf-8')}"
 
 
+def _ensure_png_compatible_image(image: Image.Image) -> Image.Image:
+    """Convert PIL modes unsupported by PNG to RGB/RGBA before serialization."""
+    if image.mode in {"RGB", "RGBA", "L", "LA"}:
+        return image
+    has_alpha = "A" in image.getbands() or "transparency" in image.info
+    return image.convert("RGBA" if has_alpha else "RGB")
+
+
 def _normalize_image_data_url(data: bytes) -> str:
     """Validate arbitrary image bytes and serialize one API-supported PNG.
 
@@ -1009,8 +1025,7 @@ def _normalize_image_data_url(data: bytes) -> str:
         with Image.open(io.BytesIO(data)) as decoded:
             decoded.load()
             image = ImageOps.exif_transpose(decoded)
-            if image.mode not in {"RGB", "RGBA", "L", "LA"}:
-                image = image.convert("RGBA" if "transparency" in image.info else "RGB")
+            image = _ensure_png_compatible_image(image)
             output = io.BytesIO()
             image.save(output, format="PNG", optimize=True)
     except Exception as exc:
@@ -1040,7 +1055,7 @@ def _image_source_to_model_url(source: Any, context: ToolRuntimeContext) -> str:
         return _normalize_image_data_url(payload)
     if isinstance(payload, Image.Image):
         buffer = io.BytesIO()
-        payload.save(buffer, format="PNG")
+        _ensure_png_compatible_image(payload).save(buffer, format="PNG")
         return _normalize_image_data_url(buffer.getvalue())
     raise ValueError(f"Unsupported image source for model input: {type(payload)!r}")
 
@@ -1333,7 +1348,7 @@ def _persist_pil_image(
     image_id = context.next_image_id()
     filename = f"{context.filename_prefix}_{context.session_id}_{tool_name}_{image_id}.png"
     save_path = os.path.join(context.intermediate_dir, filename)
-    image.save(save_path)
+    _ensure_png_compatible_image(image).save(save_path, format="PNG")
     context.image_registry[image_id] = save_path
     return image_id, save_path
 
@@ -1348,7 +1363,7 @@ def _persist_pil_image_to_cache(
     cache_dir.mkdir(parents=True, exist_ok=True)
     filename = f"{context.filename_prefix}_{context.session_id}_{tool_name}_{image_id}.png"
     save_path = str(cache_dir / filename)
-    image.save(save_path)
+    _ensure_png_compatible_image(image).save(save_path, format="PNG")
     context.image_registry[image_id] = save_path
     return image_id, save_path
 
@@ -1358,23 +1373,45 @@ def _try_upload_pil_image(
     context: ToolRuntimeContext,
     tool_name: str,
 ) -> str | None:
+    image = _ensure_png_compatible_image(image)
     try:
         from opensearch_vl.opensearch_infer import cos_upload
     except Exception as exc:  # pragma: no cover - optional dependency
         logger.debug("COS uploader import failed: %s", exc)
         return None
 
-    try:
-        return cos_upload.upload_pil_image(
-            image,
-            context.filename_prefix,
-            0,
-            0,
+    for attempt in range(1, _COS_UPLOAD_RETRIES + 2):
+        try:
+            uploaded_url = cos_upload.upload_pil_image(
+                image,
+                context.filename_prefix,
+                0,
+                0,
+                tool_name,
+            )
+            if uploaded_url:
+                return uploaded_url
+            error = "uploader returned an empty URL"
+        except Exception as exc:  # pragma: no cover - optional dependency
+            error = str(exc)
+        if attempt >= _COS_UPLOAD_RETRIES + 1:
+            logger.warning(
+                "COS upload failed for %s after %d attempt(s): %s",
+                tool_name,
+                attempt,
+                error,
+            )
+            break
+        logger.warning(
+            "COS upload failed for %s (attempt %d/%d); retrying in %ds: %s",
             tool_name,
+            attempt,
+            _COS_UPLOAD_RETRIES + 1,
+            _COS_UPLOAD_RETRY_DELAY_S * attempt,
+            error,
         )
-    except Exception as exc:  # pragma: no cover - optional dependency
-        logger.warning("COS upload failed for %s: %s", tool_name, exc)
-        return None
+        time.sleep(_COS_UPLOAD_RETRY_DELAY_S * attempt)
+    return None
 
 
 def _materialize_remote_image_url(source: Any, context: ToolRuntimeContext, tool_name: str) -> tuple[str | None, str | None]:

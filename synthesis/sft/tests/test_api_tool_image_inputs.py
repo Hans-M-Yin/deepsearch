@@ -7,10 +7,16 @@ import io
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from PIL import Image
 
-from synthesis.sft.api_tools import ToolRuntimeContext, _image_source_to_model_url
+from synthesis.sft.api_tools import (
+    ToolRuntimeContext,
+    _image_source_to_model_url,
+    _persist_pil_image,
+    _try_upload_pil_image,
+)
 
 
 class ApiToolImageInputTests(unittest.TestCase):
@@ -35,6 +41,42 @@ class ApiToolImageInputTests(unittest.TestCase):
         context = ToolRuntimeContext(working_dir=tempfile.gettempdir())
         with self.assertRaisesRegex(ValueError, "not a decodable raster image"):
             _image_source_to_model_url(b"<html>blocked</html>", context)
+
+    def test_cos_upload_retries_transient_failure(self) -> None:
+        from opensearch_vl.opensearch_infer import cos_upload
+
+        image = Image.new("RGB", (4, 3), "red")
+        context = ToolRuntimeContext(working_dir=tempfile.gettempdir())
+        with (
+            mock.patch.object(
+                cos_upload,
+                "upload_pil_image",
+                side_effect=[RuntimeError("temporary failure"), "https://cdn.example/crop.png"],
+            ) as upload,
+            mock.patch("synthesis.sft.api_tools.time.sleep") as sleep,
+        ):
+            result = _try_upload_pil_image(image, context, "i2i_region_test")
+
+        self.assertEqual(result, "https://cdn.example/crop.png")
+        self.assertEqual(upload.call_count, 2)
+        sleep.assert_called_once_with(5)
+
+    def test_cmyk_images_are_converted_before_cos_upload_and_local_save(self) -> None:
+        from opensearch_vl.opensearch_infer import cos_upload
+
+        image = Image.new("CMYK", (4, 3), (0, 128, 128, 0))
+        with tempfile.TemporaryDirectory() as directory:
+            context = ToolRuntimeContext(working_dir=directory)
+            with mock.patch.object(cos_upload, "upload_pil_image", return_value="https://cdn.example/crop.png") as upload:
+                result = _try_upload_pil_image(image, context, "i2i_region_test")
+
+            self.assertEqual(result, "https://cdn.example/crop.png")
+            uploaded_image = upload.call_args.args[0]
+            self.assertEqual(uploaded_image.mode, "RGB")
+
+            _, saved_path = _persist_pil_image(image, context, "i2i_region_test")
+            with Image.open(saved_path) as saved_image:
+                self.assertEqual(saved_image.mode, "RGB")
 
 
 if __name__ == "__main__":

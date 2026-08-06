@@ -7,7 +7,14 @@ from pathlib import Path
 from typing import Any
 
 from synthesis.model_worker import ModelResponse
-from synthesis.sft.filter_sft_trajectories import _format_cli_report, filter_jsonl
+from synthesis.sft.filter_sft_trajectories import (
+    FilterConfig,
+    SftTrajectoryFilter,
+    _extract_json_object,
+    _extract_quality_scores_from_malformed_json,
+    _format_cli_report,
+    filter_jsonl,
+)
 
 
 class FakeJudge:
@@ -57,6 +64,94 @@ def _record(sample_id: str, *, max_turns: bool = False) -> dict[str, Any]:
 
 
 class FilterSftTrajectoriesTest(unittest.TestCase):
+    def test_json_parser_ignores_trailing_model_text(self) -> None:
+        self.assertEqual(
+            _extract_json_object('{"predict":"pass"}\n}'),
+            {"predict": "pass"},
+        )
+
+    def test_quality_parser_recovers_scores_from_malformed_reason_suffix(self) -> None:
+        raw = (
+            '{"logic_coherence": 9, "answer_exposure": 8.5, "tool_use": 9, '
+            '"overall_reason": "Good trajectory." repeated prose that is not JSON}'
+        )
+        self.assertEqual(
+            _extract_quality_scores_from_malformed_json(raw),
+            {"logic_coherence": 9.0, "answer_exposure": 8.5, "tool_use": 9.0},
+        )
+
+    def test_quality_judge_marks_recovered_scores_as_scored(self) -> None:
+        class MalformedQualityJudge:
+            def generate(self, request: Any) -> ModelResponse:
+                del request
+                return ModelResponse(
+                    content=(
+                        '{"logic_coherence": 9, "answer_exposure": 8, "tool_use": 9, '
+                        '"overall_reason": "Good." repeated prose}'
+                    )
+                )
+
+        result = SftTrajectoryFilter(
+            config=FilterConfig(quality_model_alias="quality", simple_model_alias="simple"),
+            model_client=MalformedQualityJudge(),
+        )._quality_judge(_record("sample_repaired"), "sample_repaired")
+        self.assertEqual(result["status"], "ok")
+        self.assertTrue(result["parser_repaired"])
+        self.assertEqual(result["average_score"], 8.6667)
+
+    def test_tool_use_filter_counts_hidden_read_url_failures(self) -> None:
+        record = _record("sample_tool_errors")
+        record["raw_messages"].extend(
+            [
+                {
+                    "role": "tool",
+                    "name": "read_url",
+                    "content": json.dumps(
+                        {
+                            "page_id": "page_a",
+                            "title": "",
+                            "goal": "inspect",
+                            "content": "Unable to read the requested page.",
+                        }
+                    ),
+                },
+                {
+                    "role": "tool",
+                    "name": "read_url",
+                    "content": json.dumps(
+                        {
+                            "page_id": "page_b",
+                            "title": "",
+                            "goal": "inspect",
+                            "content": "Unable to read the requested page.",
+                        }
+                    ),
+                },
+            ]
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            input_path = root / "raw.jsonl"
+            output_dir = root / "filtered"
+            input_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+            fake = RoutingFakeJudge()
+            report = filter_jsonl(
+                input_path,
+                output_dir,
+                quality_model_alias="quality",
+                simple_model_alias="simple",
+                model_client=fake,
+            )
+
+        self.assertEqual(report["decision_counts"], {"reject": 1})
+        self.assertEqual(report["filtered_ids"]["tool_use_error_ids"], ["sample_tool_errors"])
+        self.assertEqual(report["stage_statistics"]["tool_use_errors"], {
+            "input_count": 1,
+            "filtered_count": 1,
+            "survivor_count": 0,
+        })
+        self.assertEqual(fake.requests, [])
+
     def test_categories_disagreements_and_accepted_jsonl(self) -> None:
         wrong = _record("sample_wrong")
         records = [_record("sample_good"), _record("sample_max", max_turns=True), _record("sample_low"), wrong]
@@ -88,12 +183,14 @@ class FilterSftTrajectoriesTest(unittest.TestCase):
             self.assertEqual(report["correctness_disagreements"][0]["record_id"], "sample_wrong")
             self.assertEqual(report["stage_survivors"], {
                 "after_max_turn": 3,
+                "after_tool_use_errors": 3,
                 "after_answer_correctness": 2,
                 "after_quality_dimensions": 1,
                 "after_quality_average": 1,
             })
             self.assertEqual(report["stage_statistics"], {
                 "max_turn": {"input_count": 4, "filtered_count": 1, "survivor_count": 3},
+                "tool_use_errors": {"input_count": 3, "filtered_count": 0, "survivor_count": 3},
                 "answer_correctness": {"input_count": 3, "filtered_count": 1, "survivor_count": 2},
                 "quality_dimensions": {
                     "input_count": 2,
@@ -221,6 +318,7 @@ class FilterSftTrajectoriesTest(unittest.TestCase):
             "decision_counts": {"keep": 1, "reject": 3},
             "stage_statistics": {
                 "max_turn": {"input_count": 4, "filtered_count": 1, "survivor_count": 3},
+                "tool_use_errors": {"input_count": 3, "filtered_count": 0, "survivor_count": 3},
                 "answer_correctness": {"input_count": 3, "filtered_count": 1, "survivor_count": 2},
                 "quality_dimensions": {"input_count": 2, "filtered_count": 1, "survivor_count": 1},
                 "quality_average": {"input_count": 1, "filtered_count": 0, "survivor_count": 1},

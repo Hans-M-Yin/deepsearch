@@ -42,6 +42,24 @@ from .schemas import PathCandidate, QuestionDraft
 _VQA_FIXED_REQUEST_ID = "3200636808"
 
 
+class TargetAskGenerationError(RuntimeError):
+    """Raised when a target-specific question cannot be generated safely.
+
+    A target description/summary is not a question-answer pair.  Treating it
+    as one produces generic questions and truncated answers, so callers must
+    handle this as an unavailable sample instead of silently falling back.
+    """
+
+    def __init__(self, *, stage: str, reason: str, cause: Exception | None = None) -> None:
+        self.stage = str(stage or "target_ask")
+        self.reason = str(reason or "target_ask_unavailable")
+        self.cause = cause
+        message = f"{self.stage}: {self.reason}"
+        if cause is not None:
+            message += f" ({cause.__class__.__name__}: {cause})"
+        super().__init__(message)
+
+
 PROMPT_COMPRESS_HOP_GENERIC = """You are compressing one hop from a multimodal reasoning trajectory.
 
 You are given:
@@ -1692,16 +1710,10 @@ class QuestionWriter:
 
     def select_target_ask(self, *, context: WriterContext) -> dict[str, Any]:
         if self.model_client is None:
-            fallback = self._fallback_select_target(context.target_node)
-            if context.target_node.get("node_type") == "image":
-                fallback["image_target_candidates"] = []
-                fallback["image_target_candidate_evaluation"] = {
-                    "decision": "fallback",
-                    "selected_candidate_id": None,
-                    "evaluations": [],
-                    "reason": "no_model_client",
-                }
-            return fallback
+            raise TargetAskGenerationError(
+                stage="select_target_ask",
+                reason="no_model_client",
+            )
         target_node_type = str(context.target_node.get("node_type") or "")
         if target_node_type == "image":
             return self._select_image_target_ask(context=context)
@@ -1721,37 +1733,26 @@ class QuestionWriter:
                 max_tokens=max(self.max_tokens, 2400),
             )
         except Exception as exc:
-            fallback = self._fallback_select_target(context.target_node)
-            fallback["writer_warning"] = self._writer_warning_entry(
+            raise TargetAskGenerationError(
                 stage="select_target_ask_text_candidates",
-                error=exc,
+                reason="llm_generation_error",
+                cause=exc,
             )
-            return fallback
 
         candidates = self._normalize_text_target_candidates(parsed.get("candidates"))
         if not candidates:
-            fallback = self._fallback_select_target(context.target_node)
-            fallback["text_target_candidates"] = []
-            fallback["text_target_candidate_verification"] = {
-                "decision": "fallback",
-                "reason": "no_valid_generated_candidates",
-                "kept_candidate_ids": [],
-                "evaluations": [],
-            }
-            return fallback
+            raise TargetAskGenerationError(
+                stage="select_target_ask_text_candidates",
+                reason="no_valid_generated_candidates",
+            )
 
         verified_candidates, verification = self._verify_text_target_candidates(candidates=candidates)
         if not verified_candidates:
-            fallback = self._fallback_select_target(context.target_node)
-            fallback["text_target_candidates"] = candidates
-            fallback["text_target_candidate_verification"] = verification
-            fallback["text_target_candidate_evaluation"] = {
-                "decision": "fallback",
-                "selected_candidate_id": None,
-                "evaluations": [],
-                "reason": "all_candidates_closed_book_solvable",
-            }
-            return fallback
+            reason = str(verification.get("reason") or "all_candidates_rejected").strip()
+            raise TargetAskGenerationError(
+                stage="verify_text_target_candidates",
+                reason=reason,
+            )
 
         evaluation_payload = {
             "target_node": context.target_node,
@@ -1766,35 +1767,21 @@ class QuestionWriter:
                 max_tokens=max(self.max_tokens, 1800),
             )
         except Exception as exc:
-            fallback = self._fallback_select_target(context.target_node)
-            fallback["text_target_candidates"] = candidates
-            fallback["text_target_candidate_verification"] = verification
-            fallback["text_target_candidate_evaluation"] = {
-                "decision": "fallback",
-                "selected_candidate_id": None,
-                "evaluations": [],
-                "reason": "candidate_evaluation_error",
-            }
-            fallback["writer_warning"] = self._writer_warning_entry(
+            raise TargetAskGenerationError(
                 stage="evaluate_text_target_candidates",
-                error=exc,
+                reason="llm_generation_error",
+                cause=exc,
             )
-            return fallback
 
         selected_candidate = self._selected_target_candidate(
             candidates=verified_candidates,
             evaluation=evaluation,
         )
         if selected_candidate is None:
-            fallback = self._fallback_select_target(context.target_node)
-            fallback["text_target_candidates"] = candidates
-            fallback["text_target_candidate_verification"] = verification
-            fallback["text_target_candidate_evaluation"] = evaluation
-            fallback["writer_warning"] = self._writer_warning_entry(
+            raise TargetAskGenerationError(
                 stage="evaluate_text_target_candidates_selection",
-                error=ValueError("Text target evaluator did not select a valid generated candidate."),
+                reason="evaluator_rejected_all_candidates",
             )
-            return fallback
 
         result = dict(selected_candidate)
         result["text_target_candidates"] = candidates
@@ -1817,36 +1804,18 @@ class QuestionWriter:
                 max_tokens=max(self.max_tokens, 2400),
             )
         except Exception as exc:
-            fallback = self._fallback_select_target(context.target_node)
-            fallback["image_target_candidates"] = []
-            fallback["image_target_candidate_evaluation"] = {
-                "decision": "fallback",
-                "selected_candidate_id": None,
-                "evaluations": [],
-                "reason": "candidate_generation_error",
-            }
-            fallback["writer_warning"] = self._writer_warning_entry(
+            raise TargetAskGenerationError(
                 stage="select_target_ask_image_candidates",
-                error=exc,
+                reason="llm_generation_error",
+                cause=exc,
             )
-            return fallback
 
         candidates = self._normalize_image_target_candidates(generated.get("candidates"))
         if not candidates:
-            fallback = self._fallback_select_target(context.target_node)
-            fallback["image_target_candidates"] = []
-            fallback["image_target_candidate_evaluation"] = {
-                "decision": "fallback",
-                "selected_candidate_id": None,
-                "evaluations": [],
-                "reason": "no_valid_generated_candidates",
-                "raw_generation": generated,
-            }
-            fallback["writer_warning"] = self._writer_warning_entry(
+            raise TargetAskGenerationError(
                 stage="select_target_ask_image_candidates_parse",
-                error=ValueError("Image target candidate generation returned no usable candidates."),
+                reason="no_valid_generated_candidates",
             )
-            return fallback
 
         verified_candidates, visual_verification = self._verify_image_target_candidates(
             candidates=candidates,
@@ -1866,20 +1835,11 @@ class QuestionWriter:
                 max_tokens=max(self.max_tokens, 2400),
             )
         except Exception as exc:
-            fallback = self._fallback_select_target(context.target_node)
-            fallback["image_target_candidates"] = candidates
-            fallback["image_target_candidate_verification"] = visual_verification
-            fallback["image_target_candidate_evaluation"] = {
-                "decision": "fallback",
-                "selected_candidate_id": None,
-                "evaluations": [],
-                "reason": "candidate_evaluation_error",
-            }
-            fallback["writer_warning"] = self._writer_warning_entry(
+            raise TargetAskGenerationError(
                 stage="evaluate_image_target_candidates",
-                error=exc,
+                reason="llm_generation_error",
+                cause=exc,
             )
-            return fallback
 
         selected_candidate = self._selected_image_target_candidate(
             candidates=verified_candidates,
@@ -1887,15 +1847,10 @@ class QuestionWriter:
             verification=visual_verification,
         )
         if selected_candidate is None:
-            fallback = self._fallback_select_target(context.target_node)
-            fallback["image_target_candidates"] = candidates
-            fallback["image_target_candidate_verification"] = visual_verification
-            fallback["image_target_candidate_evaluation"] = evaluation
-            fallback["writer_warning"] = self._writer_warning_entry(
+            raise TargetAskGenerationError(
                 stage="evaluate_image_target_candidates_selection",
-                error=ValueError("Image target evaluator did not select a valid generated candidate."),
+                reason="evaluator_rejected_all_candidates",
             )
-            return fallback
 
         result = dict(selected_candidate)
         result["image_target_candidates"] = candidates
@@ -4353,13 +4308,10 @@ class QuestionWriter:
                     }
         description = target_node.get("description") or target_node.get("summary")
         if description:
-            return {
-                "ask_target": "What key detail is described for the final entity?",
-                "answer": self._shorten_text(description, limit=120) or "",
-                "supporting_facts": [str(description)],
-                "reasoning": "The answer is directly extracted from the description or summary.",
-                "support": "Fell back to description/summary.",
-            }
+            raise TargetAskGenerationError(
+                stage="fallback_select_target",
+                reason="description_only_fallback_disabled",
+            )
         return {
             "ask_target": "What is the identity of the final entity?",
             "answer": str(target_node.get("title") or "unknown"),

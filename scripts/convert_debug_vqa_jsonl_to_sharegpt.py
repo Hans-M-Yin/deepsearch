@@ -20,12 +20,15 @@ from __future__ import annotations
 
 import argparse
 import base64
+from collections import Counter
 import hashlib
 import json
 import re
 import shutil
 import sys
 import tempfile
+import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from io import BytesIO
 from pathlib import Path
@@ -60,6 +63,10 @@ _IMAGE_EXT_BY_MIME = {
     "image/bmp": ".bmp",
     "image/tiff": ".tiff",
 }
+_IMAGE_DOWNLOAD_TIMEOUT_S = 120
+_IMAGE_DOWNLOAD_RETRIES = 60
+_IMAGE_DOWNLOAD_RETRY_DELAY_S = 5
+_RETRYABLE_IMAGE_STATUS_CODES = {408, 425, 429, 500, 502, 503, 504}
 
 
 class ConversionError(ValueError):
@@ -105,6 +112,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--include-incorrect",
         action="store_true",
         help="Keep records whose answer_judge.is_correct is false (default: skip them).",
+    )
+    parser.add_argument(
+        "--offset",
+        type=int,
+        default=0,
+        help="Zero-based offset among non-empty JSONL records (default: 0).",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=0,
+        help="Maximum number of records to inspect; 0 means all records (default: 0).",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Number of trajectories to convert concurrently; image downloads are parallelized (default: 1).",
     )
     return parser
 
@@ -331,7 +356,7 @@ def _append_attachment_to_observation(
         raise ConversionError("user attachment after a tool observation contains no image")
     for source in sources:
         image_store.save(source, stem=stem)
-    observation["value"] = observation["value"].rstrip() + "\n读取图片如下：\n" + "\n".join(
+    observation["value"] = observation["value"].rstrip() + "\nThe image is shown below:\n" + "\n".join(
         "<image>" for _ in sources
     )
 
@@ -466,13 +491,44 @@ def _materialize_image(source: Any, *, base_dir: Path) -> dict[str, Any]:
         path = Path(unquote(urlparse(value).path))
         return {"bytes": path.read_bytes(), "mime_type": None, "hint": str(path)}
     if value.startswith(("http://", "https://")):
-        try:
-            response = requests.get(value, timeout=60)
-            response.raise_for_status()
-        except Exception as exc:  # pragma: no cover - network dependent
-            raise ConversionError(f"could not download image {value!r}: {exc}") from exc
-        mime_type = response.headers.get("Content-Type", "").split(";", 1)[0].strip().lower() or None
-        return {"bytes": response.content, "mime_type": mime_type, "hint": value}
+        response = None
+        last_error: Exception | None = None
+        max_attempts = _IMAGE_DOWNLOAD_RETRIES + 1
+        for attempt in range(1, max_attempts + 1):
+            response = None
+            try:
+                response = requests.get(value, timeout=_IMAGE_DOWNLOAD_TIMEOUT_S)
+                status_code = int(getattr(response, "status_code", 0) or 0)
+                if status_code in _RETRYABLE_IMAGE_STATUS_CODES and attempt < max_attempts:
+                    response.close()
+                    time.sleep(_IMAGE_DOWNLOAD_RETRY_DELAY_S * attempt)
+                    continue
+                response.raise_for_status()
+                mime_type = response.headers.get("Content-Type", "").split(";", 1)[0].strip().lower() or None
+                payload = response.content
+                response.close()
+                return {"bytes": payload, "mime_type": mime_type, "hint": value}
+            except (requests.Timeout, requests.ConnectionError) as exc:
+                last_error = exc
+            except requests.HTTPError as exc:
+                last_error = exc
+                status_code = int(getattr(getattr(exc, "response", None), "status_code", 0) or 0)
+                if status_code not in _RETRYABLE_IMAGE_STATUS_CODES:
+                    break
+            except Exception as exc:  # pragma: no cover - network dependent
+                last_error = exc
+                break
+            finally:
+                if response is not None and attempt < max_attempts:
+                    try:
+                        response.close()
+                    except Exception:
+                        pass
+            if attempt < max_attempts:
+                time.sleep(_IMAGE_DOWNLOAD_RETRY_DELAY_S * attempt)
+        raise ConversionError(
+            f"could not download image {value!r} after {max_attempts} attempt(s): {last_error}"
+        ) from last_error
     path = Path(value).expanduser()
     if not path.is_absolute():
         path = (base_dir / path).resolve()
@@ -548,11 +604,39 @@ def _write_json(path: Path, value: Any) -> None:
     path.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
-def convert_file(input_jsonl: str | Path, output_dir: str | Path, *, include_incorrect: bool = False) -> dict[str, int]:
+def _rejection_reason_type(reason: str) -> str:
+    """Map a conversion failure to a stable, summary-friendly category."""
+
+    text = str(reason or "")
+    lowered = text.lower()
+    if "answer_judge.is_correct is false" in lowered:
+        return "answer_judge_incorrect"
+    if "could not download image" in lowered:
+        if "oss-cn-" in lowered and any(token in lowered for token in ("timed out", "timeout", "connecttimeouterror", "readtimeouterror")):
+            return "oss_image_download_timeout"
+        return "image_download_failure"
+    return "conversion_error"
+
+
+def convert_file(
+    input_jsonl: str | Path,
+    output_dir: str | Path,
+    *,
+    include_incorrect: bool = False,
+    offset: int = 0,
+    limit: int = 0,
+    workers: int = 1,
+) -> dict[str, int]:
     """Convert a raw JSONL file and return counts for the CLI/tests."""
 
     input_path = Path(input_jsonl).expanduser().resolve()
     final_dir = Path(output_dir).expanduser().resolve()
+    if offset < 0:
+        raise ValueError("offset must be non-negative")
+    if limit < 0:
+        raise ValueError("limit must be non-negative")
+    if workers <= 0:
+        raise ValueError("workers must be a positive integer")
     if not input_path.is_file():
         raise FileNotFoundError(input_path)
     if final_dir.exists():
@@ -566,23 +650,64 @@ def convert_file(input_jsonl: str | Path, output_dir: str | Path, *, include_inc
         rows: list[dict[str, Any]] = []
         rejected: list[dict[str, Any]] = []
         skipped_incorrect = 0
+        records_to_convert: list[tuple[int, int, dict[str, Any]]] = []
         for row_index, (line_number, record) in enumerate(_load_jsonl(input_path)):
+            if row_index < offset:
+                continue
+            if limit and row_index >= offset + limit:
+                break
             if not include_incorrect and not bool((record.get("answer_judge") or {}).get("is_correct")):
                 skipped_incorrect += 1
-                rejected.append({"line": line_number, "sample_id": record.get("sample_id"), "reason": "answer_judge.is_correct is false"})
-                continue
-            try:
-                rows.append(
-                    _convert_record(
-                        record,
-                        row_index=row_index,
-                        output_dir=stage_dir,
-                        source_base_dir=input_path.parent,
-                    )
+                reason = "answer_judge.is_correct is false"
+                rejected.append(
+                    {
+                        "line": line_number,
+                        "sample_id": record.get("sample_id"),
+                        "reason_type": _rejection_reason_type(reason),
+                        "reason": reason,
+                    }
                 )
-            except Exception as exc:  # noqa: BLE001 - isolate bad records
-                rejected.append({"line": line_number, "sample_id": record.get("sample_id"), "reason": str(exc)})
+                continue
+            records_to_convert.append((row_index, line_number, record))
 
+        def _convert_one(item: tuple[int, int, dict[str, Any]]) -> tuple[int, dict[str, Any] | None, dict[str, Any] | None]:
+            row_index, line_number, record = item
+            try:
+                row = _convert_record(
+                    record,
+                    row_index=row_index,
+                    output_dir=stage_dir,
+                    source_base_dir=input_path.parent,
+                )
+                return row_index, row, None
+            except Exception as exc:  # noqa: BLE001 - isolate bad records
+                reason = str(exc)
+                return row_index, None, {
+                    "line": line_number,
+                    "sample_id": record.get("sample_id"),
+                    "reason_type": _rejection_reason_type(reason),
+                    "reason": reason,
+                }
+
+        # ``executor.map`` preserves input order.  This keeps the generated
+        # ShareGPT rows deterministic while allowing independent image
+        # downloads/materialization for different trajectories to overlap.
+        if workers == 1:
+            converted = map(_convert_one, records_to_convert)
+            for _row_index, row, error in converted:
+                if row is not None:
+                    rows.append(row)
+                if error is not None:
+                    rejected.append(error)
+        else:
+            with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="sharegpt-convert") as executor:
+                for _row_index, row, error in executor.map(_convert_one, records_to_convert):
+                    if row is not None:
+                        rows.append(row)
+                    if error is not None:
+                        rejected.append(error)
+
+        rejection_reason_counts = Counter(str(item.get("reason_type") or "unknown") for item in rejected)
         _write_json(stage_dir / "trajectories_sharegpt.json", rows)
         _write_json(stage_dir / "dataset_info.json", _dataset_info())
         _write_json(
@@ -593,6 +718,11 @@ def convert_file(input_jsonl: str | Path, output_dir: str | Path, *, include_inc
                 "written_records": len(rows),
                 "rejected_records": len(rejected),
                 "skipped_incorrect": skipped_incorrect,
+                "rejection_reason_counts": dict(sorted(rejection_reason_counts.items())),
+                "oss_image_download_timeout_rejected": rejection_reason_counts.get("oss_image_download_timeout", 0),
+                "offset": offset,
+                "limit": limit,
+                "workers": workers,
                 "image_count": sum(len(row.get("images") or []) for row in rows),
             },
         )
@@ -600,7 +730,12 @@ def convert_file(input_jsonl: str | Path, output_dir: str | Path, *, include_inc
             for item in rejected:
                 handle.write(json.dumps(item, ensure_ascii=False) + "\n")
         stage_dir.rename(final_dir)
-        return {"written_records": len(rows), "rejected_records": len(rejected), "skipped_incorrect": skipped_incorrect}
+        return {
+            "written_records": len(rows),
+            "rejected_records": len(rejected),
+            "skipped_incorrect": skipped_incorrect,
+            "oss_image_download_timeout_rejected": rejection_reason_counts.get("oss_image_download_timeout", 0),
+        }
     except Exception:
         shutil.rmtree(stage_dir, ignore_errors=True)
         raise
@@ -609,7 +744,14 @@ def convert_file(input_jsonl: str | Path, output_dir: str | Path, *, include_inc
 def main(argv: list[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
     try:
-        counts = convert_file(args.input_jsonl, args.output_dir, include_incorrect=args.include_incorrect)
+        counts = convert_file(
+            args.input_jsonl,
+            args.output_dir,
+            include_incorrect=args.include_incorrect,
+            offset=args.offset,
+            limit=args.limit,
+            workers=args.workers,
+        )
     except Exception as exc:  # noqa: BLE001
         raise SystemExit(str(exc)) from exc
     print(json.dumps(counts, ensure_ascii=False, sort_keys=True))

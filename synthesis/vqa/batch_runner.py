@@ -30,7 +30,7 @@ _MAX_EDGE_OVERLAP_RATIO = 0.75
 _MAX_NODE_OVERLAP_RATIO = 0.80
 _MIN_STALLED_PROPOSALS_PER_VERSION = 8
 _STALLED_PROPOSALS_MULTIPLIER = 4
-_JSONL_PUBLISH_BATCH_SIZE = 50
+_JSONL_PUBLISH_BATCH_SIZE = 100
 _FSYNC_WARNING_PATHS: set[str] = set()
 
 logger = logging.getLogger(__name__)
@@ -241,6 +241,8 @@ class VqaBatchRunner:
         with (
             _JsonlBatchWriter(self.samples_path) as samples_file,
             _JsonlBatchWriter(self.questions_path) as questions_file,
+            _JsonlBatchWriter(self.errors_path) as errors_file,
+            _JsonlBatchWriter(self.warnings_path) as warnings_file,
             ThreadPoolExecutor(max_workers=sampler_workers) as sampler_executor,
             ThreadPoolExecutor(max_workers=self.workers) as writer_executor,
         ):
@@ -251,9 +253,20 @@ class VqaBatchRunner:
             cached_snapshot_version: int | None = None
             cached_snapshot: dict[str, Any] | None = None
 
+            def generation_goal_reached() -> bool:
+                """Whether completed samples plus active writers fill the target.
+
+                Path proposals are submitted before question generation.  A
+                writer can now reject a path when target-question generation
+                is unavailable, so proposal count must not consume the output
+                quota permanently.
+                """
+
+                return summary.completed + len(writer_futures) >= remaining
+
             def current_version_is_stalled() -> bool:
                 current_version = acceptor_state.version
-                if summary.sampled_paths >= remaining:
+                if generation_goal_reached():
                     return True
                 if any(context.state_version == current_version for context in proposal_futures.values()):
                     return False
@@ -275,7 +288,7 @@ class VqaBatchRunner:
                     return
                 room = max(0, inflight_limit - len(writer_futures))
                 target = min(sampler_workers, room)
-                while len(proposal_futures) < target and summary.sampled_paths < remaining:
+                while len(proposal_futures) < target and not generation_goal_reached():
                     proposal_sequence += 1
                     context = _ProposalContext(
                         proposal_id=proposal_sequence,
@@ -301,10 +314,10 @@ class VqaBatchRunner:
                             future=future,
                             path=path,
                             summary=summary,
-                            samples_file=self.samples_path,
-                            questions_file=self.questions_path,
-                            errors_file=self.errors_path,
-                            warnings_file=self.warnings_path,
+                            samples_file=samples_file,
+                            questions_file=questions_file,
+                            errors_file=errors_file,
+                            warnings_file=warnings_file,
                             persisted_signatures=persisted_signatures,
                             persisted_edge_usage_counts=persisted_edge_usage_counts,
                             progress=progress,
@@ -324,7 +337,7 @@ class VqaBatchRunner:
                         self._record_sampler_failure(
                             exc=exc,
                             context=context,
-                            errors_file=self.errors_path,
+                            errors_file=errors_file,
                         )
                         continue
 
@@ -336,7 +349,7 @@ class VqaBatchRunner:
                         continue
 
                     summary.proposed_paths += 1
-                    if summary.sampled_paths >= remaining:
+                    if generation_goal_reached():
                         continue
 
                     accepted, _reject_reason = self._accept_path_candidate(

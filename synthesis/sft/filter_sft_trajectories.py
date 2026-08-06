@@ -6,11 +6,12 @@ serial pipeline; a later judge only receives records that passed the previous
 stage:
 
 1. Remove trajectories truncated by the ReAct/tool-calling max-turn limit.
-2. Re-judge final-answer correctness with ``--simple-model-alias`` and compare
+2. Remove trajectories with at least two failed tool calls.
+3. Re-judge final-answer correctness with ``--simple-model-alias`` and compare
    it with the stored ``answer_judge.is_correct`` value.
-3. Score logic coherence, answer non-exposure, and tool-use quality with
+4. Score logic coherence, answer non-exposure, and tool-use quality with
    ``--quality-model-alias``.  Remove records with any dimension below 6.5.
-4. On the dimension-pass subset only, remove records whose average score is
+5. On the dimension-pass subset only, remove records whose average score is
    below 7.
 
 The output directory contains ``accepted_trajectories.jsonl`` for the next
@@ -53,6 +54,7 @@ _MAX_TURN_STATUS = {
 _CATEGORY_NAMES = (
     "wrong_answer_ids",
     "max_turn_reached_ids",
+    "tool_use_error_ids",
     "tool_call_low_score_ids",
     "answer_exposure_low_score_ids",
     "logic_coherence_low_score_ids",
@@ -60,6 +62,8 @@ _CATEGORY_NAMES = (
 )
 _QUALITY_DIMENSION_PASSING_SCORE = 6.5
 _QUALITY_AVERAGE_PASSING_SCORE = 7.0
+_TOOL_ERROR_FILTER_THRESHOLD = 2
+_PUBLIC_READ_URL_FAILURE = "Unable to read the requested page."
 
 
 PROMPT_SIMPLE_CORRECTNESS = """
@@ -86,7 +90,8 @@ Basic rules:
 1. t2t_search returns compact text-result metadata, not full page contents. t2i_search and i2i_search return candidate metadata; their images are not visible until read_url(image_id) succeeds. read_url(source_page_id) provides webpage evidence; read_url(image_id) provides an image. If a tool result has ok=false, it cannot count as successful evidence.
 2. It is allowed for the response to directly use the search snippet as evidence, even without reading the full webpage in detail.
 3. Tool-call errors may appear in the response; successfully handling errors and promptly changing reasoning direction is worth extra credit.
-4. Return strictly JSON only:
+4. Keep each reason to one short sentence (at most 30 words). Do not repeat any sentence or append commentary after the JSON object.
+5. Return strictly JSON only:
 {
 "logic_coherence": 1~10,
 "answer_exposure": 1~10,
@@ -124,18 +129,53 @@ def _extract_json_object(text: str) -> dict[str, Any] | None:
     fenced = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", candidate, flags=re.IGNORECASE | re.DOTALL)
     if fenced:
         candidate = fenced.group(1).strip()
-    try:
-        value = json.loads(candidate)
-        return value if isinstance(value, dict) else None
-    except json.JSONDecodeError:
-        start, end = candidate.find("{"), candidate.rfind("}")
-        if start < 0 or end <= start:
+    candidates = [candidate]
+    if fenced:
+        candidates.insert(0, fenced.group(1).strip())
+    decoder = json.JSONDecoder()
+    for source in candidates:
+        try:
+            value = json.loads(source)
+            if isinstance(value, dict):
+                return value
+        except json.JSONDecodeError:
+            pass
+        # Models occasionally append a second closing brace or a short prose
+        # suffix after an otherwise valid JSON object.  Decode the first object
+        # and intentionally ignore only the trailing material.
+        start = source.find("{")
+        if start < 0:
+            continue
+        try:
+            value, _end = decoder.raw_decode(source[start:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict):
+            return value
+    return None
+
+
+def _extract_quality_scores_from_malformed_json(text: str) -> dict[str, float] | None:
+    """Recover the three numeric quality fields from a malformed judge reply.
+
+    This is deliberately narrower than a general JSON repair: reasons are
+    audit-only, while accepting a score is safe only when all three required
+    numeric fields can still pass the normal 1..10 validation below.
+    """
+
+    scores: dict[str, float] = {}
+    for name in ("logic_coherence", "answer_exposure", "tool_use"):
+        match = re.search(
+            rf'"{re.escape(name)}"\s*:\s*(-?(?:\d+(?:\.\d*)?|\.\d+))',
+            str(text or ""),
+        )
+        if match is None:
             return None
         try:
-            value = json.loads(candidate[start : end + 1])
-        except json.JSONDecodeError:
+            scores[name] = _coerce_score(match.group(1), name)
+        except ValueError:
             return None
-        return value if isinstance(value, dict) else None
+    return scores
 
 
 def _truncate(text: str, limit: int) -> str:
@@ -253,6 +293,93 @@ def _max_turn_reason(record: dict[str, Any]) -> str | None:
     return None
 
 
+def _nonnegative_counter(value: Any) -> Counter[str]:
+    counts: Counter[str] = Counter()
+    if not isinstance(value, dict):
+        return counts
+    for key, raw_count in value.items():
+        try:
+            count = int(raw_count)
+        except (TypeError, ValueError):
+            continue
+        if count > 0:
+            counts[str(key)] += count
+    return counts
+
+
+def _tool_error_reason(tool_name: str, error_text: str) -> str:
+    lowered = str(error_text or "").lower()
+    if _PUBLIC_READ_URL_FAILURE.lower() in lowered:
+        return f"{tool_name}:unable_to_read"
+    if "timeout" in lowered or "timed out" in lowered:
+        return f"{tool_name}:timeout"
+    if "connect" in lowered or "connection" in lowered:
+        return f"{tool_name}:connect_error"
+    if "429" in lowered or "rate limit" in lowered or "too many requests" in lowered:
+        return f"{tool_name}:http_429"
+    if "upload" in lowered:
+        return f"{tool_name}:upload_failed"
+    return f"{tool_name}:tool_error"
+
+
+def _raw_tool_error_details(record: dict[str, Any]) -> tuple[Counter[str], Counter[str]]:
+    """Recover tool failures from raw tool messages when summary data is incomplete.
+
+    ``read_url`` deliberately hides backend diagnostics from the model.  Its
+    failed public observation is therefore the stable generic content marker
+    ``Unable to read the requested page.`` rather than the original timeout or
+    connection exception.
+    """
+
+    counts: Counter[str] = Counter()
+    reasons: Counter[str] = Counter()
+    for message in record.get("raw_messages") or []:
+        if not isinstance(message, dict) or str(message.get("role") or "").lower() != "tool":
+            continue
+        tool_name = str(message.get("name") or "unknown_tool").strip() or "unknown_tool"
+        content = message.get("content")
+        parsed = content if isinstance(content, dict) else _extract_json_object(str(content or ""))
+        error_text = ""
+        is_error = False
+        if isinstance(parsed, dict):
+            if parsed.get("ok") is False:
+                is_error = True
+                error_text = str(parsed.get("error") or parsed.get("message") or "tool returned ok=false")
+            elif parsed.get("error") not in (None, "", False):
+                is_error = True
+                error_text = str(parsed.get("error"))
+            elif str(parsed.get("content") or "").strip() == _PUBLIC_READ_URL_FAILURE:
+                is_error = True
+                error_text = _PUBLIC_READ_URL_FAILURE
+        elif str(content or "").strip() == _PUBLIC_READ_URL_FAILURE:
+            is_error = True
+            error_text = _PUBLIC_READ_URL_FAILURE
+
+        if is_error:
+            counts[tool_name] += 1
+            reasons[_tool_error_reason(tool_name, error_text)] += 1
+    return counts, reasons
+
+
+def _tool_error_details(record: dict[str, Any]) -> dict[str, Any]:
+    """Return de-duplicated tool-error counts from summary and raw messages."""
+
+    summary = record.get("generation_summary") or {}
+    summary_counts = _nonnegative_counter(summary.get("tool_error_counts")) if isinstance(summary, dict) else Counter()
+    raw_counts, raw_reasons = _raw_tool_error_details(record)
+
+    # The summary and raw messages describe the same tool calls.  Take the
+    # larger count per tool instead of adding them and double-counting errors.
+    counts = Counter({name: max(summary_counts.get(name, 0), raw_counts.get(name, 0)) for name in set(summary_counts) | set(raw_counts)})
+    summary_reasons = _nonnegative_counter(summary.get("tool_error_reasons")) if isinstance(summary, dict) else Counter()
+    reasons = Counter({name: max(summary_reasons.get(name, 0), raw_reasons.get(name, 0)) for name in set(summary_reasons) | set(raw_reasons)})
+    return {
+        "tool_error_count": sum(counts.values()),
+        "tool_error_counts": dict(sorted(counts.items())),
+        "tool_error_reasons": dict(sorted(reasons.items())),
+    }
+
+
 def _coerce_score(value: Any, name: str) -> float:
     if isinstance(value, bool):
         raise ValueError(f"quality judge field {name!r} must be numeric")
@@ -366,6 +493,15 @@ class SftTrajectoryFilter:
             max_tokens=self.config.quality_max_tokens,
             trace_label=f"sft_filter_quality:{record_id}",
         )
+        parser_repaired = False
+        if parsed is None and raw:
+            repaired_scores = _extract_quality_scores_from_malformed_json(raw)
+            if repaired_scores is not None:
+                # Preserve the original output for auditability while allowing
+                # a malformed prose suffix to not discard an otherwise valid
+                # three-dimensional score.
+                parsed = repaired_scores
+                parser_repaired = True
         if parsed is None:
             return {"status": "error", "error": error, "raw_model_output": raw}
         try:
@@ -389,6 +525,7 @@ class SftTrajectoryFilter:
             "status": "ok",
             "raw_model_output": raw,
             "model_alias": self.config.quality_model_alias,
+            "parser_repaired": parser_repaired,
         }
 
     def evaluate_record(self, record: dict[str, Any], *, source_index: int, source_line: int) -> dict[str, Any]:
@@ -411,6 +548,14 @@ class SftTrajectoryFilter:
             result["filter_stage"] = "max_turn"
             result["filter_reasons"] = ["max_turn_reached"]
             result["max_turn_reason"] = max_turn_reason
+            return result
+
+        tool_errors = _tool_error_details(record)
+        result.update(tool_errors)
+        if tool_errors["tool_error_count"] >= _TOOL_ERROR_FILTER_THRESHOLD:
+            result["decision"] = "reject"
+            result["filter_stage"] = "tool_use_errors"
+            result["filter_reasons"] = ["multiple_tool_errors"]
             return result
 
         stored = _stored_correctness(record)
@@ -487,7 +632,8 @@ def _write_jsonl(handle: Any, value: Any) -> None:
 def _mean_quality_scores(results: list[dict[str, Any]]) -> dict[str, Any]:
     """Summarize quality scores after the correctness stage.
 
-    Max-turn and answer-correctness rejects never receive a quality request.
+    Max-turn, tool-use-error, and answer-correctness rejects never receive a
+    quality request.
     Therefore the denominator is the number of post-correctness records for
     which the quality judge returned valid numeric scores.  Judge errors are
     reported explicitly instead of being silently treated as zero scores.
@@ -496,7 +642,7 @@ def _mean_quality_scores(results: list[dict[str, Any]]) -> dict[str, Any]:
     post_correctness = [
         result
         for result in results
-        if result.get("filter_stage") not in {"max_turn", "answer_correctness"}
+        if result.get("filter_stage") not in {"max_turn", "tool_use_errors", "answer_correctness"}
     ]
     scored = [
         result.get("quality_scores")
@@ -525,10 +671,15 @@ def _stage_statistics(results: list[dict[str, Any]]) -> dict[str, dict[str, int]
 
     total = len(results)
     after_max = sum(1 for result in results if result.get("filter_stage") != "max_turn")
+    after_tool_errors = sum(
+        1
+        for result in results
+        if result.get("filter_stage") not in {"max_turn", "tool_use_errors"}
+    )
     after_correctness = sum(
         1
         for result in results
-        if result.get("filter_stage") not in {"max_turn", "answer_correctness"}
+        if result.get("filter_stage") not in {"max_turn", "tool_use_errors", "answer_correctness"}
     )
     quality_scored = sum(
         1
@@ -547,9 +698,14 @@ def _stage_statistics(results: list[dict[str, Any]]) -> dict[str, dict[str, int]
             "filtered_count": total - after_max,
             "survivor_count": after_max,
         },
-        "answer_correctness": {
+        "tool_use_errors": {
             "input_count": after_max,
-            "filtered_count": after_max - after_correctness,
+            "filtered_count": after_max - after_tool_errors,
+            "survivor_count": after_tool_errors,
+        },
+        "answer_correctness": {
+            "input_count": after_tool_errors,
+            "filtered_count": after_tool_errors - after_correctness,
             "survivor_count": after_correctness,
         },
         "quality_dimensions": {
@@ -603,6 +759,7 @@ def _category_report(results: list[dict[str, Any]]) -> dict[str, Any]:
             mapping = {
                 "wrong_answer": "wrong_answer_ids",
                 "max_turn_reached": "max_turn_reached_ids",
+                "multiple_tool_errors": "tool_use_error_ids",
                 "tool_call_low_score": "tool_call_low_score_ids",
                 "answer_exposure_low_score": "answer_exposure_low_score_ids",
                 "logic_coherence_low_score": "logic_coherence_low_score_ids",
@@ -620,6 +777,9 @@ def _category_report(results: list[dict[str, Any]]) -> dict[str, Any]:
                         "source_position": result["source_position"],
                         "source_line": result["source_line"],
                         "quality_scores": result.get("quality_scores"),
+                        "tool_error_count": result.get("tool_error_count"),
+                        "tool_error_counts": result.get("tool_error_counts"),
+                        "tool_error_reasons": result.get("tool_error_reasons"),
                     }
                 )
             elif reason == "correctness_uncertain":
@@ -630,24 +790,36 @@ def _category_report(results: list[dict[str, Any]]) -> dict[str, Any]:
                 extra["quality_judge_error_ids"].append(record_id)
     stage_counts = Counter(str(result.get("filter_stage") or "accepted") for result in results)
     after_max_turn = sum(1 for result in results if result.get("filter_stage") != "max_turn")
+    after_tool_errors = sum(
+        1
+        for result in results
+        if result.get("filter_stage") not in {"max_turn", "tool_use_errors"}
+    )
     after_correctness = sum(
         1
         for result in results
-        if result.get("filter_stage") not in {"max_turn", "answer_correctness"}
+        if result.get("filter_stage") not in {"max_turn", "tool_use_errors", "answer_correctness"}
     )
     after_dimensions = sum(
         1
         for result in results
-        if result.get("filter_stage") not in {"max_turn", "answer_correctness", "quality_judge", "quality_dimensions"}
+        if result.get("filter_stage") not in {
+            "max_turn",
+            "tool_use_errors",
+            "answer_correctness",
+            "quality_judge",
+            "quality_dimensions",
+        }
     )
     stage_statistics = _stage_statistics(results)
     quality_score_averages = _mean_quality_scores(results)
     return {
-        "pipeline_order": ["max_turn", "answer_correctness", "quality_dimensions", "quality_average"],
+        "pipeline_order": ["max_turn", "tool_use_errors", "answer_correctness", "quality_dimensions", "quality_average"],
         "categories_are_nonexclusive": True,
         "stage_counts": dict(sorted(stage_counts.items())),
         "stage_survivors": {
             "after_max_turn": after_max_turn,
+            "after_tool_use_errors": after_tool_errors,
             "after_answer_correctness": after_correctness,
             "after_quality_dimensions": after_dimensions,
             "after_quality_average": stage_counts.get("accepted", 0),
@@ -673,6 +845,7 @@ def _format_cli_report(report: dict[str, Any]) -> str:
 
     stage_labels = {
         "max_turn": "Max-turn",
+        "tool_use_errors": "Tool-use errors",
         "answer_correctness": "Answer correctness",
         "quality_dimensions": "Quality dimensions",
         "quality_average": "Quality average",
@@ -708,7 +881,7 @@ def _format_cli_report(report: dict[str, Any]) -> str:
             "",
             "Mean quality scores after answer-correctness filtering",
             "-" * 72,
-            f"Candidates after correctness: {quality_summary.get('candidate_count_after_answer_correctness', 0)}",
+            f"Candidates after tool-use + correctness: {quality_summary.get('candidate_count_after_answer_correctness', 0)}",
             f"Successfully scored        : {quality_summary.get('scored_count', 0)}",
             f"Quality-judge errors       : {quality_summary.get('quality_judge_error_count', 0)}",
             f"Logic coherence mean       : {_score_text('logic_coherence')}",
@@ -847,6 +1020,7 @@ def filter_jsonl(
             "output_dir": str(final_dir),
             "quality_model_alias": quality_model_alias,
             "simple_model_alias": simple_model_alias,
+            "tool_error_filter_threshold": _TOOL_ERROR_FILTER_THRESHOLD,
             "offset": offset,
             "limit": limit,
             "workers": workers,

@@ -8,6 +8,7 @@ import tempfile
 import unittest
 from io import BytesIO
 from pathlib import Path
+from unittest import mock
 
 from PIL import Image
 
@@ -28,6 +29,35 @@ def _data_url(color: tuple[int, int, int]) -> str:
 
 
 class ConvertDebugVqaSharegptTest(unittest.TestCase):
+    def test_remote_image_download_retries_timeout(self) -> None:
+        class FakeResponse:
+            status_code = 200
+            headers = {"Content-Type": "image/png"}
+            content = base64.b64decode(_data_url((1, 2, 3)).split(",", 1)[1])
+
+            def raise_for_status(self) -> None:
+                return None
+
+            def close(self) -> None:
+                return None
+
+        with (
+            mock.patch.object(
+                CONVERTER.requests,
+                "get",
+                side_effect=[CONVERTER.requests.Timeout("timed out"), FakeResponse()],
+            ) as get,
+            mock.patch.object(CONVERTER.time, "sleep") as sleep,
+        ):
+            materialized = CONVERTER._materialize_image(
+                "https://images.example/item.png",
+                base_dir=Path("."),
+            )
+
+        self.assertEqual(get.call_count, 2)
+        sleep.assert_called_once_with(5)
+        self.assertEqual(materialized["mime_type"], "image/png")
+
     def test_rebuilds_question_normalizes_react_and_materializes_images(self) -> None:
         input_image = _data_url((10, 20, 30))
         read_url_image = _data_url((40, 50, 60))
@@ -89,7 +119,7 @@ class ConvertDebugVqaSharegptTest(unittest.TestCase):
             self.assertIn('"name": "read_url"', assistant_values[0])
             self.assertIn("<answer>\na blue square\n</answer>", assistant_values[-1])
             observations = [item["value"] for item in row["conversations"] if item["from"] == "observation"]
-            self.assertEqual(observations[0], '{\n  "image_id": "img_1"\n}\n读取图片如下：\n<image>')
+            self.assertEqual(observations[0], '{\n  "image_id": "img_1"\n}\nThe image is shown below:\n<image>')
             self.assertNotIn("<tool_response>", observations[0])
             self.assertEqual(row["conversations"][0]["value"].count("<image>") + 1, len(row["images"]))
             self.assertEqual(len(row["images"]), 2)
