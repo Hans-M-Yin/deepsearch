@@ -305,7 +305,7 @@ class GraphRunner:
         return processed_count, last_error
 
     def _text_node_count(self) -> int:
-        return sum(1 for node in self.store.list_nodes() if node.get("node_type") == "text")
+        return self.store.count_nodes("text")
 
     def _queue_breakdown(self) -> dict[str, int]:
         text_neighbor_queue = 0
@@ -688,14 +688,9 @@ class GraphRunner:
     def _emit_created_node_events(self, result: NodeExpansionResult) -> None:
         stats = self.store.stats()
         queue_breakdown = self._queue_breakdown()
-        text_count = 0
-        image_count = 0
-        for node in self.store.list_nodes():
-            node_type = node.get("node_type")
-            if node_type == "text":
-                text_count += 1
-            elif node_type == "image":
-                image_count += 1
+        node_type_counts = self.store.node_type_counts()
+        text_count = node_type_counts.get("text", 0)
+        image_count = node_type_counts.get("image", 0)
 
         created_nodes: list[dict[str, Any]] = []
         if result.text_result is not None:
@@ -738,26 +733,18 @@ class GraphRunner:
 
     def _emit_node_status(self, result: NodeExpansionResult) -> None:
         stats = self.store.stats()
-        nodes = self.store.list_nodes()
-        text_count = 0
-        image_count = 0
-        latest_title: str | None = None
-        latest_created_at: str = ""
+        node_type_counts = self.store.node_type_counts()
+        text_count = node_type_counts.get("text", 0)
+        image_count = node_type_counts.get("image", 0)
+        latest_node = self.store.latest_node()
+        latest_title = None
+        if latest_node is not None:
+            latest_title = latest_node.get("title") or latest_node.get("node_id")
         queue_breakdown = self._queue_breakdown()
         text_queue_size = queue_breakdown["text_queue"]
         image_queue_size = queue_breakdown["image_queue"]
         text_neighbor_queue = queue_breakdown["text_neighbor_queue"]
         image_entity_queue = queue_breakdown["image_entity_queue"]
-        for node in nodes:
-            node_type = node.get("node_type")
-            if node_type == "text":
-                text_count += 1
-            elif node_type == "image":
-                image_count += 1
-            created_at = str(node.get("created_at") or "")
-            if created_at >= latest_created_at:
-                latest_created_at = created_at
-                latest_title = node.get("title") or node.get("node_id")
         task_title = result.task.title or result.task.url
         print(
             "[node-status] "

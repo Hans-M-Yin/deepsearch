@@ -1,4 +1,4 @@
-"""Debug and inspect SFT trajectories over one question or a VQA batch directory."""
+"""Debug and inspect SFT trajectories over one question, VQA batch, or filtered list."""
 
 from __future__ import annotations
 
@@ -145,6 +145,114 @@ def _load_vqa_records(vqa_dir: Path) -> list[dict[str, Any]]:
             }
         )
     return merged_records
+
+
+def _filtered_input_images(record: dict[str, Any]) -> tuple[list[str], list[str]]:
+    """Extract the original input image paths/URLs from a filtered trajectory."""
+
+    image_paths: list[str] = []
+    image_urls: list[str] = []
+    seen_paths: set[str] = set()
+    seen_urls: set[str] = set()
+
+    def add_path(value: Any) -> None:
+        normalized = str(value or "").strip()
+        if normalized and normalized not in seen_paths:
+            seen_paths.add(normalized)
+            image_paths.append(normalized)
+
+    def add_url(value: Any) -> None:
+        normalized = str(value or "").strip()
+        if normalized and normalized not in seen_urls:
+            seen_urls.add(normalized)
+            image_urls.append(normalized)
+
+    for item in record.get("input_images") or []:
+        if isinstance(item, dict):
+            add_path(item.get("image_path") or item.get("local_path"))
+            add_url(item.get("image_url") or item.get("source_url"))
+        elif isinstance(item, str):
+            value = item.strip()
+            if value.startswith(("http://", "https://")):
+                add_url(value)
+            else:
+                add_path(value)
+
+    source_metadata = record.get("source_metadata") or {}
+    question_record = source_metadata.get("question_record") if isinstance(source_metadata, dict) else {}
+    sample_record = source_metadata.get("sample_record") if isinstance(source_metadata, dict) else {}
+    if not isinstance(question_record, dict):
+        question_record = {}
+    if not isinstance(sample_record, dict):
+        sample_record = {}
+    sample_metadata = sample_record.get("metadata") if isinstance(sample_record.get("metadata"), dict) else {}
+    if not image_urls:
+        for candidate in (
+            record.get("input_image_url"),
+            question_record.get("input_image_url"),
+            question_record.get("image_url"),
+            sample_record.get("input_image_url"),
+            sample_metadata.get("input_image_url"),
+        ):
+            add_url(candidate)
+    return image_paths, image_urls
+
+
+def _load_filtered_trajectory_records(path: Path) -> list[dict[str, Any]]:
+    """Load complete records emitted by filter_sft_trajectories.py.
+
+    The filtered JSONL already contains the question, answer, hop chain and
+    original input images, so no questions.jsonl/samples.jsonl join is needed.
+    """
+
+    if not path.exists():
+        raise FileNotFoundError(f"filtered trajectory JSONL does not exist: {path}")
+    records: list[dict[str, Any]] = []
+    for source_index, source in enumerate(_load_jsonl(path)):
+        source_metadata = source.get("source_metadata") or {}
+        question_record = source_metadata.get("question_record") if isinstance(source_metadata, dict) else {}
+        sample_record = source_metadata.get("sample_record") if isinstance(source_metadata, dict) else {}
+        if not isinstance(question_record, dict):
+            question_record = {}
+        if not isinstance(sample_record, dict):
+            sample_record = {}
+        question = str(
+            source.get("question")
+            or question_record.get("final_question")
+            or question_record.get("question")
+            or ""
+        ).strip()
+        if not question:
+            raise ValueError(f"filtered trajectory at source index {source_index} has no question")
+        gold_answer = str(
+            source.get("gold_answer")
+            or question_record.get("answer")
+            or ""
+        ).strip()
+        image_paths, image_urls = _filtered_input_images(source)
+        records.append(
+            {
+                "question_id": source.get("question_id") or question_record.get("question_id"),
+                "sample_id": source.get("sample_id") or question_record.get("sample_id") or sample_record.get("sample_id"),
+                "path_id": source.get("path_id") or question_record.get("path_id"),
+                "question": question,
+                "gold_answer": gold_answer,
+                "hop_chain": list(source.get("hop_chain") or sample_record.get("hop_chain") or []),
+                "image_paths": image_paths,
+                "image_urls": image_urls,
+                "question_record": question_record,
+                "sample_record": sample_record,
+                "source_filter": source.get("sft_trajectory_filter") or {},
+            }
+        )
+    return records
+
+
+def _slice_batch_records(records: list[dict[str, Any]], *, offset: int, limit: int) -> list[dict[str, Any]]:
+    if offset < 0 or limit < 0:
+        raise ValueError("offset and limit must be non-negative")
+    end = None if limit == 0 else offset + limit
+    return records[offset:end]
 
 
 def _single_question_record(
@@ -649,6 +757,12 @@ def _build_raw_trajectory_record(
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--vqa-dir", help="Directory produced by synthesis.vqa.run_batch.")
+    parser.add_argument(
+        "--question-list",
+        "--filtered-trajectories-jsonl",
+        dest="question_list",
+        help="Complete filtered_trajectories.jsonl to regenerate only those questions.",
+    )
     parser.add_argument("--question", help="Single question to debug.")
     parser.add_argument("--gold-answer", default="", help="Gold answer for single-question mode.")
     parser.add_argument("--hop-chain-json", help="JSON list for single-question hop chain.")
@@ -1019,24 +1133,30 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     firecrawl_usage_before = get_firecrawl_usage_snapshot()
 
-    if bool(args.vqa_dir) == bool(args.question):
-        parser.error("Use exactly one of --vqa-dir or --question.")
+    input_modes = sum(bool(value) for value in (args.vqa_dir, args.question_list, args.question))
+    if input_modes != 1:
+        parser.error("Use exactly one of --vqa-dir, --question-list, or --question.")
     if args.question and not args.model_alias:
         parser.error("--model-alias is required in single-question mode unless SFT_OPENAI_MODEL / OPENAI_MODEL is set.")
     if args.responses_system_prompt_v2 and args.api_mode != "responses":
         parser.error("--responses-system-prompt-v2 requires --api-mode responses.")
     if args.responses_system_prompt_v2 and args.system_prompt:
         parser.error("--responses-system-prompt-v2 cannot be combined with --system-prompt.")
-    if args.vqa_dir and not args.model_alias:
+    if (args.vqa_dir or args.question_list) and not args.model_alias:
         parser.error("--model-alias is required in batch mode unless SFT_OPENAI_MODEL / OPENAI_MODEL is set.")
     if args.workers <= 0:
         parser.error("--workers must be positive.")
     if args.worker_start_stagger_s < 0:
         parser.error("--worker-start-stagger-s must be non-negative.")
+    if args.offset < 0 or args.limit < 0:
+        parser.error("--offset and --limit must be non-negative; --limit 0 means all records.")
 
     if args.vqa_dir:
         all_records = _load_vqa_records(Path(args.vqa_dir))
-        records = all_records[args.offset : args.offset + args.limit]
+        records = _slice_batch_records(all_records, offset=args.offset, limit=args.limit)
+    elif args.question_list:
+        all_records = _load_filtered_trajectory_records(Path(args.question_list))
+        records = _slice_batch_records(all_records, offset=args.offset, limit=args.limit)
     else:
         records = _single_question_record(
             question=args.question,
@@ -1046,7 +1166,7 @@ def main(argv: list[str] | None = None) -> int:
             image_urls=args.image_url,
         )
 
-    if args.vqa_dir and (args.image or args.image_url):
+    if (args.vqa_dir or args.question_list) and (args.image or args.image_url):
         for record in records:
             record["image_paths"] = list(args.image or [])
             record["image_urls"] = list(args.image_url or [])

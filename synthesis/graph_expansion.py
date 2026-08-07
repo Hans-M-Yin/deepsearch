@@ -1442,13 +1442,7 @@ class GraphExpansionStrategy:
         return None
 
     def _find_text_node_by_source_url(self, url: str) -> dict[str, Any] | None:
-        for node in self.store.list_nodes():
-            if node.get("node_type") != "text":
-                continue
-            source = node.get("source") or {}
-            if isinstance(source, dict) and source.get("url") == url:
-                return node
-        return None
+        return self.store.find_node_by_source_url(url, node_type="text")
 
 
 def _smoke_test() -> None:

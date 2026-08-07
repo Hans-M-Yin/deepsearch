@@ -4844,12 +4844,13 @@ class ImageDiscoveryBuilder:
         if not candidate_by_url:
             return []
         matches: list[dict[str, Any]] = []
-        for node in self.store.list_nodes():
-            if node.get("node_type") != NodeType.TEXT.value:
-                continue
+        for node in self.store.find_nodes_by_source_urls(
+            candidate_by_url,
+            node_type=NodeType.TEXT.value,
+        ):
             source = node.get("source") or {}
             url = source.get("url") if isinstance(source, dict) else None
-            if not url or url not in candidate_by_url:
+            if not url:
                 continue
             candidate = candidate_by_url[url]
             matches.append(
@@ -5060,13 +5061,8 @@ class ImageDiscoveryBuilder:
     def _find_text_node_by_url(self, url: str | None) -> dict[str, Any] | None:
         if self.store is None or not url:
             return None
-        for node in self.store.list_nodes():
-            if node.get("node_type") != NodeType.TEXT.value:
-                continue
-            source = node.get("source") or {}
-            if isinstance(source, dict) and source.get("url") == url:
-                return dict(node)
-        return None
+        node = self.store.find_node_by_source_url(url, node_type=NodeType.TEXT.value)
+        return dict(node) if node is not None else None
 
     def _source_node_title(self, node_id: str | None) -> str | None:
         if self.store is None or not node_id:

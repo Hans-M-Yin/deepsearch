@@ -728,13 +728,13 @@ class WikiTextBuilder:
     def _find_text_evidence(self, node_id: str, page_url: str) -> dict[str, Any] | None:
         if self.store is None:
             return None
-        for evidence in self.store.list_evidence():
-            if evidence.get("evidence_type") != EvidenceType.WEB_TEXT.value:
-                continue
-            if node_id in evidence.get("node_ids", []):
-                return evidence
-            if evidence.get("url") == page_url:
-                return evidence
+        evidence = self.store.find_evidence(
+            node_id=node_id,
+            url=page_url,
+            evidence_type=EvidenceType.WEB_TEXT.value,
+        )
+        if evidence:
+            return evidence[0]
         return None
 
     @staticmethod
