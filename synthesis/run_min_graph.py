@@ -330,6 +330,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Maximum total expansion tasks, including text and image tasks.",
     )
     parser.add_argument(
+        "--checkpoint-every",
+        type=int,
+        default=100,
+        help="Persist graph runner state after this many completed tasks (default: 100).",
+    )
+    parser.add_argument(
         "--max-nodes",
         type=int,
         default=10,
@@ -409,14 +415,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--store-flush-record-threshold",
         type=int,
-        default=600,
-        help="Flush graph tables after at least this many record upserts have accumulated (about 300 new nodes).",
+        default=1200,
+        help="Flush graph tables after at least this many record upserts have accumulated (default: 1200).",
     )
     parser.add_argument(
         "--store-flush-interval-s",
         type=float,
-        default=30.0,
-        help="Flush graph tables if this many seconds pass since the last flush, even if the record threshold is not reached.",
+        default=36000.0,
+        help="Flush graph tables if this many seconds pass since the last flush, even if the record threshold is not reached (default: 36000s).",
     )
     return parser
 
@@ -568,7 +574,7 @@ def main(argv: list[str] | None = None) -> int:
         config=GraphRunnerConfig(
             max_steps=args.max_steps,
             max_nodes=args.max_nodes,
-            checkpoint_every=1,
+            checkpoint_every=args.checkpoint_every,
             stop_on_error=False,
             parallel_workers=args.parallel_workers,
             batch_size=args.batch_size,

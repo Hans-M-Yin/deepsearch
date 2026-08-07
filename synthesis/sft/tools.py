@@ -38,8 +38,6 @@ from synthesis.wiki_text_builder import EnhancedReaderClient
 from synthesis.model_worker import LLM_WORKER
 from synthesis.model_worker import ModelMessage
 from synthesis.model_worker import ModelRequest
-
-
 logger = logging.getLogger(__name__)
 MAX_SEARCH_RESULTS = 5
 TOOL_NETWORK_TIMEOUT_S = 120
@@ -155,6 +153,35 @@ def _read_url_debug(message: str, **kwargs: Any) -> None:
     details = " ".join(f"{key}={value!r}" for key, value in kwargs.items())
     suffix = f" {details}" if details else ""
     print(f"[read_url debug] {message}{suffix}", file=sys.stderr, flush=True)
+
+
+def _tool_retry_debug(
+    tool: str,
+    *,
+    attempt: int,
+    max_attempts: int,
+    sleep_seconds: float,
+    error: object,
+    **kwargs: Any,
+) -> None:
+    """Emit one stable, always-visible line for every tool-level retry.
+
+    ``attempt`` is the failed attempt that triggered the retry (the first
+    request is attempt 1), while ``max_attempts`` includes the initial request.
+    Keep this separate from the optional read-url debug stream so retry logs
+    are available even when ``SFT_READ_URL_DEBUG`` is disabled.
+    """
+
+    details = {
+        "tool": tool,
+        "retry_attempt": attempt,
+        "max_attempts": max_attempts,
+        "sleep_seconds": round(float(sleep_seconds), 3),
+        "error": str(error)[:1000],
+        **kwargs,
+    }
+    suffix = " ".join(f"{key}={value!r}" for key, value in details.items())
+    print(f"[tool-retry] {suffix}", file=sys.stderr, flush=True)
 
 
 def _normalize_request_url(url: str) -> str:
@@ -967,7 +994,17 @@ def _request_with_retry(
                 except (TypeError, ValueError):
                     wait_s = retry_sleep_s * attempt
                 response.close()
-                time.sleep(wait_s + random.uniform(0.0, 1.0))
+                sleep_s = wait_s + random.uniform(0.0, 1.0)
+                _tool_retry_debug(
+                    "http_request",
+                    attempt=attempt,
+                    max_attempts=attempts,
+                    sleep_seconds=sleep_s,
+                    error=f"HTTP {response.status_code}",
+                    method=method,
+                    url=url,
+                )
+                time.sleep(sleep_s)
                 continue
             response.raise_for_status()
             return response
@@ -976,7 +1013,17 @@ def _request_with_retry(
             if response is not None:
                 response.close()
             if attempt < attempts:
-                time.sleep(retry_sleep_s * attempt + random.uniform(0.0, 1.0))
+                sleep_s = retry_sleep_s * attempt + random.uniform(0.0, 1.0)
+                _tool_retry_debug(
+                    "http_request",
+                    attempt=attempt,
+                    max_attempts=attempts,
+                    sleep_seconds=sleep_s,
+                    error=exc,
+                    method=method,
+                    url=url,
+                )
+                time.sleep(sleep_s)
                 continue
             raise
         except requests.HTTPError as exc:
@@ -993,7 +1040,17 @@ def _request_with_retry(
                     wait_s = max(float(retry_after), 0.0) if retry_after else retry_sleep_s * attempt
                 except (TypeError, ValueError):
                     wait_s = retry_sleep_s * attempt
-                time.sleep(wait_s + random.uniform(0.0, 1.0))
+                sleep_s = wait_s + random.uniform(0.0, 1.0)
+                _tool_retry_debug(
+                    "http_request",
+                    attempt=attempt,
+                    max_attempts=attempts,
+                    sleep_seconds=sleep_s,
+                    error=exc,
+                    method=method,
+                    url=url,
+                )
+                time.sleep(sleep_s)
                 continue
             raise
         except Exception as exc:
@@ -1262,6 +1319,14 @@ def _read_document_with_timeout_retry(url: str) -> dict[str, Any]:
                 max_retries=TOOL_TIMEOUT_RETRIES,
                 error=str(exc),
             )
+            _tool_retry_debug(
+                "enhanced_reader",
+                attempt=attempt,
+                max_attempts=TOOL_TIMEOUT_RETRIES + 1,
+                sleep_seconds=TOOL_RETRY_SLEEP_S * attempt,
+                error=exc,
+                url=url,
+            )
             time.sleep(TOOL_RETRY_SLEEP_S * attempt)
     raise AssertionError("unreachable")
 
@@ -1307,6 +1372,14 @@ def _read_via_firecrawl_with_timeout_retry(url: str) -> dict[str, Any]:
                 attempt=attempt,
                 max_retries=TOOL_TIMEOUT_RETRIES,
                 error=str(exc),
+            )
+            _tool_retry_debug(
+                "firecrawl",
+                attempt=attempt,
+                max_attempts=TOOL_TIMEOUT_RETRIES + 1,
+                sleep_seconds=TOOL_RETRY_SLEEP_S * attempt,
+                error=exc,
+                url=url,
             )
             time.sleep(TOOL_RETRY_SLEEP_S * attempt)
     raise AssertionError("unreachable")
@@ -1615,13 +1688,12 @@ def _run_search_with_timeout_retry(
         except Exception as exc:
             if not _is_timeout_error(exc) or attempt > TOOL_TIMEOUT_RETRIES:
                 raise
-            logger.warning(
-                "%s timed out (attempt %d/%d); retrying in %d seconds: %s",
+            _tool_retry_debug(
                 tool_name,
-                attempt,
-                TOOL_TIMEOUT_RETRIES + 1,
-                TOOL_RETRY_SLEEP_S * attempt,
-                exc,
+                attempt=attempt,
+                max_attempts=TOOL_TIMEOUT_RETRIES + 1,
+                sleep_seconds=TOOL_RETRY_SLEEP_S * attempt,
+                error=exc,
             )
             time.sleep(TOOL_RETRY_SLEEP_S * attempt)
     raise AssertionError("unreachable")
@@ -1768,24 +1840,7 @@ def i2i_search(
     while attempt <= max_attempts:
         attempts_made = attempt
         try:
-            print(
-                "[i2i_search debug] backend_search_start "
-                f"attempt={attempt} image_url={image_url!r} top_k={top_k} "
-                f"max_retries={max_retries} max_attempts={max_attempts} base_delay={base_delay} "
-                f"visual_lookup={getattr(visual_lookup, '__name__', type(visual_lookup).__name__)}",
-                file=sys.stderr,
-                flush=True,
-            )
-            backend_started_at = time.perf_counter()
             result = visual_lookup(image_url=image_url, top_k=top_k)
-            backend_elapsed_s = time.perf_counter() - backend_started_at
-            print(
-                "[i2i_search debug] backend_search_done "
-                f"attempt={attempt} elapsed_s={backend_elapsed_s:.3f} "
-                f"raw_output={json.dumps(_jsonify(result), ensure_ascii=False)}",
-                file=sys.stderr,
-                flush=True,
-            )
             if isinstance(result, dict) and "error" in result:
                 raise RuntimeError(str(result["error"]))
             matches = summarize_image_search(result)
@@ -1803,11 +1858,13 @@ def i2i_search(
             result_count = len(matches) if isinstance(matches, list) else (1 if matches else 0)
             if result_count == 0 and not retried_empty_result:
                 retried_empty_result = True
-                print(
-                    "[i2i_search debug] empty_result "
-                    "sleeping_s=5 before one retry",
-                    file=sys.stderr,
-                    flush=True,
+                _tool_retry_debug(
+                    "i2i_search",
+                    attempt=attempt,
+                    max_attempts=max_attempts,
+                    sleep_seconds=5,
+                    error="empty result",
+                    retry_reason="empty_result",
                 )
                 time.sleep(5)
                 continue
@@ -1819,15 +1876,17 @@ def i2i_search(
             }
         except Exception as exc:  # pragma: no cover - network bound
             last_error = exc
-            print(
-                "[i2i_search debug] error "
-                f"attempt={attempt} error_type={type(exc).__name__} "
-                f"error={exc}",
-                file=sys.stderr,
-                flush=True,
-            )
             if _is_timeout_error(exc) and attempt < max_attempts:
-                time.sleep(base_delay * (2 ** (attempt - 1)))
+                sleep_s = base_delay * (2 ** (attempt - 1))
+                _tool_retry_debug(
+                    "i2i_search",
+                    attempt=attempt,
+                    max_attempts=max_attempts,
+                    sleep_seconds=sleep_s,
+                    error=exc,
+                    retry_reason="timeout",
+                )
+                time.sleep(sleep_s)
             elif not _is_timeout_error(exc):
                 break
             attempt += 1

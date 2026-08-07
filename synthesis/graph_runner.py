@@ -46,7 +46,7 @@ class GraphRunnerConfig:
 
     max_steps: int = 100
     max_nodes: int | None = None
-    checkpoint_every: int = 1
+    checkpoint_every: int = 100
     stop_on_error: bool = False
     state_file_name: str = "graph_runner_state.json"
     parallel_workers: int = 1

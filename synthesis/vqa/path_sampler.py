@@ -290,6 +290,10 @@ class SamplerConfiguration:
     min_attempts: int = 100
     hop_sampling_strategy: str = "middle_biased"
     require_simple_path: bool = True
+    # When enabled, accepted trajectories must contain at least one image
+    # node. Disable this for text-only graph paths whose agent may search for
+    # images later during tool use.
+    require_image_in_path: bool = True
     min_modality_switches: int = 0
     dedup_by_exact_signature: bool = True
     allowed_start_node_types: tuple[str, ...] = ()
@@ -353,6 +357,7 @@ class SamplerGenerationStats:
     rejected_cycle: int = 0
     rejected_duplicate_exact: int = 0
     rejected_modality_switch: int = 0
+    rejected_image_requirement: int = 0
     rejected_start_type: int = 0
     rejected_end_type: int = 0
     accepted_start_node_id: str | None = None
@@ -464,6 +469,7 @@ class RandomPathSampler(PathSampler):
                 aggregate.rejected_cycle += one_stats.rejected_cycle
                 aggregate.rejected_duplicate_exact += one_stats.rejected_duplicate_exact
                 aggregate.rejected_modality_switch += one_stats.rejected_modality_switch
+                aggregate.rejected_image_requirement += one_stats.rejected_image_requirement
                 aggregate.rejected_start_type += one_stats.rejected_start_type
                 aggregate.rejected_end_type += one_stats.rejected_end_type
             if candidate is None:
@@ -596,9 +602,12 @@ class RandomPathSampler(PathSampler):
         trajectory = self._trajectory_stats(node_types)
         if trajectory.modality_switch_count < self.config.min_modality_switches:
             return None, "modality_switch"
-        # Temporary debug guard: keep only trajectories that involve an image
-        # at the beginning, end, or in an intermediate position.
-        if not (trajectory.starts_with_image or trajectory.ends_with_image or trajectory.has_mid_image):
+        # Optionally require an image node somewhere in the sampled path. This
+        # is configurable because some trajectories intentionally start from a
+        # text-only path and let the agent search for images later.
+        if self.config.require_image_in_path and not (
+            trajectory.starts_with_image or trajectory.ends_with_image or trajectory.has_mid_image
+        ):
             return None, "image_position_requirement"
         if not self._valid_end_type(node_types[-1]):
             return None, "end_type"
@@ -1713,6 +1722,8 @@ class RandomPathSampler(PathSampler):
             stats.rejected_cycle += 1
         elif reject_reason == "modality_switch":
             stats.rejected_modality_switch += 1
+        elif reject_reason == "image_position_requirement":
+            stats.rejected_image_requirement += 1
         elif reject_reason == "end_type":
             stats.rejected_end_type += 1
 

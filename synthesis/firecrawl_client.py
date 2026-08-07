@@ -36,6 +36,23 @@ _PROCESS_USAGE: dict[str, int] = {
 }
 
 
+def _status_code_from_exception(exc: BaseException) -> int | None:
+    """Extract an HTTP status from an SDK/API exception without parsing its text."""
+    candidates: list[Any] = [exc, getattr(exc, "response", None)]
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        for attribute in ("status_code", "status"):
+            value = getattr(candidate, attribute, None)
+            try:
+                status_code = int(value)
+            except (TypeError, ValueError):
+                continue
+            if 100 <= status_code <= 599:
+                return status_code
+    return None
+
+
 def _utc_now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
@@ -136,8 +153,13 @@ class FirecrawlApiKeyPool:
         error: str | None = None,
         credits_used: int = 0,
         status_code: int | None = None,
+        key_auth_failed: bool = False,
     ) -> dict[str, Any]:
-        """Persist the result of one Firecrawl call for the selected key."""
+        """Persist a result, disabling a key only after API-level auth failure.
+
+        ``status_code`` may be the target page's status code from Firecrawl
+        metadata.  It must never, by itself, disable the API key.
+        """
         def update(state: dict[str, Any]) -> dict[str, Any]:
             state = self._initialize_state(state)
             record = dict(state["keys"].get(key_id) or {})
@@ -162,13 +184,11 @@ class FirecrawlApiKeyPool:
                 record["failed_requests"] = int(record.get("failed_requests") or 0) + 1
                 record["consecutive_failures"] = int(record.get("consecutive_failures") or 0) + 1
                 record["last_error"] = (error or "unknown Firecrawl error")[:2000]
-                if self._is_terminal_key_error(error or ""):
+                if key_auth_failed:
                     record["state"] = "disabled"
                     record["disabled"] = True
-                    if "credit" in (error or "").lower() or "quota" in (error or "").lower():
-                        record["remaining_credits"] = 0
                     record["disabled_at"] = now
-                    record["disabled_reason"] = "firecrawl_key_rejected_or_exhausted"
+                    record["disabled_reason"] = "firecrawl_api_auth_failed"
             if int(record.get("remaining_credits") or 0) == 0:
                 record["state"] = "disabled"
                 record["disabled"] = True
@@ -187,10 +207,23 @@ class FirecrawlApiKeyPool:
     def _initialize_state(self, state: dict[str, Any]) -> dict[str, Any]:
         pool = dict(state.get("keys") or {})
         ordered_ids: list[str] = []
+        now = _utc_now()
+        recovered_legacy_record = False
         for key in self.keys:
             key_id = self.key_id(key)
             ordered_ids.append(key_id)
             record = dict(pool.get(key_id) or {})
+            if self._is_legacy_page_401_disable(record):
+                # Before page-level and API-level status codes were separated,
+                # a target page's metadata.statusCode=401 could disable the key.
+                # Those records are safe to restore because API exceptions did
+                # not previously persist last_status_code.
+                record["state"] = "active"
+                record["disabled"] = False
+                record.pop("disabled_at", None)
+                record.pop("disabled_reason", None)
+                record["recovered_from_page_status_at"] = now
+                recovered_legacy_record = True
             record.setdefault("masked_key", self._mask_key(key))
             record.setdefault("state", "active")
             record.setdefault("disabled", False)
@@ -205,6 +238,8 @@ class FirecrawlApiKeyPool:
         state["keys"] = pool
         state["key_order"] = ordered_ids
         state["default_credits"] = self.default_credits
+        if recovered_legacy_record:
+            state["updated_at"] = now
         self._store_pool_status(state)
         return state
 
@@ -296,13 +331,15 @@ class FirecrawlApiKeyPool:
         os.replace(temporary, self.state_path)
 
     @staticmethod
-    def _is_terminal_key_error(error: str) -> bool:
-        message = error.lower()
-        return any(marker in message for marker in (
-            "invalid api key", "invalid_api_key", "api key is invalid", "unauthorized",
-            "authentication failed", "api key not found", "insufficient credits",
-            "credits exhausted", "credit balance", "quota exhausted",
-        ))
+    def _is_legacy_page_401_disable(record: dict[str, Any]) -> bool:
+        return (
+            bool(record.get("disabled"))
+            and record.get("disabled_reason") == "firecrawl_key_rejected_or_exhausted"
+            and int(record.get("last_status_code") or 0) == 401
+            and str(record.get("last_error") or "").startswith(
+                "Firecrawl scrape returned statusCode 401"
+            )
+        )
 
     @staticmethod
     def _mask_key(key: str) -> str:
@@ -353,9 +390,28 @@ class FirecrawlClient:
             result = self._app(api_key).scrape(url, **request_kwargs)
             raw = self._response_as_dict(result)
         except Exception as exc:  # SDK transport and provider exceptions are recorded identically.
-            self.key_pool.record_result(pool_metadata["key_id"], success=False, error=str(exc))
+            api_status_code = _status_code_from_exception(exc)
+            self.key_pool.record_result(
+                pool_metadata["key_id"],
+                success=False,
+                error=str(exc),
+                status_code=api_status_code,
+                key_auth_failed=api_status_code == 401,
+            )
             _record_process_usage(success=False)
             raise RuntimeError(f"Firecrawl scrape failed for {url}: {exc}") from exc
+        root_status_code = self._root_status_code(raw)
+        if root_status_code == 401:
+            error = str(raw.get("error") or "Firecrawl API authentication failed")
+            self.key_pool.record_result(
+                pool_metadata["key_id"],
+                success=False,
+                error=error,
+                status_code=root_status_code,
+                key_auth_failed=True,
+            )
+            _record_process_usage(success=False)
+            return {"error": error}
         response_metadata = self._response_metadata(raw)
         credits_used = self._non_negative_int(
             response_metadata.get("creditsUsed", response_metadata.get("credits_used"))
@@ -446,6 +502,19 @@ class FirecrawlClient:
             return payload["metadata"]
         metadata = response.get("metadata")
         return metadata if isinstance(metadata, dict) else {}
+
+    @staticmethod
+    def _root_status_code(response: dict[str, Any]) -> int | None:
+        """Return an API response status, excluding nested page metadata."""
+        for key in ("statusCode", "status_code"):
+            value = response.get(key)
+            try:
+                status_code = int(value)
+            except (TypeError, ValueError):
+                continue
+            if 100 <= status_code <= 599:
+                return status_code
+        return None
 
     @staticmethod
     def _content_payload(response: dict[str, Any]) -> dict[str, Any]:

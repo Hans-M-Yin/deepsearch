@@ -6,16 +6,15 @@ nohup python synthesis/run_min_graph.py \
   --store-dir runs/0712_multi_seed_visual_test_8192_6 \
   --reader-base-url http://localhost:8004 \
   --skip-attributes \
-  --max-neighbors 10 \
+  --max-neighbors 8 \
   --max-llm-neighbor-candidates 80 \
   --max-steps 12345678 \
-  --max-nodes 20000 \
+  --max-nodes 25000 \
   --max-depth 128 \
-  --queue-pop-strategy random \
   --parallel-workers 80 \
   --batch-size 120 \
   --max-inflight-text 40 \
   --image-backend serper \
-  --queue-pop-strategy random \
   --image-entity-only \
   > synthesis/ignore/output.log 2>&1 &
+  # --queue-pop-strategy random \

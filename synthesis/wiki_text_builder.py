@@ -36,6 +36,19 @@ def _trace_timing(message: str) -> None:
         print(f"[trace]{message}", file=sys.stderr, flush=True)
 
 
+def _reader_retry_debug(*, target: str, sleep_seconds: float, error: object) -> None:
+    """Always expose the Enhanced Reader's built-in retry."""
+
+    print(
+        "[tool-retry]"
+        f" tool='enhanced_reader' retry_attempt=1 max_attempts=2"
+        f" sleep_seconds={float(sleep_seconds):.3f}"
+        f" error={str(error)[:1000]!r} url={target!r}",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
 WIKI_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
 MARKDOWN_TRUNCATION_MARKER = "\n\n<!-- wiki_text_builder_truncated -->"
 WIKI_MISSING_PAGE_PATTERNS = (
@@ -402,6 +415,7 @@ class EnhancedReaderClient:
         except HTTPError as exc:
             if exc.code != 502:
                 raise
+            _reader_retry_debug(target=target, sleep_seconds=15, error=exc)
             _trace_timing(f"[reader] phase=retry_502 target={target!r} sleep_s=15")
             time.sleep(15)
             request = Request(

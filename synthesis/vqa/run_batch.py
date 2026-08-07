@@ -36,6 +36,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-hops", type=int, default=5)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--edge-penalty-alpha", type=float, default=1.0)
+    image_requirement_group = parser.add_mutually_exclusive_group()
+    image_requirement_group.add_argument(
+        "--require-image-in-path",
+        dest="require_image_in_path",
+        action="store_true",
+        help="Require every sampled path to contain an image node (default).",
+    )
+    image_requirement_group.add_argument(
+        "--allow-text-only-paths",
+        dest="require_image_in_path",
+        action="store_false",
+        help="Allow paths without image nodes; the agent may search for images later.",
+    )
+    parser.set_defaults(require_image_in_path=True)
     parser.add_argument(
         "--hop-sampling-strategy",
         choices=("uniform", "middle_biased"),
@@ -124,6 +138,7 @@ def main(argv: list[str] | None = None) -> int:
         max_samples=args.samples,
         random_seed=args.seed,
         edge_penalty_alpha=args.edge_penalty_alpha,
+        require_image_in_path=args.require_image_in_path,
         hop_sampling_strategy=args.hop_sampling_strategy,
         neighbor_selection_strategy=args.neighbor_selection_strategy,
         llm_candidate_count=args.llm_candidate_count,

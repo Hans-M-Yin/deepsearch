@@ -7,15 +7,18 @@ import base64
 # #### START Response 0720 ####
 from copy import deepcopy
 # #### END Response 0720 ####
+import contextvars
 import io
 import json
 import logging
 import os
 import re
+import threading
 import time
 import uuid
 import urllib.parse
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
@@ -38,6 +41,106 @@ from . import tools
 import sys
 
 logger = logging.getLogger(__name__)
+
+
+# Temporary generation diagnostics.  A process-wide batch is intentional:
+# ``debug_vqa_batch`` uses a ThreadPoolExecutor, so this reports the aggregate
+# over the next ten completed trajectories across all workers in the process.
+_SFT_TIMING_ENABLED_ENV = "SFT_TIMING_DEBUG"
+_SFT_TIMING_BATCH_SIZE_ENV = "SFT_TIMING_BATCH_SIZE"
+
+
+def _sft_timing_enabled() -> bool:
+    return str(os.environ.get(_SFT_TIMING_ENABLED_ENV, "1")).strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+
+
+def _sft_timing_batch_size() -> int:
+    try:
+        return max(1, int(os.environ.get(_SFT_TIMING_BATCH_SIZE_ENV, "10")))
+    except (TypeError, ValueError):
+        return 10
+
+
+@dataclass(slots=True)
+class _TrajectoryTiming:
+    events: dict[str, tuple[float, int]] = field(default_factory=dict)
+
+    def add(self, name: str, elapsed_s: float) -> None:
+        total_s, calls = self.events.get(name, (0.0, 0))
+        self.events[name] = (total_s + max(0.0, float(elapsed_s)), calls + 1)
+
+
+_ACTIVE_TRAJECTORY_TIMING: contextvars.ContextVar[_TrajectoryTiming | None] = contextvars.ContextVar(
+    "sft_active_trajectory_timing",
+    default=None,
+)
+_TIMING_BATCH_LOCK = threading.Lock()
+_TIMING_BATCH_SAMPLE_COUNT = 0
+_TIMING_BATCH_NUMBER = 0
+_TIMING_BATCH_EVENTS: dict[str, tuple[float, int]] = {}
+
+
+def _record_active_timing(name: str, elapsed_s: float) -> None:
+    if not _sft_timing_enabled():
+        return
+    active = _ACTIVE_TRAJECTORY_TIMING.get()
+    if active is not None:
+        active.add(name, elapsed_s)
+
+
+def _timed_call(name: str, callback: Callable[[], Any]) -> Any:
+    """Run a module call and record wall time, including internal sleeps/retries."""
+
+    if not _sft_timing_enabled() or _ACTIVE_TRAJECTORY_TIMING.get() is None:
+        return callback()
+    started_at = time.perf_counter()
+    try:
+        return callback()
+    finally:
+        _record_active_timing(name, time.perf_counter() - started_at)
+
+
+def _finish_trajectory_timing(timing: _TrajectoryTiming, elapsed_s: float) -> None:
+    """Add one completed trajectory and print every configured batch."""
+
+    global _TIMING_BATCH_SAMPLE_COUNT, _TIMING_BATCH_NUMBER, _TIMING_BATCH_EVENTS
+    if not _sft_timing_enabled():
+        return
+    timing.add("trajectory", elapsed_s)
+    batch_size = _sft_timing_batch_size()
+    with _TIMING_BATCH_LOCK:
+        _TIMING_BATCH_SAMPLE_COUNT += 1
+        for name, (total_s, calls) in timing.events.items():
+            previous_total, previous_calls = _TIMING_BATCH_EVENTS.get(name, (0.0, 0))
+            _TIMING_BATCH_EVENTS[name] = (previous_total + total_s, previous_calls + calls)
+        if _TIMING_BATCH_SAMPLE_COUNT < batch_size:
+            return
+        _TIMING_BATCH_NUMBER += 1
+        batch_number = _TIMING_BATCH_NUMBER
+        sample_count = _TIMING_BATCH_SAMPLE_COUNT
+        snapshot = dict(_TIMING_BATCH_EVENTS)
+        _TIMING_BATCH_SAMPLE_COUNT = 0
+        _TIMING_BATCH_EVENTS = {}
+
+        print(
+            f"[sft-timing] batch={batch_number} samples={sample_count}",
+            file=sys.stderr,
+            flush=True,
+        )
+        for name in sorted(snapshot):
+            total_s, calls = snapshot[name]
+            average_s = total_s / calls if calls else 0.0
+            print(
+                f"[sft-timing]   module={name} calls={calls} "
+                f"total_s={total_s:.3f} avg_per_call_s={average_s:.3f}",
+                file=sys.stderr,
+                flush=True,
+            )
 
 # COS uploads are external network operations.  Keep the initial attempt plus
 # a bounded retry budget so a transient upload failure does not discard an
@@ -573,6 +676,58 @@ class ToolExecutionResult:
     new_images: dict[str, Any] = field(default_factory=dict)
 
 
+_DEFAULT_FAILURE_JSONL_PATH = Path("synthesis/ignore/failure.jsonl")
+_FAILURE_JSONL_ENV = "SFT_FAILURE_JSONL"
+_TOOL_FAILURE_RECORDS: list[dict[str, Any]] = []
+_TOOL_FAILURE_LOCK = threading.Lock()
+
+
+def get_tool_failure_records() -> list[dict[str, Any]]:
+    """Return a snapshot of tool failures recorded in this process."""
+    with _TOOL_FAILURE_LOCK:
+        return deepcopy(_TOOL_FAILURE_RECORDS)
+
+
+def _json_safe(value: Any) -> Any:
+    try:
+        return json.loads(json.dumps(value, ensure_ascii=False, default=str))
+    except Exception:
+        return str(value)
+
+
+def _failure_jsonl_path() -> Path:
+    configured = str(os.environ.get(_FAILURE_JSONL_ENV) or "").strip()
+    return Path(configured) if configured else _DEFAULT_FAILURE_JSONL_PATH
+
+
+def _record_tool_failure(
+    *,
+    tool_name: str,
+    arguments: dict[str, Any],
+    error_output: Any,
+) -> None:
+    """Keep an in-memory failure list and append one durable JSONL record."""
+    record = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "tool_name": tool_name,
+        "arguments": _json_safe(arguments),
+        "error_output": _json_safe(error_output),
+    }
+    with _TOOL_FAILURE_LOCK:
+        _TOOL_FAILURE_RECORDS.append(record)
+        try:
+            path = _failure_jsonl_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as handle:
+                json.dump(record, handle, ensure_ascii=False, default=str)
+                handle.write("\n")
+                handle.flush()
+        except Exception:
+            # Failure logging must not turn the original tool failure into a
+            # separate dispatcher failure.
+            logger.exception("Unable to persist tool failure to %s", _failure_jsonl_path())
+
+
 def _read_url_image_attachment(
     result: ToolExecutionResult,
     context: ToolRuntimeContext,
@@ -737,17 +892,20 @@ def _worker_generate_json_message(
     max_tokens: int,
     trace_label: str,
 ) -> dict[str, Any]:
-    response = LLM_WORKER.generate(
-        ModelRequest(
-            model=model_alias,
-            messages=[
-                ModelMessage(role="system", content=system_prompt),
-                ModelMessage(role="user", content=user_content),
-            ],
-            response_format={"type": "json_object"},
-            max_tokens=max_tokens,
-            metadata=_sft_worker_metadata(trace_label),
-        )
+    response = _timed_call(
+        "llm:auxiliary_json",
+        lambda: LLM_WORKER.generate(
+            ModelRequest(
+                model=model_alias,
+                messages=[
+                    ModelMessage(role="system", content=system_prompt),
+                    ModelMessage(role="user", content=user_content),
+                ],
+                response_format={"type": "json_object"},
+                max_tokens=max_tokens,
+                metadata=_sft_worker_metadata(trace_label),
+            )
+        ),
     )
     parsed = _extract_json_object(response.content or "")
     if parsed is None:
@@ -763,16 +921,19 @@ def _worker_generate_text_message(
     max_tokens: int,
     trace_label: str,
 ) -> str:
-    response = LLM_WORKER.generate(
-        ModelRequest(
-            model=model_alias,
-            messages=[
-                ModelMessage(role="system", content=system_prompt),
-                ModelMessage(role="user", content=user_content),
-            ],
-            max_tokens=max_tokens,
-            metadata=_sft_worker_metadata(trace_label),
-        )
+    response = _timed_call(
+        "llm:auxiliary_text",
+        lambda: LLM_WORKER.generate(
+            ModelRequest(
+                model=model_alias,
+                messages=[
+                    ModelMessage(role="system", content=system_prompt),
+                    ModelMessage(role="user", content=user_content),
+                ],
+                max_tokens=max_tokens,
+                metadata=_sft_worker_metadata(trace_label),
+            )
+        ),
     )
     return response.content or ""
 
@@ -1402,6 +1563,14 @@ def _try_upload_pil_image(
                 error,
             )
             break
+        tools._tool_retry_debug(
+            "cos_upload",
+            attempt=attempt,
+            max_attempts=_COS_UPLOAD_RETRIES + 1,
+            sleep_seconds=_COS_UPLOAD_RETRY_DELAY_S * attempt,
+            error=error,
+            tool_name=tool_name,
+        )
         logger.warning(
             "COS upload failed for %s (attempt %d/%d); retrying in %ds: %s",
             tool_name,
@@ -1875,7 +2044,7 @@ def _public_read_url_text_observation(
     }
 
 
-def execute_tool_call(
+def _execute_tool_call(
     name: str,
     arguments: dict[str, Any],
     context: ToolRuntimeContext,
@@ -1921,16 +2090,31 @@ def execute_tool_call(
         resource = context.resolve_resource_id(resource_id) if resource_id else None
         effective_goal = str(params.get("goal") or tool_goal or "").strip()
         if resource_id and resource is None and not direct_url:
+            failure_output = {
+                "ok": False,
+                "error": f"resource_id not found: {resource_id}",
+            }
+            _record_tool_failure(
+                tool_name=name,
+                arguments=params,
+                error_output=failure_output,
+            )
             output = _public_read_url_text_observation(
-                output={"ok": False},
+                output=failure_output,
                 page_id=resource_id,
                 goal=effective_goal,
             )
             return ToolExecutionResult(name=name, arguments=params, output=output, output_text=_json_text(output))
         url = resource.primary_url if resource is not None else direct_url
         if not url:
+            failure_output = {"ok": False, "error": "URL is required."}
+            _record_tool_failure(
+                tool_name=name,
+                arguments=params,
+                error_output=failure_output,
+            )
             output = _public_read_url_text_observation(
-                output={"ok": False},
+                output=failure_output,
                 page_id=resource_id,
                 goal=effective_goal,
             )
@@ -1948,6 +2132,12 @@ def execute_tool_call(
             assistant_output=assistant_text,
             resource=resource or context.resolve_url_resource(url),
         )
+        if isinstance(output, dict) and output.get("ok") is False:
+            _record_tool_failure(
+                tool_name=name,
+                arguments=params,
+                error_output=output,
+            )
         new_images: dict[str, Any] = {}
         if output.get("ok") and output.get("local_path"):
             image_id = context.register_image(output["local_path"])
@@ -2044,6 +2234,47 @@ def execute_tool_call(
     return ToolExecutionResult(name=name, arguments=params, output=output, output_text=_json_text(output))
 
 
+def execute_tool_call(
+    name: str,
+    arguments: dict[str, Any],
+    context: ToolRuntimeContext,
+    question_text: str = "",
+    assistant_text: str = "",
+    tool_goal: str = "",
+) -> ToolExecutionResult:
+    """Execute one tool and record failures before returning or re-raising."""
+    try:
+        result = _timed_call(
+            f"tool:{name}",
+            lambda: _execute_tool_call(
+                name=name,
+                arguments=arguments,
+                context=context,
+                question_text=question_text,
+                assistant_text=assistant_text,
+                tool_goal=tool_goal,
+            ),
+        )
+    except Exception as exc:
+        _record_tool_failure(
+            tool_name=name,
+            arguments=arguments,
+            error_output={
+                "ok": False,
+                "error": f"{exc.__class__.__name__}: {exc}",
+            },
+        )
+        raise
+
+    if isinstance(result.output, dict) and result.output.get("ok") is False:
+        _record_tool_failure(
+            tool_name=name,
+            arguments=result.arguments,
+            error_output=result.output,
+        )
+    return result
+
+
 class OpenAIToolAgent:
     """OpenAI/AzureOpenAI-based multi-turn chat-completions agent with tool calling."""
 
@@ -2133,7 +2364,10 @@ class OpenAIToolAgent:
                 extra_body=self.config.extra_body,
             ),
         )
-        response = LLM_WORKER.generate(request)
+        response = _timed_call(
+            "llm:chat_worker",
+            lambda: LLM_WORKER.generate(request),
+        )
         return request, response
 
     def run(
@@ -2144,26 +2378,34 @@ class OpenAIToolAgent:
         context: ToolRuntimeContext | None = None,
         system_prompt: str | None = None,
     ) -> AgentRunResult:
-        if self.config.api_mode == "manual_react":
-            return self._run_manual_react(
+        timing = _TrajectoryTiming()
+        timing_token = _ACTIVE_TRAJECTORY_TIMING.set(timing)
+        started_at = time.perf_counter()
+        try:
+            if self.config.api_mode == "manual_react":
+                return self._run_manual_react(
+                    prompt=prompt,
+                    messages=messages,
+                    context=context,
+                    system_prompt=system_prompt,
+                )
+            if self.config.api_mode == "responses":
+                return self._run_responses(
+                    prompt=prompt,
+                    messages=messages,
+                    context=context,
+                    system_prompt=system_prompt,
+                )
+            return self._run_chat_completions(
                 prompt=prompt,
                 messages=messages,
                 context=context,
                 system_prompt=system_prompt,
             )
-        if self.config.api_mode == "responses":
-            return self._run_responses(
-                prompt=prompt,
-                messages=messages,
-                context=context,
-                system_prompt=system_prompt,
-            )
-        return self._run_chat_completions(
-            prompt=prompt,
-            messages=messages,
-            context=context,
-            system_prompt=system_prompt,
-        )
+        finally:
+            elapsed_s = time.perf_counter() - started_at
+            _ACTIVE_TRAJECTORY_TIMING.reset(timing_token)
+            _finish_trajectory_timing(timing, elapsed_s)
 
     def _run_manual_react(
         self,
@@ -2335,7 +2577,10 @@ class OpenAIToolAgent:
                 kwargs["temperature"] = self.config.temperature
             if self.config.extra_body:
                 kwargs["extra_body"] = self.config.extra_body
-            completion = self.client.chat.completions.create(**kwargs)
+            completion = _timed_call(
+                "llm:chat_completions",
+                lambda: self.client.chat.completions.create(**kwargs),
+            )
             raw_responses.append(
                 completion.model_dump() if hasattr(completion, "model_dump") else {"repr": repr(completion)}
             )
@@ -2487,23 +2732,26 @@ class OpenAIToolAgent:
             previous_id_for_request = previous_response_id if use_previous_response_id else None
 
             try:
-                worker_response = LLM_WORKER.responses_generate(
-                    ResponsesModelRequest(
-                        model=self.config.model,
-                        input=current_input,
-                        tools=tools.get_responses_tool_definitions(),
-                        instructions=responses_instructions,
-                        previous_response_id=previous_id_for_request,
-                        max_output_tokens=self.config.max_tokens,
-                        reasoning=reasoning_payload,
-                        parallel_tool_calls=self.config.responses_parallel_tool_calls,
-                        store=self.config.responses_store,
-                        temperature=self.config.temperature,
-                        metadata=_sft_worker_metadata(
-                            f"responses_turn_{turn_index + 1}",
-                            extra_body=self.config.extra_body,
-                        ),
-                    )
+                worker_response = _timed_call(
+                    "llm:responses",
+                    lambda: LLM_WORKER.responses_generate(
+                        ResponsesModelRequest(
+                            model=self.config.model,
+                            input=current_input,
+                            tools=tools.get_responses_tool_definitions(),
+                            instructions=responses_instructions,
+                            previous_response_id=previous_id_for_request,
+                            max_output_tokens=self.config.max_tokens,
+                            reasoning=reasoning_payload,
+                            parallel_tool_calls=self.config.responses_parallel_tool_calls,
+                            store=self.config.responses_store,
+                            temperature=self.config.temperature,
+                            metadata=_sft_worker_metadata(
+                                f"responses_turn_{turn_index + 1}",
+                                extra_body=self.config.extra_body,
+                            ),
+                        )
+                    ),
                 )
                 raw_response = worker_response.raw_response
             except Exception as exc:
@@ -2514,22 +2762,25 @@ class OpenAIToolAgent:
                     )
                     use_previous_response_id = False
                     current_input = _conversation_messages_to_responses_input(conversation_messages)
-                    worker_response = LLM_WORKER.responses_generate(
-                        ResponsesModelRequest(
-                            model=self.config.model,
-                            input=current_input,
-                            tools=tools.get_responses_tool_definitions(),
-                            instructions=responses_instructions,
-                            max_output_tokens=self.config.max_tokens,
-                            reasoning=reasoning_payload,
-                            parallel_tool_calls=self.config.responses_parallel_tool_calls,
-                            store=self.config.responses_store,
-                            temperature=self.config.temperature,
-                            metadata=_sft_worker_metadata(
-                                f"responses_turn_{turn_index + 1}:full_replay",
-                                extra_body=self.config.extra_body,
-                            ),
-                        )
+                    worker_response = _timed_call(
+                        "llm:responses",
+                        lambda: LLM_WORKER.responses_generate(
+                            ResponsesModelRequest(
+                                model=self.config.model,
+                                input=current_input,
+                                tools=tools.get_responses_tool_definitions(),
+                                instructions=responses_instructions,
+                                max_output_tokens=self.config.max_tokens,
+                                reasoning=reasoning_payload,
+                                parallel_tool_calls=self.config.responses_parallel_tool_calls,
+                                store=self.config.responses_store,
+                                temperature=self.config.temperature,
+                                metadata=_sft_worker_metadata(
+                                    f"responses_turn_{turn_index + 1}:full_replay",
+                                    extra_body=self.config.extra_body,
+                                ),
+                            )
+                        ),
                     )
                     raw_response = worker_response.raw_response
                 else:

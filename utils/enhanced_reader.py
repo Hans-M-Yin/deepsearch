@@ -343,6 +343,371 @@ def looks_like_antibot(text: str | None) -> bool:
     return any(pattern in normalized for pattern in ANTI_BOT_PATTERNS)
 
 
+# ``markdown_clean`` deliberately uses a small, deterministic rule set instead
+# of another LLM pass.  The rules are intentionally conservative: link labels
+# and table cell order are kept, while URLs, citation plumbing, and reference
+# sections are removed from the model-facing content.
+_MARKDOWN_REFERENCE_HEADINGS = frozenset(
+    {
+        "references",
+        "reference",
+        "notes",
+        "footnotes",
+        "citations",
+        "bibliography",
+        "works cited",
+        "sources",
+        "external links",
+        "further reading",
+        "see also",
+    }
+)
+_MARKDOWN_CITATION_HREF_RE = re.compile(
+    r"(?:cite[_-](?:note|ref)|mw-reference|#cite|#ref|footnote)",
+    flags=re.IGNORECASE,
+)
+_MARKDOWN_CITATION_LABEL_RE = re.compile(
+    r"^(?:\[?\s*(?:\d{1,4}|[a-z]|[α-ωΑ-Ω])\s*\]?|↑|up)$",
+    flags=re.IGNORECASE,
+)
+_MARKDOWN_GENERIC_IMAGE_ALT_RE = re.compile(
+    r"^(?:image|img|photo|picture|figure|thumbnail)(?:\s*[-_:]?\s*\d+(?:\s*:\s*.+)?)?$",
+    flags=re.IGNORECASE,
+)
+_MARKDOWN_LINK_DEFINITION_RE = re.compile(r"^\s{0,3}\[[^\]]+\]:\s*\S+", flags=re.IGNORECASE)
+_MARKDOWN_CITATION_MARKER_RE = re.compile(
+    r"\[\s*(?:\d{1,4}|[a-z]|[α-ωΑ-Ω])\s*\]",
+    flags=re.IGNORECASE,
+)
+
+
+def _markdown_heading_info(line: str) -> tuple[int, str] | None:
+    """Return ``(level, normalized_title)`` for a Markdown heading.
+
+    Plain ``References``-style lines are accepted as level ``0`` because some
+    Jina Markdown responses omit the heading markers for section titles.
+    """
+
+    match = re.match(r"^\s{0,3}(#{1,6})\s+(.+?)\s*#*\s*$", line)
+    if match:
+        title = match.group(2)
+        level = len(match.group(1))
+    else:
+        title = line.strip()
+        level = 0
+        if len(title) > 80 or "|" in title or not title:
+            return None
+    normalized = re.sub(r"[*_`]+", "", title)
+    normalized = re.sub(r"\s+", " ", normalized).strip(" :").casefold()
+    if normalized not in _MARKDOWN_REFERENCE_HEADINGS:
+        return None
+    return level, normalized
+
+
+def _parse_markdown_link_at(text: str, start: int) -> tuple[int, str, str, bool] | None:
+    """Parse one Markdown link/image beginning at ``start``.
+
+    A small scanner is used instead of a single regex so URLs containing
+    parentheses (common in Wikipedia links) are handled correctly.
+    """
+
+    is_image = text.startswith("!", start)
+    bracket_start = start + 1 if is_image else start
+    if bracket_start >= len(text) or text[bracket_start] != "[":
+        return None
+
+    bracket_depth = 0
+    close_bracket: int | None = None
+    escaped = False
+    for index in range(bracket_start, len(text)):
+        char = text[index]
+        if escaped:
+            escaped = False
+            continue
+        if char == "\\":
+            escaped = True
+            continue
+        if char == "[":
+            bracket_depth += 1
+        elif char == "]":
+            bracket_depth -= 1
+            if bracket_depth == 0:
+                close_bracket = index
+                break
+    if close_bracket is None:
+        return None
+
+    open_paren = close_bracket + 1
+    while open_paren < len(text) and text[open_paren].isspace():
+        open_paren += 1
+    if open_paren >= len(text) or text[open_paren] != "(":
+        return None
+
+    paren_depth = 0
+    escaped = False
+    close_paren: int | None = None
+    for index in range(open_paren, len(text)):
+        char = text[index]
+        if escaped:
+            escaped = False
+            continue
+        if char == "\\":
+            escaped = True
+            continue
+        if char == "(":
+            paren_depth += 1
+        elif char == ")":
+            paren_depth -= 1
+            if paren_depth == 0:
+                close_paren = index
+                break
+    if close_paren is None:
+        return None
+
+    label = text[bracket_start + 1 : close_bracket]
+    destination = text[open_paren + 1 : close_paren].strip()
+    return close_paren + 1, label, destination, is_image
+
+
+def _is_markdown_citation(label: str, destination: str) -> bool:
+    label_normalized = re.sub(r"[*_`]+", "", label).strip()
+    label_normalized = re.sub(r"\s+", " ", label_normalized)
+    return bool(
+        _MARKDOWN_CITATION_HREF_RE.search(destination)
+        or label_normalized.casefold().startswith("jump up to")
+        or _MARKDOWN_CITATION_LABEL_RE.fullmatch(label_normalized)
+    )
+
+
+def _clean_markdown_inline(text: str, stats: dict[str, Any]) -> str:
+    """Remove URL-bearing Markdown syntax while preserving visible labels."""
+
+    def replace_malformed_image(label: str) -> str:
+        """Keep the ``![alt]`` residue and remove its unmatched ``(``."""
+
+        stats["images_seen"] += 1
+        stats["malformed_images_seen"] += 1
+        normalized_label = label.strip()
+        stats["images_preserved"] += 1
+        stats["malformed_images_fixed"] += 1
+        # The source is already truncated, so preserving the visible marker
+        # is more useful than deleting it. Only the unmatched opening
+        # parenthesis (and the truncated destination after it) is discarded.
+        return f"![{normalized_label}]"
+
+    # The raw response can contain a truncated image token such as
+    # ``![Image 10](``. It has no parseable destination, so fix it before
+    # the regular Markdown scanner; otherwise the dangling opener leaks into
+    # the model-facing content.
+    text = re.sub(
+        r"!\[([^\]\n]*)\]\(\s*$",
+        lambda match: replace_malformed_image(match.group(1)),
+        text,
+    )
+
+    # MediaWiki/Jina occasionally emits ``[[label]](url)`` instead of the
+    # normal ``[label](url)`` form.  Handle this before the general scanner.
+    double_link_pattern = re.compile(r"(!?)\[\[([^\]]+)\]\]\((.*?)\)")
+
+    def replace_double_link(match: re.Match[str]) -> str:
+        is_image = bool(match.group(1))
+        label = match.group(2)
+        destination = match.group(3)
+        if is_image:
+            stats["images_seen"] += 1
+            if not label.strip() or _MARKDOWN_GENERIC_IMAGE_ALT_RE.fullmatch(label.strip()):
+                stats["images_removed"] += 1
+                return ""
+            stats["images_preserved"] += 1
+            return f"[Image: {label.strip()}]"
+        stats["links_seen"] += 1
+        if _is_markdown_citation(label, destination):
+            stats["citation_links_removed"] += 1
+            return ""
+        stats["link_urls_removed"] += 1
+        return label
+
+    text = double_link_pattern.sub(replace_double_link, text)
+
+    output: list[str] = []
+    index = 0
+    while index < len(text):
+        start = index
+        if text[index] == "!" and index + 1 < len(text) and text[index + 1] == "[":
+            start = index
+        elif text[index] != "[":
+            output.append(text[index])
+            index += 1
+            continue
+
+        parsed = _parse_markdown_link_at(text, start)
+        if parsed is None:
+            # A malformed image may have additional truncated text after the
+            # opener (for example ``![Image 18]( 19: @user](``).  There is no
+            # reliable URL boundary in this case; consume the remainder of the
+            # line after preserving the visible ``![alt]`` marker.
+            malformed_image = re.match(r"!\[([^\]\n]*)\]\(\s*", text[start:]) if text.startswith("![", start) else None
+            if malformed_image and ")" not in text[start + malformed_image.end() :]:
+                output.append(replace_malformed_image(malformed_image.group(1)))
+                index = len(text)
+                continue
+            output.append(text[index])
+            index += 1
+            continue
+        end, label, destination, is_image = parsed
+        if is_image:
+            stats["images_seen"] += 1
+            if not label.strip() or _MARKDOWN_GENERIC_IMAGE_ALT_RE.fullmatch(label.strip()):
+                stats["images_removed"] += 1
+                replacement = ""
+            else:
+                stats["images_preserved"] += 1
+                replacement = f"[Image: {label.strip()}]"
+        else:
+            stats["links_seen"] += 1
+            if _is_markdown_citation(label, destination):
+                stats["citation_links_removed"] += 1
+                replacement = ""
+            else:
+                stats["link_urls_removed"] += 1
+                replacement = label
+        output.append(replacement)
+        index = end
+
+    text = "".join(output)
+
+    def remove_bare_url(match: re.Match[str]) -> str:
+        stats["bare_urls_removed"] += 1
+        return ""
+
+    text = re.sub(BARE_URL_PATTERN, remove_bare_url, text)
+    text = re.sub(r"<\s*>", "", text)
+    text, marker_count = _MARKDOWN_CITATION_MARKER_RE.subn("", text)
+    stats["citation_markers_removed"] += marker_count
+    # Citation markers are often glued between a comma and the sentence
+    # terminator (``fact,[[12]].``).  Removing the marker should not leave
+    # malformed ``,.``/``;,`` punctuation behind.
+    text = re.sub(r"([,;:])\s*([.!?])", r"\2", text)
+    text = re.sub(r"[ \t]{2,}", " ", text)
+    return text.strip()
+
+
+def clean_raw_markdown(raw_markdown: str | None) -> tuple[str, dict[str, Any]]:
+    """Clean raw Jina Markdown with deterministic, model-free rules.
+
+    The original Markdown is never mutated in-place by callers and remains
+    available as ``raw_markdown`` in the response.  Reference sections are
+    removed, ordinary link URLs are replaced by their visible labels, complete
+    generic images are dropped, malformed image residues retain their visible
+    ``![alt]`` marker, and tables retain their original row/cell ordering.
+    """
+
+    raw_text = str(raw_markdown or "").replace("\r\n", "\n").replace("\r", "\n")
+    stats: dict[str, Any] = {
+        "cleaner": "rule_v1",
+        "cleaning_applied": True,
+        "original_chars": len(raw_text),
+        "cleaned_chars": 0,
+        "removed_chars": 0,
+        "reference_sections_removed": 0,
+        "reference_lines_removed": 0,
+        "link_definitions_removed": 0,
+        "links_seen": 0,
+        "link_urls_removed": 0,
+        "citation_links_removed": 0,
+        "citation_markers_removed": 0,
+        "bare_urls_removed": 0,
+        "images_seen": 0,
+        "images_removed": 0,
+        "images_preserved": 0,
+        "malformed_images_seen": 0,
+        "malformed_images_fixed": 0,
+        "malformed_images_removed": 0,
+        "table_count": 0,
+        "table_rows_checked": 0,
+        "table_column_mismatch_count": 0,
+        "table_warnings": [],
+    }
+
+    cleaned_lines: list[str] = []
+    reference_level: int | None = None
+    in_fence = False
+    fence_marker = ""
+    table_expected_columns: int | None = None
+    table_active = False
+
+    for line_number, line in enumerate(raw_text.split("\n"), start=1):
+        fence_match = re.match(r"^\s*(`{3,}|~{3,})", line)
+        if fence_match:
+            marker = fence_match.group(1)[0]
+            if not in_fence:
+                in_fence = True
+                fence_marker = marker
+            elif marker == fence_marker:
+                in_fence = False
+            cleaned_lines.append(line.rstrip())
+            table_active = False
+            table_expected_columns = None
+            continue
+        if in_fence:
+            cleaned_lines.append(line.rstrip())
+            continue
+
+        heading_info = _markdown_heading_info(line)
+        heading_match = re.match(r"^\s{0,3}(#{1,6})\s+", line)
+        heading_level = len(heading_match.group(1)) if heading_match else None
+        if reference_level is not None:
+            # A Markdown heading ends the removed section.  Plain headings
+            # are intentionally not treated as terminators because reference
+            # lists themselves often contain short, title-like lines.
+            if heading_level is not None and (reference_level == 0 or heading_level <= reference_level):
+                reference_level = None
+            else:
+                stats["reference_lines_removed"] += 1
+                continue
+
+        if heading_info is not None:
+            reference_level = heading_info[0]
+            stats["reference_sections_removed"] += 1
+            continue
+
+        if _MARKDOWN_LINK_DEFINITION_RE.match(line):
+            stats["link_definitions_removed"] += 1
+            continue
+
+        stripped = line.strip()
+        is_table_line = stripped.startswith("|") or ("|" in stripped and stripped.count("|") >= 2)
+        if is_table_line:
+            cells = stripped.strip("|").split("|")
+            cell_count = len(cells)
+            if not table_active:
+                stats["table_count"] += 1
+                table_active = True
+                table_expected_columns = cell_count
+            stats["table_rows_checked"] += 1
+            if table_expected_columns is not None and cell_count != table_expected_columns:
+                stats["table_column_mismatch_count"] += 1
+                stats["table_warnings"].append(
+                    {
+                        "line": line_number,
+                        "expected_columns": table_expected_columns,
+                        "actual_columns": cell_count,
+                    }
+                )
+        else:
+            table_active = False
+            table_expected_columns = None
+
+        cleaned_lines.append(_clean_markdown_inline(line.rstrip(), stats))
+
+    cleaned = "\n".join(cleaned_lines)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+    stats["cleaned_chars"] = len(cleaned)
+    stats["removed_chars"] = max(0, len(raw_text) - len(cleaned))
+    stats["empty_after_cleaning"] = not bool(cleaned)
+    return cleaned, stats
+
+
 def _usable_text(text: str | None) -> bool:
     value = str(text or "").strip()
     return len(value) >= ENHANCED_READER_MIN_USABLE_CHARS and not looks_like_antibot(value)
@@ -883,7 +1248,10 @@ async def read(target_url: str, request: Request):
 
     total_started = time.perf_counter()
     url = normalize_url(target_url)
-    wants_json = "application/json" in request.headers.get("accept", "")
+    debug_requested = request.query_params.get("debug", "").strip().lower() in {"1", "true", "yes", "on"}
+    # ``debug=1`` is convenient with curl: it forces the structured response
+    # even when curl sends the default ``Accept: */*`` header.
+    wants_json = debug_requested or "application/json" in request.headers.get("accept", "")
     debug_timing: dict[str, Any] = {}
     refresh_cache = request.query_params.get("refresh", "").strip().lower() in {"1", "true", "yes"}
 
@@ -924,6 +1292,27 @@ async def read(target_url: str, request: Request):
                     raw_markdown=markdown_response,
                     debug_timing=debug_timing,
                 )
+            elif ENHANCED_READER_FETCH_STRATEGY == "markdown_clean":
+                markdown_response = await timed_stage_call(
+                    "fetch_markdown",
+                    fetch_raw_markdown_via_cache_layer(client, url),
+                    debug_timing,
+                )
+                debug_timing["raw_markdown_chars"] = len(markdown_response or "")
+                debug_timing["raw_markdown_antibot"] = looks_like_antibot(markdown_response)
+                markdown, cleaning = clean_raw_markdown(markdown_response)
+                debug_timing["markdown_cleaning"] = cleaning
+                debug_timing["cleaning_original_chars"] = cleaning["original_chars"]
+                debug_timing["cleaning_cleaned_chars"] = cleaning["cleaned_chars"]
+                content_source = "rule_cleaned_markdown"
+                if not markdown:
+                    content_quality = "empty"
+                elif looks_like_antibot(markdown):
+                    content_quality = "anti_bot"
+                elif len(markdown) >= ENHANCED_READER_MIN_USABLE_CHARS:
+                    content_quality = "usable"
+                else:
+                    content_quality = "short"
             else:
                 markdown_response = await timed_stage_call(
                     "fetch_markdown",
@@ -994,6 +1383,7 @@ async def read(target_url: str, request: Request):
 
     debug_timing["total_s"] = time.perf_counter() - total_started
     debug_timing["cache_hit"] = False
+    cleaning = debug_timing.get("markdown_cleaning")
     payload = {
         "data": {
             "title": "",
@@ -1008,16 +1398,20 @@ async def read(target_url: str, request: Request):
         "status": 200,
         "debug_timing": debug_timing,
     }
+    if isinstance(cleaning, dict):
+        payload["data"]["cleaning"] = cleaning
     _write_cache(url, wants_json=wants_json, payload=payload, negative=content_quality in {"anti_bot", "empty"})
 
     if wants_json:
         return payload
 
     body = f"URL Source: {url}\n\nMarkdown Content:\n{markdown}\n"
-    response_headers = {
-        "X-Debug-Timing-Readerlm-S": f"{debug_timing['readerlm_s']:.6f}",
-        "X-Debug-Timing-Total-S": f"{debug_timing['total_s']:.6f}",
-    }
+    response_headers = {"X-Debug-Timing-Total-S": f"{debug_timing['total_s']:.6f}"}
+    if "readerlm_s" in debug_timing:
+        response_headers["X-Debug-Timing-Readerlm-S"] = f"{debug_timing['readerlm_s']:.6f}"
+    if isinstance(cleaning, dict):
+        response_headers["X-Markdown-Clean-Original-Chars"] = str(cleaning.get("original_chars", 0))
+        response_headers["X-Markdown-Clean-Cleaned-Chars"] = str(cleaning.get("cleaned_chars", 0))
     parallel_fetch_s = debug_timing.get("fetch_markdown_html_parallel_s")
     if parallel_fetch_s is not None:
         response_headers["X-Debug-Timing-Fetch-Markdown-Html-Parallel-S"] = f"{parallel_fetch_s:.6f}"
