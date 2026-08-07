@@ -47,6 +47,7 @@ TOOL_NETWORK_TIMEOUT_S = 120
 # the trajectory and cannot make them succeed.
 TOOL_TIMEOUT_RETRIES = 5
 TOOL_RETRY_SLEEP_S = 5
+TOOL_429_RETRY_SLEEP_S = 60
 MAX_DOWNLOADED_IMAGE_LONG_EDGE = 1920
 MAX_DOWNLOADED_IMAGE_SHORT_EDGE = 1080
 RESIZED_IMAGE_LONG_EDGE = 1200
@@ -73,6 +74,17 @@ I2I_BLOCKED_IMAGE_SEARCH_DOMAINS: tuple[str, ...] = ()
 _SFT_FIXED_REQUEST_ID = "3200636808"
 _URL_KEYWORD_CACHE: dict[tuple[str, str], str] = {}
 _URL_KEYWORD_CACHE_LOCK = threading.Lock()
+
+# Wikimedia's upload CDN has stricter limits than ordinary web pages.  Keep
+# this transport-level guard isolated and switchable so it can be removed (or
+# disabled) without changing any tool implementation.
+_WIKIMEDIA_UPLOAD_HOST = "upload.wikimedia.org"
+_WIKIMEDIA_REQUEST_SEMAPHORE = threading.BoundedSemaphore(3)
+_WIKIMEDIA_THROTTLE_LOCK = threading.Lock()
+_WIKIMEDIA_NEXT_REQUEST_AT = 0.0
+_WIKIMEDIA_COOLDOWN_UNTIL = 0.0
+_WIKIMEDIA_ACTIVE_REQUESTS = 0
+_WIKIMEDIA_QUEUED_REQUESTS = 0
 
 _URL_KEYWORD_NOISE_TOKENS = {
     "image", "images", "img", "upload", "uploads", "static", "media",
@@ -145,6 +157,145 @@ def _env_flag(name: str, default: bool = False) -> bool:
     if raw is None or str(raw).strip() == "":
         return default
     return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _is_wikimedia_upload_url(url: str) -> bool:
+    try:
+        return (urlparse(str(url or "")).hostname or "").lower() == _WIKIMEDIA_UPLOAD_HOST
+    except Exception:
+        return False
+
+
+def _wikimedia_throttle_enabled() -> bool:
+    return _env_flag("SFT_WIKIMEDIA_THROTTLE", True)
+
+
+def _wikimedia_min_interval_s() -> float:
+    raw = str(os.environ.get("SFT_WIKIMEDIA_MIN_INTERVAL_S") or "0.75").strip()
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return 0.75
+
+
+def _wikimedia_429_cooldown_s() -> float:
+    raw = str(os.environ.get("SFT_WIKIMEDIA_429_COOLDOWN_S") or "60").strip()
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return 60.0
+
+
+def _wikimedia_throttle_debug_enabled() -> bool:
+    return _env_flag("SFT_WIKIMEDIA_THROTTLE_DEBUG", True)
+
+
+def _wikimedia_throttle_debug(event: str, **kwargs: Any) -> None:
+    if not _wikimedia_throttle_debug_enabled():
+        return
+    details = " ".join(f"{key}={value!r}" for key, value in kwargs.items())
+    suffix = f" {details}" if details else ""
+    print(f"[wikimedia-throttle] event={event}{suffix}", file=sys.stderr, flush=True)
+
+
+def _acquire_wikimedia_request_slot(url: str) -> bool:
+    """Rate-limit only upload.wikimedia.org requests in this process."""
+
+    if not _wikimedia_throttle_enabled() or not _is_wikimedia_upload_url(url):
+        return False
+
+    global _WIKIMEDIA_NEXT_REQUEST_AT, _WIKIMEDIA_QUEUED_REQUESTS, _WIKIMEDIA_ACTIVE_REQUESTS
+    with _WIKIMEDIA_THROTTLE_LOCK:
+        _WIKIMEDIA_QUEUED_REQUESTS += 1
+        queued = _WIKIMEDIA_QUEUED_REQUESTS
+        active = _WIKIMEDIA_ACTIVE_REQUESTS
+    if active >= 3 or queued > 1:
+        _wikimedia_throttle_debug("queued", active=active, queued=queued, url=url)
+
+    semaphore_acquired = False
+    try:
+        _WIKIMEDIA_REQUEST_SEMAPHORE.acquire()
+        semaphore_acquired = True
+        with _WIKIMEDIA_THROTTLE_LOCK:
+            now = time.monotonic()
+            scheduled_at = max(now, _WIKIMEDIA_NEXT_REQUEST_AT, _WIKIMEDIA_COOLDOWN_UNTIL)
+            _WIKIMEDIA_NEXT_REQUEST_AT = scheduled_at + _wikimedia_min_interval_s()
+        wait_s = scheduled_at - now
+        if wait_s > 0:
+            time.sleep(wait_s)
+        with _WIKIMEDIA_THROTTLE_LOCK:
+            _WIKIMEDIA_QUEUED_REQUESTS = max(0, _WIKIMEDIA_QUEUED_REQUESTS - 1)
+            _WIKIMEDIA_ACTIVE_REQUESTS += 1
+            queued = _WIKIMEDIA_QUEUED_REQUESTS
+            active = _WIKIMEDIA_ACTIVE_REQUESTS
+        if wait_s > 0 or queued > 0:
+            _wikimedia_throttle_debug(
+                "started",
+                active=active,
+                queued=queued,
+                wait_s=round(wait_s, 3),
+                url=url,
+            )
+        return True
+    except BaseException:
+        with _WIKIMEDIA_THROTTLE_LOCK:
+            _WIKIMEDIA_QUEUED_REQUESTS = max(0, _WIKIMEDIA_QUEUED_REQUESTS - 1)
+        if semaphore_acquired:
+            _WIKIMEDIA_REQUEST_SEMAPHORE.release()
+        raise
+
+
+def _release_wikimedia_request_slot(acquired: bool, url: str = "") -> None:
+    if not acquired:
+        return
+    global _WIKIMEDIA_ACTIVE_REQUESTS
+    with _WIKIMEDIA_THROTTLE_LOCK:
+        _WIKIMEDIA_ACTIVE_REQUESTS = max(0, _WIKIMEDIA_ACTIVE_REQUESTS - 1)
+        active = _WIKIMEDIA_ACTIVE_REQUESTS
+        queued = _WIKIMEDIA_QUEUED_REQUESTS
+    _WIKIMEDIA_REQUEST_SEMAPHORE.release()
+    if queued > 0:
+        _wikimedia_throttle_debug("finished", active=active, queued=queued, url=url)
+
+
+def _note_wikimedia_429(url: str, retry_after: str | None) -> None:
+    if not _wikimedia_throttle_enabled() or not _is_wikimedia_upload_url(url):
+        return
+    try:
+        cooldown_s = max(float(retry_after or ""), 0.0)
+    except (TypeError, ValueError):
+        cooldown_s = _wikimedia_429_cooldown_s()
+    global _WIKIMEDIA_COOLDOWN_UNTIL
+    with _WIKIMEDIA_THROTTLE_LOCK:
+        _WIKIMEDIA_COOLDOWN_UNTIL = max(
+            _WIKIMEDIA_COOLDOWN_UNTIL,
+            time.monotonic() + cooldown_s,
+        )
+
+
+def _read_url_image_max_retries() -> int:
+    """Return the bounded retry budget for direct image downloads.
+
+    Image CDNs commonly answer a burst of requests with HTTP 429.  Retrying
+    the same URL six times is counterproductive and can also delay trying a
+    registered thumbnail or source-page image.  Non-429 failures use the
+    normal six-attempt budget by default; 429 responses have a separate,
+    smaller budget below.
+    """
+
+    return max(0, _env_int("SFT_READ_URL_IMAGE_RETRIES", TOOL_TIMEOUT_RETRIES))
+
+
+def _read_url_image_retry_sleep_s() -> int:
+    return max(0, _env_int("SFT_READ_URL_IMAGE_RETRY_SLEEP_S", TOOL_RETRY_SLEEP_S))
+
+
+def _read_url_429_max_retries() -> int:
+    return max(0, min(1, _env_int("SFT_READ_URL_429_RETRIES", 1)))
+
+
+def _read_url_429_retry_sleep_s() -> int:
+    return max(0, _env_int("SFT_READ_URL_429_RETRY_SLEEP_S", TOOL_429_RETRY_SLEEP_S))
 
 
 def _read_url_debug(message: str, **kwargs: Any) -> None:
@@ -348,10 +499,18 @@ def _resource_candidate_urls(resource: UrlResource | None, requested_url: str) -
     return candidates
 
 
-def _source_page_image_candidates(resource: UrlResource | None) -> list[str]:
+def _source_page_image_candidates(
+    resource: UrlResource | None,
+    *,
+    max_retries: int | None = None,
+    max_429_retries: int | None = None,
+) -> list[str]:
     """Best-effort og:image/twitter:image extraction from a result page."""
     if resource is None or not resource.source_page_url:
         return []
+    effective_max_retries = (
+        _read_url_image_max_retries() if max_retries is None else max(0, int(max_retries))
+    )
     try:
         response = _request_with_retry(
             "GET",
@@ -359,8 +518,13 @@ def _source_page_image_candidates(resource: UrlResource | None) -> list[str]:
             timeout=TOOL_NETWORK_TIMEOUT_S,
             allow_redirects=True,
             headers=_web_request_headers(referer_url=resource.source_page_url),
-            max_retries=TOOL_TIMEOUT_RETRIES,
-            retry_sleep_s=TOOL_RETRY_SLEEP_S,
+            max_retries=effective_max_retries,
+            retry_sleep_s=_read_url_image_retry_sleep_s(),
+            max_429_retries=(
+                _read_url_429_max_retries() if max_429_retries is None else max(0, int(max_429_retries))
+            ),
+            retry_429_sleep_s=_read_url_429_retry_sleep_s(),
+            retry_on_429=True,
         )
         html = response.text
         response.close()
@@ -554,7 +718,7 @@ def _serper_client() -> SerperSearchClient:
     return SerperSearchClient(
         search_url=os.environ.get("SERPER_SEARCH_URL") or "https://google.serper.dev/search",
         images_url=os.environ.get("SERPER_IMAGES_URL") or "https://google.serper.dev/images",
-        timeout_s=TOOL_NETWORK_TIMEOUT_S,
+        timeout_s=60.0,
     )
 
 
@@ -979,19 +1143,36 @@ def _request_with_retry(
     timeout: int,
     max_retries: int = TOOL_TIMEOUT_RETRIES,
     retry_sleep_s: int = TOOL_RETRY_SLEEP_S,
+    retry_on_429: bool = True,
+    max_429_retries: int | None = 1,
+    retry_429_sleep_s: float = TOOL_429_RETRY_SLEEP_S,
     **kwargs: Any,
 ) -> requests.Response:
     last_error: Exception | None = None
     attempts = 1 + max(0, int(max_retries))
     for attempt in range(1, attempts + 1):
         response: requests.Response | None = None
+        wikimedia_slot_acquired = False
         try:
+            wikimedia_slot_acquired = _acquire_wikimedia_request_slot(url)
             response = requests.request(method, url, timeout=timeout, **kwargs)
-            if _should_retry_http_status(response.status_code) and attempt < attempts:
+            if response.status_code == 429:
+                _note_wikimedia_429(url, response.headers.get("Retry-After"))
+            if response.status_code == 429:
+                can_retry_status = retry_on_429 and (
+                    max_429_retries is None or attempt <= max(0, int(max_429_retries))
+                )
+            else:
+                can_retry_status = True
+            should_retry_status = _should_retry_http_status(response.status_code) and can_retry_status
+            if should_retry_status and attempt < attempts:
                 retry_after = response.headers.get("Retry-After")
-                try:
-                    wait_s = max(float(retry_after), 0.0) if retry_after else retry_sleep_s * attempt
-                except (TypeError, ValueError):
+                if response.status_code == 429:
+                    try:
+                        wait_s = max(float(retry_after), retry_429_sleep_s) if retry_after else retry_429_sleep_s
+                    except (TypeError, ValueError):
+                        wait_s = retry_429_sleep_s
+                else:
                     wait_s = retry_sleep_s * attempt
                 response.close()
                 sleep_s = wait_s + random.uniform(0.0, 1.0)
@@ -1033,12 +1214,25 @@ def _request_with_retry(
             if (
                 exc.response is not None
                 and _should_retry_http_status(exc.response.status_code)
+                and (
+                    exc.response.status_code != 429
+                    or (
+                        retry_on_429
+                        and (
+                            max_429_retries is None
+                            or attempt <= max(0, int(max_429_retries))
+                        )
+                    )
+                )
                 and attempt < attempts
             ):
                 retry_after = exc.response.headers.get("Retry-After") if exc.response is not None else None
-                try:
-                    wait_s = max(float(retry_after), 0.0) if retry_after else retry_sleep_s * attempt
-                except (TypeError, ValueError):
+                if exc.response.status_code == 429:
+                    try:
+                        wait_s = max(float(retry_after), retry_429_sleep_s) if retry_after else retry_429_sleep_s
+                    except (TypeError, ValueError):
+                        wait_s = retry_429_sleep_s
+                else:
                     wait_s = retry_sleep_s * attempt
                 sleep_s = wait_s + random.uniform(0.0, 1.0)
                 _tool_retry_debug(
@@ -1058,6 +1252,8 @@ def _request_with_retry(
             if response is not None:
                 response.close()
             raise
+        finally:
+            _release_wikimedia_request_slot(wikimedia_slot_acquired, url)
     assert last_error is not None
     raise last_error
 
@@ -1160,17 +1356,72 @@ def _probe_content_type(url: str) -> str:
     return guessed_image_type or "text/html"
 
 
+def _classify_read_url_content_type(
+    url: str,
+    *,
+    resource: UrlResource | None = None,
+) -> tuple[str, str, bool]:
+    """Classify a ``read_url`` target without an eager network probe.
+
+    Search results carry a reliable resource kind, and explicit file suffixes
+    are also sufficient to choose the binary path.  For every other URL we
+    deliberately treat the target as a web page and let Enhanced Reader (and
+    its Firecrawl fallback) perform the fetch.  Previously these URLs first
+    incurred a HEAD request and often a streaming GET; each of those requests
+    could independently consume all HTTP retries and turn one read into a
+    burst of quota-limited requests.
+
+    The third return value indicates whether the image branch should be used.
+    Keeping that decision separate from ``content_type`` is important for
+    extensionless image resources, whose URL does not provide a MIME guess.
+    """
+
+    resource_kind = str(resource.kind if resource is not None else "").strip().lower()
+    guessed_image_type = _guess_image_content_type(url)
+    guessed_pdf_type = _guess_pdf_content_type(url)
+
+    if resource_kind == "image":
+        return guessed_image_type, "resource_kind_image", True
+    if resource_kind == "pdf":
+        return guessed_pdf_type or "application/pdf", "resource_kind_pdf", False
+    if guessed_image_type:
+        return guessed_image_type, "url_suffix_image", True
+    if guessed_pdf_type:
+        return guessed_pdf_type, "url_suffix_pdf", False
+
+    # Unknown URLs are pages by default.  This is intentionally not a MIME
+    # assertion; it only selects the text-reader path and avoids a redundant
+    # HEAD/GET classification round trip.
+    return "text/html", "default_text_reader", False
+
+
 def _download_binary(
     url: str,
     *,
     timeout: int = TOOL_NETWORK_TIMEOUT_S,
     referer_url: str | None = None,
+    max_retries: int | None = None,
+    retry_sleep_s: int | None = None,
+    retry_on_429: bool = True,
+    max_429_retries: int | None = None,
+    retry_429_sleep_s: float | None = None,
 ) -> tuple[bytes, str]:
+    effective_max_retries = TOOL_TIMEOUT_RETRIES if max_retries is None else max(0, int(max_retries))
+    effective_retry_sleep_s = TOOL_RETRY_SLEEP_S if retry_sleep_s is None else max(0, int(retry_sleep_s))
+    effective_max_429_retries = 1 if max_429_retries is None else max(0, int(max_429_retries))
+    effective_retry_429_sleep_s = (
+        TOOL_429_RETRY_SLEEP_S if retry_429_sleep_s is None else max(0.0, float(retry_429_sleep_s))
+    )
     response = _request_with_retry(
         "GET",
         url,
         timeout=timeout,
         headers=_web_request_headers(referer_url=referer_url or url),
+        max_retries=effective_max_retries,
+        retry_sleep_s=effective_retry_sleep_s,
+        retry_on_429=retry_on_429,
+        max_429_retries=effective_max_429_retries,
+        retry_429_sleep_s=effective_retry_429_sleep_s,
     )
     content_type = response.headers.get("Content-Type", "")
     normalized = content_type.split(";", 1)[0].strip().lower() if content_type else ""
@@ -1440,15 +1691,36 @@ def read_url(
         return {"ok": False, "error": "URL is required."}
     _read_url_debug("normalized_url", original_url=original_url, normalized_url=normalized_url)
 
-    content_type = _probe_content_type(normalized_url)
-    _read_url_debug("probed_content_type", url=normalized_url, content_type=content_type)
-    # Search results already carry an authoritative resource kind.  Some image
-    # CDNs (notably Instagram's crawler endpoint) have no image extension and
-    # can return an anti-bot HTML response to a probe.  Do not reinterpret an
-    # image resource as a webpage in that case: keep it on the binary-download
-    # path and never invoke the text reader / Firecrawl fallback for it.
-    is_image_resource = resource is not None and resource.kind == "image"
+    # Do not make a HEAD/streaming-GET round trip merely to classify the URL.
+    # Search resources and explicit suffixes provide enough information for
+    # the binary paths; all other URLs are sent directly to Enhanced Reader.
+    # This avoids multiplying a single read into several retryable requests
+    # (and is especially important for sites returning HTTP 429 to HEAD).
+    content_type, content_type_source, is_image_resource = _classify_read_url_content_type(
+        normalized_url,
+        resource=resource,
+    )
+    _read_url_debug(
+        "classified_content_type",
+        url=normalized_url,
+        content_type=content_type,
+        source=content_type_source,
+        probe_skipped=True,
+    )
     if is_image_resource or content_type.startswith("image/"):
+        image_max_retries = _read_url_image_max_retries()
+        image_retry_sleep_s = _read_url_image_retry_sleep_s()
+        image_max_429_retries = _read_url_429_max_retries()
+        image_429_retry_sleep_s = _read_url_429_retry_sleep_s()
+        _read_url_debug(
+            "image_download_retry_policy",
+            url=normalized_url,
+            max_retries=image_max_retries,
+            max_attempts=image_max_retries + 1,
+            retry_sleep_s=image_retry_sleep_s,
+            max_429_retries=image_max_429_retries,
+            retry_429_sleep_s=image_429_retry_sleep_s,
+        )
         failures: list[str] = []
         candidates = _resource_candidate_urls(resource, normalized_url)
         source_page_checked = False
@@ -1463,12 +1735,17 @@ def read_url(
                     candidate_url,
                     timeout=TOOL_NETWORK_TIMEOUT_S,
                     referer_url=referer_url,
+                    max_retries=image_max_retries,
+                    retry_sleep_s=image_retry_sleep_s,
+                    retry_on_429=True,
+                    max_429_retries=image_max_429_retries,
+                    retry_429_sleep_s=image_429_retry_sleep_s,
                 )
                 candidate_content_type = (
                     downloaded_type
                     or _sniff_image_content_type(response_content)
                     or _guess_image_content_type(candidate_url)
-                    or content_type
+                    or (content_type if content_type != "text/html" else "")
                 )
                 if not candidate_content_type.startswith("image/"):
                     raise ValueError(f"downloaded fallback is not an image: {candidate_content_type or 'unknown'}")
@@ -1496,7 +1773,11 @@ def read_url(
                 if not source_page_checked and candidate_index >= len(candidates):
                     source_page_checked = True
                     seen_urls = {url for _, url, _ in candidates}
-                    for page_image_url in _source_page_image_candidates(resource):
+                    for page_image_url in _source_page_image_candidates(
+                        resource,
+                        max_retries=image_max_retries,
+                        max_429_retries=image_max_429_retries,
+                    ):
                         if page_image_url in seen_urls:
                             continue
                         seen_urls.add(page_image_url)

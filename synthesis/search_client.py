@@ -663,7 +663,7 @@ class SerperAdapterSearchClient:
         base_url: str = "http://127.0.0.1:7001",
         *,
         api_key: str = "local-openserp",
-        timeout_s: float = 120.0,
+        timeout_s: float = 60.0,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
@@ -753,7 +753,7 @@ class SerperSearchClient:
         api_keys: list[str] | None = None,
         search_url: str | None = None,
         images_url: str | None = None,
-        timeout_s: float = 120.0,
+        timeout_s: float = 60.0,
         pool_state_path: str | Path | None = None,
         pool_default_credits: int | None = None,
         pool_min_remaining: int | None = None,
