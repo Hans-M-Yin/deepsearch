@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections import deque
+from collections import OrderedDict, deque
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 from hashlib import sha256
@@ -77,6 +77,9 @@ class ExpansionTask:
     priority: float = 0.0
     status: ExpansionTaskStatus = ExpansionTaskStatus.PENDING
     metadata: dict[str, Any] = field(default_factory=dict)
+    # Persisted for FIFO queue checkpoints.  Older checkpoints omit this
+    # field and are assigned sequence numbers in their saved queue order.
+    enqueue_seq: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return _jsonify(asdict(self))
@@ -245,8 +248,24 @@ class GraphExpansionStrategy:
         self.visual_planner = visual_planner
         self.image_builder = image_builder
         self.config = config or GraphExpansionConfig()
+        self._fifo_enabled = (self.config.queue_pop_strategy or "fifo").lower() != "random"
+
+        # Keep the old queue exclusively for the random compatibility path.
+        # FIFO uses an active ordered map plus small category queues so task
+        # selection never scans the full queue or deletes from its middle.
         self._queue: deque[ExpansionTask] = deque()
+        self._fifo_active_tasks: OrderedDict[str, ExpansionTask] = OrderedDict()
+        self._fifo_task_buckets: dict[tuple[str, str | None], deque[str]] = {}
+        self._fifo_task_bucket_by_key: dict[str, tuple[str, str | None]] = {}
+        self._fifo_next_enqueue_seq = 0
+        self._fifo_text_count = 0
+        self._fifo_image_count = 0
+        self._fifo_image_entity_count = 0
         self._seen_task_keys: set[str] = set()
+        # A text URL has at most one active text task because its dedupe key
+        # is ``text_expand:<url>``.  Keep a direct index so adding another
+        # parent link does not scan the whole queue.
+        self._active_text_tasks_by_url: dict[str, ExpansionTask] = {}
         self._pending_parent_links_by_url: dict[str, list[dict[str, Any]]] = {}
         self._lock = RLock()
         self._raw_markdown_reader = RawMarkdownReaderClient(
@@ -276,11 +295,22 @@ class GraphExpansionStrategy:
                 links = list(task.metadata.get("pending_parent_links") or [])
                 links.extend(pending_links)
                 task.metadata["pending_parent_links"] = links
-            self._queue.append(task)
+            if task.task_type == ExpansionTaskType.TEXT_EXPAND:
+                self._active_text_tasks_by_url[task.url] = task
+            if self._fifo_enabled:
+                self._enqueue_fifo_task_locked(task, task_key)
+            else:
+                self._queue.append(task)
             return True
 
     def queue_size(self, task_type: ExpansionTaskType | None = None) -> int:
         with self._lock:
+            if self._fifo_enabled:
+                if task_type == ExpansionTaskType.TEXT_EXPAND:
+                    return self._fifo_text_count
+                if task_type == ExpansionTaskType.IMAGE_EXPAND:
+                    return self._fifo_image_count
+                return len(self._fifo_active_tasks)
             if task_type is not None:
                 return sum(1 for task in self._queue if task.task_type == task_type)
             return len(self._queue)
@@ -305,10 +335,19 @@ class GraphExpansionStrategy:
         root_text_only: bool = False,
     ) -> ExpansionTask | None:
         with self._lock:
-            if not self._queue:
-                return None
             if allowed_task_types is None:
                 allowed_task_types = {ExpansionTaskType.TEXT_EXPAND, ExpansionTaskType.IMAGE_EXPAND}
+
+            if self._fifo_enabled:
+                return self._pop_next_fifo_task_locked(
+                    allowed_task_types=allowed_task_types,
+                    text_task_origin=text_task_origin,
+                    exclude_text_task_origin=exclude_text_task_origin,
+                    root_text_only=root_text_only,
+                )
+
+            if not self._queue:
+                return None
             eligible_indices: list[int] = []
             for index, task in enumerate(self._queue):
                 if task.task_type in allowed_task_types:
@@ -333,6 +372,7 @@ class GraphExpansionStrategy:
             selected_index = self._select_queue_index(eligible_indices)
             task = self._queue[selected_index]
             del self._queue[selected_index]
+            self._remove_active_text_task_index_locked(task)
             return task
 
     def pop_next_batch(
@@ -344,15 +384,33 @@ class GraphExpansionStrategy:
         with self._lock:
             tasks: list[ExpansionTask] = []
             limit = max(1, int(batch_size))
+            if self._fifo_enabled:
+                effective_allowed_task_types = (
+                    {ExpansionTaskType.TEXT_EXPAND, ExpansionTaskType.IMAGE_EXPAND}
+                    if allowed_task_types is None
+                    else allowed_task_types
+                )
+                while len(tasks) < limit:
+                    task = self._pop_next_fifo_task_locked(
+                        allowed_task_types=effective_allowed_task_types,
+                    )
+                    if task is None:
+                        break
+                    tasks.append(task)
+                return tasks
+
             if allowed_task_types is None:
                 while self._queue and len(tasks) < limit:
                     if self.config.queue_pop_strategy == "random":
                         selected_index = self._select_queue_index(list(range(len(self._queue))))
                         task = self._queue[selected_index]
                         del self._queue[selected_index]
+                        self._remove_active_text_task_index_locked(task)
                         tasks.append(task)
                     else:
-                        tasks.append(self._queue.popleft())
+                        task = self._queue.popleft()
+                        self._remove_active_text_task_index_locked(task)
+                        tasks.append(task)
                 return tasks
             index = 0
             while index < len(self._queue) and len(tasks) < limit:
@@ -360,6 +418,7 @@ class GraphExpansionStrategy:
                 if task.task_type in allowed_task_types:
                     tasks.append(task)
                     del self._queue[index]
+                    self._remove_active_text_task_index_locked(task)
                     continue
                 index += 1
             return tasks
@@ -380,7 +439,61 @@ class GraphExpansionStrategy:
 
     def queue_records(self) -> list[dict[str, Any]]:
         with self._lock:
+            if self._fifo_enabled:
+                return [task.to_dict() for task in self._fifo_active_tasks.values()]
             return [task.to_dict() for task in self._queue]
+
+    def queue_breakdown(self) -> dict[str, int]:
+        """Return queue counts without serializing or scanning FIFO tasks."""
+
+        with self._lock:
+            if self._fifo_enabled:
+                text_queue_size = self._fifo_text_count
+                image_queue_size = self._fifo_image_count
+                image_entity_queue = self._fifo_image_entity_count
+                return {
+                    "text_queue": text_queue_size,
+                    "image_queue": image_queue_size,
+                    "text_neighbor_queue": text_queue_size - image_entity_queue,
+                    "image_entity_queue": image_entity_queue,
+                }
+
+            text_queue_size = 0
+            image_queue_size = 0
+            image_entity_queue = 0
+            for task in self._queue:
+                if task.task_type == ExpansionTaskType.IMAGE_EXPAND:
+                    image_queue_size += 1
+                    continue
+                if task.task_type != ExpansionTaskType.TEXT_EXPAND:
+                    continue
+                text_queue_size += 1
+                if (task.metadata or {}).get("task_origin") == "image_entity":
+                    image_entity_queue += 1
+            return {
+                "text_queue": text_queue_size,
+                "image_queue": image_queue_size,
+                "text_neighbor_queue": text_queue_size - image_entity_queue,
+                "image_entity_queue": image_entity_queue,
+            }
+
+    def has_root_text_tasks(self) -> bool:
+        """Return whether a root text task is queued without serializing it."""
+
+        with self._lock:
+            if self._fifo_enabled:
+                task_keys = self._fifo_task_buckets.get(("text_root", None))
+                if not task_keys:
+                    return False
+                while task_keys and task_keys[0] not in self._fifo_active_tasks:
+                    task_keys.popleft()
+                return bool(task_keys)
+            return any(
+                task.task_type == ExpansionTaskType.TEXT_EXPAND
+                and task.parent_node_id is None
+                and not (task.metadata or {}).get("task_origin")
+                for task in self._queue
+            )
 
     def seen_task_keys(self) -> list[str]:
         with self._lock:
@@ -389,6 +502,119 @@ class GraphExpansionStrategy:
     def add_seen_task_keys(self, keys: list[str]) -> None:
         with self._lock:
             self._seen_task_keys.update(keys)
+
+    @staticmethod
+    def _fifo_bucket_for_task(task: ExpansionTask) -> tuple[str, str | None]:
+        if task.task_type == ExpansionTaskType.IMAGE_EXPAND:
+            return ("image", None)
+        origin = (task.metadata or {}).get("task_origin")
+        if origin is not None:
+            return ("text_origin", str(origin))
+        if task.parent_node_id is None:
+            return ("text_root", None)
+        return ("text_neighbor", None)
+
+    def _enqueue_fifo_task_locked(
+        self,
+        task: ExpansionTask,
+        task_key: str,
+    ) -> None:
+        sequence = task.enqueue_seq
+        if sequence is None or int(sequence) < self._fifo_next_enqueue_seq:
+            sequence = self._fifo_next_enqueue_seq
+            task.enqueue_seq = sequence
+        else:
+            sequence = int(sequence)
+            task.enqueue_seq = sequence
+        self._fifo_next_enqueue_seq = max(self._fifo_next_enqueue_seq, sequence + 1)
+
+        bucket = self._fifo_bucket_for_task(task)
+        self._fifo_active_tasks[task_key] = task
+        self._fifo_task_buckets.setdefault(bucket, deque()).append(task_key)
+        self._fifo_task_bucket_by_key[task_key] = bucket
+        if task.task_type == ExpansionTaskType.TEXT_EXPAND:
+            self._fifo_text_count += 1
+            if bucket == ("text_origin", "image_entity"):
+                self._fifo_image_entity_count += 1
+        else:
+            self._fifo_image_count += 1
+
+    def _pop_next_fifo_task_locked(
+        self,
+        *,
+        allowed_task_types: set[ExpansionTaskType],
+        text_task_origin: str | None = None,
+        exclude_text_task_origin: str | None = None,
+        root_text_only: bool = False,
+    ) -> ExpansionTask | None:
+        best_key: str | None = None
+        best_sequence: int | None = None
+
+        for bucket, task_keys in self._fifo_task_buckets.items():
+            while task_keys and task_keys[0] not in self._fifo_active_tasks:
+                task_keys.popleft()
+            if not task_keys:
+                continue
+
+            bucket_kind, bucket_value = bucket
+            if bucket_kind == "image":
+                task_type = ExpansionTaskType.IMAGE_EXPAND
+            else:
+                task_type = ExpansionTaskType.TEXT_EXPAND
+            if task_type not in allowed_task_types:
+                continue
+            if text_task_origin is not None:
+                if bucket != ("text_origin", str(text_task_origin)):
+                    continue
+            if exclude_text_task_origin is not None:
+                if bucket == ("text_origin", str(exclude_text_task_origin)):
+                    continue
+            if root_text_only and bucket != ("text_root", None):
+                continue
+
+            task_key = task_keys[0]
+            task = self._fifo_active_tasks[task_key]
+            sequence = task.enqueue_seq
+            if sequence is None:
+                sequence = 0
+            if best_sequence is None or sequence < best_sequence:
+                best_key = task_key
+                best_sequence = sequence
+
+        if best_key is None:
+            return None
+
+        bucket = self._fifo_task_bucket_by_key.pop(best_key)
+        bucket_tasks = self._fifo_task_buckets[bucket]
+        if bucket_tasks and bucket_tasks[0] == best_key:
+            bucket_tasks.popleft()
+        else:
+            # This should only be reachable after recovering a malformed
+            # checkpoint; retain correctness rather than leaving a stale key.
+            try:
+                bucket_tasks.remove(best_key)
+            except ValueError:
+                pass
+        if not bucket_tasks:
+            self._fifo_task_buckets.pop(bucket, None)
+
+        task = self._fifo_active_tasks.pop(best_key)
+        self._remove_active_text_task_index_locked(task)
+        if task.task_type == ExpansionTaskType.TEXT_EXPAND:
+            self._fifo_text_count -= 1
+            if bucket == ("text_origin", "image_entity"):
+                self._fifo_image_entity_count -= 1
+        else:
+            self._fifo_image_count -= 1
+        return task
+
+    def _remove_active_text_task_index_locked(self, task: ExpansionTask) -> None:
+        """Remove a text task from the URL index after it leaves the queue."""
+
+        if task.task_type != ExpansionTaskType.TEXT_EXPAND:
+            return
+        if self._active_text_tasks_by_url.get(task.url) is task:
+            self._active_text_tasks_by_url.pop(task.url, None)
 
     def expand_task(
         self,
@@ -416,6 +642,36 @@ class GraphExpansionStrategy:
             _trace_timing(
                 f"[expand-task] stage=text_build url={task.url!r} elapsed_s={timing['text_build_s']:.3f} node_id={text_result.node.node_id!r}"
             )
+
+            # A text task can remain in the queue after another task has
+            # already materialized the same Wikipedia node.  The builder's
+            # cache lookup is based on the stable node id, so a cache hit
+            # means the graph already contains this text node.  In that case
+            # only materialize the pending source links and do not repeat
+            # attribute extraction, neighbor discovery, or image expansion.
+            if text_result.from_cache:
+                started = time.perf_counter()
+                materialized_edges, parent_link_failures = self._materialize_pending_parent_links(
+                    task,
+                    target_result=text_result,
+                    run_id=run_id,
+                    materialize_backlinks=False,
+                )
+                timing["materialize_existing_parent_edges_s"] = time.perf_counter() - started
+                timing["total_s"] = time.perf_counter() - total_started
+                task.status = ExpansionTaskStatus.SKIPPED
+                _trace_timing(
+                    f"[expand-task] phase=skipped_existing url={task.url!r} "
+                    f"elapsed_s={timing['total_s']:.3f} "
+                    f"edges={len(materialized_edges)} failures={len(parent_link_failures)}"
+                )
+                return NodeExpansionResult(
+                    task=task,
+                    text_result=text_result,
+                    materialized_edges=materialized_edges,
+                    parent_link_failures=parent_link_failures,
+                    timing=timing,
+                )
 
             started = time.perf_counter()
             materialized_edges, parent_link_failures = self._materialize_pending_parent_links(
@@ -623,15 +879,20 @@ class GraphExpansionStrategy:
         *,
         target_result: WikiTextBuildResult,
         run_id: str | None,
+        materialize_backlinks: bool = True,
     ) -> tuple[list[Edge], list[dict[str, Any]]]:
         pending_links = list(task.metadata.get("pending_parent_links") or [])
         with self._lock:
             pending_links.extend(self._pending_parent_links_by_url.pop(task.url, []))
         materialized: list[Edge] = []
         failures: list[dict[str, Any]] = []
-        backlink_candidates = self._find_pending_parent_backlinks(
-            pending_links,
-            source_result=target_result,
+        backlink_candidates = (
+            self._find_pending_parent_backlinks(
+                pending_links,
+                source_result=target_result,
+            )
+            if materialize_backlinks
+            else {}
         )
         existing_backlink_targets = (
             {
@@ -971,9 +1232,8 @@ class GraphExpansionStrategy:
             )
 
         with self._lock:
-            for task in self._queue:
-                if task.url != url:
-                    continue
+            task = self._active_text_tasks_by_url.get(url)
+            if task is not None:
                 links = list(task.metadata.get("pending_parent_links") or [])
                 key = _pending_key(pending_link)
                 for existing in links:

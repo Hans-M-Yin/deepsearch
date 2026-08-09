@@ -10,9 +10,16 @@ from PIL import Image
 import re
 from collections import Counter
 import json5
+from synthesis.sft import api_tools as sft_api
+from synthesis.sft.api_tools import ToolRuntimeContext
 
 # rLLM imports
 from rllm.engine.rollout import RolloutEngine
+
+from vision_deepresearch_async_workflow.deepresearch_tools_async_executor import (
+    SFTToolAdapter,
+    build_sft_react_system_prompt,
+)
 
 # Constants from original DeepResearch
 OBS_START = "<tool_response>"
@@ -181,7 +188,10 @@ boxed{50%}
 Current date: """
 
 
-DEEPRESEARCH_SYSTEM_PROMPT = DEEPRESEARCH_SYSTEM_PROMPT_TEXT
+# Keep the historical prompt above for reference, but use the SFT schemas and
+# tool names at runtime.  The SFT backend still uses its own exact dispatcher;
+# only the RL wire format remains ``<tool_call>``/``<response>``.
+DEEPRESEARCH_SYSTEM_PROMPT = build_sft_react_system_prompt()
 
 
 def today_date():
@@ -302,6 +312,12 @@ class MultiTurnReactAgent:
         self.rollout_engine = rollout_engine
         self.tools = tools or {}
         self.system_prompt = system_prompt
+        # SFT tools are synchronous and may sleep during their retry budget.
+        # Run them in the workflow's shared executor instead of blocking the
+        # async rollout event loop.
+        self.executor = kwargs.get("executor")
+        self._sft_context: ToolRuntimeContext | None = None
+        self._pending_sft_attachment: dict[str, Any] | None = None
         # Configuration from original DeepResearch
         self.max_llm_calls = MAX_LLM_CALL_PER_RUN
         self.default_max_tries = default_max_tries
@@ -450,6 +466,24 @@ class MultiTurnReactAgent:
         if image_path:
             self._image_paths["img_1"] = image_path
 
+        # One SFT ToolRuntimeContext is created per trajectory.  It owns the
+        # search-result/resource registry and image registry, so IDs returned by
+        # t2t/t2i/i2i_search remain resolvable by later read_url calls.
+        self._sft_context = ToolRuntimeContext(
+            working_dir=self._intermediate_dir,
+            filename_prefix="rl",
+            case_id="rl_session",
+        )
+        initial_image = None
+        if images:
+            initial_image = images[0]
+        elif image_path:
+            initial_image = image_path
+        if initial_image is not None:
+            self._sft_context.image_registry["img_1"] = initial_image
+            self._sft_context._image_counter = 1
+        self._pending_sft_attachment = None
+
         if images:
             user_message = {
                 "role": "user",
@@ -551,18 +585,39 @@ class MultiTurnReactAgent:
                 else:
                     try:
                         tool_call = json5.loads(tool_call_text)
-                        tool_name = tool_call.get("name", "")
-                        tool_args = tool_call.get("arguments", {})
-                        result = await self.custom_call_tool(tool_name, tool_args)
                     except Exception:
                         result = "[Json Parse Error]: Tool call is not a valid JSON."
                         tool_error = True
+                    else:
+                        tool_name = tool_call.get("name", "")
+                        tool_args = tool_call.get("arguments", {})
+                        if not isinstance(tool_name, str) or not isinstance(tool_args, dict):
+                            result = "[Json Parse Error]: Tool call requires a name and an arguments object."
+                            tool_error = True
+                        else:
+                            try:
+                                result = await self.custom_call_tool(
+                                    tool_name,
+                                    tool_args,
+                                    question_text=question,
+                                    assistant_text=content,
+                                    tool_goal=str(tool_args.get("goal") or ""),
+                                )
+                            except Exception as exc:  # noqa: BLE001
+                                result = f"Tool execution error: {type(exc).__name__}: {exc}"
+                                tool_error = True
 
                 if tool_error:
                     assistant_message["step_error"] = True
 
                 tool_response = f"<tool_response>\n{result}\n</tool_response>"
                 messages.append({"role": "user", "content": tool_response})
+                if self._pending_sft_attachment is not None:
+                    # Match synthesis.sft.api_tools: an image returned by
+                    # read_url becomes a separate multimodal user message for
+                    # the next model turn, not merely a textual path.
+                    messages.append(self._pending_sft_attachment)
+                    self._pending_sft_attachment = None
                 if assistant_message["step_error"]:
                     consecutive_bad_steps += 1
                 else:
@@ -691,44 +746,71 @@ class MultiTurnReactAgent:
         return result
 
     async def custom_call_tool(self, tool_name: str, tool_args: dict, **kwargs) -> str:
+        """Execute one tool call through the SFT dispatcher when applicable.
+
+        SFT tools are synchronous and may sleep during their timeout retry
+        budget.  They therefore run in the workflow's shared executor instead
+        of blocking the async rollout event loop.
         """
-        Execute tool calls with the available tools.
 
-        Visual tools (crop, layout_parsing, image_search, perspective_correct,
-        super_resolution, sharpen) receive extra context via **ctx so they can
-        manage the shared ``image_paths`` dictionary.
-        """
-        VISUAL_TOOLS = {
-            "crop", "layout_parsing", "text_search", "image_search",
-            "web_search", "perspective_correct", "super_resolution", "sharpen",
-        }
-
-        if tool_name in self.tools:
-            try:
-                ctx = {}
-                if tool_name in VISUAL_TOOLS:
-                    ctx["image_paths"] = getattr(self, "_image_paths", {})
-                    ctx["intermediate_dir"] = getattr(
-                        self, "_intermediate_dir", "/tmp/vdr_tools"
-                    )
-
-                if hasattr(self.tools[tool_name], "call"):
-                    if asyncio.iscoroutinefunction(self.tools[tool_name].call):
-                        result = await self.tools[tool_name].call(**tool_args, **ctx)
-                    else:
-                        result = self.tools[tool_name].call(**tool_args, **ctx)
-                elif callable(self.tools[tool_name]):
-                    result = self.tools[tool_name](**tool_args, **ctx)
-                else:
-                    result = f"Tool {tool_name} is not callable"
-
-                return str(result)
-
-            except Exception as e:
-                return f"Error calling tool {tool_name}: {e}"
-        else:
+        if tool_name not in self.tools:
             available_tools = list(self.tools.keys())
             return f"Tool {tool_name} not found. Available tools: {available_tools}"
+
+        tool = self.tools[tool_name]
+        if isinstance(tool, SFTToolAdapter) or getattr(tool, "uses_sft_dispatcher", False):
+            context = self._sft_context
+            if context is None:
+                raise RuntimeError(
+                    "SFT ToolRuntimeContext has not been initialized for this trajectory"
+                )
+
+            question_text = str(kwargs.get("question_text") or "")
+            assistant_text = str(kwargs.get("assistant_text") or "")
+            tool_goal = str(kwargs.get("tool_goal") or "")
+
+            def execute_sft_tool():
+                execution = sft_api.execute_tool_call(
+                    name=tool_name,
+                    arguments=tool_args,
+                    context=context,
+                    question_text=question_text,
+                    assistant_text=assistant_text,
+                    tool_goal=tool_goal,
+                )
+                attachment = None
+                if execution.new_images:
+                    attachment = sft_api._read_url_image_attachment(execution, context)
+                return execution, attachment
+
+            loop = asyncio.get_running_loop()
+            execution, attachment = await loop.run_in_executor(
+                self.executor,
+                execute_sft_tool,
+            )
+            self._pending_sft_attachment = attachment
+            return execution.output_text
+
+        # Compatibility path for a caller that supplies a legacy non-SFT tool.
+        try:
+            if hasattr(tool, "call"):
+                if asyncio.iscoroutinefunction(tool.call):
+                    result = await tool.call(**tool_args)
+                else:
+                    result = await asyncio.get_running_loop().run_in_executor(
+                        self.executor,
+                        lambda: tool.call(**tool_args),
+                    )
+            elif callable(tool):
+                result = await asyncio.get_running_loop().run_in_executor(
+                    self.executor,
+                    lambda: tool(**tool_args),
+                )
+            else:
+                result = f"Tool {tool_name} is not callable"
+            return str(result)
+        except Exception as exc:  # noqa: BLE001
+            return f"Error calling tool {tool_name}: {exc}"
 
     async def execute_python(self, code: str) -> str:
         """

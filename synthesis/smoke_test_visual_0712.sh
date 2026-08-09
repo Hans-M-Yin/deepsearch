@@ -7,13 +7,13 @@ nohup python synthesis/run_min_graph.py \
   --reader-base-url http://localhost:8004 \
   --skip-attributes \
   --max-neighbors 8 \
-  --max-llm-neighbor-candidates 80 \
+  --max-llm-neighbor-candidates 50 \
   --max-steps 12345678 \
   --max-nodes 25000 \
   --max-depth 128 \
-  --parallel-workers 80 \
+  --parallel-workers 64 \
   --batch-size 120 \
-  --max-inflight-text 40 \
+  --max-inflight-text 32 \
   --image-backend serper \
   --image-entity-only \
   > synthesis/ignore/output.log 2>&1 &

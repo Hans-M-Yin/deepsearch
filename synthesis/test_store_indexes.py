@@ -75,7 +75,7 @@ class JsonlGraphStoreIndexTests(unittest.TestCase):
                 [item["node_id"] for item in reloaded.find_nodes_by_source_url(
                     "https://example.test/a"
                 )],
-                ["image-a", "text-a"],
+                ["text-a", "image-a"],
             )
             self.assertEqual(
                 [item["edge_id"] for item in reloaded.edges_from("text-a")],
@@ -90,6 +90,38 @@ class JsonlGraphStoreIndexTests(unittest.TestCase):
                 ["evidence-a"],
             )
             self.assertEqual(reloaded.latest_node()["node_id"], "image-a")
+
+    def test_flush_appends_delta_and_compact_rebuilds_canonical_jsonl(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            store = JsonlGraphStore(root)
+            store.upsert_node(
+                {
+                    "node_id": "text-a",
+                    "node_type": "text",
+                    "title": "Version 1",
+                }
+            )
+            self.assertTrue(store.flush())
+            self.assertFalse((root / "nodes.jsonl").exists())
+            self.assertTrue((root / "nodes.delta.jsonl").exists())
+            self.assertEqual(store.delta_stats()["nodes"]["records"], 1)
+
+            reloaded = JsonlGraphStore(root)
+            self.assertEqual(reloaded.get_node("text-a")["title"], "Version 1")
+            reloaded.upsert_node(
+                {
+                    "node_id": "text-a",
+                    "node_type": "text",
+                    "title": "Version 2",
+                }
+            )
+            reloaded.flush()
+            self.assertEqual(reloaded.get_node("text-a")["title"], "Version 2")
+            self.assertTrue(reloaded.compact())
+            self.assertTrue((root / "nodes.jsonl").exists())
+            self.assertFalse((root / "nodes.delta.jsonl").exists())
+            self.assertEqual(JsonlGraphStore(root).get_node("text-a")["title"], "Version 2")
 
     def test_upsert_updates_and_removes_derived_index_entries(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -148,6 +180,23 @@ class JsonlGraphStoreIndexTests(unittest.TestCase):
                 [item["evidence_id"] for item in store.find_evidence(node_id="text-c")],
                 ["evidence-a"],
             )
+
+    def test_reload_repairs_incomplete_delta_tail(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            store = JsonlGraphStore(root)
+            store.upsert_node({"node_id": "text-a", "node_type": "text"})
+            store.flush()
+            delta_path = root / "nodes.delta.jsonl"
+            with delta_path.open("ab") as handle:
+                handle.write(b'{"node_id":"partial"')
+
+            reloaded = JsonlGraphStore(root)
+            self.assertIsNotNone(reloaded.get_node("text-a"))
+            self.assertIsNone(reloaded.get_node("partial"))
+            repaired_delta = delta_path.read_bytes()
+            self.assertTrue(repaired_delta.endswith(b"\n"))
+            self.assertNotIn(b"partial", repaired_delta)
 
 
 if __name__ == "__main__":

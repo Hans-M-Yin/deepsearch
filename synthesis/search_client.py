@@ -3,20 +3,23 @@
 from __future__ import annotations
 
 import hashlib
+import http.client
 import json
 import os
 import re
 import socket
 import sys
 import tempfile
+import threading
 import time
+from collections import deque
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import urlencode, urlparse
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.request import HTTPHandler, HTTPSHandler, Request, build_opener, urlopen
 
 try:
     import fcntl
@@ -31,6 +34,70 @@ _FIXED_SERPER_POOL_STATE_FILE = (
 _FIXED_SERPER_POOL_MIN_REMAINING = 10
 _FIXED_SERPER_POOL_DEFAULT_CREDITS = 2500
 _FIXED_SERPER_KEY_POOL: "SerperApiKeyPool | None" = None
+
+# QPM is intentionally tracked per Python process.  Serper requests can be
+# issued concurrently by several worker threads, so access to the rolling
+# window must be synchronized.  This is a debug metric, not a rate limiter.
+_SERPER_QPM_WINDOW_S = 60.0
+_SERPER_QPM_LOCK = threading.Lock()
+_SERPER_SUCCESS_TIMES: deque[float] = deque()
+
+# ``fcntl.flock`` coordinates separate processes, but it is not sufficient to
+# protect all callers in the same process/thread pool.  Serialize the local
+# read-modify-write operation as well.
+_SERPER_POOL_THREAD_LOCK = threading.RLock()
+
+
+def _create_ipv6_connection(address, timeout=socket._GLOBAL_DEFAULT_TIMEOUT, source_address=None):
+    """Create a TCP connection using only AF_INET6 DNS results."""
+
+    host, port = address
+    errors: list[OSError] = []
+    infos = socket.getaddrinfo(host, port, socket.AF_INET6, socket.SOCK_STREAM)
+    for family, socktype, proto, _canonname, sockaddr in infos:
+        sock = socket.socket(family, socktype, proto)
+        try:
+            if timeout is not socket._GLOBAL_DEFAULT_TIMEOUT:
+                sock.settimeout(timeout)
+            if source_address:
+                sock.bind(source_address)
+            sock.connect(sockaddr)
+            return sock
+        except OSError as exc:
+            errors.append(exc)
+            sock.close()
+    if errors:
+        raise errors[-1]
+    raise OSError(f"No IPv6 address found for {host!r}")
+
+
+class _SerperIPv6HTTPConnection(http.client.HTTPConnection):
+    _create_connection = staticmethod(_create_ipv6_connection)
+
+
+class _SerperIPv6HTTPSConnection(http.client.HTTPSConnection):
+    _create_connection = staticmethod(_create_ipv6_connection)
+
+
+class _SerperIPv6HTTPHandler(HTTPHandler):
+    def http_open(self, req):
+        return self.do_open(_SerperIPv6HTTPConnection, req)
+
+
+class _SerperIPv6HTTPSHandler(HTTPSHandler):
+    def https_open(self, req):
+        return self.do_open(
+            _SerperIPv6HTTPSConnection,
+            req,
+            context=getattr(self, "_context", None),
+        )
+
+
+def _serper_ipv6_enabled(value: bool | None) -> bool:
+    if value is not None:
+        return bool(value)
+    raw = os.environ.get("SERPER_IPV6_ONLY") or os.environ.get("SFT_SERPER_IPV6_ONLY")
+    return str(raw or "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _jsonify(value: Any) -> Any:
@@ -144,6 +211,57 @@ def _serper_debug(event: str, **kwargs: Any) -> None:
     details = " ".join(f"{key}={value!r}" for key, value in kwargs.items())
     suffix = f" {details}" if details else ""
     print(f"[serper-debug] {event}{suffix}", file=sys.stderr, flush=True)
+
+
+def _serper_qpm_debug_enabled() -> bool:
+    """Return whether per-success Serper QPM debug output is enabled.
+
+    This output is enabled by default because it is useful for diagnosing the
+    effective request rate.  Set ``SFT_SERPER_QPM_DEBUG=0`` to silence it.
+    """
+
+    raw = os.environ.get("SFT_SERPER_QPM_DEBUG")
+    if raw is None or not str(raw).strip():
+        return True
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _record_serper_success_qpm() -> int:
+    """Record one successful request and return successes in the last minute."""
+
+    now = time.monotonic()
+    cutoff = now - _SERPER_QPM_WINDOW_S
+    with _SERPER_QPM_LOCK:
+        while _SERPER_SUCCESS_TIMES and _SERPER_SUCCESS_TIMES[0] <= cutoff:
+            _SERPER_SUCCESS_TIMES.popleft()
+        _SERPER_SUCCESS_TIMES.append(now)
+        return len(_SERPER_SUCCESS_TIMES)
+
+
+def _log_serper_success_qpm(
+    *,
+    url: str,
+    status_code: int,
+    elapsed_s: float,
+    response_chars: int,
+) -> None:
+    """Print the rolling process-local QPM after a successful Serper call."""
+
+    current_qpm = _record_serper_success_qpm()
+    if not _serper_qpm_debug_enabled():
+        return
+    print(
+        "[serper-qpm]"
+        f" pid={os.getpid()}"
+        f" url={url!r}"
+        f" status_code={status_code}"
+        f" current_qpm={current_qpm}"
+        f" successful_calls_last_60s={current_qpm}"
+        f" elapsed_s={elapsed_s:.3f}"
+        f" response_chars={response_chars}",
+        file=sys.stderr,
+        flush=True,
+    )
 
 
 def _serper_dns_debug(url: str) -> dict[str, Any] | None:
@@ -433,17 +551,18 @@ class SerperApiKeyPool:
     def _with_locked_state(self, callback) -> dict[str, Any]:
         lock_path = _local_lock_path_for_state(self.state_path)
         lock_path.parent.mkdir(parents=True, exist_ok=True)
-        with lock_path.open("a+", encoding="utf-8") as lock_handle:
-            if fcntl is not None:
-                fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
-            try:
-                state = self._read_state()
-                updated = callback(state)
-                self._write_state(updated)
-                return updated
-            finally:
+        with _SERPER_POOL_THREAD_LOCK:
+            with lock_path.open("a+", encoding="utf-8") as lock_handle:
                 if fcntl is not None:
-                    fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+                    fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+                try:
+                    state = self._read_state()
+                    updated = callback(state)
+                    self._write_state(updated)
+                    return updated
+                finally:
+                    if fcntl is not None:
+                        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
 
     def _read_state(self) -> dict[str, Any]:
         if not self.state_path.exists():
@@ -455,9 +574,28 @@ class SerperApiKeyPool:
 
     def _write_state(self, state: dict[str, Any]) -> None:
         persisted = {key: value for key, value in state.items() if not key.startswith("_")}
-        tmp_path = self.state_path.with_suffix(self.state_path.suffix + ".tmp")
-        tmp_path.write_text(json.dumps(persisted, ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8")
-        os.replace(tmp_path, self.state_path)
+        tmp_path: Path | None = None
+        try:
+            # Use a unique temporary file.  A fixed ``.tmp`` path can be
+            # replaced by another worker before the first worker calls
+            # ``os.replace``.
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=str(self.state_path.parent),
+                prefix=f".{self.state_path.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as tmp_handle:
+                tmp_path = Path(tmp_handle.name)
+                tmp_handle.write(json.dumps(persisted, ensure_ascii=False, sort_keys=True, indent=2) + "\n")
+                tmp_handle.flush()
+                os.fsync(tmp_handle.fileno())
+            os.replace(tmp_path, self.state_path)
+            tmp_path = None
+        finally:
+            if tmp_path is not None:
+                tmp_path.unlink(missing_ok=True)
 
     @staticmethod
     def _mask_key(key: str) -> str:
@@ -757,6 +895,7 @@ class SerperSearchClient:
         pool_state_path: str | Path | None = None,
         pool_default_credits: int | None = None,
         pool_min_remaining: int | None = None,
+        ipv6_only: bool | None = None,
     ) -> None:
         self.api_key = None
         self.key_pool: SerperApiKeyPool | None = None
@@ -772,6 +911,12 @@ class SerperSearchClient:
         self.search_url = search_url or os.environ.get("SERPER_SEARCH_URL") or "https://google.serper.dev/search"
         self.images_url = images_url or os.environ.get("SERPER_IMAGES_URL") or "https://google.serper.dev/images"
         self.timeout_s = timeout_s
+        self.ipv6_only = _serper_ipv6_enabled(ipv6_only)
+        self._url_opener = (
+            build_opener(_SerperIPv6HTTPHandler(), _SerperIPv6HTTPSHandler())
+            if self.ipv6_only
+            else None
+        )
 
     def search_text(self, query: str, *, limit: int = 10, **kwargs: Any) -> SearchResponse:
         raw, status_code, metadata = self._post_json(self.search_url, self._serper_body(_augment_text_query(query), limit, kwargs))
@@ -823,19 +968,24 @@ class SerperSearchClient:
             dns=_serper_dns_debug(url),
         )
         payload = json.dumps(body).encode("utf-8")
+        request_headers = {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "X-API-KEY": api_key,
+        }
+        relay_token = os.environ.get("SERPER_RELAY_TOKEN")
+        if relay_token:
+            request_headers["X-Serper-Relay-Token"] = relay_token
         request = Request(
             url,
             data=payload,
-            headers={
-                "Accept": "application/json",
-                "Content-Type": "application/json",
-                "X-API-KEY": api_key,
-            },
+            headers=request_headers,
             method="POST",
         )
         started_at = time.perf_counter()
         try:
-            with urlopen(request, timeout=self.timeout_s) as response:
+            open_request = self._url_opener.open if self._url_opener is not None else urlopen
+            with open_request(request, timeout=self.timeout_s) as response:
                 response_payload = response.read().decode("utf-8")
                 status_code = response.getcode()
             _serper_debug(
@@ -902,6 +1052,12 @@ class SerperSearchClient:
                 f"Request body: {json.dumps(body, ensure_ascii=False)}"
             ) from exc
         raw = json.loads(response_payload)
+        _log_serper_success_qpm(
+            url=url,
+            status_code=status_code,
+            elapsed_s=time.perf_counter() - started_at,
+            response_chars=len(response_payload),
+        )
         _log_serper_raw_response(url=url, status_code=status_code, raw=raw)
         self._log_raw_response(url=url, body=body, status_code=status_code, raw=raw)
         metadata = {

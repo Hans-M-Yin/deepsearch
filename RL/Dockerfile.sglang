@@ -1,0 +1,98 @@
+# syntax=docker/dockerfile:1
+
+# The base image is expected to provide the CUDA/PyTorch stack and vLLM.
+# In particular, this Dockerfile does not reinstall torch or vLLM.
+ARG BASE_IMAGE=aliyun-va-hub.byted.org/base/verl-megatron:231e135fe13d5b0be75ab96727c12a8e
+FROM ${BASE_IMAGE}
+
+ARG REPO_URL=https://github.com/shawn0728/OpenSearch-VL.git
+ARG REPO_REF=main
+ARG PIP_INDEX=https://pypi.org/simple
+
+# The checked-in verl source is 0.6.1-compatible, while some base images ship
+# a 0.6.0 wheel. Installing the local package with --no-deps only changes the
+# Python source/package registration; it does not reinstall torch, CUDA, or vLLM.
+ARG INSTALL_LOCAL_VERL=1
+
+# This is the SGLang version declared by the local verl setup.py extra. It can
+# be overridden at build time after validating another version with the base image.
+ARG SGLANG_VERSION=0.5.5
+ARG RAY_VERSION=2.41.0
+
+# The base image should already contain transformer-engine and flash-attn.
+# Set this to 1 only when they are missing from the base image and the image has
+# a compatible CUDA compiler/toolchain.
+ARG INSTALL_GPU_EXTENSIONS=0
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PIP_ROOT_USER_ACTION=ignore \
+    PYTHONUNBUFFERED=1 \
+    MAX_JOBS=16 \
+    FLASH_ATTENTION_FORCE_BUILD=TRUE \
+    VLLM_WORKER_MULTIPROC_METHOD=spawn \
+    TOKENIZERS_PARALLELISM=false
+
+SHELL ["/bin/bash", "-c"]
+WORKDIR /workspace
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends git ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN pip config set global.index-url "${PIP_INDEX}" && \
+    pip config set global.extra-index-url "${PIP_INDEX}" && \
+    pip install --no-cache-dir packaging wheel setuptools editables
+
+# Pin the source revision when building a reproducible image, for example:
+#   --build-arg REPO_REF=<commit-sha>
+RUN git clone --depth 1 --branch "${REPO_REF}" "${REPO_URL}" OpenSearch-VL
+
+WORKDIR /workspace/OpenSearch-VL/RL/rllm
+
+# Install the repository copies in editable mode, but keep dependency
+# resolution disabled so pip cannot replace the base image's torch/vLLM stack.
+RUN if [[ "${INSTALL_LOCAL_VERL}" == "1" ]]; then \
+        pip install --no-cache-dir --no-build-isolation --no-deps -e ./verl; \
+    fi && \
+    pip install --no-cache-dir --no-build-isolation --no-deps -e .
+
+WORKDIR /workspace/OpenSearch-VL/RL/Megatron-LM
+RUN pip install --no-cache-dir --no-build-isolation --no-deps -e .
+
+WORKDIR /workspace/OpenSearch-VL/RL/mbridge
+RUN pip install --no-cache-dir --no-build-isolation --no-deps -e .
+
+# Install only the Python-side runtime dependencies. torch, torchvision,
+# transformer-engine, flash-attn, verl, and vLLM are intentionally omitted:
+# they are supplied by the base image (except for the optional local verl source
+# installation above).
+RUN pip install --no-cache-dir --upgrade-strategy only-if-needed \
+    "ray[default]==${RAY_VERSION}" \
+    "sglang[srt,openai]==${SGLANG_VERSION}" \
+    "transformers>=4.55.0" \
+    "datasets>=2.20.0" \
+    accelerate codetiming dill hydra-core omegaconf \
+    "numpy<2.0.0" pandas polars pillow \
+    "pyarrow>=19.0.0" pybind11 pylatexenc peft \
+    "tensordict>=0.8.0,<=0.10.0,!=0.9.0" torchdata \
+    wandb tensorboard packaging \
+    mcp eval-protocol openai fastapi uvicorn tqdm PyYAML pydantic \
+    wrapt "asgiref>=3.7.0" json5 aiosqlite oss2 \
+    "requests==2.32.3" huggingface_hub \
+    qwen-vl-utils av decord safetensors einops pymupdf
+
+# Optional fallback for a base image that does not contain the GPU extensions.
+# Building flash-attn can take a long time and requires a matching CUDA toolchain.
+RUN if [[ "${INSTALL_GPU_EXTENSIONS}" == "1" ]]; then \
+        pip install --no-cache-dir --no-build-isolation transformer_engine flash-attn; \
+    fi
+
+ENV PYTHONPATH=/workspace/OpenSearch-VL:/workspace/OpenSearch-VL/RL/rllm:/workspace/OpenSearch-VL/RL/Megatron-LM:/workspace/OpenSearch-VL/RL/mbridge:${PYTHONPATH}
+WORKDIR /workspace/OpenSearch-VL/RL/rllm
+
+# Fail early on package/version mistakes before a multi-GPU job is submitted.
+# The local verl source may report 0.6.1 when INSTALL_LOCAL_VERL=1; this is
+# intentional because the checked-in trainer uses APIs standardized in 0.6.1.
+RUN python -c 'import importlib.metadata as md; import torch; import rllm, verl, sglang, mbridge; print({name: md.version(name) for name in ("torch", "verl", "vllm", "sglang", "ray")}); print("torch.cuda:", torch.version.cuda); print("RL imports: OK")'
+
+CMD ["/bin/bash"]

@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """Run concurrent direct-Serper text searches and report transport failures.
 
-By default this launches 32 distinct text searches concurrently against the
-configured Serper endpoint. It uses ``SerperSearchClient`` directly, so it
+By default this launches 128 text searches concurrently for two rounds against
+the configured Serper endpoint. It uses ``SerperSearchClient`` directly, so it
 exercises the same request path used by ``synthesis.sft.tools.t2t_search``.
 
 Examples:
   python debug/stress_test_serper.py
-  python debug/stress_test_serper.py --requests 16 --workers 16 --timeout-s 30
+  python debug/stress_test_serper.py --requests 128 --workers 128 --rounds 2 --timeout-s 60
+  python debug/stress_test_serper.py --ipv6-only --requests 128 --workers 128 --rounds 2
   SERPER_SEARCH_URL=https://google.serper.dev/search python debug/stress_test_serper.py --output /tmp/serper_stress.json
 """
 
@@ -69,14 +70,23 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--requests",
         type=int,
-        default=32,
-        help="Number of distinct predefined searches to launch concurrently (default: 32).",
+        default=128,
+        help=(
+            "Number of requests to launch concurrently in each round (default: 128). "
+            "The built-in query list is cycled when this exceeds its length."
+        ),
     )
     parser.add_argument(
         "--workers",
         type=int,
         default=None,
         help="Thread-pool size. Defaults to --requests, producing one concurrent request per query.",
+    )
+    parser.add_argument(
+        "--rounds",
+        type=int,
+        default=2,
+        help="Number of sequential concurrent batches to execute (default: 2).",
     )
     parser.add_argument("--timeout-s", type=float, default=60.0, help="Timeout for each Serper request.")
     parser.add_argument("--limit", type=int, default=5, help="Requested result count for each search.")
@@ -85,6 +95,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "--search-url",
         default=None,
         help="Override SERPER_SEARCH_URL for this run.",
+    )
+    parser.add_argument(
+        "--ipv6-only",
+        action="store_true",
+        help="Force the official Serper requests to use AF_INET6 only.",
     )
     parser.add_argument(
         "--output",
@@ -135,10 +150,11 @@ def run_stress_test(
     limit: int,
     lang: str,
     search_url: str | None,
+    ipv6_only: bool,
 ) -> dict[str, Any]:
     """Run one direct Serper request for every supplied query."""
 
-    client = SerperSearchClient(search_url=search_url, timeout_s=timeout_s)
+    client = SerperSearchClient(search_url=search_url, timeout_s=timeout_s, ipv6_only=ipv6_only)
     started_at = time.perf_counter()
     results: list[dict[str, Any]] = []
     with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="serper-stress") as executor:
@@ -166,6 +182,7 @@ def run_stress_test(
         "limit": limit,
         "lang": lang,
         "search_url": client.search_url,
+        "ipv6_only": ipv6_only,
         "elapsed_s": round(time.perf_counter() - started_at, 3),
         "success_count": len(results) - len(failures),
         "failure_count": len(failures),
@@ -207,12 +224,35 @@ def _print_report(report: dict[str, Any]) -> None:
     print("=" * 88)
 
 
+def _build_queries(request_count: int) -> list[str]:
+    """Build a request list, cycling the built-in queries as needed."""
+
+    return [DEFAULT_QUERIES[index % len(DEFAULT_QUERIES)] for index in range(request_count)]
+
+
+def _build_combined_report(reports: list[dict[str, Any]]) -> dict[str, Any]:
+    """Summarize all rounds while retaining each round's full report."""
+
+    error_types = Counter()
+    for report in reports:
+        error_types.update(report["error_types"])
+    return {
+        "round_count": len(reports),
+        "total_request_count": sum(int(report["request_count"]) for report in reports),
+        "success_count": sum(int(report["success_count"]) for report in reports),
+        "failure_count": sum(int(report["failure_count"]) for report in reports),
+        "wall_elapsed_s": round(sum(float(report["elapsed_s"]) for report in reports), 3),
+        "error_types": dict(error_types),
+        "rounds": reports,
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     if args.requests <= 0:
         raise SystemExit("--requests must be positive")
-    if args.requests > len(DEFAULT_QUERIES):
-        raise SystemExit(f"--requests cannot exceed {len(DEFAULT_QUERIES)} predefined distinct queries")
+    if args.rounds <= 0:
+        raise SystemExit("--rounds must be positive")
     if args.limit <= 0:
         raise SystemExit("--limit must be positive")
     if args.timeout_s <= 0:
@@ -222,20 +262,36 @@ def main(argv: list[str] | None = None) -> int:
     if workers <= 0:
         raise SystemExit("--workers must be positive")
 
-    report = run_stress_test(
-        queries=DEFAULT_QUERIES[: args.requests],
-        workers=workers,
-        timeout_s=args.timeout_s,
-        limit=args.limit,
-        lang=args.lang,
-        search_url=args.search_url,
+    queries = _build_queries(args.requests)
+    reports: list[dict[str, Any]] = []
+    for round_index in range(1, args.rounds + 1):
+        print(f"Starting Serper stress-test round {round_index}/{args.rounds} ({args.requests} requests)")
+        report = run_stress_test(
+            queries=queries,
+            workers=workers,
+            timeout_s=args.timeout_s,
+            limit=args.limit,
+            lang=args.lang,
+            search_url=args.search_url,
+            ipv6_only=args.ipv6_only,
+        )
+        report["round"] = round_index
+        reports.append(report)
+        _print_report(report)
+
+    combined_report = _build_combined_report(reports)
+    print(
+        "Serper stress-test total: "
+        f"rounds={combined_report['round_count']} "
+        f"requests={combined_report['total_request_count']} "
+        f"success={combined_report['success_count']} "
+        f"failure={combined_report['failure_count']}"
     )
-    _print_report(report)
     if args.output is not None:
         args.output.parent.mkdir(parents=True, exist_ok=True)
-        args.output.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        args.output.write_text(json.dumps(combined_report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         print(f"Detailed JSON report: {args.output}")
-    return 1 if report["failure_count"] else 0
+    return 1 if combined_report["failure_count"] else 0
 
 
 if __name__ == "__main__":

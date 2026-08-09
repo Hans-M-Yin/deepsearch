@@ -870,7 +870,11 @@ def _resolve_registered_model_alias(alias_or_model: str | None) -> dict[str, Any
 
 
 def _i2i_wrapper_model_alias() -> str | None:
-    alias = os.environ.get("SFT_I2I_WRAPPER_MODEL") or _I2I_WRAPPER_DEFAULT_MODEL_ALIAS
+    alias = (
+        os.environ.get("SFT_I2I_WRAPPER_MODEL")
+        or tools.get_sft_qwen_model_alias()
+        or _I2I_WRAPPER_DEFAULT_MODEL_ALIAS
+    )
     return alias if _resolve_registered_model_alias(alias) is not None else None
 
 

@@ -5,8 +5,9 @@ Example:
     python -m synthesis.sft.merge_sft_jsonl \
         --input-jsonl \
         runs/0712_multi_seed_visual_test_8192_6/vqa/0803_batch_1/0804_test_2_0_to_500.jsonl \
-        runs/0712_multi_seed_visual_test_8192_6/vqa/0803_batch_1/0804_test_2_500_to_1000.jsonl \
         runs/0712_multi_seed_visual_test_8192_6/vqa/0803_batch_1/0804_test_2_1000_to_1500.jsonl \
+        runs/0712_multi_seed_visual_test_8192_6/vqa/0803_batch_1/0804_test_2_4000_9000.jsonl \
+        runs/0712_multi_seed_visual_test_8192_6/vqa/0803_batch_1/0804_test_3_500_to_1000.jsonl \
         --output-jsonl runs/0712_multi_seed_visual_test_8192_6/vqa/0803_batch_1/0804_test_2_merged.jsonl
 
 Records are appended in the same order as the input files. The script validates

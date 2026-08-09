@@ -38,6 +38,11 @@ class JsonlGraphStore:
         "search_snapshots": "search_snapshots.jsonl",
     }
 
+    DELTA_TABLE_FILES = {
+        table: f"{file_name[:-6]}.delta.jsonl"
+        for table, file_name in TABLE_FILES.items()
+    }
+
     TABLE_KEYS = {
         "nodes": "node_id",
         "edges": "edge_id",
@@ -62,6 +67,12 @@ class JsonlGraphStore:
 
         self._tables: dict[str, dict[str, JsonRecord]] = {
             table: {} for table in self.TABLE_FILES
+        }
+        self._pending_records: dict[str, list[JsonRecord]] = {
+            table: [] for table in self.TABLE_FILES
+        }
+        self._delta_record_counts: dict[str, int] = {
+            table: 0 for table in self.TABLE_FILES
         }
         self._dirty: set[str] = set()
         self._lock = RLock()
@@ -92,13 +103,20 @@ class JsonlGraphStore:
         with self._lock:
             for table, file_name in self.TABLE_FILES.items():
                 self._tables[table] = self._read_table(table, self.root_dir / file_name)
+                delta_path = self.root_dir / self.DELTA_TABLE_FILES[table]
+                self._delta_record_counts[table] = self._apply_delta_table(
+                    table,
+                    self._tables[table],
+                    delta_path,
+                )
             self._rebuild_indexes_locked()
+            self._pending_records = {table: [] for table in self.TABLE_FILES}
             self._dirty.clear()
             self._pending_write_count = 0
             self._last_flush_monotonic = time.monotonic()
 
-    def flush(self) -> None:
-        self.maybe_flush(force=True)
+    def flush(self) -> bool:
+        return self.maybe_flush(force=True)
 
     def maybe_flush(self, *, force: bool = False) -> bool:
         with self._lock:
@@ -106,12 +124,25 @@ class JsonlGraphStore:
                 return False
             if not force and not self._should_flush_locked():
                 return False
+
+            flushed = False
             for table in list(self._dirty):
-                self._write_table(table, self.root_dir / self.TABLE_FILES[table])
-            self._dirty.clear()
-            self._pending_write_count = 0
+                records = self._pending_records[table]
+                if not records:
+                    self._dirty.discard(table)
+                    continue
+                self._append_delta_table(
+                    table,
+                    self.root_dir / self.DELTA_TABLE_FILES[table],
+                    records,
+                )
+                self._delta_record_counts[table] += len(records)
+                self._pending_records[table] = []
+                self._dirty.discard(table)
+                self._pending_write_count -= len(records)
+                flushed = True
             self._last_flush_monotonic = time.monotonic()
-            return True
+            return flushed
 
     def has_pending_writes(self) -> bool:
         with self._lock:
@@ -120,6 +151,48 @@ class JsonlGraphStore:
     def pending_write_count(self) -> int:
         with self._lock:
             return self._pending_write_count
+
+    def delta_stats(self) -> dict[str, dict[str, int]]:
+        """Return append-log record and byte counts for operational monitoring."""
+
+        with self._lock:
+            return {
+                table: {
+                    "records": self._delta_record_counts[table],
+                    "bytes": self._delta_path_size_locked(table),
+                }
+                for table in self.TABLE_FILES
+            }
+
+    def compact(self, tables: Iterable[str] | None = None) -> bool:
+        """Merge delta JSONL records into canonical tables atomically.
+
+        Normal graph expansion never needs to call this on every flush.  It is
+        intended for maintenance checkpoints or after a run completes.  The
+        canonical table is replaced before its delta is removed, so a crash
+        between those operations is recoverable: replaying already-compacted
+        records is idempotent because records are keyed by ID.
+        """
+
+        self.flush()
+        with self._lock:
+            selected_tables = list(tables) if tables is not None else list(self.TABLE_FILES)
+            unknown_tables = set(selected_tables) - set(self.TABLE_FILES)
+            if unknown_tables:
+                raise ValueError(f"Unknown graph tables for compact: {sorted(unknown_tables)}")
+
+            compacted = False
+            for table in selected_tables:
+                delta_path = self.root_dir / self.DELTA_TABLE_FILES[table]
+                if not delta_path.exists() or self._delta_record_counts[table] <= 0:
+                    continue
+                self._write_table(table, self.root_dir / self.TABLE_FILES[table])
+                # Remove the delta only after the canonical snapshot is in
+                # place.  If removal fails, a later load safely replays it.
+                delta_path.unlink()
+                self._delta_record_counts[table] = 0
+                compacted = True
+            return compacted
 
     def upsert_node(self, node: Node | JsonRecord) -> JsonRecord:
         return self._upsert("nodes", node)
@@ -330,6 +403,7 @@ class JsonlGraphStore:
             if old_was_latest_node:
                 self._recompute_latest_node_locked()
             self._dirty.add(table)
+            self._pending_records[table].append(dict(record))
             self._pending_write_count += 1
             if self.auto_flush:
                 self.flush()
@@ -367,6 +441,73 @@ class JsonlGraphStore:
                     raise ValueError(f"{path}:{line_no} missing key {key_name!r}")
                 records[record_id] = record
         return records
+
+    def _apply_delta_table(
+        self,
+        table: str,
+        records: dict[str, JsonRecord],
+        path: Path,
+    ) -> int:
+        """Replay an append-only table delta and repair a partial final line."""
+
+        if not path.exists():
+            return 0
+
+        key_name = self.TABLE_KEYS[table]
+        applied_count = 0
+        with path.open("rb") as handle:
+            while True:
+                line_start = handle.tell()
+                line = handle.readline()
+                if not line:
+                    break
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                try:
+                    record = json.loads(stripped)
+                except json.JSONDecodeError:
+                    if line.endswith(b"\n"):
+                        raise ValueError(f"Malformed JSON in delta table {path}")
+                    # A process can die after writing only part of the final
+                    # record.  Discard only that incomplete tail; all prior
+                    # newline-terminated records remain valid.
+                    with path.open("r+b") as repair_handle:
+                        repair_handle.truncate(line_start)
+                    break
+                record_id = record.get(key_name)
+                if not record_id:
+                    raise ValueError(f"{path} missing key {key_name!r}")
+                records[record_id] = record
+                applied_count += 1
+        return applied_count
+
+    @staticmethod
+    def _append_delta_table(
+        table: str,
+        path: Path,
+        records: list[JsonRecord],
+    ) -> None:
+        del table
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("ab") as handle:
+            for record in records:
+                payload = json.dumps(
+                    record,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ).encode("utf-8")
+                handle.write(payload)
+                handle.write(b"\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+
+    def _delta_path_size_locked(self, table: str) -> int:
+        path = self.root_dir / self.DELTA_TABLE_FILES[table]
+        try:
+            return path.stat().st_size
+        except FileNotFoundError:
+            return 0
 
     def _rebuild_indexes_locked(self) -> None:
         self._record_order = {table: {} for table in self.TABLE_FILES}
@@ -532,6 +673,8 @@ class JsonlGraphStore:
             for record_id in sorted(records):
                 json.dump(records[record_id], handle, ensure_ascii=False, sort_keys=True)
                 handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
         os.replace(tmp_path, path)
 
 

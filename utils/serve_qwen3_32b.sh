@@ -8,6 +8,7 @@ set -euo pipefail
 PORT=6658
 TENSOR_PARALLEL_SIZE="${1:-${TENSOR_PARALLEL_SIZE:-8}}"
 USE_VL="${2:-${USE_VL:-false}}"
+MAX_MODEL_LEN="${MAX_MODEL_LEN:-48000}"
 
 if [[ "${USE_VL}" == "true" ]]; then
   MODEL_PATH="${MODEL_PATH:-/mnt/hdfs/byte_ai_sales/user/user/yinzhihan/models/qwen3-vl-32b}"
@@ -21,7 +22,7 @@ echo $PORT
 vllm serve "${MODEL_PATH}" \
   --served-model-name "${SERVED_MODEL_NAME}" \
   --tensor-parallel-size "${TENSOR_PARALLEL_SIZE}" \
-  --max-model-len 48000 \
+  --max-model-len "${MAX_MODEL_LEN}" \
   --port "${PORT}" \
   --gpu-memory-utilization 0.9 \
   --trust-remote-code \

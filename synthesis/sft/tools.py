@@ -72,6 +72,7 @@ T2I_BLOCKED_IMAGE_SEARCH_DOMAINS = (
 )
 I2I_BLOCKED_IMAGE_SEARCH_DOMAINS: tuple[str, ...] = ()
 _SFT_FIXED_REQUEST_ID = "3200636808"
+_DEFAULT_SFT_QWEN_MODEL_ALIAS = "multimodal_process"
 _URL_KEYWORD_CACHE: dict[tuple[str, str], str] = {}
 _URL_KEYWORD_CACHE_LOCK = threading.Lock()
 
@@ -731,12 +732,20 @@ def _resolve_registered_model_alias(alias_or_model: str | None) -> dict[str, Any
         return None
 
 
+def get_sft_qwen_model_alias() -> str:
+    """Return the shared default auxiliary Qwen model alias for SFT tools."""
+
+    return str(
+        os.environ.get("SFT_QWEN_MODEL_ALIAS") or _DEFAULT_SFT_QWEN_MODEL_ALIAS
+    ).strip() or _DEFAULT_SFT_QWEN_MODEL_ALIAS
+
+
 def _summarizer_model_alias() -> str | None:
     configured_alias = os.environ.get("SFT_SUMMARIZER_MODEL")
     if configured_alias and _resolve_registered_model_alias(configured_alias) is not None:
         return configured_alias
 
-    default_alias = os.environ.get("SFT_SUMMARIZER_MODEL_ALIAS") or "text_process"
+    default_alias = os.environ.get("SFT_SUMMARIZER_MODEL_ALIAS") or get_sft_qwen_model_alias()
     if _resolve_registered_model_alias(default_alias) is not None:
         return default_alias
 
@@ -806,7 +815,7 @@ def _validate_url_keyword_hint(value: Any, *, allowed_tokens: list[str]) -> str:
 def extract_url_semantic_keywords(
     url: str,
     *,
-    model_alias: str = "multimodal_process",
+    model_alias: str | None = None,
 ) -> str:
     """Return a conservative, URL-derived retrieval hint.
 
@@ -816,6 +825,7 @@ def extract_url_semantic_keywords(
     raw_url = str(url or "").strip()
     if not raw_url:
         return ""
+    model_alias = model_alias or get_sft_qwen_model_alias()
     cleaned = _clean_url_for_keyword_prompt(raw_url)
     allowed_tokens = list(cleaned["tokens"])
     if not allowed_tokens:
@@ -893,7 +903,7 @@ def postprocess_search_output(
     *,
     tool_name: str,
     output: dict[str, Any],
-    url_keyword_model: str = "multimodal_process",
+    url_keyword_model: str | None = None,
 ) -> tuple[dict[str, Any], list[UrlResource]]:
     """Convert search results into compact agent output plus private resources.
 
@@ -914,11 +924,16 @@ def postprocess_search_output(
         if url
     }
     hints: dict[str, str] = {}
+    resolved_url_keyword_model = url_keyword_model or get_sft_qwen_model_alias()
     max_workers = len(unique_urls)
     if max_workers:
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_url = {
-                executor.submit(extract_url_semantic_keywords, url, model_alias=url_keyword_model): url
+                executor.submit(
+                    extract_url_semantic_keywords,
+                    url,
+                    model_alias=resolved_url_keyword_model,
+                ): url
                 for url in unique_urls
             }
             for future in as_completed(future_to_url):
@@ -1014,8 +1029,8 @@ Raw webpage content:\n{content[:80000]}\n
         if not model_alias:
             raise RuntimeError(
                 "No registered summarizer model alias is available. "
-                "Set SFT_SUMMARIZER_MODEL to a registered synthesis/models.json alias, "
-                "or ensure the default alias 'text_process' exists."
+                "Set SFT_SUMMARIZER_MODEL or SFT_QWEN_MODEL_ALIAS to a registered "
+                "synthesis/models.json alias."
             )
         response = LLM_WORKER.generate(
             ModelRequest(
@@ -2066,12 +2081,16 @@ def _image_search_via_serper(image_url: str, top_k: int = MAX_SEARCH_RESULTS) ->
     serper_api_key, _ = acquire_serper_api_key()
     fetch_limit = _search_fetch_limit(max(1, min(int(top_k), MAX_SEARCH_RESULTS)), tool_name="i2i_search")
 
+    lens_headers = {
+        "X-API-KEY": serper_api_key,
+        "Content-Type": "application/json",
+    }
+    relay_token = os.environ.get("SERPER_RELAY_TOKEN")
+    if relay_token:
+        lens_headers["X-Serper-Relay-Token"] = relay_token
     response = requests.post(
         os.environ.get("SERPER_LENS_URL") or "https://google.serper.dev/lens",
-        headers={
-            "X-API-KEY": serper_api_key,
-            "Content-Type": "application/json",
-        },
+        headers=lens_headers,
         json={"url": image_url},
         timeout=TOOL_NETWORK_TIMEOUT_S,
     )

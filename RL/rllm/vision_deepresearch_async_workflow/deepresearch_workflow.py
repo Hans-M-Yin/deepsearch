@@ -443,6 +443,7 @@ class DeepResearchWorkflow(Workflow):
             rollout_engine=rollout_engine,
             tools=self.tools,
             system_prompt=self.system_prompt,
+            executor=executor,
         )
 
     async def run(self, task: dict, uid: str, **kwargs) -> Episode:

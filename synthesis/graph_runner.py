@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 import sys
+import time
 from typing import Any
 
 if __package__ in (None, ""):
@@ -143,6 +144,7 @@ class GraphRunner:
         self._saved_visual_plan_ids = self._load_saved_visual_plan_ids()
         self._progress_width = 0
         self._text_dispatch_since_image_entity = 0
+        self._last_checkpoint_timing: dict[str, Any] = {}
 
     def add_seed(
         self,
@@ -216,9 +218,10 @@ class GraphRunner:
 
     def _handle_result(self, result: NodeExpansionResult, last_error: str | None) -> str | None:
         self.state.step += 1
+        result_record_started = time.perf_counter()
         self._record_result(result)
+        result.timing["runner_result_persist_s"] = time.perf_counter() - result_record_started
         self._emit_created_node_events(result)
-        self._emit_node_status(result)
         self._emit_progress()
         self._emit_warning(result)
         if result.error:
@@ -226,19 +229,42 @@ class GraphRunner:
             if self.config.stop_on_error:
                 self.state.status = "failed"
         self._checkpoint_progress(force=False)
+        self._emit_node_status(result)
         return last_error
 
     def _checkpoint_progress(self, *, force: bool) -> None:
+        checkpoint_started = time.perf_counter()
+        self._last_checkpoint_timing = {
+            "checkpoint_store_flush_s": 0.0,
+            "checkpoint_queue_sync_s": 0.0,
+            "checkpoint_state_save_s": 0.0,
+            "checkpoint_total_s": 0.0,
+            "checkpoint_status": "deferred",
+        }
         if force:
+            started = time.perf_counter()
             self.store.flush()
+            self._last_checkpoint_timing["checkpoint_store_flush_s"] = time.perf_counter() - started
+            started = time.perf_counter()
             self._sync_state_from_strategy()
+            self._last_checkpoint_timing["checkpoint_queue_sync_s"] = time.perf_counter() - started
+            started = time.perf_counter()
             self.save_state()
+            self._last_checkpoint_timing["checkpoint_state_save_s"] = time.perf_counter() - started
+            self._last_checkpoint_timing["checkpoint_total_s"] = time.perf_counter() - checkpoint_started
+            self._last_checkpoint_timing["checkpoint_status"] = "saved"
             return
         if self.store.has_pending_writes():
             return
         if self.config.checkpoint_every <= 1 or self.state.step % self.config.checkpoint_every == 0:
+            started = time.perf_counter()
             self._sync_state_from_strategy()
+            self._last_checkpoint_timing["checkpoint_queue_sync_s"] = time.perf_counter() - started
+            started = time.perf_counter()
             self.save_state()
+            self._last_checkpoint_timing["checkpoint_state_save_s"] = time.perf_counter() - started
+            self._last_checkpoint_timing["checkpoint_total_s"] = time.perf_counter() - checkpoint_started
+            self._last_checkpoint_timing["checkpoint_status"] = "saved_without_store_flush"
 
     def _run_parallel_batch(self, *, last_error: str | None) -> tuple[int, str | None]:
         remaining_steps = self.config.max_steps - self.state.step
@@ -308,29 +334,7 @@ class GraphRunner:
         return self.store.count_nodes("text")
 
     def _queue_breakdown(self) -> dict[str, int]:
-        text_neighbor_queue = 0
-        image_entity_queue = 0
-        text_queue_size = 0
-        image_queue_size = 0
-        for record in self.strategy.queue_records():
-            task_type = record.get("task_type")
-            if task_type == ExpansionTaskType.IMAGE_EXPAND.value:
-                image_queue_size += 1
-                continue
-            if task_type != ExpansionTaskType.TEXT_EXPAND.value:
-                continue
-            text_queue_size += 1
-            metadata = record.get("metadata") or {}
-            if metadata.get("task_origin") == "image_entity":
-                image_entity_queue += 1
-            else:
-                text_neighbor_queue += 1
-        return {
-            "text_queue": text_queue_size,
-            "image_queue": image_queue_size,
-            "text_neighbor_queue": text_neighbor_queue,
-            "image_entity_queue": image_entity_queue,
-        }
+        return self.strategy.queue_breakdown()
 
     def _remaining_text_slots(self, *, in_flight_text_count: int = 0) -> int | None:
         if self.config.max_nodes is None:
@@ -413,12 +417,7 @@ class GraphRunner:
             queue_breakdown = self._queue_breakdown()
             if queue_breakdown["image_entity_queue"] > 0:
                 return remaining_text_slots is None or remaining_text_slots > 0
-            return any(
-                record.get("task_type") == ExpansionTaskType.TEXT_EXPAND.value
-                and record.get("parent_node_id") is None
-                and not (record.get("metadata") or {}).get("task_origin")
-                for record in self.strategy.queue_records()
-            )
+            return self.strategy.has_root_text_tasks()
         return (
             (remaining_text_slots is None or remaining_text_slots > 0)
             and self.strategy.queue_size(ExpansionTaskType.TEXT_EXPAND) > 0
@@ -699,6 +698,7 @@ class GraphRunner:
                     "node_type": "text",
                     "node_id": result.text_result.node.node_id,
                     "title": result.text_result.node.title or result.text_result.node.node_id,
+                    "event": "node-reused" if result.text_result.from_cache else "node-created",
                 }
             )
         for image_result in result.image_results:
@@ -709,12 +709,13 @@ class GraphRunner:
                     "node_type": "image",
                     "node_id": image_result.image_node.node_id,
                     "title": image_result.image_node.title or image_result.image_node.node_id,
+                    "event": "node-created",
                 }
             )
 
         for node in created_nodes:
             print(
-                "[node-created] "
+                f"[{node['event']}] "
                 f"type={node['node_type']} "
                 f"node_id={node['node_id']!r} "
                 f"title={node['title']!r} "
@@ -746,6 +747,15 @@ class GraphRunner:
         text_neighbor_queue = queue_breakdown["text_neighbor_queue"]
         image_entity_queue = queue_breakdown["image_entity_queue"]
         task_title = result.task.title or result.task.url
+        timing = dict(result.timing or {})
+        timing.update(self._last_checkpoint_timing)
+        timing_parts = " ".join(
+            f"{key}={float(value):.3f}s"
+            for key, value in sorted(timing.items())
+            if isinstance(value, (int, float))
+        )
+        checkpoint_status = self._last_checkpoint_timing.get("checkpoint_status")
+        timing_text = f"timing={timing_parts} checkpoint_status={checkpoint_status}"
         print(
             "[node-status] "
             f"task={task_title!r} "
@@ -756,7 +766,8 @@ class GraphRunner:
             f"text_neighbor_queue={text_neighbor_queue} "
             f"image_entity_queue={image_entity_queue} "
             f"image_queue={image_queue_size} "
-            f"latest={latest_title!r}",
+            f"latest={latest_title!r} "
+            f"{timing_text}",
             file=sys.stdout,
             flush=True,
         )
@@ -921,6 +932,11 @@ class GraphRunner:
             priority=float(record.get("priority", 0.0)),
             status=ExpansionTaskStatus(record.get("status", ExpansionTaskStatus.PENDING.value)),
             metadata=dict(record.get("metadata") or {}),
+            enqueue_seq=(
+                int(record["enqueue_seq"])
+                if record.get("enqueue_seq") is not None
+                else None
+            ),
         )
 
 

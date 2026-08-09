@@ -999,6 +999,19 @@ class WikiTextBuilder:
                 )
             )
         candidates = self._uniformly_sample_candidates(candidates, self.max_raw_links)
+
+        # Rule-score the uniformly sampled candidates before spending one LLM
+        # call per candidate on relation extraction.  Relation text is useful
+        # for the semantic neighbor filter and the eventual edge, but it is
+        # not part of the cheap rule score.  Restricting relation extraction
+        # to the final linked-entity budget avoids extracting relations for
+        # candidates that will never be considered.  The neighbor filter may
+        # still use a separate, larger legacy cap, but it cannot see more
+        # candidates than this stage passes to it.
+        candidates = sorted(
+            candidates,
+            key=lambda item: (-item.score, item.rank or 10**9),
+        )[: max(1, self.max_links)]
         candidates = self._attach_relations_to_candidates(
             source_title=self._title_from_url(source_url) or source_url,
             candidates=candidates,
@@ -1814,20 +1827,22 @@ class WikiTextBuilder:
         self,
         candidates: list[WikiLinkCandidate],
     ) -> list[WikiLinkCandidate]:
-        sorted_candidates = sorted(candidates, key=lambda item: (-item.score, item.rank or 10**9))
-        selected: list[WikiLinkCandidate] = []
-        window_counts: dict[int, int] = {}
+        """Return the highest-scoring candidates without spatial filtering.
 
-        for candidate in sorted_candidates:
-            if len(selected) >= self.max_links:
-                break
-            if not self._passes_position_diversity(candidate, selected, window_counts):
-                continue
-            selected.append(candidate)
-            if candidate.window_id is not None:
-                window_counts[candidate.window_id] = window_counts.get(candidate.window_id, 0) + 1
-            candidate.quality_reasons.append("position_diverse")
+        The method name is retained for compatibility with the neighbor
+        debugging utility.  Graph expansion only consumes the first
+        ``max_new_text_neighbors`` items from this score-ranked list, so
+        applying a second character-distance/window filter here could replace
+        a higher-scoring LLM-approved candidate with a lower-scoring one.
+        """
 
+        sorted_candidates = sorted(
+            candidates,
+            key=lambda item: (-item.score, item.rank or 10**9),
+        )
+        selected = sorted_candidates[: self.max_links]
+        for candidate in selected:
+            candidate.quality_reasons.append("score_ranked")
         return selected
 
     def _passes_position_diversity(
@@ -1916,6 +1931,7 @@ class WikiTextBuilder:
                 "link_score": candidate.score,
                 "quality_reasons": candidate.quality_reasons,
                 "position_diversity": {
+                    "enabled": False,
                     "window_size": self.diversity_window_size,
                     "max_links_per_window": self.max_links_per_window,
                     "min_char_distance": self.min_link_char_distance,
@@ -2318,6 +2334,7 @@ def _smoke_test() -> None:
             )
             diversity_builder = WikiTextBuilder(
                 reader=MockReader(),
+                model_client=MockModel(),
                 max_links=5,
                 diversity_window_size=120,
                 max_links_per_window=1,
@@ -2328,7 +2345,7 @@ def _smoke_test() -> None:
                 nearby_markdown,
                 source_url="https://en.wikipedia.org/wiki/NBA_Finals",
             )
-            assert len(diverse_links) == 2
+            assert len(diverse_links) == 4
             assert any(link.title == "Jerry West" for link in diverse_links)
             assert all(link.window_id is not None for link in diverse_links)
             escaped_markdown = "[Hokusai Manga](/wiki/Hokusai\\_Manga)"

@@ -607,6 +607,9 @@ def main(argv: list[str] | None = None) -> int:
 
     started_at = time.perf_counter()
     result = runner.run()
+    compact_started = time.perf_counter()
+    compacted = store.compact()
+    compact_elapsed_s = time.perf_counter() - compact_started
     elapsed_s = time.perf_counter() - started_at
     store_size = directory_size_bytes(store_dir)
     print("=== min graph run ===")
@@ -632,6 +635,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f"failed: {result.failed_count}")
     print(f"skipped: {result.skipped_count}")
     print(f"store_stats: {result.store_stats}")
+    print(f"store_compacted: {compacted}")
+    print(f"store_compact_elapsed_s: {compact_elapsed_s:.2f}")
     if result.last_error:
         print(f"last_error: {result.last_error}")
     failed_preview = load_failed_task_preview(store_dir, limit=1)
