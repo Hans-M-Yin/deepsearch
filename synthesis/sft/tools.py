@@ -33,7 +33,12 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     __package__ = "synthesis.sft"
 
-from synthesis.search_client import SerperSearchClient, acquire_serper_api_key
+from synthesis.search_client import (
+    SerperApiKeyPool,
+    SerperSearchClient,
+    _is_serper_credit_exhausted,
+    acquire_serper_api_key,
+)
 from synthesis.wiki_text_builder import EnhancedReaderClient
 from synthesis.model_worker import LLM_WORKER
 from synthesis.model_worker import ModelMessage
@@ -634,8 +639,7 @@ def get_tool_definitions() -> list[dict[str, Any]]:
                     "Read a URL. If it returns text, fetch content through a "
                     "reader backend and optionally summarize only the part "
                     "relevant to the current tool goal. If it returns an image, the image will be downloaded for you. "
-                    "Use resource_id from a prior search result whenever available; url remains supported for direct links. "
-                    "NOTICE, only resources or URLs you have got from search tools can be read. Wikipedia and Wiki commons is excluded for safety reasons."
+                    "Use resource_id from a prior search result whenever available; url remains supported for direct links."
                 ),
                 "parameters": {
                     "type": "object",
@@ -2078,7 +2082,7 @@ def t2i_search(query: str, lang: str = "en", top_k: int = DEFAULT_SEARCH_TOP_K) 
 
 
 def _image_search_via_serper(image_url: str, top_k: int = MAX_SEARCH_RESULTS) -> object:
-    serper_api_key, _ = acquire_serper_api_key()
+    serper_api_key, pool_metadata = acquire_serper_api_key()
     fetch_limit = _search_fetch_limit(max(1, min(int(top_k), MAX_SEARCH_RESULTS)), tool_name="i2i_search")
 
     lens_headers = {
@@ -2088,13 +2092,27 @@ def _image_search_via_serper(image_url: str, top_k: int = MAX_SEARCH_RESULTS) ->
     relay_token = os.environ.get("SERPER_RELAY_TOKEN")
     if relay_token:
         lens_headers["X-Serper-Relay-Token"] = relay_token
+    lens_url = os.environ.get("SERPER_LENS_URL") or "https://google.serper.dev/lens"
     response = requests.post(
-        os.environ.get("SERPER_LENS_URL") or "https://google.serper.dev/lens",
+        lens_url,
         headers=lens_headers,
         json={"url": image_url},
         timeout=TOOL_NETWORK_TIMEOUT_S,
     )
-    response.raise_for_status()
+    try:
+        response.raise_for_status()
+    except requests.HTTPError:
+        response_body = getattr(response, "text", "") or ""
+        status_code = int(getattr(response, "status_code", 0) or 0)
+        if _is_serper_credit_exhausted(
+            status_code=status_code,
+            response_body=response_body,
+        ):
+            SerperApiKeyPool.from_fixed_pool().mark_credits_exhausted(
+                str(pool_metadata.get("key_id") or ""),
+                reason=f"serper_lens_http_{status_code}_credits_exhausted",
+            )
+        raise
     data = response.json()
     organic = data.get("organic", []) or []
     if not organic:

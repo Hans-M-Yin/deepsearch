@@ -57,7 +57,7 @@ def get_all_tools() -> dict[str, SFTToolAdapter]:
     """Return the SFT tool set used by RL.
 
     ``finish`` is intentionally not included: it is represented by the RL
-    agent's ``<response>...</response>`` termination format, not a backend tool.
+    agent's ``<answer>...</answer>`` termination format, not a backend tool.
     """
 
     return {
@@ -73,9 +73,9 @@ def get_tool(name: str) -> SFTToolAdapter | None:
 def build_sft_react_system_prompt() -> str:
     """Build an RL-compatible prompt from the SFT schemas.
 
-    SFT's ``manual_react`` client uses ``<action>`` blocks.  RL's trajectory
-    parser already records ``<tool_call>`` blocks, so the backend and tool
-    semantics are shared while the wire format remains the RL format.
+    The exported SFT training data uses ``<thinking>``/``<tool_call>`` and
+    ``<answer>`` blocks.  RL uses the same model-facing protocol while keeping
+    its own internal trajectory representation.
     """
 
     definitions = get_tool_definitions()
@@ -85,7 +85,7 @@ def build_sft_react_system_prompt() -> str:
     ]
     return """You are a visual research agent. Answer the question with evidence and do not guess.
 
-Before every action, write a concise analysis inside <think>...</think>.
+Before every action, write a concise analysis inside <thinking>...</thinking>.
 Use exactly one tool call per turn and wait for its observation:
 <tool_call>{{"name":"tool_name","arguments":{{...}}}}</tool_call>
 
@@ -102,7 +102,7 @@ Tool rules:
 5. Use resource IDs returned by search tools instead of inventing or exposing backend URLs.
 
 When enough evidence has been collected, finish with:
-<response>final answer</response>
+<answer>final answer</answer>
 
 Do not call tools not listed above. Do not emit more than one tool call in a turn.
 """.format(tools="\n\n".join(tool_lines))

@@ -78,10 +78,20 @@ def _infer_case_id(image_path: str, fallback_prefix: str, index: int) -> str:
     return stem or f"{fallback_prefix}_{index}"
 
 
+def _infer_level(input_path: Path) -> str:
+    name = input_path.stem.lower()
+    if "level1" in name:
+        return "level1"
+    if "level2" in name:
+        return "level2"
+    return "unknown"
+
+
 def _iter_rows(
     records: Iterable[dict[str, Any]],
     dataset_root: Path,
     source_name: str,
+    level: str,
 ) -> Iterable[dict[str, Any]]:
     for index, item in enumerate(records):
         question = str(item.get("question", "")).strip()
@@ -99,30 +109,50 @@ def _iter_rows(
         case_id = _infer_case_id(image_path, source_name, index)
         image_bytes = _resolve_image_bytes(dataset_root, image_path)
         image_format = Path(image_path).suffix.lower().lstrip(".") or "jpg"
+        answer = ", ".join(str(value) for value in answers if str(value).strip())
+        source_record = {
+            "question": question,
+            "answers": answers,
+            "image_path": image_path,
+            "domain": domain,
+            "source": source_name,
+            "level": level,
+        }
 
         yield {
             "data_id": case_id,
+            "question_id": case_id,
+            "sample_id": case_id,
             "category": domain,
             "data_source": source_name,
+            "level": level,
             "question": question,
+            "answer": answer,
             "answers": answers,
-            "original_data": {
-                "question": question,
-                "answers": answers,
-                "image_path": image_path,
-                "domain": domain,
-                "source": source_name,
-            },
+            "original_data": source_record,
+            "source_metadata": json.dumps(source_record, ensure_ascii=False),
             "prompt": [{"role": "user", "content": question}],
             "images": [{"bytes": image_bytes, "format": image_format}],
         }
 
 
-def build_dataframe(input_path: Path, dataset_root: Path, source_name: str):
+def build_dataframe(
+    input_path: Path,
+    dataset_root: Path,
+    source_name: str,
+    level: str | None = None,
+):
     import pandas as pd
 
     records = _load_records(input_path)
-    rows = list(_iter_rows(records, dataset_root=dataset_root, source_name=source_name))
+    rows = list(
+        _iter_rows(
+            records,
+            dataset_root=dataset_root,
+            source_name=source_name,
+            level=level or _infer_level(input_path),
+        )
+    )
     return pd.DataFrame(rows)
 
 
@@ -159,6 +189,12 @@ def main() -> None:
         default="BrowseComp-VL",
         help="Value to write into the data_source column",
     )
+    parser.add_argument(
+        "--level",
+        choices=["level1", "level2"],
+        default=None,
+        help="Benchmark level; inferred from the input filename when omitted",
+    )
     args = parser.parse_args()
 
     input_path = Path(args.input).expanduser().resolve()
@@ -169,6 +205,7 @@ def main() -> None:
         input_path=input_path,
         dataset_root=dataset_root,
         source_name=args.source_name,
+        level=args.level,
     )
     write_parquet_via_buffer(df, output_path)
     print(f"Wrote {len(df)} rows to {output_path}")

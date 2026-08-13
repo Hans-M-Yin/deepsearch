@@ -31,7 +31,7 @@ _FIXED_SERPER_KEYS_FILE = Path(__file__).resolve().parent / "serper_keys.txt.exa
 _FIXED_SERPER_POOL_STATE_FILE = (
     Path(__file__).resolve().parent / "ignore" / "serper_pool_state.json"
 )
-_FIXED_SERPER_POOL_MIN_REMAINING = 10
+_FIXED_SERPER_POOL_MIN_REMAINING = 100
 _FIXED_SERPER_POOL_DEFAULT_CREDITS = 2500
 _FIXED_SERPER_KEY_POOL: "SerperApiKeyPool | None" = None
 
@@ -353,7 +353,7 @@ class SerperApiKeyPool:
         keys: list[str],
         state_path: str | Path | None = None,
         default_credits: int = 2500,
-        min_remaining: int = 10,
+        min_remaining: int = 100,
     ) -> None:
         cleaned = list(dict.fromkeys(key.strip() for key in keys if key and key.strip()))
         if not cleaned:
@@ -384,7 +384,7 @@ class SerperApiKeyPool:
             keys=keys,
             state_path=os.environ.get("SERPER_API_POOL_STATE_FILE"),
             default_credits=int(os.environ.get("SERPER_API_POOL_DEFAULT_CREDITS") or 2500),
-            min_remaining=int(os.environ.get("SERPER_API_POOL_MIN_REMAINING") or 10),
+            min_remaining=int(os.environ.get("SERPER_API_POOL_MIN_REMAINING") or 100),
         )
 
     @classmethod
@@ -902,9 +902,17 @@ class SerperSearchClient:
         if api_keys:
             self.key_pool = SerperApiKeyPool(
                 keys=api_keys,
-                state_path=pool_state_path or _FIXED_SERPER_POOL_STATE_FILE,
-                default_credits=pool_default_credits or _FIXED_SERPER_POOL_DEFAULT_CREDITS,
-                min_remaining=pool_min_remaining or _FIXED_SERPER_POOL_MIN_REMAINING,
+                state_path=pool_state_path if pool_state_path is not None else _FIXED_SERPER_POOL_STATE_FILE,
+                default_credits=(
+                    pool_default_credits
+                    if pool_default_credits is not None
+                    else _FIXED_SERPER_POOL_DEFAULT_CREDITS
+                ),
+                min_remaining=(
+                    pool_min_remaining
+                    if pool_min_remaining is not None
+                    else _FIXED_SERPER_POOL_MIN_REMAINING
+                ),
             )
         else:
             self.key_pool = SerperApiKeyPool.from_fixed_pool()

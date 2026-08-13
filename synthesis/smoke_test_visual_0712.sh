@@ -9,12 +9,11 @@ nohup python synthesis/run_min_graph.py \
   --max-neighbors 8 \
   --max-llm-neighbor-candidates 50 \
   --max-steps 12345678 \
-  --max-nodes 25000 \
+  --max-nodes 35000 \
   --max-depth 128 \
-  --parallel-workers 64 \
+  --parallel-workers 56 \
   --batch-size 120 \
-  --max-inflight-text 32 \
+  --max-inflight-text 28 \
   --image-backend serper \
-  --image-entity-only \
   > synthesis/ignore/output.log 2>&1 &
   # --queue-pop-strategy random \

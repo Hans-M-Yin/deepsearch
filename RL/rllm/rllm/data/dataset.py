@@ -1,6 +1,8 @@
 import json
 import logging
 import os
+import shutil
+import tempfile
 from typing import Any
 
 import pandas as pd
@@ -190,8 +192,36 @@ class DatasetRegistry:
     def _save_registry(cls, registry: dict[str, dict[str, str]]) -> None:
         """Save the dataset registry to the registry file."""
         cls._ensure_directories()
-        with open(cls._REGISTRY_FILE, "w", encoding="utf-8") as f:
-            json.dump(registry, f, indent=2)
+        # Some workspace/HDFS-backed filesystems do not support the direct
+        # truncate-and-write pattern reliably.  Materialize the file on the
+        # local filesystem first, then move it into the registry directory.
+        temp_dir = tempfile.mkdtemp(prefix="rllm-registry-", dir="/tmp")
+        temp_path = os.path.join(temp_dir, os.path.basename(cls._REGISTRY_FILE))
+        try:
+            with open(temp_path, "w", encoding="utf-8") as f:
+                json.dump(registry, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            shutil.move(temp_path, cls._REGISTRY_FILE)
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    @staticmethod
+    def _write_parquet_via_tmp(dataframe: pd.DataFrame, destination: str) -> None:
+        """Write parquet locally, then move it to the registry destination.
+
+        Direct parquet writes can fail on HDFS/FUSE-mounted workspace paths
+        with ``OSError: [Errno 16] Device or resource busy``.  Writing the
+        complete file under /tmp avoids that failure mode.  ``shutil.move``
+        handles both same-filesystem renames and cross-filesystem copies.
+        """
+        temp_dir = tempfile.mkdtemp(prefix="rllm-parquet-", dir="/tmp")
+        temp_path = os.path.join(temp_dir, os.path.basename(destination))
+        try:
+            dataframe.to_parquet(temp_path)
+            shutil.move(temp_path, destination)
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
     @classmethod
     def register_dataset(cls, name: str, data: list[dict[str, Any]] | Any, split: str = "default") -> Dataset:
@@ -223,13 +253,13 @@ class DatasetRegistry:
 
         # Save original data
         dataset_path = os.path.join(dataset_dir, f"{split}.parquet")
-        data_df.to_parquet(dataset_path)
+        cls._write_parquet_via_tmp(data_df, dataset_path)
 
         # Apply Verl postprocessing and save
         verl_data = cls.apply_verl_postprocessing(data_list)
         verl_dataset_path = os.path.join(dataset_dir, f"{split}_verl.parquet")
         verl_data_df = pd.DataFrame(verl_data)
-        verl_data_df.to_parquet(verl_dataset_path)
+        cls._write_parquet_via_tmp(verl_data_df, verl_dataset_path)
 
         # Update registry
         registry = cls._load_registry()

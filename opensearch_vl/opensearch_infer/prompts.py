@@ -8,6 +8,7 @@ Requirements:
 2. If the evidence is insufficient, state the uncertainty and continue searching instead of guessing.
 3. Use at most one tool call per turn.
 4. Prefer tool use whenever identification, external knowledge, or webpage inspection is needed.
+5. Use at most 45 tool calls in total for one case; when the evidence is sufficient, stop using tools and provide the final answer.
 
 Available tools are provided inside `<tools></tools>`.
 

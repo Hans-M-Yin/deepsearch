@@ -11,6 +11,7 @@ from pathlib import Path
 import random
 import re
 import sys
+import threading
 from typing import Any
 
 if __package__ in (None, ""):
@@ -26,6 +27,8 @@ from .schemas import PathCandidate, TrajectoryStats
 
 
 SAMPLER_STATE_VERSION = 1
+EDGE_QUALITY_CACHE_VERSION = 1
+EDGE_QUALITY_PROMPT_VERSION = "edge_quality_prompt_v1"
 DEFAULT_HISTORY_EXPOSURE_MODEL = "multimodal_process"
 DEFAULT_EDGE_QUALITY_MODEL = "multimodal_process"
 _VQA_FIXED_REQUEST_ID = "3200636808"
@@ -278,6 +281,105 @@ def _stable_hash(*parts: object, length: int = 16) -> str:
     return sha256(payload.encode("utf-8")).hexdigest()[:length]
 
 
+class EdgeQualityCache:
+    """Thread-safe edge-quality cache with an append-only JSONL backing file.
+
+    The JSONL file is only the durable representation.  All sampler lookups
+    use the in-memory ``_records`` dictionary, so sampling never rescans the
+    cache file for individual edges.
+    """
+
+    def __init__(self, path: str | Path | None = None) -> None:
+        self.path = Path(path).resolve() if path is not None else None
+        self._records: dict[str, dict[str, Any]] = {}
+        self._lock = threading.RLock()
+        self._load()
+
+    def get(self, cache_key: str) -> dict[str, Any] | None:
+        with self._lock:
+            record = self._records.get(str(cache_key))
+            return dict(record) if record is not None else None
+
+    def put(
+        self,
+        cache_key: str,
+        decision: dict[str, Any],
+        *,
+        edge_id: str,
+        model_alias: str,
+    ) -> None:
+        normalized_key = str(cache_key).strip()
+        if not normalized_key:
+            return
+        normalized_decision = dict(decision)
+        with self._lock:
+            if normalized_key in self._records:
+                return
+            self._records[normalized_key] = normalized_decision
+            if self.path is None:
+                return
+            payload = {
+                "cache_version": EDGE_QUALITY_CACHE_VERSION,
+                "cache_key": normalized_key,
+                "edge_id": str(edge_id),
+                "model_alias": str(model_alias),
+                "prompt_version": EDGE_QUALITY_PROMPT_VERSION,
+                "decision": normalized_decision,
+            }
+            self._append_record(payload)
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._records)
+
+    def _load(self) -> None:
+        if self.path is None or not self.path.exists():
+            return
+        try:
+            with self.path.open("r", encoding="utf-8") as handle:
+                for raw_line in handle:
+                    line = raw_line.strip()
+                    if not line:
+                        continue
+                    try:
+                        payload = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if not isinstance(payload, dict):
+                        continue
+                    if payload.get("cache_version") not in (None, EDGE_QUALITY_CACHE_VERSION):
+                        continue
+                    cache_key = str(payload.get("cache_key") or "").strip()
+                    decision = payload.get("decision")
+                    if cache_key and isinstance(decision, dict):
+                        # Later records win, which makes the file forward
+                        # compatible with future cache refreshes.
+                        self._records[cache_key] = dict(decision)
+        except OSError:
+            # Cache persistence is an optimization.  A read failure must not
+            # prevent VQA sampling from falling back to live judgments.
+            return
+
+    def _append_record(self, payload: dict[str, Any]) -> None:
+        assert self.path is not None
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            with self.path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+                handle.write("\n")
+                handle.flush()
+                try:
+                    os.fsync(handle.fileno())
+                except OSError:
+                    # Some FUSE-backed filesystems do not support fsync; the
+                    # flushed append is still useful for the next process.
+                    pass
+        except OSError:
+            # Keep the in-memory decision even if the optional durable cache
+            # cannot be written.  The current sampling run remains correct.
+            return
+
+
 @dataclass(slots=True)
 class SamplerConfiguration:
     """Configuration for first-pass random trajectory sampling."""
@@ -288,6 +390,12 @@ class SamplerConfiguration:
     random_seed: int = 0
     max_attempts_multiplier: int = 20
     min_attempts: int = 100
+    max_backtracks: int = 32
+    # Optional hard quotas by trajectory length.  An absent length is
+    # unlimited; a configured length may be used only while its accepted-path
+    # quota has not been exhausted.  The batch acceptor also enforces this
+    # centrally because sampler clones run concurrently.
+    hop_quotas: dict[int, int] = field(default_factory=dict)
     hop_sampling_strategy: str = "middle_biased"
     require_simple_path: bool = True
     # When enabled, accepted trajectories must contain at least one image
@@ -326,6 +434,27 @@ class SamplerConfiguration:
             raise ValueError("max_attempts_multiplier must be positive")
         if self.min_attempts <= 0:
             raise ValueError("min_attempts must be positive")
+        if self.max_backtracks < 0:
+            raise ValueError("max_backtracks must be >= 0")
+        normalized_hop_quotas: dict[int, int] = {}
+        for raw_hop_count, raw_quota in (self.hop_quotas or {}).items():
+            try:
+                hop_count = int(raw_hop_count)
+                quota = int(raw_quota)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"hop_quotas must map integer hop counts to integer quotas: "
+                    f"{raw_hop_count!r}={raw_quota!r}"
+                ) from exc
+            if hop_count < self.min_hops or hop_count > self.max_hops:
+                raise ValueError(
+                    f"hop quota length {hop_count} must be within "
+                    f"[{self.min_hops}, {self.max_hops}]"
+                )
+            if quota < 0:
+                raise ValueError(f"hop quota for length {hop_count} must be >= 0")
+            normalized_hop_quotas[hop_count] = quota
+        self.hop_quotas = normalized_hop_quotas
         if self.hop_sampling_strategy not in {"uniform", "middle_biased"}:
             raise ValueError("hop_sampling_strategy must be 'uniform' or 'middle_biased'")
         if self.min_modality_switches < 0:
@@ -352,6 +481,8 @@ class SamplerGenerationStats:
     requested: int
     accepted: int = 0
     attempts: int = 0
+    backtracks: int = 0
+    backtrack_budget_exhausted: int = 0
     rejected_too_short: int = 0
     rejected_dead_end: int = 0
     rejected_cycle: int = 0
@@ -393,6 +524,7 @@ class RandomPathSampler(PathSampler):
 
     used_exact_signatures: set[str] = field(default_factory=set)
     edge_usage_counts: dict[str, int] = field(default_factory=dict)
+    hop_counts: dict[int, int] = field(default_factory=dict)
     model_client: ModelWorkerClient | None = None
     model: str | None = None
     history_exposure_model_client: ModelWorkerClient | None = None
@@ -400,11 +532,35 @@ class RandomPathSampler(PathSampler):
     edge_quality_model_client: ModelWorkerClient | None = None
     edge_quality_model: str | None = None
     llm_max_tokens: int = 800
-    edge_quality_cache: dict[str, dict[str, Any]] = field(default_factory=dict)
+    edge_quality_cache: EdgeQualityCache | None = None
+    _candidate_start_node_ids: tuple[str, ...] = field(init=False, repr=False)
+    _candidate_start_node_id_set: frozenset[str] = field(init=False, repr=False)
     _rng: random.Random = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         self._rng = random.Random(self.config.random_seed)
+        if self.edge_quality_cache is None:
+            self.edge_quality_cache = EdgeQualityCache()
+        node_ids_tuple = getattr(self.graph, "node_ids_tuple", None)
+        if callable(node_ids_tuple):
+            all_node_ids = node_ids_tuple()
+        else:
+            # Keep lightweight test/dummy graph implementations compatible.
+            list_node_ids = getattr(self.graph, "list_node_ids", None)
+            if callable(list_node_ids):
+                all_node_ids = tuple(list_node_ids())
+            else:
+                all_node_ids = tuple(getattr(self.graph, "nodes", {}).keys())
+        if self.config.allowed_start_node_types:
+            allowed_types = set(self.config.allowed_start_node_types)
+            self._candidate_start_node_ids = tuple(
+                node_id
+                for node_id in all_node_ids
+                if self.graph.node_type(node_id) in allowed_types
+            )
+        else:
+            self._candidate_start_node_ids = tuple(all_node_ids)
+        self._candidate_start_node_id_set = frozenset(self._candidate_start_node_ids)
 
     def generate_one(self, start_node_id: str | None = None) -> PathCandidate | None:
         node_ids = self._candidate_start_nodes()
@@ -413,7 +569,7 @@ class RandomPathSampler(PathSampler):
             return None
 
         forced_start_node_id = start_node_id
-        if forced_start_node_id is not None and forced_start_node_id not in node_ids:
+        if forced_start_node_id is not None and forced_start_node_id not in self._candidate_start_node_id_set:
             self.last_generation_stats = SamplerGenerationStats(
                 requested=1,
                 attempts=0,
@@ -426,7 +582,10 @@ class RandomPathSampler(PathSampler):
         stats = SamplerGenerationStats(requested=1)
         max_attempts = max(self.config.max_attempts_multiplier, self.config.min_attempts)
         attempts = 0
-        target_hop_count = self._sample_hop_count(self._rng)
+        target_hop_count = self._sample_hop_count_with_quota(self._rng)
+        if target_hop_count is None:
+            self.last_generation_stats = stats
+            return None
         while attempts < max_attempts:
             attempts += 1
             stats.attempts = attempts
@@ -437,6 +596,7 @@ class RandomPathSampler(PathSampler):
                 start_node_id=sampled_start_node_id,
                 rng=self._rng,
                 hop_count=target_hop_count,
+                generation_stats=stats,
             )
             if candidate is None:
                 self._count_rejection(stats, reject_reason)
@@ -446,9 +606,12 @@ class RandomPathSampler(PathSampler):
                 continue
             self.used_exact_signatures.add(candidate.exact_signature)
             self._register_edge_usage(candidate.edge_ids)
+            actual_hop_count = len(candidate.edge_ids)
+            self.hop_counts[actual_hop_count] = self.hop_counts.get(actual_hop_count, 0) + 1
             stats.accepted = 1
             stats.accepted_start_node_id = sampled_start_node_id
-            candidate.metadata["sampled_hop_count"] = target_hop_count
+            candidate.metadata["target_hop_count"] = target_hop_count
+            candidate.metadata["sampled_hop_count"] = actual_hop_count
             self.last_generation_stats = stats
             return candidate
         self.last_generation_stats = stats
@@ -463,6 +626,8 @@ class RandomPathSampler(PathSampler):
             one_stats = self.last_generation_stats
             if one_stats is not None:
                 aggregate.attempts += one_stats.attempts
+                aggregate.backtracks += one_stats.backtracks
+                aggregate.backtrack_budget_exhausted += one_stats.backtrack_budget_exhausted
                 aggregate.accepted += one_stats.accepted
                 aggregate.rejected_too_short += one_stats.rejected_too_short
                 aggregate.rejected_dead_end += one_stats.rejected_dead_end
@@ -487,9 +652,11 @@ class RandomPathSampler(PathSampler):
         *,
         used_exact_signatures: set[str] | None = None,
         edge_usage_counts: dict[str, int] | None = None,
+        hop_counts: dict[int, int] | None = None,
     ) -> dict[str, Any]:
         signatures_source = self.used_exact_signatures if used_exact_signatures is None else used_exact_signatures
         counts_source = self.edge_usage_counts if edge_usage_counts is None else edge_usage_counts
+        hop_counts_source = self.hop_counts if hop_counts is None else hop_counts
         normalized_signatures = sorted(
             {
                 str(signature).strip()
@@ -502,12 +669,18 @@ class RandomPathSampler(PathSampler):
             for edge_id, count in sorted(counts_source.items())
             if str(edge_id).strip() and int(count) > 0
         }
+        normalized_hop_counts = {
+            str(int(hop_count)): int(count)
+            for hop_count, count in sorted(hop_counts_source.items(), key=lambda item: int(item[0]))
+            if int(count) > 0
+        }
         return {
             "version": SAMPLER_STATE_VERSION,
             "sampler_type": self.__class__.__name__,
             "config": self.config.to_dict(),
             "used_exact_signatures": normalized_signatures,
             "edge_usage_counts": normalized_counts,
+            "hop_counts": normalized_hop_counts,
         }
 
     def load_state(self, state: dict[str, Any], *, replace: bool = True) -> None:
@@ -519,10 +692,13 @@ class RandomPathSampler(PathSampler):
 
         raw_signatures = state.get("used_exact_signatures") or []
         raw_edge_counts = state.get("edge_usage_counts") or {}
+        raw_hop_counts = state.get("hop_counts") or {}
         if not isinstance(raw_signatures, list):
             raise ValueError("sampler state field 'used_exact_signatures' must be a list")
         if not isinstance(raw_edge_counts, dict):
             raise ValueError("sampler state field 'edge_usage_counts' must be an object")
+        if not isinstance(raw_hop_counts, dict):
+            raise ValueError("sampler state field 'hop_counts' must be an object")
 
         normalized_signatures = {
             str(signature).strip()
@@ -542,12 +718,28 @@ class RandomPathSampler(PathSampler):
                 continue
             normalized_edge_counts[edge_text] = normalized_count
 
+        normalized_hop_counts: dict[int, int] = {}
+        for hop_count, count in raw_hop_counts.items():
+            try:
+                normalized_hop_count = int(hop_count)
+                normalized_count = int(count)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"invalid sampler hop count for {hop_count!r}: {count!r}"
+                ) from exc
+            if normalized_hop_count <= 0 or normalized_count <= 0:
+                continue
+            normalized_hop_counts[normalized_hop_count] = normalized_count
+
         if replace:
             self.used_exact_signatures = set()
             self.edge_usage_counts = {}
+            self.hop_counts = {}
         self.used_exact_signatures.update(normalized_signatures)
         for edge_id, count in normalized_edge_counts.items():
             self.edge_usage_counts[edge_id] = self.edge_usage_counts.get(edge_id, 0) + count
+        for hop_count, count in normalized_hop_counts.items():
+            self.hop_counts[hop_count] = self.hop_counts.get(hop_count, 0) + count
 
     def _sample_one(
         self,
@@ -555,6 +747,7 @@ class RandomPathSampler(PathSampler):
         start_node_id: str,
         rng: random.Random,
         hop_count: int | None = None,
+        generation_stats: SamplerGenerationStats | None = None,
     ) -> tuple[PathCandidate | None, str | None]:
         node_ids = [start_node_id]
         edge_ids: list[str] = []
@@ -562,40 +755,125 @@ class RandomPathSampler(PathSampler):
         relations: list[str] = []
         selection_trace: list[dict[str, Any]] = []
         used_edge_ids: set[str] = set()
-        current = start_node_id
         hop_count = hop_count if hop_count is not None else self._sample_hop_count(rng)
+        # One frame is kept for every path prefix.  Its candidates are filtered
+        # once and then consumed one by one, so a failed descendant can return
+        # to the same prefix without re-running edge-quality filtering.
+        frames: list[dict[str, Any]] = []
+        backtracks = 0
+        last_failure_reason: str | None = None
 
-        for _ in range(hop_count):
-            neighbors = self._traversable_neighbors(current, node_ids=node_ids)
-            if self.config.require_simple_path:
-                neighbors = [edge for edge in neighbors if edge.get("dst_node_id") not in node_ids]
-            neighbors = [edge for edge in neighbors if edge.get("edge_id") not in used_edge_ids]
-            neighbors = self._filter_candidate_neighbors(
-                neighbors,
-                node_ids=node_ids,
-                selection_trace=selection_trace,
-            )
-            if not neighbors:
-                if len(edge_ids) < self.config.min_hops:
-                    return None, "too_short"
-                return None, "dead_end"
-            edge = self._weighted_edge_choice(
-                neighbors,
-                node_ids=node_ids,
-                rng=rng,
-                selection_trace=selection_trace,
-            )
-            if edge is None:
-                return None, "no_viable_llm_candidate"
-            current = edge["dst_node_id"]
-            if self.config.require_simple_path and current in node_ids:
-                return None, "cycle"
-            node_ids.append(current)
-            edge_ids.append(edge["edge_id"])
-            edge_types.append(edge.get("edge_type") or "")
-            relations.append(edge.get("relation") or "")
-            used_edge_ids.add(edge["edge_id"])
+        while True:
+            depth = len(edge_ids)
+            if depth == hop_count:
+                if not self._hop_quota_available(hop_count):
+                    candidate, failure_reason = None, "hop_quota_exhausted"
+                else:
+                    candidate, failure_reason = self._build_path_candidate(
+                        node_ids=node_ids,
+                        edge_ids=edge_ids,
+                        edge_types=edge_types,
+                        relations=relations,
+                        selection_trace=selection_trace,
+                        hop_count=hop_count,
+                    )
+                if candidate is not None:
+                    if generation_stats is not None:
+                        generation_stats.backtracks += backtracks
+                    return candidate, None
+                last_failure_reason = failure_reason
+            else:
+                if len(frames) <= depth:
+                    current = node_ids[-1]
+                    neighbors = self._traversable_neighbors(current, node_ids=node_ids)
+                    if self.config.require_simple_path:
+                        neighbors = [edge for edge in neighbors if edge.get("dst_node_id") not in node_ids]
+                    neighbors = [edge for edge in neighbors if edge.get("edge_id") not in used_edge_ids]
+                    neighbors = self._filter_candidate_neighbors(
+                        neighbors,
+                        node_ids=node_ids,
+                        selection_trace=selection_trace,
+                    )
+                    frames.append({
+                        "neighbors": neighbors,
+                        "tried_edge_ids": set(),
+                    })
 
+                frame = frames[depth]
+                tried_edge_ids = frame["tried_edge_ids"]
+                remaining_neighbors = [
+                    edge
+                    for edge in frame["neighbors"]
+                    if str(edge.get("edge_id") or "") not in tried_edge_ids
+                ]
+                if remaining_neighbors:
+                    edge = self._weighted_edge_choice(
+                        remaining_neighbors,
+                        node_ids=node_ids,
+                        rng=rng,
+                        selection_trace=selection_trace,
+                    )
+                    if edge is not None:
+                        edge_id = str(edge.get("edge_id") or "")
+                        tried_edge_ids.add(edge_id)
+                        current = str(edge.get("dst_node_id") or "")
+                        if not current or (self.config.require_simple_path and current in node_ids):
+                            last_failure_reason = "cycle"
+                        else:
+                            node_ids.append(current)
+                            edge_ids.append(edge_id)
+                            edge_types.append(edge.get("edge_type") or "")
+                            relations.append(edge.get("relation") or "")
+                            used_edge_ids.add(edge_id)
+                            continue
+                    else:
+                        # LLM-guided selection failed closed.  Do not call it
+                        # repeatedly for the same prefix during backtracking.
+                        tried_edge_ids.update(
+                            str(candidate_edge.get("edge_id") or "")
+                            for candidate_edge in remaining_neighbors
+                        )
+                        last_failure_reason = "no_viable_llm_candidate"
+                else:
+                    last_failure_reason = "too_short" if depth < self.config.min_hops else "dead_end"
+
+            if not edge_ids:
+                if generation_stats is not None:
+                    generation_stats.backtracks += backtracks
+                return None, last_failure_reason or "too_short"
+            if backtracks >= self.config.max_backtracks:
+                if generation_stats is not None:
+                    generation_stats.backtracks += backtracks
+                    generation_stats.backtrack_budget_exhausted += 1
+                return None, last_failure_reason or "dead_end"
+
+            # Abandon the last edge and let the parent frame select another
+            # branch.  The parent frame remains cached; all deeper frames are
+            # invalid because their history prefix has changed.
+            removed_edge_id = edge_ids.pop()
+            node_ids.pop()
+            edge_types.pop()
+            relations.pop()
+            used_edge_ids.discard(removed_edge_id)
+            frames = frames[: len(edge_ids) + 1]
+            backtracks += 1
+
+    def _hop_quota_available(self, hop_count: int) -> bool:
+        quota = self.config.hop_quotas.get(int(hop_count))
+        if quota is None:
+            return True
+        return self.hop_counts.get(int(hop_count), 0) < quota
+
+    def _build_path_candidate(
+        self,
+        *,
+        node_ids: list[str],
+        edge_ids: list[str],
+        edge_types: list[str],
+        relations: list[str],
+        selection_trace: list[dict[str, Any]],
+        hop_count: int,
+    ) -> tuple[PathCandidate | None, str | None]:
         if len(edge_ids) < self.config.min_hops:
             return None, "too_short"
         node_types = [self.graph.node_type(node_id) or "unknown" for node_id in node_ids]
@@ -680,30 +958,65 @@ class RandomPathSampler(PathSampler):
     ) -> list[dict[str, Any]]:
         if not neighbors:
             return []
-        quality_rejections = self._edge_quality_rejections(neighbors)
         kept: list[dict[str, Any]] = []
         rejected: list[dict[str, Any]] = []
-        exposure_parts: list[dict[str, Any]] | None = None
+        cheap_kept: list[dict[str, Any]] = []
+        history_hard_matches: dict[str, dict[str, Any]] = {}
+        has_text_candidate = any(
+            self.graph.node_type(str(edge.get("dst_node_id") or "")) == "text"
+            for edge in neighbors
+        )
+        exposure_parts = self._history_exposure_parts(node_ids) if has_text_candidate else []
+
+        # Apply deterministic filters first.  This avoids sending candidates
+        # that are structurally invalid or obviously generic to edge-quality
+        # or history LLMs.
         for edge in neighbors:
             generic_category_reject = self._generic_category_target_reject_reason(edge)
             if generic_category_reject is not None:
                 rejected.append(generic_category_reject)
-                continue
-            quality_reject = quality_rejections.get(str(edge.get("edge_id") or ""))
-            if quality_reject is not None:
-                rejected.append(quality_reject)
                 continue
             shortcut_reject = self._shortcut_reject_reason(edge=edge, node_ids=node_ids)
             if shortcut_reject is not None:
                 rejected.append(shortcut_reject)
                 continue
             if self.graph.node_type(str(edge.get("dst_node_id") or "")) == "text":
-                if exposure_parts is None:
-                    exposure_parts = self._history_exposure_parts(node_ids)
+                edge_id = str(edge.get("edge_id") or "")
+                hard_match_result = self._hard_history_match_for_edge(
+                    edge=edge,
+                    exposure_parts=exposure_parts,
+                )
                 exposure_reject = self._history_exposure_reject_reason(
                     edge=edge,
                     node_ids=node_ids,
                     exposure_parts=exposure_parts,
+                    hard_match_result=hard_match_result,
+                    run_llm=False,
+                )
+                if exposure_reject is not None:
+                    rejected.append(exposure_reject)
+                    continue
+                if edge_id:
+                    history_hard_matches[edge_id] = hard_match_result
+            cheap_kept.append(edge)
+
+        # Edge quality is still evaluated at every hop, but only for candidates
+        # that survived the cheap filters.  Cached decisions remain cheap; only
+        # uncached survivors can trigger an LLM request.
+        quality_rejections = self._edge_quality_rejections(cheap_kept)
+        for edge in cheap_kept:
+            quality_reject = quality_rejections.get(str(edge.get("edge_id") or ""))
+            if quality_reject is not None:
+                rejected.append(quality_reject)
+                continue
+            if self.graph.node_type(str(edge.get("dst_node_id") or "")) == "text":
+                edge_id = str(edge.get("edge_id") or "")
+                exposure_reject = self._history_exposure_reject_reason(
+                    edge=edge,
+                    node_ids=node_ids,
+                    exposure_parts=exposure_parts,
+                    hard_match_result=history_hard_matches.get(edge_id),
+                    run_llm=True,
                 )
                 if exposure_reject is not None:
                     rejected.append(exposure_reject)
@@ -753,21 +1066,49 @@ class RandomPathSampler(PathSampler):
         if not candidates:
             return {}
 
-        uncached = [edge for edge in candidates if str(edge.get("edge_id") or "") not in self.edge_quality_cache]
+        model_alias = self._edge_quality_model_alias()
+        cache_keys = {
+            str(edge.get("edge_id") or ""): self._edge_quality_cache_key(
+                edge,
+                model_alias=model_alias,
+            )
+            for edge in candidates
+            if str(edge.get("edge_id") or "")
+        }
+        evaluations: dict[str, dict[str, Any]] = {}
+        uncached: list[dict[str, Any]] = []
+        for edge in candidates:
+            edge_id = str(edge.get("edge_id") or "")
+            if not edge_id:
+                continue
+            cached = self.edge_quality_cache.get(cache_keys[edge_id])
+            if cached is None:
+                uncached.append(edge)
+            else:
+                evaluations[edge_id] = cached
+
         if uncached:
-            evaluations = self._llm_edge_quality_judge(uncached)
-            if evaluations is not None:
+            judged = self._llm_edge_quality_judge(uncached)
+            if judged is not None:
                 for edge in uncached:
                     edge_id = str(edge.get("edge_id") or "")
-                    if edge_id:
-                        # Missing individual results fail open; a malformed response should not
-                        # silently eliminate a graph branch.
-                        self.edge_quality_cache[edge_id] = evaluations.get(edge_id, {"keep": True, "decision": "missing_result"})
+                    if not edge_id:
+                        continue
+                    # Missing individual results fail open; a malformed
+                    # response should not silently eliminate a graph branch.
+                    decision = judged.get(edge_id, {"keep": True, "decision": "missing_result"})
+                    evaluations[edge_id] = decision
+                    self.edge_quality_cache.put(
+                        cache_keys[edge_id],
+                        decision,
+                        edge_id=edge_id,
+                        model_alias=model_alias,
+                    )
 
         rejections: dict[str, dict[str, Any]] = {}
         for edge in candidates:
             edge_id = str(edge.get("edge_id") or "")
-            evaluation = self.edge_quality_cache.get(edge_id)
+            evaluation = evaluations.get(edge_id)
             if evaluation is None or bool(evaluation.get("keep", True)):
                 continue
             reject = {
@@ -785,6 +1126,26 @@ class RandomPathSampler(PathSampler):
             rejections[edge_id] = reject
         return rejections
 
+    def _edge_quality_model_alias(self) -> str:
+        return str(
+            self.edge_quality_model
+            or os.environ.get("VQA_EDGE_QUALITY_MODEL")
+            or DEFAULT_EDGE_QUALITY_MODEL
+            or self.history_exposure_model
+            or os.environ.get("VQA_HISTORY_EXPOSURE_MODEL")
+            or DEFAULT_HISTORY_EXPOSURE_MODEL
+        )
+
+    def _edge_quality_cache_key(self, edge: dict[str, Any], *, model_alias: str) -> str:
+        payload = {
+            "cache_version": EDGE_QUALITY_CACHE_VERSION,
+            "prompt_version": EDGE_QUALITY_PROMPT_VERSION,
+            "model_alias": model_alias,
+            "edge_payload": self._edge_quality_payload(edge),
+        }
+        serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+        return sha256(serialized.encode("utf-8")).hexdigest()
+
     def _edge_requires_quality_judge(self, edge: dict[str, Any]) -> bool:
         src_type = self.graph.node_type(str(edge.get("src_node_id") or ""))
         dst_type = self.graph.node_type(str(edge.get("dst_node_id") or ""))
@@ -798,14 +1159,7 @@ class RandomPathSampler(PathSampler):
             or self.history_exposure_model_client
             or self.model_client
         )
-        model_alias = (
-            self.edge_quality_model
-            or os.environ.get("VQA_EDGE_QUALITY_MODEL")
-            or DEFAULT_EDGE_QUALITY_MODEL
-            or self.history_exposure_model
-            or os.environ.get("VQA_HISTORY_EXPOSURE_MODEL")
-            or DEFAULT_HISTORY_EXPOSURE_MODEL
-        )
+        model_alias = self._edge_quality_model_alias()
         if model_client is None or not model_alias:
             return None
         try:
@@ -954,11 +1308,14 @@ class RandomPathSampler(PathSampler):
         edge: dict[str, Any],
         node_ids: list[str],
         exposure_parts: list[dict[str, Any]],
+        hard_match_result: dict[str, Any] | None = None,
+        run_llm: bool = True,
     ) -> dict[str, Any] | None:
         dst_node_id = str(edge.get("dst_node_id") or "").strip()
         dst_node = self.graph.get_node(dst_node_id) or {}
         labels = self._candidate_text_exposure_labels(dst_node)
-        hard_match_result = self._hard_history_exposure_match(labels=labels, exposure_parts=exposure_parts)
+        if hard_match_result is None:
+            hard_match_result = self._hard_history_exposure_match(labels=labels, exposure_parts=exposure_parts)
         if not bool(hard_match_result.get("allow", True)):
             reject = {
                 "filter_reason": "history_exposure_hard_match",
@@ -970,6 +1327,9 @@ class RandomPathSampler(PathSampler):
             }
             self._emit_history_exposure_debug(reject)
             return reject
+
+        if not run_llm:
+            return None
 
         llm_result = self._llm_history_exposure_judge(
             edge=edge,
@@ -991,6 +1351,18 @@ class RandomPathSampler(PathSampler):
             self._emit_history_exposure_debug(reject)
             return reject
         return None
+
+    def _hard_history_match_for_edge(
+        self,
+        *,
+        edge: dict[str, Any],
+        exposure_parts: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        dst_node = self.graph.get_node(str(edge.get("dst_node_id") or "")) or {}
+        return self._hard_history_exposure_match(
+            labels=self._candidate_text_exposure_labels(dst_node),
+            exposure_parts=exposure_parts,
+        )
 
     def _emit_history_exposure_debug(self, reject: dict[str, Any]) -> None:
         if os.environ.get("VQA_HISTORY_EXPOSURE_DEBUG", "1") == "0":
@@ -1341,16 +1713,9 @@ class RandomPathSampler(PathSampler):
             "hard_match_result": hard_match_result,
         }
 
-    def _candidate_start_nodes(self) -> list[str]:
-        node_ids = self.graph.list_node_ids()
-        if not self.config.allowed_start_node_types:
-            return node_ids
-        allowed = set(self.config.allowed_start_node_types)
-        return [
-            node_id
-            for node_id in node_ids
-            if self.graph.node_type(node_id) in allowed
-        ]
+    def _candidate_start_nodes(self) -> tuple[str, ...]:
+        """Return the sampler's immutable, precomputed start-node view."""
+        return self._candidate_start_node_ids
 
     def _valid_end_type(self, node_type: str) -> bool:
         if not self.config.allowed_end_node_types:
@@ -1677,6 +2042,26 @@ class RandomPathSampler(PathSampler):
         sampled = rng.triangular(self.config.min_hops, self.config.max_hops, mid)
         hop_count = int(round(sampled))
         return max(self.config.min_hops, min(self.config.max_hops, hop_count))
+
+    def _sample_hop_count_with_quota(self, rng: random.Random) -> int | None:
+        """Sample a target length while avoiding exhausted hard quotas."""
+        available = [
+            hop_count
+            for hop_count in range(self.config.min_hops, self.config.max_hops + 1)
+            if self._hop_quota_available(hop_count)
+        ]
+        if not available:
+            return None
+        if len(available) == self.config.max_hops - self.config.min_hops + 1:
+            return self._sample_hop_count(rng)
+
+        # Preserve the configured distribution when possible.  The fallback
+        # makes progress when the sampled mode has just exhausted its quota.
+        for _ in range(8):
+            sampled = self._sample_hop_count(rng)
+            if sampled in available:
+                return sampled
+        return rng.choice(available)
 
     def _edge_weight(self, edge_id: str | None) -> float:
         if not edge_id:

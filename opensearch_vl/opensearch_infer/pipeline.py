@@ -72,6 +72,53 @@ def _strip_base64_payloads(obj: Any, image_urls: Dict[str, str]) -> Any:
     return obj
 
 
+def _save_failure_trajectory(
+    trajectory: Dict[str, Any],
+    output_dir: str,
+    image_paths_dict: Dict[str, Any],
+    *,
+    failure_kind: str,
+    failure_reason: str,
+    failed_turn: int,
+    tool_call_count: int,
+) -> str:
+    """Persist an incomplete trajectory for post-mortem inspection.
+
+    Failure files live outside the normal ``*_trajectory.json`` namespace so
+    ``run_infer`` will retry them on a later invocation rather than treating
+    them as completed cases.
+    """
+
+    trajectory["status"] = "failed"
+    trajectory["failure_kind"] = failure_kind
+    trajectory["failure_reason"] = failure_reason
+    trajectory["failed_turn"] = failed_turn
+    trajectory["tool_call_count"] = tool_call_count
+    trajectory["max_turns"] = config.MAX_TURNS
+    trajectory["max_tool_calls"] = config.MAX_TOOL_CALLS
+    trajectory["final_response_text"] = "\n\n".join(
+        turn.get("response_text", "")
+        for turn in trajectory.get("turns", [])
+        if turn.get("response_text")
+    )
+
+    image_urls = {
+        img_id: data
+        for img_id, data in image_paths_dict.items()
+        if isinstance(data, str) and data.startswith(("http://", "https://"))
+    }
+    serialised = _strip_base64_payloads(trajectory, image_urls)
+
+    failure_dir = os.path.join(output_dir, "failures")
+    os.makedirs(failure_dir, exist_ok=True)
+    case_id = str(trajectory.get("case_id", "unknown_case"))
+    out_path = os.path.join(failure_dir, f"{case_id}_failure.json")
+    with open(out_path, "w", encoding="utf-8") as fh:
+        json.dump(serialised, fh, ensure_ascii=False, indent=2, default=str)
+    logger.info("Failure trajectory saved to %s", out_path)
+    return out_path
+
+
 # ---------------------------------------------------------------------------
 # Image bootstrap helpers
 # ---------------------------------------------------------------------------
@@ -288,6 +335,23 @@ def process_single_case(
     intermediate_dir = os.path.join(output_dir, "intermediate")
     cfg = inference_cfg or InferenceConfig()
     completed = False
+    tool_call_count = 0
+
+    def persist_failure(kind: str, reason: str, failed_turn: int) -> None:
+        try:
+            _save_failure_trajectory(
+                trajectory,
+                output_dir,
+                image_paths_dict,
+                failure_kind=kind,
+                failure_reason=reason,
+                failed_turn=failed_turn,
+                tool_call_count=tool_call_count,
+            )
+        except Exception as save_exc:
+            # Preserve the original inference failure even if serialising the
+            # diagnostic artifact itself fails.
+            logger.error("Could not save failure trajectory: %s", save_exc, exc_info=True)
 
     for turn_num in range(config.MAX_TURNS):
         try:
@@ -298,6 +362,7 @@ def process_single_case(
             )
         except Exception as exc:
             logger.error("Inference failed on turn %d: %s", turn_num, exc, exc_info=True)
+            persist_failure("inference_error", str(exc), turn_num)
             raise RuntimeError(f"Inference failed on turn {turn_num}: {exc}") from exc
 
         response_text = ""
@@ -328,22 +393,42 @@ def process_single_case(
 
         tool_call_json = tools.extract_tool_call(response_text)
         if not tool_call_json:
+            persist_failure(
+                "invalid_response",
+                f"Inference ended on turn {turn_num} without a complete <answer> response.",
+                turn_num,
+            )
             raise RuntimeError(
                 f"Inference ended on turn {turn_num} without a complete <answer> response."
             )
 
+        tool_call_count += 1
+        turn_record["tool_call"] = tool_call_json
+        turn_record["tool_call_index"] = tool_call_count
+        if tool_call_count > config.MAX_TOOL_CALLS:
+            reason = (
+                f"Inference attempted more than {config.MAX_TOOL_CALLS} tool calls "
+                f"on turn {turn_num}."
+            )
+            persist_failure("tool_call_limit", reason, turn_num)
+            raise RuntimeError(reason)
+
         os.makedirs(intermediate_dir, exist_ok=True)
-        tool_message, new_images = tools.execute_tool(
-            tool_call_json,
-            image_paths_dict,
-            case_id,
-            case_idx,
-            turn_num,
-            intermediate_dir,
-            filename_prefix=filename_prefix,
-            visual_lookup=visual_lookup,
-            url_registry=url_registry,
-        )
+        try:
+            tool_message, new_images = tools.execute_tool(
+                tool_call_json,
+                image_paths_dict,
+                case_id,
+                case_idx,
+                turn_num,
+                intermediate_dir,
+                filename_prefix=filename_prefix,
+                visual_lookup=visual_lookup,
+                url_registry=url_registry,
+            )
+        except Exception as exc:
+            persist_failure("tool_execution_error", str(exc), turn_num)
+            raise
         observation_text = f"<tool_response>\n{tool_message}\n</tool_response>"
         turn_record["tool_output"] = observation_text
 
@@ -416,11 +501,15 @@ def process_single_case(
             )
 
     if not completed:
-        raise RuntimeError(
-            f"Inference reached the {config.MAX_TURNS}-turn limit without a complete <answer> response."
+        reason = (
+            f"Inference reached the {config.MAX_TURNS}-turn limit "
+            "without a complete <answer> response."
         )
+        persist_failure("max_turns", reason, config.MAX_TURNS - 1)
+        raise RuntimeError(reason)
 
-    # Only completed trajectories are persisted.
+    trajectory["status"] = "completed"
+    trajectory["tool_call_count"] = tool_call_count
     trajectory["final_response_text"] = "\n\n".join(
         turn.get("response_text", "")
         for turn in trajectory["turns"]

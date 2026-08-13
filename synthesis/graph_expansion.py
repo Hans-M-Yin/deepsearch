@@ -268,9 +268,109 @@ class GraphExpansionStrategy:
         self._active_text_tasks_by_url: dict[str, ExpansionTask] = {}
         self._pending_parent_links_by_url: dict[str, list[dict[str, Any]]] = {}
         self._lock = RLock()
+        # The runner installs the per-run node limit here.  Image discovery
+        # can materialize more than one image node while handling a single
+        # image-expansion task, so the image budget also needs reservations
+        # that cover concurrent discovery calls.
+        self._max_image_nodes: int | None = None
+        self._reserved_image_nodes = 0
         self._raw_markdown_reader = RawMarkdownReaderClient(
             base_url=os.environ.get("WIKI_INLINE_IMAGE_READER_BASE_URL", "http://127.0.0.1:8003"),
             timeout_s=float(os.environ.get("WIKI_INLINE_IMAGE_READER_TIMEOUT_S") or 180.0),
+        )
+
+    def configure_node_limits(self, max_nodes: int | None) -> None:
+        """Apply the runner's per-node-type limit to image materialization."""
+
+        with self._lock:
+            self._max_image_nodes = None if max_nodes is None else max(0, int(max_nodes))
+            self._reserved_image_nodes = 0
+
+    def _reserve_image_node_slot(self) -> bool | None:
+        """Reserve one image-node slot; ``None`` means no limit is active."""
+
+        with self._lock:
+            if self._max_image_nodes is None:
+                return None
+            if self.store.count_nodes("image") + self._reserved_image_nodes >= self._max_image_nodes:
+                return False
+            self._reserved_image_nodes += 1
+            return True
+
+    def _release_image_node_slot(self) -> None:
+        with self._lock:
+            self._reserved_image_nodes = max(0, self._reserved_image_nodes - 1)
+
+    def _run_image_discovery_with_budget(
+        self,
+        plan_id: str,
+        *,
+        persist: bool,
+        discover: Any,
+    ) -> ImageDiscoveryResult:
+        """Run one discovery call without allowing image nodes past the cap."""
+
+        reservation = self._reserve_image_node_slot() if persist else None
+        if reservation is False:
+            return ImageDiscoveryResult(
+                plan_id=plan_id,
+                metadata={
+                    "image_node_limit_reached": True,
+                    "image_node_limit": self._max_image_nodes,
+                },
+            )
+
+        try:
+            result = discover()
+        except Exception:
+            if reservation is True:
+                self._release_image_node_slot()
+            raise
+
+        # The reservation protects the discovery call while it is in flight.
+        # Once the call returns, a persisted node is visible in the store and
+        # therefore already contributes to the count used by the next
+        # reservation.  Release the temporary reservation in either case.
+        if reservation is True:
+            self._release_image_node_slot()
+        return result
+
+    def _discover_for_plan_with_budget(
+        self,
+        plan: VisualSearchPlan,
+        *,
+        run_id: str | None,
+        persist: bool,
+    ) -> ImageDiscoveryResult:
+        assert self.image_builder is not None
+        return self._run_image_discovery_with_budget(
+            plan.plan_id,
+            persist=persist,
+            discover=lambda: self.image_builder.discover_for_plan(
+                plan,
+                run_id=run_id,
+                persist=persist,
+            ),
+        )
+
+    def _discover_for_wiki_inline_image_with_budget(
+        self,
+        plan: VisualSearchPlan,
+        *,
+        search_result: Any,
+        run_id: str | None,
+        persist: bool,
+    ) -> ImageDiscoveryResult:
+        assert self.image_builder is not None
+        return self._run_image_discovery_with_budget(
+            plan.plan_id,
+            persist=persist,
+            discover=lambda: self.image_builder.discover_for_wiki_inline_image(
+                plan,
+                search_result=search_result,
+                run_id=run_id,
+                persist=persist,
+            ),
         )
 
     def add_seed(
@@ -1320,7 +1420,7 @@ class GraphExpansionStrategy:
         for index, plan in enumerate(visual_plans, start=1):
             self._log_image_plan_execute_start(text_result, plan_index=index, plan=plan)
             try:
-                image_result = self.image_builder.discover_for_plan(
+                image_result = self._discover_for_plan_with_budget(
                     plan,
                     run_id=run_id,
                     persist=self.config.persist,
@@ -1377,7 +1477,7 @@ class GraphExpansionStrategy:
             if search_result is None:
                 continue
             try:
-                image_result = self.image_builder.discover_for_wiki_inline_image(
+                image_result = self._discover_for_wiki_inline_image_with_budget(
                     plan,
                     search_result=search_result,
                     run_id=run_id,

@@ -64,13 +64,31 @@ def as_pil_image(image: Any) -> Image.Image | None:
     return None
 
 
+def _task_system_prompt(task: dict[str, Any]) -> str | None:
+    """Return an optional per-example system prompt from Registry metadata.
+
+    DatasetRegistry puts the complete registered record into the task's
+    runtime ``extra_info``.  The converter keeps future metadata in a nested
+    ``extra_info`` object, so support both a direct field and the nested form.
+    A missing value deliberately falls back to the workflow-level prompt.
+    """
+    direct_prompt = task.get("system_prompt")
+    nested_info = task.get("extra_info")
+    nested_prompt = (
+        nested_info.get("system_prompt")
+        if isinstance(nested_info, dict)
+        else None
+    )
+    prompt = direct_prompt or nested_prompt
+    if isinstance(prompt, str) and prompt.strip():
+        return prompt.strip()
+    return None
+
+
 def _extract_action_from_response(response: str) -> Action:
     if "<tool_call>" in response and "</tool_call>" in response:
         tool_call_text = response.split("<tool_call>")[1].split("</tool_call>")[0]
         return Action(action={"type": "tool_call", "tool_call": tool_call_text.strip()})
-    if "<response>" in response and "</response>" in response:
-        answer = response.split("<response>")[1].split("</response>")[0].strip()
-        return Action(action={"type": "final_answer", "answer": answer})
     if "<answer>" in response and "</answer>" in response:
         answer = response.split("<answer>")[1].split("</answer>")[0].strip()
         return Action(action={"type": "final_answer", "answer": answer})
@@ -81,7 +99,7 @@ def _is_valid_format(content: str) -> bool:
     if not isinstance(content, str) or not content:
         return False
     pattern = (
-        r"^<think>.*?</think>\s*(<tool_call>.*?</tool_call>|<response>.*?</response>|<answer>.*?</answer>)\s*$"
+        r"^<thinking>.*?</thinking>\s*(<tool_call>.*?</tool_call>|<answer>.*?</answer>)\s*$"
     )
     return re.match(pattern, content, re.DOTALL) is not None
 
@@ -451,6 +469,7 @@ class DeepResearchWorkflow(Workflow):
 
         question = task.get("question", task.get("query", "No question provided"))
         answer = task.get("answer", "")
+        task_system_prompt = _task_system_prompt(task)
 
         print(f"🚀 Starting DeepResearch workflow for task {uid}")
         print(f"   Question: {question}")
@@ -475,11 +494,15 @@ class DeepResearchWorkflow(Workflow):
                     answer=answer,
                     images=pil_images,
                     image_path=raw_images[0],
+                    system_prompt=task_system_prompt,
                     **kwargs,
                 )
             else:
                 result = await self.agent.run(
-                    question=question, answer=answer, **kwargs
+                    question=question,
+                    answer=answer,
+                    system_prompt=task_system_prompt,
+                    **kwargs,
                 )
 
             episode = self._convert_result_to_episode(result, task, uid)

@@ -136,6 +136,7 @@ class GraphRunner:
         self.strategy = strategy
         self.store = store
         self.config = config or GraphRunnerConfig()
+        self.strategy.configure_node_limits(self.config.max_nodes)
         self.state_path = Path(state_path) if state_path else store.root_dir / self.config.state_file_name
         self.visual_plans_path = store.root_dir / self.config.visual_plans_file_name
         self.visual_plan_attempts_path = store.root_dir / self.config.visual_plan_attempts_file_name
@@ -145,6 +146,9 @@ class GraphRunner:
         self._progress_width = 0
         self._text_dispatch_since_image_entity = 0
         self._last_checkpoint_timing: dict[str, Any] = {}
+        self._active_tasks: dict[str, ExpansionTask] = {}
+        self._parallel_batch_active = False
+        self._last_state_store_flush_generation = self.store.flush_generation
 
     def add_seed(
         self,
@@ -167,34 +171,47 @@ class GraphRunner:
         self.save_state()
         last_error: str | None = None
 
-        while self._should_continue():
-            if self.config.parallel_workers <= 1:
-                results = self._run_one()
-                if not results:
-                    self.state.status = "completed"
-                    break
-
-                for result in results:
-                    last_error = self._handle_result(result, last_error)
-                    if self.state.status == "failed":
+        try:
+            while self._should_continue():
+                if self.config.parallel_workers <= 1:
+                    results = self._run_one()
+                    if not results:
+                        self.state.status = "completed"
                         break
-                if self.state.status == "failed":
-                    self._checkpoint_progress(force=True)
-                    break
-            else:
-                processed_count, last_error = self._run_parallel_batch(last_error=last_error)
-                if processed_count == 0:
-                    self.state.status = "completed"
-                    break
-                if self.state.status == "failed":
-                    self._checkpoint_progress(force=True)
-                    break
 
-        if self.state.status == "running":
-            self.state.status = "completed" if self.strategy.queue_size() == 0 else "paused"
+                    for result in results:
+                        last_error = self._handle_result(result, last_error)
+                        if self.state.status == "failed":
+                            break
+                    if self.state.status == "failed":
+                        self._checkpoint_progress(force=True)
+                        break
+                else:
+                    processed_count, last_error = self._run_parallel_batch(last_error=last_error)
+                    if processed_count == 0:
+                        self.state.status = "completed"
+                        break
+                    if self.state.status == "failed":
+                        self._checkpoint_progress(force=True)
+                        break
 
-        self._finish_progress()
-        self._checkpoint_progress(force=True)
+            if self.state.status == "running":
+                self.state.status = "completed" if self.strategy.queue_size() == 0 else "paused"
+
+            self._finish_progress()
+            self._checkpoint_progress(force=True)
+        except KeyboardInterrupt:
+            # Keep the interrupted task(s) in state.queue via _active_tasks so
+            # resume can retry them.  The graph delta is flushed first.
+            self.state.status = "paused"
+            self._checkpoint_progress(force=True)
+            self._finish_progress()
+            raise
+        except Exception:
+            self.state.status = "failed"
+            self._checkpoint_progress(force=True)
+            self._finish_progress()
+            raise
         return GraphRunnerResult(
             run_id=self.state.run_id,
             status=self.state.status,
@@ -213,11 +230,13 @@ class GraphRunner:
         task = self._pop_next_schedulable_task(in_flight_text_count=0)
         if task is None:
             return []
+        self._active_tasks[task.dedupe_key()] = task
         result = self.strategy.expand_task(task, run_id=self.state.run_id)
         return [result] if result is not None else []
 
     def _handle_result(self, result: NodeExpansionResult, last_error: str | None) -> str | None:
         self.state.step += 1
+        self._active_tasks.pop(result.task.dedupe_key(), None)
         result_record_started = time.perf_counter()
         self._record_result(result)
         result.timing["runner_result_persist_s"] = time.perf_counter() - result_record_started
@@ -245,6 +264,7 @@ class GraphRunner:
             started = time.perf_counter()
             self.store.flush()
             self._last_checkpoint_timing["checkpoint_store_flush_s"] = time.perf_counter() - started
+            self._last_state_store_flush_generation = self.store.flush_generation
             started = time.perf_counter()
             self._sync_state_from_strategy()
             self._last_checkpoint_timing["checkpoint_queue_sync_s"] = time.perf_counter() - started
@@ -254,6 +274,29 @@ class GraphRunner:
             self._last_checkpoint_timing["checkpoint_total_s"] = time.perf_counter() - checkpoint_started
             self._last_checkpoint_timing["checkpoint_status"] = "saved"
             return
+
+        # Builders may call store.maybe_flush() before the runner receives a
+        # task result.  Check once more here and use the generation counter to
+        # detect either that flush or a flush performed at this boundary.
+        self.store.maybe_flush()
+        store_flushed = self.store.flush_generation != self._last_state_store_flush_generation
+        if self._parallel_batch_active:
+            if store_flushed:
+                self._last_checkpoint_timing["checkpoint_status"] = "deferred_inflight"
+            return
+
+        if store_flushed:
+            started = time.perf_counter()
+            self._sync_state_from_strategy()
+            self._last_checkpoint_timing["checkpoint_queue_sync_s"] = time.perf_counter() - started
+            started = time.perf_counter()
+            self.save_state()
+            self._last_checkpoint_timing["checkpoint_state_save_s"] = time.perf_counter() - started
+            self._last_state_store_flush_generation = self.store.flush_generation
+            self._last_checkpoint_timing["checkpoint_total_s"] = time.perf_counter() - checkpoint_started
+            self._last_checkpoint_timing["checkpoint_status"] = "saved_after_store_flush"
+            return
+
         if self.store.has_pending_writes():
             return
         if self.config.checkpoint_every <= 1 or self.state.step % self.config.checkpoint_every == 0:
@@ -275,63 +318,85 @@ class GraphRunner:
 
         initial_tasks: list[ExpansionTask] = []
         initial_text_count = 0
+        initial_image_count = 0
         while len(initial_tasks) < max_inflight:
-            task = self._pop_next_schedulable_task(in_flight_text_count=initial_text_count)
+            task = self._pop_next_schedulable_task(
+                in_flight_text_count=initial_text_count,
+                in_flight_image_count=initial_image_count,
+            )
             if task is None:
                 break
             initial_tasks.append(task)
+            self._active_tasks[task.dedupe_key()] = task
             if task.task_type == ExpansionTaskType.TEXT_EXPAND:
                 initial_text_count += 1
+            elif task.task_type == ExpansionTaskType.IMAGE_EXPAND:
+                initial_image_count += 1
         if not initial_tasks:
             return 0, last_error
 
         processed_count = 0
-        with ThreadPoolExecutor(max_workers=self.config.parallel_workers) as executor:
-            future_to_task = {}
-            for task in initial_tasks:
-                future_to_task[executor.submit(self.strategy.expand_task, task, run_id=self.state.run_id)] = task
-            in_flight_text_count = initial_text_count
+        self._parallel_batch_active = True
+        try:
+            with ThreadPoolExecutor(max_workers=self.config.parallel_workers) as executor:
+                future_to_task = {}
+                for task in initial_tasks:
+                    future_to_task[executor.submit(self.strategy.expand_task, task, run_id=self.state.run_id)] = task
+                in_flight_text_count = initial_text_count
+                in_flight_image_count = initial_image_count
 
-            while future_to_task:
-                done, _ = wait(tuple(future_to_task.keys()), return_when=FIRST_COMPLETED)
-                for future in done:
-                    task = future_to_task.pop(future)
-                    if task.task_type == ExpansionTaskType.TEXT_EXPAND:
-                        in_flight_text_count -= 1
-                    try:
-                        result = future.result()
-                    except Exception as exc:
-                        task.status = ExpansionTaskStatus.FAILED
-                        result = NodeExpansionResult(
-                            task=task,
-                            error=f"{exc.__class__.__name__}: {exc}",
-                        )
-                    processed_count += 1
-                    last_error = self._handle_result(result, last_error)
-                    if self.state.status == "failed":
-                        return processed_count, last_error
+                while future_to_task:
+                    done, _ = wait(tuple(future_to_task.keys()), return_when=FIRST_COMPLETED)
+                    for future in done:
+                        task = future_to_task.pop(future)
+                        if task.task_type == ExpansionTaskType.TEXT_EXPAND:
+                            in_flight_text_count -= 1
+                        elif task.task_type == ExpansionTaskType.IMAGE_EXPAND:
+                            in_flight_image_count -= 1
+                        try:
+                            result = future.result()
+                        except Exception as exc:
+                            task.status = ExpansionTaskStatus.FAILED
+                            result = NodeExpansionResult(
+                                task=task,
+                                error=f"{exc.__class__.__name__}: {exc}",
+                            )
+                        processed_count += 1
+                        last_error = self._handle_result(result, last_error)
+                        if self.state.status == "failed":
+                            return processed_count, last_error
 
-                    while (
-                        processed_count + len(future_to_task) < remaining_steps
-                        and len(future_to_task) < max_inflight
-                    ):
-                        next_task = self._pop_next_schedulable_task(
-                            in_flight_text_count=in_flight_text_count,
-                        )
-                        if next_task is None:
-                            break
-                        next_future = executor.submit(
-                            self.strategy.expand_task,
-                            next_task,
-                            run_id=self.state.run_id,
-                        )
-                        future_to_task[next_future] = next_task
-                        if next_task.task_type == ExpansionTaskType.TEXT_EXPAND:
-                            in_flight_text_count += 1
+                        while (
+                            processed_count + len(future_to_task) < remaining_steps
+                            and len(future_to_task) < max_inflight
+                        ):
+                            next_task = self._pop_next_schedulable_task(
+                                in_flight_text_count=in_flight_text_count,
+                                in_flight_image_count=in_flight_image_count,
+                            )
+                            if next_task is None:
+                                break
+                            self._active_tasks[next_task.dedupe_key()] = next_task
+                            next_future = executor.submit(
+                                self.strategy.expand_task,
+                                next_task,
+                                run_id=self.state.run_id,
+                            )
+                            future_to_task[next_future] = next_task
+                            if next_task.task_type == ExpansionTaskType.TEXT_EXPAND:
+                                in_flight_text_count += 1
+                            elif next_task.task_type == ExpansionTaskType.IMAGE_EXPAND:
+                                in_flight_image_count += 1
+        finally:
+            self._parallel_batch_active = False
+            self._checkpoint_progress(force=False)
         return processed_count, last_error
 
     def _text_node_count(self) -> int:
         return self.store.count_nodes("text")
+
+    def _image_node_count(self) -> int:
+        return self.store.count_nodes("image")
 
     def _queue_breakdown(self) -> dict[str, int]:
         return self.strategy.queue_breakdown()
@@ -341,13 +406,22 @@ class GraphRunner:
             return None
         return max(0, self.config.max_nodes - self._text_node_count() - in_flight_text_count)
 
+    def _remaining_image_slots(self, *, in_flight_image_count: int = 0) -> int | None:
+        if self.config.max_nodes is None:
+            return None
+        return max(0, self.config.max_nodes - self._image_node_count() - in_flight_image_count)
+
     def _pop_next_schedulable_task(
         self,
         *,
         in_flight_text_count: int,
+        in_flight_image_count: int = 0,
     ) -> ExpansionTask | None:
         remaining_text_slots = self._remaining_text_slots(
             in_flight_text_count=in_flight_text_count,
+        )
+        remaining_image_slots = self._remaining_image_slots(
+            in_flight_image_count=in_flight_image_count,
         )
         queue_breakdown = self._queue_breakdown()
         text_inflight_cap = self.config.max_inflight_text
@@ -386,7 +460,9 @@ class GraphRunner:
                 if task is not None:
                     self._text_dispatch_since_image_entity = 0
                     return task
-        allowed_types = {ExpansionTaskType.IMAGE_EXPAND}
+        allowed_types: set[ExpansionTaskType] = set()
+        if remaining_image_slots is None or remaining_image_slots > 0:
+            allowed_types.add(ExpansionTaskType.IMAGE_EXPAND)
         if (
             (remaining_text_slots is None or remaining_text_slots > 0)
             and not limit_text_for_images
@@ -410,7 +486,11 @@ class GraphRunner:
         )
 
     def _has_schedulable_tasks(self) -> bool:
-        if self.strategy.queue_size(ExpansionTaskType.IMAGE_EXPAND) > 0:
+        remaining_image_slots = self._remaining_image_slots()
+        if (
+            self.strategy.queue_size(ExpansionTaskType.IMAGE_EXPAND) > 0
+            and (remaining_image_slots is None or remaining_image_slots > 0)
+        ):
             return True
         remaining_text_slots = self._remaining_text_slots()
         if self.config.image_entity_only:
@@ -426,7 +506,7 @@ class GraphRunner:
     def save_state(self) -> None:
         self.state.updated_at = _utc_now()
         self.state.stats = {
-            "queue_size": self.strategy.queue_size(),
+            "queue_size": self.strategy.queue_size() + len(self._active_tasks),
             "store": self.store.stats(),
         }
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
@@ -449,6 +529,12 @@ class GraphRunner:
 
     def _sync_state_from_strategy(self) -> None:
         self.state.queue = self.strategy.queue_records()
+        active_records = {
+            task.dedupe_key(): task.to_dict()
+            for task in self._active_tasks.values()
+        }
+        for record in active_records.values():
+            self.state.queue.append(record)
         self.state.seen_task_keys = self.strategy.seen_task_keys()
 
     def _record_result(self, result: NodeExpansionResult) -> None:
@@ -661,7 +747,9 @@ class GraphRunner:
         steps_text = f"{self.state.step}/{max_steps}" if max_steps else str(self.state.step)
         node_count = int(stats.get("nodes", 0))
         text_node_count = self._text_node_count()
+        image_node_count = self._image_node_count()
         nodes_text = f"{text_node_count}/{max_nodes}" if max_nodes is not None else str(text_node_count)
+        image_nodes_text = f"{image_node_count}/{max_nodes}" if max_nodes is not None else str(image_node_count)
         line = (
             "[progress] "
             f"steps={steps_text} "
@@ -671,6 +759,7 @@ class GraphRunner:
             f"image_entity_queue={image_entity_queue} "
             f"image_queue={image_queue_size} "
             f"text_nodes={nodes_text} "
+            f"image_nodes={image_nodes_text} "
             f"nodes={node_count} "
             f"edges={int(stats.get('edges', 0))} "
             f"completed={len(self.state.completed_tasks)} "

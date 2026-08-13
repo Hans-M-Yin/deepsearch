@@ -18,8 +18,24 @@ from rllm.trainer.agent_trainer import AgentTrainer
     version_base=None,
 )
 def main(config):
-    train_dataset = DatasetRegistry.load_dataset("Vision-DeepResearch-QA", "train")
-    test_dataset = DatasetRegistry.load_dataset("Vision-DeepResearch-QA", "test")
+    dataset_name = config.data.dataset_name
+    train_dataset = DatasetRegistry.load_dataset(
+        dataset_name, config.data.train_split
+    )
+    val_dataset = DatasetRegistry.load_dataset(
+        dataset_name, config.data.val_split
+    )
+
+    if train_dataset is None:
+        raise FileNotFoundError(
+            f"Training split '{config.data.train_split}' for dataset "
+            f"'{dataset_name}' was not found in DatasetRegistry."
+        )
+    if val_dataset is None:
+        raise FileNotFoundError(
+            f"Validation split '{config.data.val_split}' for dataset "
+            f"'{dataset_name}' was not found in DatasetRegistry."
+        )
 
     trainer = AgentTrainer(
         workflow_class=DeepResearchWorkflow,
@@ -29,7 +45,7 @@ def main(config):
         },
         config=config,
         train_dataset=train_dataset,
-        val_dataset=test_dataset,
+        val_dataset=val_dataset,
     )
     trainer.train()
 

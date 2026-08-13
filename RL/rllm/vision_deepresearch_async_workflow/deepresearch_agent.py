@@ -28,7 +28,7 @@ MAX_LLM_CALL_PER_RUN = 50
 MAX_PROMPT_LENGTH_PER_RUN = 64000
 MAX_RESPONSE_LENGTH_PER_RUN = 4096
 
-DEEPRESEARCH_SYSTEM_PROMPT_TEXT = """You are an advanced **Visual Investigation Agent**. Your goal is to answer user questions with maximum precision by proactively using a suite of powerful image processing and retrieval tools. When you have gathered sufficient information and are ready to provide the definitive response, you must enclose the entire final answer within <response></response> tags.
+DEEPRESEARCH_SYSTEM_PROMPT_TEXT = """You are an advanced **Visual Investigation Agent**. Your goal is to answer user questions with maximum precision by proactively using a suite of powerful image processing and retrieval tools. When you have gathered sufficient information and are ready to provide the definitive response, you must enclose the entire final answer within <answer></answer> tags.
 
 **CORE PHILOSOPHY: "Verify, Don't Guess"**
 1. **Tool-First Mindset**: Do not rely solely on your internal visual encoder if a tool can provide a clearer view or exact text. If text is small, **Crop** it. If text is blurry, **Sharpen** it. If the image is tilted, **Correct Perspective**.
@@ -97,9 +97,9 @@ You may call one or more functions to assist with the user query. You are provid
 
 ---
 
-### 3. THE THINKING PROTOCOL (<think>)
+### 3. THE THINKING PROTOCOL (<thinking>)
 
-Before generating ANY tag, you must perform a structured analysis inside `<think>` tags. You must evaluate the **Image Quality** and **Information Gap**.
+Before generating ANY tag, you must perform a structured analysis inside `<thinking>` tags. You must evaluate the **Image Quality** and **Information Gap**.
 
 **Mandatory Thinking Structure:**
 1.  **Analyze Request**: What is the user actually looking for?
@@ -157,10 +157,10 @@ Before generating ANY tag, you must perform a structured analysis inside `<think
 ### 5. OUTPUT RULES
 
 1.  **Single Action Per Turn**: Output only ONE `<tool_call>` per turn. Wait for the result before proceeding.
-2.  **Think First**: Never output a `<tool_call>` or `<response>` without a preceding `<think>` block (or `<think>` tag).
+2.  **Think First**: Never output a `<tool_call>` or `<answer>` without a preceding `<thinking>` block (or `<thinking>` tag).
 3.  **Tool Call Format**: Always use `<tool_call>` XML tag with JSON format: `<tool_call>{"name": "tool_name", "arguments": {...}}</tool_call>`
 4.  **Image References**: Start with `img_1`. Results from tools become `img_2`, `img_3`, etc. Always operate on the *latest* best version of the image.
-5.  **Final Answer**: When you have sufficient info, output `<response>...</response>`.
+5.  **Final Answer**: When you have sufficient info, output `<answer>...</answer>`.
     * **Visual Aids**: In your final response, if a diagram would help explain a concept (e.g., scientific process, machine part), insert `[Image of <query>]` tags naturally in the text.
 
 ---
@@ -168,29 +168,29 @@ Before generating ANY tag, you must perform a structured analysis inside `<think
 ### 6. EXECUTION FORMATS
 
 **Case: Tool Use (Example)**
-<think>
+<thinking>
 The user asks for the total on the invoice. The image (img_1) is taken from a side angle (skewed). Direct layout parsing will likely fail. I must first correct the perspective to make the text horizontal.
-</think>
+</thinking>
 <tool_call>
 {"name": "perspective_correct", "arguments": {"image": "img_1"}}
 </tool_call>
 
 **Case: Final Response (Example)**
-<think>
+<thinking>
 I have cropped the chart (img_2) and used layout parsing on the values. The trend shows a 50% increase. I can now answer the user.
-</think>
-<response>
+</thinking>
+<answer>
 Based on the analysis of the chart, the revenue increased by 50%.
 
 boxed{50%}
-</response>
+</answer>
 
 Current date: """
 
 
 # Keep the historical prompt above for reference, but use the SFT schemas and
 # tool names at runtime.  The SFT backend still uses its own exact dispatcher;
-# only the RL wire format remains ``<tool_call>``/``<response>``.
+# the RL model-facing format remains ``<thinking>``/``<tool_call>``/``<answer>``.
 DEEPRESEARCH_SYSTEM_PROMPT = build_sft_react_system_prompt()
 
 
@@ -331,7 +331,7 @@ class MultiTurnReactAgent:
 
     def sanity_check_output(self, content: str) -> bool:
         """Check if the model output contains the expected thinking structure."""
-        return "<think>" in content and "</think>" in content
+        return "<thinking>" in content and "</thinking>" in content
 
     async def call_server(
         self, messages: list[dict], max_tries: Optional[int] = None, **kwargs
@@ -443,6 +443,7 @@ class MultiTurnReactAgent:
         answer: str = None,
         images: list = None,
         image_path: str = None,
+        system_prompt: str | None = None,
         **kwargs,
     ) -> dict:
         """
@@ -453,8 +454,8 @@ class MultiTurnReactAgent:
         """
         start_time = time.time()
 
-        system_prompt = (
-            self.system_prompt or DEEPRESEARCH_SYSTEM_PROMPT
+        effective_system_prompt = (
+            system_prompt or self.system_prompt or DEEPRESEARCH_SYSTEM_PROMPT
         ) + today_date()
 
         # ---- image_paths management for visual tools ----
@@ -494,7 +495,7 @@ class MultiTurnReactAgent:
             user_message = {"role": "user", "content": question}
 
         messages = [
-            {"role": "system", "content": system_prompt},
+            {"role": "system", "content": effective_system_prompt},
             user_message,
         ]
 
@@ -530,19 +531,6 @@ class MultiTurnReactAgent:
                 response.text if hasattr(response, "text") and response.text else ""
             )
 
-            if "<tool_call>" in content:
-                if "python" in content.lower() and "<code>" in content:
-                    pass
-                elif '"name":' in content:
-                    try:
-                        tool_text = content.split("<tool_call>")[1].split(
-                            "</tool_call>"
-                        )[0]
-                        tool_data = json5.loads(tool_text)
-                        tool_name = tool_data.get("name", "Unknown")
-                    except Exception:
-                        pass
-
             if "<tool_response>" in content:
                 pos = content.find("<tool_response>")
                 content = content[:pos]
@@ -559,53 +547,58 @@ class MultiTurnReactAgent:
                 tool_call_text = content.split("<tool_call>")[1].split("</tool_call>")[
                     0
                 ]
-                if "python" in tool_call_text.lower():
-                    try:
-                        code_raw = (
-                            content.split("<tool_call>")[1]
-                            .split("</tool_call>")[0]
-                            .split("<code>")[1]
-                            .split("</code>")[0]
-                            .strip()
-                        )
-                        result = await self.execute_python(code_raw)
-                        if isinstance(result, str) and result.startswith(
-                            (
-                                "Python execution error:",
-                                "PythonInterpreter tool not available",
-                                "PythonInterpreter tool is not callable",
-                            )
-                        ):
-                            tool_error = True
-                    except Exception:
-                        result = (
-                            "[Python Interpreter Error]: Python code formatting error."
-                        )
-                        tool_error = True
+
+                try:
+                    tool_call = json5.loads(tool_call_text)
+                except Exception:
+                    tool_call = None
+                    result = "[Json Parse Error]: Tool call is not a valid JSON."
+                    tool_error = True
+                if not isinstance(tool_call, dict):
+                    if not tool_error:
+                        result = "[Json Parse Error]: Tool call must be a JSON object."
+                    tool_error = True
                 else:
-                    try:
-                        tool_call = json5.loads(tool_call_text)
-                    except Exception:
-                        result = "[Json Parse Error]: Tool call is not a valid JSON."
+                    tool_name = tool_call.get("name", "")
+                    tool_args = tool_call.get("arguments", {})
+                    if not isinstance(tool_name, str) or not isinstance(tool_args, dict):
+                        result = "[Json Parse Error]: Tool call requires a name and an arguments object."
                         tool_error = True
-                    else:
-                        tool_name = tool_call.get("name", "")
-                        tool_args = tool_call.get("arguments", {})
-                        if not isinstance(tool_name, str) or not isinstance(tool_args, dict):
-                            result = "[Json Parse Error]: Tool call requires a name and an arguments object."
-                            tool_error = True
-                        else:
-                            try:
-                                result = await self.custom_call_tool(
-                                    tool_name,
-                                    tool_args,
-                                    question_text=question,
-                                    assistant_text=content,
-                                    tool_goal=str(tool_args.get("goal") or ""),
-                                )
-                            except Exception as exc:  # noqa: BLE001
-                                result = f"Tool execution error: {type(exc).__name__}: {exc}"
+                    elif tool_name == "PythonInterpreter":
+                        # Keep the legacy compatibility path, but dispatch it
+                        # only by the parsed tool name.  Checking whether the
+                        # raw JSON contains the word "python" would wrongly
+                        # intercept valid search queries such as "Python history".
+                        try:
+                            code_raw = str(tool_args.get("code") or "").strip()
+                            if not code_raw:
+                                result = "[Python Interpreter Error]: Python code is required."
                                 tool_error = True
+                            else:
+                                result = await self.execute_python(code_raw)
+                                if isinstance(result, str) and result.startswith(
+                                    (
+                                        "Python execution error:",
+                                        "PythonInterpreter tool not available",
+                                        "PythonInterpreter tool is not callable",
+                                    )
+                                ):
+                                    tool_error = True
+                        except Exception:
+                            result = "[Python Interpreter Error]: Python code formatting error."
+                            tool_error = True
+                    else:
+                        try:
+                            result = await self.custom_call_tool(
+                                tool_name,
+                                tool_args,
+                                question_text=question,
+                                assistant_text=content,
+                                tool_goal=str(tool_args.get("goal") or ""),
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            result = f"Tool execution error: {type(exc).__name__}: {exc}"
+                            tool_error = True
 
                 if tool_error:
                     assistant_message["step_error"] = True
@@ -635,7 +628,7 @@ class MultiTurnReactAgent:
                         start_time=start_time,
                     )
 
-            elif "<response>" in content and "</response>" in content:
+            elif "<answer>" in content and "</answer>" in content:
                 messages.append(
                     {
                         "role": "assistant",
@@ -643,7 +636,7 @@ class MultiTurnReactAgent:
                         "step_error": False,
                     }
                 )
-                prediction = content.split("<response>")[1].split("</response>")[0].strip()
+                prediction = content.split("<answer>")[1].split("</answer>")[0].strip()
                 termination = "answer"
                 consecutive_bad_steps = 0
                 break
@@ -671,7 +664,7 @@ class MultiTurnReactAgent:
                         start_time=start_time,
                     )
 
-                observation = "Error: Invalid content format. Content must contain <tool_call> or <response> tags. Let's try again."
+                observation = "Error: Invalid content format. Content must contain <thinking> followed by <tool_call> or <answer> tags. Let's try again."
                 messages.append(
                     {
                         "role": "assistant",
@@ -694,7 +687,7 @@ class MultiTurnReactAgent:
                         start_time=start_time,
                     )
 
-            if num_llm_calls_available <= 0 and "<answer>" not in content and "<response>" not in content:
+            if num_llm_calls_available <= 0 and "<answer>" not in content:
                 prediction = f"No answer found after {self.max_llm_calls} rounds."
                 termination = f"answer not found after {self.max_llm_calls} rounds"
                 return self._build_result(
@@ -710,10 +703,7 @@ class MultiTurnReactAgent:
         last_message_content = (
             messages[-1].get("content", "") if isinstance(messages[-1], dict) else ""
         )
-        if last_message_content and "<response>" in last_message_content:
-            prediction = last_message_content.split("<response>")[1].split("</response>")[0].strip()
-            termination = "answer"
-        elif last_message_content and "<answer>" in last_message_content:
+        if last_message_content and "<answer>" in last_message_content:
             prediction = last_message_content.split("<answer>")[1].split("</answer>")[0].strip()
             termination = "answer"
         else:
@@ -851,6 +841,7 @@ class MultiTurnReactAgent:
         answer: str = None,
         images: list = None,
         image_path: str = None,
+        system_prompt: str | None = None,
         **kwargs,
     ) -> dict:
         """
@@ -865,7 +856,14 @@ class MultiTurnReactAgent:
         """
         # Reset token counters for each new run
         self.reset()
-        return await self._run(question, answer, images, image_path, **kwargs)
+        return await self._run(
+            question,
+            answer,
+            images,
+            image_path,
+            system_prompt=system_prompt,
+            **kwargs,
+        )
 
 
 DeepResearchAgent = MultiTurnReactAgent

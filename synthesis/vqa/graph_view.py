@@ -17,6 +17,8 @@ class GraphView:
     allowed_edge_types: set[str] | None = None
     include_inactive_edges: bool = False
     nodes_by_id: dict[str, dict[str, Any]] = field(init=False)
+    all_node_ids: tuple[str, ...] = field(init=False)
+    node_ids_by_type: dict[str, tuple[str, ...]] = field(init=False)
     edges_by_id: dict[str, dict[str, Any]] = field(init=False)
     out_edges: dict[str, list[dict[str, Any]]] = field(init=False)
     in_edges: dict[str, list[dict[str, Any]]] = field(init=False)
@@ -24,6 +26,16 @@ class GraphView:
     def __post_init__(self) -> None:
         self.nodes_by_id: dict[str, dict[str, Any]] = {
             record["node_id"]: record for record in self.store.list_nodes()
+        }
+        self.all_node_ids = tuple(self.nodes_by_id.keys())
+        grouped_node_ids: dict[str, list[str]] = defaultdict(list)
+        for node_id, node in self.nodes_by_id.items():
+            node_type = str(node.get("node_type") or "")
+            if node_type:
+                grouped_node_ids[node_type].append(node_id)
+        self.node_ids_by_type = {
+            node_type: tuple(node_ids)
+            for node_type, node_ids in grouped_node_ids.items()
         }
         self.edges_by_id: dict[str, dict[str, Any]] = {
             record["edge_id"]: record for record in self.store.list_edges()
@@ -60,6 +72,11 @@ class GraphView:
         return None if node is None else node.get("node_type")
 
     def list_node_ids(self, *, node_type: str | None = None) -> list[str]:
+        """Return a compatibility copy of node IDs.
+
+        Use ``node_ids_tuple`` in hot sampling paths to avoid rebuilding this
+        list for every proposal.
+        """
         if node_type is None:
             return list(self.nodes_by_id.keys())
         return [
@@ -67,3 +84,9 @@ class GraphView:
             for node_id, node in self.nodes_by_id.items()
             if node.get("node_type") == node_type
         ]
+
+    def node_ids_tuple(self, *, node_type: str | None = None) -> tuple[str, ...]:
+        """Return the read-only node-ID view cached during graph construction."""
+        if node_type is None:
+            return self.all_node_ids
+        return self.node_ids_by_type.get(node_type, ())

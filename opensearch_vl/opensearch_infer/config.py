@@ -20,6 +20,10 @@ from typing import Dict, Optional
 # Maximum number of agent turns per case before forcing termination.
 MAX_TURNS: int = int(os.environ.get("AGENT_MAX_TURNS", "50"))
 
+# Maximum number of tool calls allowed for one case.  Keep this below
+# MAX_TURNS so the agent still has room to produce a final answer.
+MAX_TOOL_CALLS: int = int(os.environ.get("AGENT_MAX_TOOL_CALLS", "45"))
+
 # Optional retrieval server (used when the agent runs against a local index).
 RETRIEVAL_SERVER_URL: str = os.environ.get(
     "RETRIEVAL_SERVER_URL", "http://127.0.0.1:8000"

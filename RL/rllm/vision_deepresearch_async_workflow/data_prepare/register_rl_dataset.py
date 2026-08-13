@@ -31,6 +31,12 @@ def parse_args():
         default=42,
         help="Random seed for shuffling (default: 42)"
     )
+    parser.add_argument(
+        "--val_split",
+        type=str,
+        default="test",
+        help="Name used for the held-out split (default: test)",
+    )
     
     return parser.parse_args()
 
@@ -46,14 +52,36 @@ def load_jsonl(file_path):
 
 # ==================== 处理并注册数据集 ====================
 def process_data(data_list, start_id=0):
-    """将原始数据转换为注册格式"""
+    """Normalize required fields while preserving all user metadata.
+
+    ``DatasetRegistry.apply_verl_postprocessing`` places each complete record
+    under Verl's runtime ``extra_info`` field.  The old implementation rebuilt
+    every item from only four keys, which silently discarded fields produced
+    by the VQA converter.  Keep the complete record here so that fields such
+    as ``extra_info.system_prompt`` remain available to the workflow.
+    """
     output = []
     for i, item in enumerate(data_list):
-        x = dict()
-        x['id'] = str(start_id + i)
-        x['question'] = f"image_id: 1 \n Question: {item['question']}"
-        x['answer'] = item['answer']
-        x['images'] = item['images']
+        if not isinstance(item, dict):
+            raise TypeError(f"Dataset item {i} must be a JSON object")
+        if "question" not in item or not str(item["question"]).strip():
+            raise ValueError(f"Dataset item {i} is missing a non-empty 'question'")
+        if "answer" not in item:
+            raise ValueError(f"Dataset item {i} is missing 'answer'")
+
+        x = dict(item)
+        # Preserve a stable source ID (e.g. q_000001) when available.  The
+        # numeric fallback keeps compatibility with older hand-written JSONL.
+        x["id"] = str(item.get("id") or item.get("question_id") or start_id + i)
+        x["question"] = str(item["question"])
+        x["answer"] = item["answer"]
+        images = item.get("images", [])
+        if images is None:
+            x["images"] = []
+        elif isinstance(images, list):
+            x["images"] = images
+        else:
+            x["images"] = [images]
         output.append(x)
     return output
 
@@ -72,6 +100,7 @@ def main():
     print(f"JSONL Path: {args.jsonl_path}")
     print(f"Register Name: {args.register_name}")
     print(f"Train Ratio: {args.train_ratio}")
+    print(f"Validation Split: {args.val_split}")
     print(f"Random Seed: {args.random_seed}")
     print(f"{'='*50}\n")
     
@@ -97,7 +126,7 @@ def main():
     
     # 6. 注册数据集
     register_dataset(train_output, args.register_name, "train")
-    register_dataset(test_output, args.register_name, "test")
+    register_dataset(test_output, args.register_name, args.val_split)
     
     print("\n✅ Dataset registration completed!")
 

@@ -78,6 +78,10 @@ class JsonlGraphStore:
         self._lock = RLock()
         self._pending_write_count = 0
         self._last_flush_monotonic = time.monotonic()
+        # Incremented whenever one or more pending records are durably
+        # appended to delta JSONL files. Runners use this to notice flushes
+        # that happened inside builders and checkpoint their queue state.
+        self._flush_generation = 0
 
         # These are derived indexes.  The JSONL tables remain the source of
         # truth and all of these structures can be rebuilt by load().  Lists
@@ -141,12 +145,21 @@ class JsonlGraphStore:
                 self._dirty.discard(table)
                 self._pending_write_count -= len(records)
                 flushed = True
+            if flushed:
+                self._flush_generation += 1
             self._last_flush_monotonic = time.monotonic()
             return flushed
 
     def has_pending_writes(self) -> bool:
         with self._lock:
             return bool(self._dirty)
+
+    @property
+    def flush_generation(self) -> int:
+        """Return the number of successful delta flush generations."""
+
+        with self._lock:
+            return self._flush_generation
 
     def pending_write_count(self) -> int:
         with self._lock:

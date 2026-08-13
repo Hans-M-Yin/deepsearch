@@ -179,8 +179,8 @@ class RewardDeepResearchFn:
                 self._client = None
 
     def _strip_think(self, s: str) -> str:
-        # Remove <think>...</think> blocks and collapse whitespace
-        s = re.sub(r"<think>[\s\S]*?</think>", " ", s, flags=re.IGNORECASE)
+        # Remove the SFT/RL thinking block and collapse whitespace.
+        s = re.sub(r"<thinking>[\s\S]*?</thinking>", " ", s, flags=re.IGNORECASE)
         s = re.sub(r"\s+", " ", s).strip()
         return s
 
@@ -189,7 +189,7 @@ class RewardDeepResearchFn:
         if not response:
             return ""
 
-        # Remove <think> ... </think>
+        # Remove <thinking> ... </thinking>
         response = self._strip_think(response)
 
         # Prefer <answer>...</answer>

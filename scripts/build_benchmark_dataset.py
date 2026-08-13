@@ -417,14 +417,20 @@ def _image_entry_from_value(value: Any) -> Optional[dict[str, object]]:
             return {"bytes": decoded}
         return {"url": _normalize_image_reference(stripped)}
     if isinstance(value, dict):
+        # Dataset image structs may contain both an embedded ``bytes`` payload
+        # and a repository-relative ``path``.  Prefer the embedded payload so
+        # the converted parquet remains self-contained; a relative path is not
+        # a URL that the inference runtime can dereference.
+        if any(key in value for key in ("bytes", "data")):
+            payload = _image_bytes_from_object(value)
+            if payload:
+                return {"bytes": payload}
         url_value = value.get("url")
         if url_value is not None and str(url_value).strip() and str(url_value).strip().lower() != "none":
             return {"url": _normalize_image_reference(str(url_value).strip())}
         path_value = value.get("path")
         if path_value is not None and str(path_value).strip() and str(path_value).strip().lower() != "none":
             return {"url": _normalize_image_reference(str(path_value).strip())}
-        if any(key in value for key in ("bytes", "data")):
-            return {"bytes": _image_bytes_from_object(value)}
     return {"bytes": _image_bytes_from_object(value)}
 
 
@@ -706,7 +712,10 @@ ADAPTERS: dict[str, BenchmarkAdapter] = {
         id_keys=("id", "question_id", "sample_id"),
         sample_id_keys=("sample_id", "id", "question_id"),
         category_keys=("category", "subfield", "field", "domain"),
-        image_keys=("images", "image"),
+        # The MMSearch source stores the question image in ``query_image``.
+        # Older converted parquet files only looked for ``images``/``image``
+        # and consequently dropped the visual input entirely.
+        image_keys=("query_image", "images", "image"),
     ),
     "mmsearch_plus": BenchmarkAdapter(
         benchmark="mmsearch_plus",

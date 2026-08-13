@@ -18,13 +18,13 @@ try:
 except ImportError:  # pragma: no cover - optional progress dependency
     tqdm = None
 
-from .path_sampler import RandomPathSampler, SamplerConfiguration
+from .path_sampler import EdgeQualityCache, RandomPathSampler, SamplerConfiguration
 from .pipeline import VqaGenerationError, VqaGenerationPipeline
 from .schemas import PathCandidate, VqaSample
 
 
 _MAX_SAME_CORE_SIGNATURE = 2
-_MAX_SAME_PREFIX_SIGNATURE = 2
+_MAX_SAME_PREFIX_SIGNATURE = 10
 _MAX_SAME_TARGET_NODE = 3
 _MAX_EDGE_OVERLAP_RATIO = 0.75
 _MAX_NODE_OVERLAP_RATIO = 0.80
@@ -47,6 +47,7 @@ class VqaBatchSummary:
     sampled_paths: int
     proposed_paths: int = 0
     acceptor_rejected: int = 0
+    acceptor_rejected_by_reason: dict[str, int] = field(default_factory=dict)
     sampler_exhausted_proposals: int = 0
     completed: int = 0
     verified: int = 0
@@ -73,6 +74,7 @@ class _AcceptedPathFingerprint:
     core_signature: str
     prefix_signature: str
     target_node_id: str
+    hop_count: int
     node_ids: tuple[str, ...]
     node_id_set: frozenset[str]
     edge_id_set: frozenset[str]
@@ -83,6 +85,8 @@ class _AcceptedPathFingerprint:
 class _AcceptorState:
     used_exact_signatures: set[str]
     edge_usage_counts: dict[str, int]
+    hop_quotas: dict[int, int] = field(default_factory=dict)
+    hop_counts: dict[int, int] = field(default_factory=dict)
     version: int = 0
     core_counts: dict[str, int] = field(default_factory=dict)
     prefix_counts: dict[str, int] = field(default_factory=dict)
@@ -132,7 +136,9 @@ class VqaBatchRunner:
     resume: bool = True
     max_inflight: int | None = None
     sampler_state_input_path: Path | None = None
+    edge_quality_cache_path: Path | None = None
     question_metadata: dict[str, Any] = field(default_factory=dict)
+    _edge_quality_cache: EdgeQualityCache | None = field(init=False, default=None, repr=False)
 
     @property
     def samples_path(self) -> Path:
@@ -169,6 +175,7 @@ class VqaBatchRunner:
             raise ValueError("workers must be positive")
 
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        self._prepare_edge_quality_cache()
         existing = self._load_existing_samples() if self.resume else {}
         persisted_signatures, persisted_edge_usage_counts, persisted_fingerprints, acceptor_state, sampler_state_info = self._restore_sampler_state(
             existing_records=existing.values(),
@@ -183,7 +190,12 @@ class VqaBatchRunner:
         batch_parameters = dict(self.question_metadata.get("batch_parameters") or {})
         batch_parameters["pipeline_mode"] = "streaming_acceptor_writer"
         batch_parameters["sampler_workers"] = sampler_workers
+        batch_parameters["edge_quality_cache_path"] = str(self._edge_quality_cache_path().resolve())
         self.question_metadata["batch_parameters"] = batch_parameters
+        self.question_metadata["edge_quality_cache"] = {
+            "path": str(self._edge_quality_cache_path().resolve()),
+            "loaded_records": len(self._edge_quality_cache or ()),
+        }
 
         self._write_question_metadata(
             limit=limit,
@@ -214,6 +226,7 @@ class VqaBatchRunner:
             self._write_sampler_state(
                 used_exact_signatures=persisted_signatures,
                 edge_usage_counts=persisted_edge_usage_counts,
+                hop_counts=acceptor_state.hop_counts,
                 persisted_fingerprints=persisted_fingerprints,
             )
             self._refresh_sampler_state_info(
@@ -278,6 +291,7 @@ class VqaBatchRunner:
                     cached_snapshot = self._sampler_template().export_state(
                         used_exact_signatures=acceptor_state.used_exact_signatures,
                         edge_usage_counts=acceptor_state.edge_usage_counts,
+                        hop_counts=acceptor_state.hop_counts,
                     )
                     cached_snapshot_version = acceptor_state.version
                 return cached_snapshot
@@ -352,12 +366,16 @@ class VqaBatchRunner:
                     if generation_goal_reached():
                         continue
 
-                    accepted, _reject_reason = self._accept_path_candidate(
+                    accepted, reject_reason = self._accept_path_candidate(
                         path=candidate,
                         acceptor_state=acceptor_state,
                     )
                     if not accepted:
                         summary.acceptor_rejected += 1
+                        reason_key = reject_reason or "unknown"
+                        summary.acceptor_rejected_by_reason[reason_key] = (
+                            summary.acceptor_rejected_by_reason.get(reason_key, 0) + 1
+                        )
                         stalled_proposals_by_version[context.state_version] = (
                             stalled_proposals_by_version.get(context.state_version, 0) + 1
                         )
@@ -377,6 +395,7 @@ class VqaBatchRunner:
         self._write_sampler_state(
             used_exact_signatures=persisted_signatures,
             edge_usage_counts=persisted_edge_usage_counts,
+            hop_counts=acceptor_state.hop_counts,
             persisted_fingerprints=persisted_fingerprints,
         )
         self._refresh_sampler_state_info(
@@ -415,19 +434,23 @@ class VqaBatchRunner:
             summary.failed += 1
             stage = exc.stage if isinstance(exc, VqaGenerationError) else "unknown"
             cause = exc.cause if isinstance(exc, VqaGenerationError) else exc
-            self._append_jsonl(
-                errors_file,
-                {
-                    "path_id": path.path_id,
-                    "stage": stage,
-                    "error_type": cause.__class__.__name__,
-                    "error": str(cause),
-                    "traceback": "".join(traceback.format_exception(exc)),
-                    "path": path.to_dict(),
-                    "created_at": _utc_now(),
-                },
-                flush=True,
-            )
+            error_record = {
+                "path_id": path.path_id,
+                "stage": stage,
+                "error_type": cause.__class__.__name__,
+                "error": str(cause),
+                "traceback": "".join(traceback.format_exception(exc)),
+                "path": path.to_dict(),
+                "created_at": _utc_now(),
+            }
+            writer_stage = getattr(cause, "stage", None)
+            if writer_stage:
+                error_record["writer_stage"] = str(writer_stage)
+            underlying_cause = getattr(cause, "cause", None)
+            if underlying_cause is not None:
+                error_record["underlying_error_type"] = underlying_cause.__class__.__name__
+                error_record["underlying_error"] = str(underlying_cause)
+            self._append_jsonl(errors_file, error_record, flush=True)
             return
 
         summary.completed += 1
@@ -556,9 +579,19 @@ class VqaBatchRunner:
             edge_quality_model_client=template.edge_quality_model_client,
             edge_quality_model=template.edge_quality_model,
             llm_max_tokens=template.llm_max_tokens,
+            edge_quality_cache=template.edge_quality_cache,
         )
         sampler.load_state(sampler_state, replace=True)
         return sampler
+
+    def _edge_quality_cache_path(self) -> Path:
+        return self.edge_quality_cache_path or self.output_dir / "edge_quality_cache.jsonl"
+
+    def _prepare_edge_quality_cache(self) -> None:
+        cache = EdgeQualityCache(self._edge_quality_cache_path())
+        sampler = self._sampler_template()
+        sampler.edge_quality_cache = cache
+        self._edge_quality_cache = cache
 
     def _sampler_template(self) -> RandomPathSampler:
         sampler = self.pipeline.sampler
@@ -577,6 +610,9 @@ class VqaBatchRunner:
         fingerprint = self._fingerprint_from_path_candidate(path)
         if fingerprint is None:
             return False, "invalid_path"
+        hop_quota = acceptor_state.hop_quotas.get(fingerprint.hop_count)
+        if hop_quota is not None and acceptor_state.hop_counts.get(fingerprint.hop_count, 0) >= hop_quota:
+            return False, "hop_quota_exhausted"
         if self.pipeline.config.dedup_by_exact_signature and fingerprint.exact_signature in acceptor_state.used_exact_signatures:
             return False, "duplicate_exact"
         if fingerprint.core_signature and acceptor_state.core_counts.get(fingerprint.core_signature, 0) >= _MAX_SAME_CORE_SIGNATURE:
@@ -611,8 +647,13 @@ class VqaBatchRunner:
         fingerprint: _AcceptedPathFingerprint,
         increment_version: bool,
         count_edge_usage: bool,
+        count_hop: bool = True,
     ) -> None:
         acceptor_state.used_exact_signatures.add(fingerprint.exact_signature)
+        if count_hop:
+            acceptor_state.hop_counts[fingerprint.hop_count] = (
+                acceptor_state.hop_counts.get(fingerprint.hop_count, 0) + 1
+            )
         if count_edge_usage:
             for edge_id in fingerprint.edge_ids:
                 acceptor_state.edge_usage_counts[edge_id] = acceptor_state.edge_usage_counts.get(edge_id, 0) + 1
@@ -663,7 +704,11 @@ class VqaBatchRunner:
     def _overlap_ratio(left: frozenset[str], right: frozenset[str]) -> float:
         if not left or not right:
             return 0.0
-        return len(left & right) / float(min(len(left), len(right)))
+        # Measure shared structure against the longer path.  Using the
+        # shorter path made a short trajectory fully contained in a longer
+        # one look like 100% overlap, even when the longer path added several
+        # meaningful hops.
+        return len(left & right) / float(max(len(left), len(right)))
 
     @staticmethod
     def _fingerprint_from_path_candidate(path: PathCandidate) -> _AcceptedPathFingerprint | None:
@@ -685,6 +730,7 @@ class VqaBatchRunner:
             core_signature=core_signature,
             prefix_signature=VqaBatchRunner._prefix_signature(start_node_id, edge_ids),
             target_node_id=target_node_id,
+            hop_count=len(edge_ids),
             node_ids=node_ids,
             node_id_set=frozenset(node_ids),
             edge_id_set=frozenset(edge_ids),
@@ -712,6 +758,7 @@ class VqaBatchRunner:
             core_signature=core_signature,
             prefix_signature=VqaBatchRunner._prefix_signature(start_node_id, edge_ids),
             target_node_id=target_node_id,
+            hop_count=len(edge_ids),
             node_ids=node_ids,
             node_id_set=frozenset(node_ids),
             edge_id_set=frozenset(edge_ids),
@@ -728,12 +775,17 @@ class VqaBatchRunner:
         core_signature = str(record.get("core_signature") or exact_signature).strip()
         prefix_signature = str(record.get("prefix_signature") or "").strip()
         target_node_id = str(record.get("target_node_id") or "").strip()
+        try:
+            hop_count = int(record.get("hop_count") or len(edge_ids))
+        except (TypeError, ValueError):
+            hop_count = len(edge_ids)
         return _AcceptedPathFingerprint(
             path_id=str(record.get("path_id") or exact_signature),
             exact_signature=exact_signature,
             core_signature=core_signature,
             prefix_signature=prefix_signature,
             target_node_id=target_node_id,
+            hop_count=hop_count,
             node_ids=node_ids,
             node_id_set=frozenset(node_ids),
             edge_id_set=frozenset(edge_ids),
@@ -801,6 +853,9 @@ class VqaBatchRunner:
         *,
         question_number: int,
     ) -> dict[str, Any]:
+        writer_fallback_used, writer_fallback_stages, writer_fallback_reason = (
+            VqaBatchRunner._writer_fallback_info(sample)
+        )
         writer_outputs = sample.get("writer_outputs") or {}
         drafted_question = (
             sample.get("draft")
@@ -833,11 +888,76 @@ class VqaBatchRunner:
             "enhanced_question": enhanced_question.get("question"),
             "final_question": final_question.get("question"),
             "answer": final_question.get("answer"),
+            # Keep the provenance needed to remove rule-composed questions
+            # without reopening the full writer payload.
+            "writer_fallback_used": writer_fallback_used,
+            "writer_fallback_stages": writer_fallback_stages,
         }
+        if writer_fallback_reason:
+            record["writer_fallback_reason"] = writer_fallback_reason
         image_url = VqaBatchRunner._extract_input_image_url(sample)
         if image_url:
             record["image_url"] = image_url
         return record
+
+    @staticmethod
+    def _writer_fallback_info(
+        sample: dict[str, Any],
+    ) -> tuple[bool, list[str], str | None]:
+        """Return whether final question writing used rule-based composition.
+
+        New records carry an explicit marker in ``metadata``.  The warning
+        fallback keeps compatibility with older ``samples.jsonl`` files,
+        where the marker did not exist but ``compose_question`` failures were
+        already written to ``metadata.writer_warnings``.
+        """
+
+        metadata = sample.get("metadata") or {}
+        stages: list[str] = []
+        reason: str | None = None
+
+        def add_stage(value: Any) -> None:
+            if isinstance(value, str):
+                values = [value]
+            elif isinstance(value, (list, tuple, set)):
+                values = list(value)
+            else:
+                values = []
+            for item in values:
+                stage = str(item or "").strip()
+                if stage and stage not in stages:
+                    stages.append(stage)
+
+        used = metadata.get("writer_fallback_used") is True
+        add_stage(metadata.get("writer_fallback_stages"))
+        reason_value = metadata.get("writer_fallback_reason")
+        if reason_value:
+            reason = str(reason_value)
+
+        # Also inspect the full draft fields when this helper is called before
+        # compacting a VqaSample.
+        for stage_name in ("obfuscated", "polished", "draft"):
+            stage_record = sample.get(stage_name) or {}
+            stage_metadata = stage_record.get("metadata") or {}
+            if stage_metadata.get("writer_fallback_used") is True:
+                used = True
+            add_stage(stage_metadata.get("writer_fallback_stages"))
+            if not reason and stage_metadata.get("writer_fallback_reason"):
+                reason = str(stage_metadata["writer_fallback_reason"])
+
+        warnings = metadata.get("writer_warnings") or []
+        if isinstance(warnings, list):
+            for warning in warnings:
+                if not isinstance(warning, dict):
+                    continue
+                warning_stage = str(warning.get("stage") or "").strip()
+                if warning_stage == "compose_question":
+                    used = True
+                    add_stage(warning_stage)
+                    if not reason and warning.get("error"):
+                        reason = str(warning["error"])
+
+        return used, stages, reason
 
     @staticmethod
     def _compact_sample_record(sample: dict[str, Any]) -> dict[str, Any]:
@@ -989,6 +1109,13 @@ class VqaBatchRunner:
             "created_at": sample.get("created_at"),
             "updated_at": sample.get("updated_at"),
         }
+        writer_fallback_used, writer_fallback_stages, writer_fallback_reason = (
+            VqaBatchRunner._writer_fallback_info(sample)
+        )
+        record["metadata"]["writer_fallback_used"] = writer_fallback_used
+        record["metadata"]["writer_fallback_stages"] = writer_fallback_stages
+        if writer_fallback_reason:
+            record["metadata"]["writer_fallback_reason"] = writer_fallback_reason
         image_target_candidates = VqaBatchRunner._extract_stage_metadata_value(
             sample,
             field_name="image_target_candidates",
@@ -1091,11 +1218,13 @@ class VqaBatchRunner:
         *,
         used_exact_signatures: set[str],
         edge_usage_counts: dict[str, int],
+        hop_counts: dict[int, int] | None = None,
         persisted_fingerprints: list[_AcceptedPathFingerprint] | None = None,
     ) -> None:
         payload = self._sampler_template().export_state(
             used_exact_signatures=used_exact_signatures,
             edge_usage_counts=edge_usage_counts,
+            hop_counts=hop_counts,
         )
         payload["accepted_path_fingerprints"] = [
             self._fingerprint_to_state_record(fingerprint)
@@ -1104,6 +1233,11 @@ class VqaBatchRunner:
         payload["updated_at"] = _utc_now()
         payload["tracked_exact_signature_count"] = len(used_exact_signatures)
         payload["tracked_edge_count"] = len(edge_usage_counts)
+        payload["tracked_hop_counts"] = {
+            str(int(hop_count)): int(count)
+            for hop_count, count in sorted((hop_counts or {}).items(), key=lambda item: int(item[0]))
+            if int(count) > 0
+        }
         with self.sampler_state_path.open("w", encoding="utf-8") as handle:
             json.dump(payload, handle, ensure_ascii=False, sort_keys=True, indent=2)
             handle.write("\n")
@@ -1170,6 +1304,7 @@ class VqaBatchRunner:
     ) -> tuple[set[str], dict[str, int], list[_AcceptedPathFingerprint], _AcceptorState, dict[str, Any]]:
         loaded_state, source_info = self._load_sampler_state_file()
         persisted_signatures, persisted_edge_usage_counts = self._state_accumulator_from_sampler_state(loaded_state)
+        persisted_hop_counts = self._hop_counts_from_sampler_state(loaded_state)
         persisted_fingerprints = self._state_fingerprints_from_sampler_state(loaded_state)
         merged_existing = self._merge_sample_records_into_state(
             existing_records,
@@ -1194,17 +1329,28 @@ class VqaBatchRunner:
         acceptor_state = _AcceptorState(
             used_exact_signatures=set(persisted_signatures),
             edge_usage_counts=dict(persisted_edge_usage_counts),
+            hop_quotas=self._configured_hop_quotas(),
+            hop_counts=dict(persisted_hop_counts),
         )
         registered_exact_signatures: set[str] = set()
         self._merge_fingerprints_into_acceptor_state(
             persisted_fingerprints,
             acceptor_state=acceptor_state,
             registered_exact_signatures=registered_exact_signatures,
+            count_hop=not bool(persisted_hop_counts),
         )
         self._merge_sample_records_into_acceptor_state(
             existing_records,
             acceptor_state=acceptor_state,
             registered_exact_signatures=registered_exact_signatures,
+        )
+        self._sampler_template().load_state(
+            self._sampler_template().export_state(
+                used_exact_signatures=acceptor_state.used_exact_signatures,
+                edge_usage_counts=acceptor_state.edge_usage_counts,
+                hop_counts=acceptor_state.hop_counts,
+            ),
+            replace=True,
         )
         return persisted_signatures, persisted_edge_usage_counts, persisted_fingerprints, acceptor_state, source_info
 
@@ -1261,6 +1407,28 @@ class VqaBatchRunner:
         return used_exact_signatures, edge_usage_counts
 
     @staticmethod
+    def _hop_counts_from_sampler_state(state: dict[str, Any] | None) -> dict[int, int]:
+        if not state:
+            return {}
+        hop_counts: dict[int, int] = {}
+        for hop_count, count in dict(state.get("hop_counts") or {}).items():
+            try:
+                normalized_hop_count = int(hop_count)
+                normalized_count = int(count)
+            except (TypeError, ValueError):
+                continue
+            if normalized_hop_count <= 0 or normalized_count <= 0:
+                continue
+            hop_counts[normalized_hop_count] = normalized_count
+        return hop_counts
+
+    def _configured_hop_quotas(self) -> dict[int, int]:
+        return {
+            int(hop_count): int(quota)
+            for hop_count, quota in (self.pipeline.config.hop_quotas or {}).items()
+        }
+
+    @staticmethod
     def _merge_sample_records_into_state(
         records,
         *,
@@ -1304,6 +1472,7 @@ class VqaBatchRunner:
         *,
         acceptor_state: _AcceptorState,
         registered_exact_signatures: set[str] | None = None,
+        count_hop: bool = True,
     ) -> None:
         registered = registered_exact_signatures if registered_exact_signatures is not None else set()
         for fingerprint in fingerprints:
@@ -1315,6 +1484,7 @@ class VqaBatchRunner:
                 fingerprint=fingerprint,
                 increment_version=True,
                 count_edge_usage=False,
+                count_hop=count_hop,
             )
 
     @staticmethod
@@ -1325,6 +1495,7 @@ class VqaBatchRunner:
             "core_signature": fingerprint.core_signature,
             "prefix_signature": fingerprint.prefix_signature,
             "target_node_id": fingerprint.target_node_id,
+            "hop_count": fingerprint.hop_count,
             "node_ids": list(fingerprint.node_ids),
             "edge_ids": list(fingerprint.edge_ids),
         }

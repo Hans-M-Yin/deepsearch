@@ -32,6 +32,23 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--samples", type=int, default=100)
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--max-inflight", type=int, default=None)
+    parser.add_argument(
+        "--max-backtracks",
+        type=int,
+        default=32,
+        help="Maximum local backtracks within one start-node proposal (0 disables backtracking).",
+    )
+    parser.add_argument(
+        "--hop-quota",
+        action="append",
+        default=[],
+        metavar="HOPS=COUNT",
+        help=(
+            "Optional accepted-path quota for one hop length; repeat for multiple lengths, "
+            "for example --hop-quota 2=6000 --hop-quota 3=8000. "
+            "Unconfigured lengths are unlimited."
+        ),
+    )
     parser.add_argument("--min-hops", type=int, default=3)
     parser.add_argument("--max-hops", type=int, default=5)
     parser.add_argument("--seed", type=int, default=0)
@@ -114,8 +131,32 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional sampler state JSON file to import before sampling.",
     )
+    parser.add_argument(
+        "--edge-quality-cache",
+        type=Path,
+        default=None,
+        help="Persistent edge-quality cache JSONL. Defaults to <graph-dir>/vqa/edge_quality_cache.jsonl.",
+    )
     parser.add_argument("--no-resume", action="store_true")
     return parser
+
+
+def _parse_hop_quotas(raw_values: list[str]) -> dict[int, int]:
+    quotas: dict[int, int] = {}
+    for raw_value in raw_values:
+        text = str(raw_value).strip()
+        if "=" not in text:
+            raise ValueError(f"invalid --hop-quota {raw_value!r}; expected HOPS=COUNT")
+        raw_hops, raw_count = text.split("=", 1)
+        try:
+            hop_count = int(raw_hops)
+            quota = int(raw_count)
+        except ValueError as exc:
+            raise ValueError(f"invalid --hop-quota {raw_value!r}; expected integer HOPS=COUNT") from exc
+        if hop_count in quotas:
+            raise ValueError(f"duplicate --hop-quota for {hop_count} hops")
+        quotas[hop_count] = quota
+    return quotas
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -124,6 +165,11 @@ def main(argv: list[str] | None = None) -> int:
     graph_dir = args.graph_dir.resolve()
     output_dir = args.output_dir.resolve() if args.output_dir else _default_output_dir(graph_dir)
     sampler_state_input_path = args.sampler_state.resolve() if args.sampler_state else None
+    edge_quality_cache_path = (
+        args.edge_quality_cache.resolve()
+        if args.edge_quality_cache
+        else (graph_dir / "vqa" / "edge_quality_cache.jsonl").resolve()
+    )
     model_alias = args.model_alias or os.environ.get("VQA_WRITER_MODEL")
     sampler_model_alias = args.sampler_model_alias or os.environ.get("VQA_SAMPLER_MODEL")
     history_exposure_model_alias = args.history_exposure_model_alias
@@ -132,11 +178,14 @@ def main(argv: list[str] | None = None) -> int:
     image_bridge_model_alias = args.image_bridge_model_alias or os.environ.get("VQA_IMAGE_BRIDGE_MODEL")
     ask_target_verify_model_alias = args.ask_target_verify_model_alias or os.environ.get("ASK_TARGET_VERIFY_MODEL")
     shortcut_audit_model_alias = args.shortcut_audit_model_alias or os.environ.get("VQA_SHORTCUT_AUDIT_MODEL")
+    hop_quotas = _parse_hop_quotas(args.hop_quota)
     config = SamplerConfiguration(
         min_hops=args.min_hops,
         max_hops=args.max_hops,
         max_samples=args.samples,
         random_seed=args.seed,
+        max_backtracks=args.max_backtracks,
+        hop_quotas=hop_quotas,
         edge_penalty_alpha=args.edge_penalty_alpha,
         require_image_in_path=args.require_image_in_path,
         hop_sampling_strategy=args.hop_sampling_strategy,
@@ -182,6 +231,7 @@ def main(argv: list[str] | None = None) -> int:
         resume=not args.no_resume,
         max_inflight=args.max_inflight,
         sampler_state_input_path=sampler_state_input_path,
+        edge_quality_cache_path=edge_quality_cache_path,
         question_metadata={
             "entrypoint": "synthesis.vqa.run_batch",
             "invocation": {
@@ -201,6 +251,7 @@ def main(argv: list[str] | None = None) -> int:
                 "workers": args.workers,
                 "max_inflight": args.max_inflight,
                 "resume": not args.no_resume,
+                "edge_quality_cache_path": str(edge_quality_cache_path),
             },
             "models": {
                 "writer_model_alias": model_alias,

@@ -17,7 +17,6 @@ ARG INSTALL_LOCAL_VERL=1
 # This is the SGLang version declared by the local verl setup.py extra. It can
 # be overridden at build time after validating another version with the base image.
 ARG SGLANG_VERSION=0.5.5
-ARG RAY_VERSION=2.41.0
 
 # The base image should already contain transformer-engine and flash-attn.
 # Set this to 1 only when they are missing from the base image and the image has
@@ -67,7 +66,6 @@ RUN pip install --no-cache-dir --no-build-isolation --no-deps -e .
 # they are supplied by the base image (except for the optional local verl source
 # installation above).
 RUN pip install --no-cache-dir --upgrade-strategy only-if-needed \
-    "ray[default]==${RAY_VERSION}" \
     "sglang[srt,openai]==${SGLANG_VERSION}" \
     "transformers>=4.55.0" \
     "datasets>=2.20.0" \
@@ -93,6 +91,6 @@ WORKDIR /workspace/OpenSearch-VL/RL/rllm
 # Fail early on package/version mistakes before a multi-GPU job is submitted.
 # The local verl source may report 0.6.1 when INSTALL_LOCAL_VERL=1; this is
 # intentional because the checked-in trainer uses APIs standardized in 0.6.1.
-RUN python -c 'import importlib.metadata as md; import torch; import rllm, verl, sglang, mbridge; print({name: md.version(name) for name in ("torch", "verl", "vllm", "sglang", "ray")}); print("torch.cuda:", torch.version.cuda); print("RL imports: OK")'
+RUN python -c 'import importlib.metadata as md; import torch; import rllm, verl, sglang, mbridge; print({name: md.version(name) for name in ("torch", "verl", "vllm", "sglang")}); print("torch.cuda:", torch.version.cuda); print("RL imports: OK")'
 
 CMD ["/bin/bash"]

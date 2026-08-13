@@ -262,11 +262,26 @@ class OpenAICompatibleRunner(BaseRunner):
                     headers=headers,
                     timeout=self.timeout,
                 )
+                logger.debug(
+                    "OpenAI-compatible raw response body "
+                    "(status_code=%s): %s",
+                    response.status_code,
+                    response.text,
+                )
                 response.raise_for_status()
                 response_json = response.json()
                 choice = (response_json.get("choices") or [{}])[0]
                 message = choice.get("message") or {}
                 text = message.get("content") or ""
+                logger.debug(
+                    "OpenAI-compatible model raw output "
+                    "(finish_reason=%s, chars=%d):\n"
+                    "----- BEGIN MODEL OUTPUT -----\n%s\n"
+                    "----- END MODEL OUTPUT -----",
+                    choice.get("finish_reason"),
+                    len(text),
+                    text,
+                )
                 usage = response_json.get("usage") or {}
                 return {
                     "candidates": [

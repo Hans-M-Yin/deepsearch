@@ -18,6 +18,16 @@ actor_rollout_ref:
       do_sample: True # if do_sample is False, temperature is overridden to 0.0
 
 data:
+  # DatasetRegistry name. The corresponding train/validation splits are
+  # selected below instead of being hard-coded in the training entrypoint.
+  dataset_name: Vision-DeepResearch-QA
+
+  # DatasetRegistry split used for optimization.
+  train_split: train
+
+  # DatasetRegistry split used for validation.
+  val_split: test
+
   gen_batch_size: ${mul:${data.train_batch_size},${rllm.rejection_sample.multiplier}}
 
 rllm:

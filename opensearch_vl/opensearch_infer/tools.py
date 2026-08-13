@@ -206,6 +206,14 @@ def _register_search_resources(
             rank = None
         resource = sft_tools.UrlResource(
             primary_url=primary_url,
+            resource_id=str(
+                raw.get("resource_id")
+                or raw.get("page_id")
+                or raw.get("source_page_id")
+                or raw.get("image_id")
+                or ""
+            ).strip(),
+            result_id=str(raw.get("result_id") or "").strip() or None,
             kind="text" if tool_name == "t2t_search" else "image",
             title=str(raw.get("title") or "").strip() or None,
             snippet=str(raw.get("snippet") or "").strip() or None,
@@ -216,10 +224,47 @@ def _register_search_resources(
             search_query=query,
             rank=rank,
         )
-        for candidate in (primary_url, image_url, thumbnail_url, source_page_url):
+        for candidate in (
+            primary_url,
+            image_url,
+            thumbnail_url,
+            source_page_url,
+            resource.resource_id,
+            resource.result_id,
+            raw.get("page_id"),
+            raw.get("source_page_id"),
+            raw.get("image_id"),
+        ):
             key = _normalize_resource_url(candidate)
             if key:
                 registry[key] = resource
+
+
+def _resolve_registered_resource(
+    registry: dict[str, sft_tools.UrlResource],
+    alias: object,
+) -> Optional[sft_tools.UrlResource]:
+    """Resolve a search result URL or compact page/image ID."""
+
+    key = _normalize_resource_url(alias)
+    if not key:
+        return None
+    resource = registry.get(key)
+    if resource is not None:
+        return resource
+    # Keep this fallback for registries created by older code that only keyed
+    # resources by URL and did not register compact IDs explicitly.
+    for candidate in registry.values():
+        if key in {
+            _normalize_resource_url(candidate.primary_url),
+            _normalize_resource_url(candidate.resource_id),
+            _normalize_resource_url(candidate.result_id),
+            _normalize_resource_url(candidate.source_page_url),
+            _normalize_resource_url(candidate.image_url),
+            _normalize_resource_url(candidate.thumbnail_url),
+        }:
+            return candidate
+    return None
 
 
 def _resolve_image_for_search(
@@ -523,12 +568,32 @@ def execute_tool(
 
     if name == "read_url":
         url = params.get("url") or params.get("URL") or ""
+        resource_id = (
+            params.get("resource_id")
+            or params.get("page_id")
+            or params.get("image_id")
+            or ""
+        )
+        resource = None
+        if resource_id:
+            resource = _resolve_registered_resource(resource_registry, resource_id)
+            if resource is not None:
+                url = resource.primary_url
+            elif isinstance(resource_id, str) and resource_id.startswith(
+                ("http://", "https://")
+            ):
+                # Some search backends expose a full URL under resource_id.
+                url = resource_id
         if not url:
-            return "Tool execution error:\n'url' is required for read_url.", {}
+            return (
+                "Tool execution error:\nread_url requires either 'url' or a "
+                "resolvable 'resource_id'.",
+                {},
+            )
         result = sft_tools.read_url(
             url=url,
             goal=str(params.get("goal") or "").strip(),
-            resource=resource_registry.get(_normalize_resource_url(url)),
+            resource=resource or _resolve_registered_resource(resource_registry, url),
         )
         if not result.get("ok", False):
             return f"Tool execution error:\n{result.get('error', 'Unknown read_url error')}", {}

@@ -58,6 +58,28 @@ class ConvertDebugVqaSharegptTest(unittest.TestCase):
         sleep.assert_called_once_with(5)
         self.assertEqual(materialized["mime_type"], "image/png")
 
+    def test_beijing_oss_url_uses_accelerated_endpoint(self) -> None:
+        class FakeResponse:
+            status_code = 200
+            headers = {"Content-Type": "image/png"}
+            content = base64.b64decode(_data_url((1, 2, 3)).split(",", 1)[1])
+
+            def raise_for_status(self) -> None:
+                return None
+
+            def close(self) -> None:
+                return None
+
+        source = "https://search-hans.oss-cn-beijing.aliyuncs.com/path/image.png"
+        with mock.patch.object(CONVERTER.requests, "get", return_value=FakeResponse()) as get:
+            materialized = CONVERTER._materialize_image(source, base_dir=Path("."))
+
+        get.assert_called_once_with(
+            "https://search-hans.oss-accelerate.aliyuncs.com/path/image.png",
+            timeout=CONVERTER._IMAGE_DOWNLOAD_TIMEOUT_S,
+        )
+        self.assertEqual(materialized["hint"], source)
+
     def test_rebuilds_question_normalizes_react_and_materializes_images(self) -> None:
         input_image = _data_url((10, 20, 30))
         read_url_image = _data_url((40, 50, 60))
@@ -144,6 +166,37 @@ class ConvertDebugVqaSharegptTest(unittest.TestCase):
             self.assertEqual(counts["skipped_incorrect"], 1)
             rejected = (output_path / ".metadata" / "rejected.jsonl").read_text(encoding="utf-8")
             self.assertIn("is_correct is false", rejected)
+
+    def test_resume_skips_existing_sample_ids(self) -> None:
+        def record(sample_id: str) -> dict[str, object]:
+            return {
+                "question_id": f"q_{sample_id}",
+                "sample_id": sample_id,
+                "path_id": f"path_{sample_id}",
+                "question": f"Question {sample_id}",
+                "extracted_answer": "Answer",
+                "answer_judge": {"is_correct": True},
+                "raw_messages": [
+                    {"role": "user", "content": f"Question {sample_id}"},
+                    {"role": "assistant", "content": "<answer>Answer</answer>"},
+                ],
+            }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            input_path = temp_path / "raw.jsonl"
+            output_path = temp_path / "my_agent_sft"
+            input_path.write_text(json.dumps(record("sample1")) + "\n", encoding="utf-8")
+            CONVERTER.convert_file(input_path, output_path)
+
+            input_path.write_text(
+                "\n".join(json.dumps(record(sample_id)) for sample_id in ("sample1", "sample2")) + "\n",
+                encoding="utf-8",
+            )
+            counts = CONVERTER.convert_file(input_path, output_path, resume=True)
+            self.assertEqual(counts["resumed_records"], 1)
+            self.assertEqual(counts["skipped_existing"], 1)
+            self.assertEqual(counts["written_records"], 2)
 
     def test_native_tool_calls_are_normalized(self) -> None:
         record = {

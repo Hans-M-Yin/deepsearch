@@ -1,9 +1,47 @@
+import json
+from pathlib import Path
+import tempfile
 import unittest
+from unittest.mock import patch
 from types import SimpleNamespace
 
 from synthesis.model_worker import ModelResponse
 from synthesis.vqa.batch_runner import VqaBatchRunner
-from synthesis.vqa.question_writer import HopContext, QuestionWriter, WriterContext
+from synthesis.vqa.filter_fallback_questions import filter_questions
+from synthesis.vqa.question_writer import (
+    HopContext,
+    QuestionWriter,
+    QuestionWriterGenerationError,
+    WriterContext,
+)
+
+
+class MultimodalImageUrlTests(unittest.TestCase):
+    def test_rewrites_configured_oss_host_to_accelerate_host(self) -> None:
+        with patch.dict(
+            "os.environ",
+            {
+                "OSS_ENDPOINT": "oss-cn-beijing.aliyuncs.com",
+                "OSS_BUCKET_NAME": "search-hans",
+                "OSS_ENDPOINT_ACCELERATE": "oss-accelerate.aliyuncs.com",
+            },
+            clear=False,
+        ):
+            self.assertEqual(
+                QuestionWriter._resolve_multimodal_image_url(
+                    "https://search-hans.oss-cn-beijing.aliyuncs.com/vision/a.png?x=1"
+                ),
+                "https://search-hans.oss-accelerate.aliyuncs.com/vision/a.png?x=1",
+            )
+
+    def test_leaves_non_oss_url_unchanged(self) -> None:
+        with patch.dict(
+            "os.environ",
+            {"OSS_ENDPOINT_ACCELERATE": "oss-accelerate.aliyuncs.com"},
+            clear=False,
+        ):
+            url = "https://images.example.com/photo.png"
+            self.assertEqual(QuestionWriter._resolve_multimodal_image_url(url), url)
 
 
 def _hop(
@@ -396,7 +434,12 @@ class DifficultyEnhancementImageMarkTests(unittest.TestCase):
             hops=[hop],
             target_node={"node_id": "text-1", "node_type": "text", "title": "Target"},
         )
-        entry = QuestionWriter().build_entry_hop(
+        entry = QuestionWriter(
+            model_client=_QueuedModelClient(
+                [{"rewritten_statement": "This image shows a scene."}]
+            ),
+            model="test-model",
+        ).build_entry_hop(
             path=SimpleNamespace(trajectory=SimpleNamespace(starts_with_image=True)),
             context=context,
             hop_summaries=[
@@ -448,6 +491,112 @@ class DifficultyEnhancementImageMarkTests(unittest.TestCase):
             terminal["statement"],
             "What brand is directly behind the goalkeeper?",
         )
+
+
+class WriterFallbackTrackingTests(unittest.TestCase):
+    def test_required_llm_stage_fails_instead_of_rule_composing(self) -> None:
+        with self.assertRaises(QuestionWriterGenerationError) as caught:
+            QuestionWriter().compress_hop(hop=_hop(0, "a", "b", "Object A", "Object B"))
+
+        self.assertEqual(caught.exception.stage, "compress_hop_0")
+        self.assertEqual(caught.exception.reason, "no_model_client")
+
+    def test_image_entry_requires_llm_rewrite(self) -> None:
+        image_hop = HopContext(
+            hop_index=0,
+            src_node_id="image-1",
+            dst_node_id="text-1",
+            src_modality="image",
+            dst_modality="text",
+            edge_id="edge-1",
+            edge_type="image_depicts",
+            relation="depicts",
+            src_content={"node_id": "image-1", "node_type": "image", "caption": "A scene"},
+            dst_content={"node_id": "text-1", "node_type": "text", "title": "Target"},
+        )
+        context = WriterContext(
+            path_id="path-image-entry-no-model",
+            trajectory={},
+            hops=[image_hop],
+            target_node={"node_id": "text-1", "node_type": "text", "title": "Target"},
+        )
+
+        with self.assertRaises(QuestionWriterGenerationError) as caught:
+            QuestionWriter().build_entry_hop(
+                path=SimpleNamespace(trajectory=SimpleNamespace(starts_with_image=True)),
+                context=context,
+                hop_summaries=[
+                    {
+                        "hop_index": 0,
+                        "source": "A scene",
+                        "target": "Target",
+                        "statement": "A scene depicts Target.",
+                    }
+                ],
+                target_ask={"ask_target": "What is the answer?"},
+            )
+
+        self.assertEqual(caught.exception.stage, "rewrite_image_first_hop")
+
+    def test_compact_records_include_final_fallback_marker(self) -> None:
+        sample = {
+            "sample_id": "sample-fallback",
+            "path": {"path_id": "path-fallback"},
+            "draft": {
+                "question": "A rule-composed question?",
+                "answer": "answer",
+                "metadata": {
+                    "writer_fallback_used": True,
+                    "writer_fallback_stages": ["compose_question"],
+                    "writer_fallback_reason": "llm_compose_failed_or_invalid",
+                },
+            },
+        }
+
+        question_record = VqaBatchRunner._compact_question_record(sample, question_number=1)
+        sample_record = VqaBatchRunner._compact_sample_record(sample)
+
+        self.assertTrue(question_record["writer_fallback_used"])
+        self.assertEqual(question_record["writer_fallback_stages"], ["compose_question"])
+        self.assertTrue(sample_record["metadata"]["writer_fallback_used"])
+
+    def test_filter_uses_sample_metadata_and_keeps_samples_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            vqa_dir = Path(directory)
+            samples = [
+                {
+                    "sample_id": "sample-good",
+                    "metadata": {"writer_fallback_used": False},
+                },
+                {
+                    "sample_id": "sample-bad",
+                    "metadata": {
+                        "writer_fallback_used": True,
+                        "writer_fallback_stages": ["compose_question"],
+                    },
+                },
+            ]
+            questions = [
+                {"question_id": "q_000001", "sample_id": "sample-good"},
+                {"question_id": "q_000002", "sample_id": "sample-bad"},
+            ]
+            for name, records in (("samples.jsonl", samples), ("questions.jsonl", questions)):
+                (vqa_dir / name).write_text(
+                    "".join(json.dumps(record) + "\n" for record in records),
+                    encoding="utf-8",
+                )
+
+            result = filter_questions(vqa_dir=vqa_dir, in_place=True)
+
+            self.assertEqual(result["removed_questions"], 1)
+            self.assertEqual(result["kept_questions"], 1)
+            remaining = [
+                json.loads(line)
+                for line in (vqa_dir / "questions.jsonl").read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertEqual([item["sample_id"] for item in remaining], ["sample-good"])
+            self.assertEqual(len((vqa_dir / "samples.jsonl").read_text(encoding="utf-8").splitlines()), 2)
 
 
 if __name__ == "__main__":

@@ -21,10 +21,12 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 import json
 import mimetypes
+import os
 from pathlib import Path
 import re
 import sys
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -53,6 +55,31 @@ class TargetAskGenerationError(RuntimeError):
     def __init__(self, *, stage: str, reason: str, cause: Exception | None = None) -> None:
         self.stage = str(stage or "target_ask")
         self.reason = str(reason or "target_ask_unavailable")
+        self.cause = cause
+        message = f"{self.stage}: {self.reason}"
+        if cause is not None:
+            message += f" ({cause.__class__.__name__}: {cause})"
+        super().__init__(message)
+
+
+class QuestionWriterGenerationError(RuntimeError):
+    """Raised when a required LLM writing stage cannot produce valid output.
+
+    Question writing must never silently replace an LLM result with a
+    hand-written approximation.  The batch runner treats this exception as a
+    failed trajectory and records it in ``errors.jsonl`` without publishing a
+    question.
+    """
+
+    def __init__(
+        self,
+        *,
+        stage: str,
+        reason: str,
+        cause: Exception | None = None,
+    ) -> None:
+        self.stage = str(stage or "question_writer")
+        self.reason = str(reason or "generation_failed")
         self.cause = cause
         message = f"{self.stage}: {self.reason}"
         if cause is not None:
@@ -1639,7 +1666,10 @@ class QuestionWriter:
         model_client = self.compress_hop_model_client or self.model_client
         model = self.compress_hop_model or self.model
         if model_client is None:
-            return self._fallback_compress_hop(hop, source_label=source_label, target_label=target_label)
+            raise QuestionWriterGenerationError(
+                stage=f"compress_hop_{hop.hop_index}",
+                reason="no_model_client",
+            )
         prompt = self._compress_hop_prompt_payload(hop=hop)
         try:
             parsed = self._generate_json(
@@ -1650,12 +1680,11 @@ class QuestionWriter:
                 model=model,
             )
         except Exception as exc:
-            fallback = self._fallback_compress_hop(hop, source_label=source_label, target_label=target_label)
-            fallback["writer_warning"] = self._writer_warning_entry(
+            raise QuestionWriterGenerationError(
                 stage=f"compress_hop_{hop.hop_index}",
-                error=exc,
+                reason="llm_generation_error",
+                cause=exc,
             )
-            return fallback
         statement = str(parsed.get("statement") or "").strip()
         source = source_label
         target = target_label
@@ -1672,7 +1701,10 @@ class QuestionWriter:
             ):
                 retrieval_query = raw_retrieval_query or retrieval_query
         if not statement or not source or not target:
-            return self._fallback_compress_hop(hop, source_label=source_label, target_label=target_label)
+            raise QuestionWriterGenerationError(
+                stage=f"compress_hop_{hop.hop_index}",
+                reason="invalid_llm_output",
+            )
         return {
             "hop_index": hop.hop_index,
             "statement": statement,
@@ -2299,23 +2331,10 @@ class QuestionWriter:
     ) -> dict[str, Any]:
         """Return the question-facing hop 0 for either a text or image entry."""
         if not context.hops or not hop_summaries:
-            target = str(context.target_node.get("title") or context.target_node.get("node_id") or "the target").strip()
-            source_description = str(context.target_node.get("description") or context.target_node.get("summary") or "").strip()
-            clue = self._shorten_text(source_description, limit=180) or "the described starting subject"
-            return {
-                "hop_index": 0,
-                "source": "-",
-                "target": target,
-                "statement": self._ensure_declarative_statement(f"{clue} was {target}"),
-                "relation": "is",
-                "retrieval_query": "",
-                "edge_id": "",
-                "src_node_id": None,
-                "dst_node_id": context.target_node.get("node_id"),
-                "entry_kind": "text",
-                "supporting_facts": [clue] if clue else [],
-                "why_relevant": "Fallback entry hop generated because no path hop was available.",
-            }
+            raise QuestionWriterGenerationError(
+                stage="build_entry_hop",
+                reason="path_has_no_hops",
+            )
 
         first_hop = context.hops[0]
         first_summary = dict(hop_summaries[0])
@@ -2350,11 +2369,9 @@ class QuestionWriter:
             "target_ask": str(target_ask.get("ask_target") or "").strip(),
         }
         if self.model_client is None:
-            return self._fallback_text_entry_hop(
-                first_hop=first_hop,
-                target=target,
-                source_node=source_node,
-                target_aliases=target_aliases,
+            raise QuestionWriterGenerationError(
+                stage="build_text_entry_hop",
+                reason="no_model_client",
             )
         try:
             parsed = self._generate_json(
@@ -2363,14 +2380,11 @@ class QuestionWriter:
                 trace_label="build_text_entry_hop",
             )
         except Exception as exc:
-            fallback = self._fallback_text_entry_hop(
-                first_hop=first_hop,
-                target=target,
-                source_node=source_node,
-                target_aliases=target_aliases,
+            raise QuestionWriterGenerationError(
+                stage="build_text_entry_hop",
+                reason="llm_generation_error",
+                cause=exc,
             )
-            fallback["writer_warning"] = self._writer_warning_entry(stage="build_text_entry_hop", error=exc)
-            return fallback
 
         statement = self._ensure_declarative_statement(str(parsed.get("opening_statement") or "").strip())
         supporting_facts = parsed.get("supporting_facts") or []
@@ -2379,17 +2393,10 @@ class QuestionWriter:
         supporting_facts = [str(item).strip() for item in supporting_facts if str(item).strip()]
         why_relevant = str(parsed.get("why_relevant") or "").strip()
         if not self._valid_text_entry_statement(statement=statement, target=target, target_aliases=target_aliases):
-            fallback = self._fallback_text_entry_hop(
-                first_hop=first_hop,
-                target=target,
-                source_node=source_node,
-                target_aliases=target_aliases,
-            )
-            fallback["writer_warning"] = self._writer_warning_entry(
+            raise QuestionWriterGenerationError(
                 stage="build_text_entry_hop_validation",
-                error=ValueError("Opening statement did not identify the target exactly once after an alias-free clue."),
+                reason="invalid_opening_statement",
             )
-            return fallback
         return {
             "hop_index": 0,
             "source": "-",
@@ -2449,22 +2456,9 @@ class QuestionWriter:
         answer_type = self._default_answer_type(context.target_node)
         starting_image_url = self._starting_image_url(path=path, graph=graph)
         if self.model_client is None:
-            return self._draft_with_writer_warnings(
-                self._fallback_compose_question(
-                    path=path,
-                    hop_summaries=compose_hops,
-                    target_ask=question_target_ask,
-                    answer_type=answer_type,
-                    raw_target_ask=raw_target_ask,
-                    raw_hop_summaries=raw_hop_summaries,
-                    image_bridge_normalization=image_bridge_normalization,
-                    image_target_terminal_normalization=image_target_terminal_normalization,
-                    question_terminal_bridge=question_terminal_bridge,
-                    entry_hop=entry_hop,
-                    starting_image_url=starting_image_url,
-                    writer_context=context.to_dict(),
-                ),
-                warnings=draft_warnings,
+            raise QuestionWriterGenerationError(
+                stage="compose_question",
+                reason="no_model_client",
             )
         # `compose_hops` has already passed image-bridge normalization, so every
         # item here is a merge-ready hop.  Build the question backwards: start
@@ -2485,66 +2479,16 @@ class QuestionWriter:
                 image_url=starting_image_url,
             )
         except Exception as exc:
-            draft_warnings.append(self._writer_warning_entry(stage="compose_question", error=exc))
-            return self._draft_with_writer_warnings(
-                self._fallback_compose_question(
-                    path=path,
-                    hop_summaries=compose_hops,
-                    target_ask=question_target_ask,
-                    answer_type=answer_type,
-                    raw_target_ask=raw_target_ask,
-                    raw_hop_summaries=raw_hop_summaries,
-                    image_bridge_normalization=image_bridge_normalization,
-                    image_target_terminal_normalization=image_target_terminal_normalization,
-                    question_terminal_bridge=question_terminal_bridge,
-                    entry_hop=entry_hop,
-                    starting_image_url=starting_image_url,
-                    writer_context=context.to_dict(),
-                ),
-                warnings=draft_warnings,
+            raise QuestionWriterGenerationError(
+                stage="compose_question",
+                reason="llm_generation_error",
+                cause=exc,
             )
         answer = str(raw_target_ask.get("answer") or "").strip()
         if not question or not answer or self._looks_like_chain_narration(question):
-            draft_warnings.append(
-                self._writer_warning_entry(
-                    stage="compose_question",
-                    error=ValueError("recursive composition produced an empty or chain-narration question"),
-                )
-            )
-            return self._draft_with_writer_warnings(
-                self._fallback_compose_question(
-                    path=path,
-                    hop_summaries=compose_hops,
-                    target_ask=question_target_ask,
-                    answer_type=answer_type,
-                    raw_target_ask=raw_target_ask,
-                    raw_hop_summaries=raw_hop_summaries,
-                    image_bridge_normalization=image_bridge_normalization,
-                    image_target_terminal_normalization=image_target_terminal_normalization,
-                    question_terminal_bridge=question_terminal_bridge,
-                    entry_hop=entry_hop,
-                    starting_image_url=starting_image_url,
-                    writer_context=context.to_dict(),
-                ),
-                warnings=draft_warnings,
-            )
-        if not question or not answer:
-            return self._draft_with_writer_warnings(
-                self._fallback_compose_question(
-                    path=path,
-                    hop_summaries=compose_hops,
-                    target_ask=question_target_ask,
-                    answer_type=answer_type,
-                    raw_target_ask=raw_target_ask,
-                    raw_hop_summaries=raw_hop_summaries,
-                    image_bridge_normalization=image_bridge_normalization,
-                    image_target_terminal_normalization=image_target_terminal_normalization,
-                    question_terminal_bridge=question_terminal_bridge,
-                    entry_hop=entry_hop,
-                    starting_image_url=starting_image_url,
-                    writer_context=context.to_dict(),
-                ),
-                warnings=draft_warnings,
+            raise QuestionWriterGenerationError(
+                stage="compose_question_validation",
+                reason="empty_answer_or_chain_narration",
             )
         return self._draft_with_writer_warnings(
             QuestionDraft(
@@ -2555,6 +2499,8 @@ class QuestionWriter:
                 used_evidence_ids=[hop.edge_id for hop in context.hops],
                 metadata={
                     "path_id": path.path_id,
+                    "writer_fallback_used": False,
+                    "writer_fallback_stages": [],
                     "entry_hop": entry_hop,
                     "compose_payload": compose_payload,
                     "compose_result": {
@@ -2727,42 +2673,17 @@ class QuestionWriter:
                 image_url=starting_image_url,
             )
         except Exception as exc:
-            warning_draft = self._record_writer_warning(draft, stage="polish_rewrite_request", error=exc)
-            if warnings:
-                warning_metadata = dict(warning_draft.metadata)
-                combined_warnings = list(warning_metadata.get("writer_warnings") or [])
-                combined_warnings.extend(warnings)
-                warning_metadata["writer_warnings"] = combined_warnings
-                warning_draft = QuestionDraft(
-                    question=warning_draft.question,
-                    answer=warning_draft.answer,
-                    answer_type=warning_draft.answer_type,
-                    reasoning_steps=list(warning_draft.reasoning_steps),
-                    used_evidence_ids=list(warning_draft.used_evidence_ids),
-                    metadata=warning_metadata,
-                )
-            return warning_draft
+            raise QuestionWriterGenerationError(
+                stage="polish_rewrite",
+                reason="llm_generation_error",
+                cause=exc,
+            )
         polished_question = self._clean_composed_question(str(parsed.get("question") or "").strip())
         if not polished_question:
-            warning_draft = self._record_writer_warning(
-                draft,
+            raise QuestionWriterGenerationError(
                 stage="polish_rewrite_parse",
-                error=ValueError("Model returned an empty rewritten question."),
+                reason="empty_rewritten_question",
             )
-            if warnings:
-                warning_metadata = dict(warning_draft.metadata)
-                combined_warnings = list(warning_metadata.get("writer_warnings") or [])
-                combined_warnings.extend(warnings)
-                warning_metadata["writer_warnings"] = combined_warnings
-                warning_draft = QuestionDraft(
-                    question=warning_draft.question,
-                    answer=warning_draft.answer,
-                    answer_type=warning_draft.answer_type,
-                    reasoning_steps=list(warning_draft.reasoning_steps),
-                    used_evidence_ids=list(warning_draft.used_evidence_ids),
-                    metadata=warning_metadata,
-                )
-            return warning_draft
         metadata["polish_rewrite_payload"] = rewrite_payload
         metadata["polish_rewrite_skipped"] = False
         metadata["polish_result"] = {
@@ -2825,7 +2746,11 @@ class QuestionWriter:
                 max_tokens=max(self.max_tokens, 1600),
             )
         except Exception as exc:
-            return self._record_writer_warning(draft, stage="shortcut_object_audit", error=exc)
+            raise QuestionWriterGenerationError(
+                stage="shortcut_object_audit",
+                reason="llm_generation_error",
+                cause=exc,
+            )
 
         payload = self._shortcut_repair_payload(
             question=draft.question,
@@ -2842,14 +2767,17 @@ class QuestionWriter:
                 max_tokens=max(self.max_tokens, 1600),
             )
         except Exception as exc:
-            return self._record_writer_warning(draft, stage="shortcut_repair", error=exc)
+            raise QuestionWriterGenerationError(
+                stage="shortcut_repair",
+                reason="llm_generation_error",
+                cause=exc,
+            )
 
         repaired_question = self._clean_composed_question(str(repaired.get("question") or "").strip())
         if not repaired_question:
-            return self._record_writer_warning(
-                draft,
+            raise QuestionWriterGenerationError(
                 stage="shortcut_repair_parse",
-                error=ValueError("Model returned an empty shortcut-repaired question."),
+                reason="empty_repaired_question",
             )
         metadata = dict(draft.metadata)
         metadata["shortcut_repair"] = {
@@ -2892,13 +2820,16 @@ class QuestionWriter:
                 image_url=starting_image_url,
             )
         except Exception as exc:
-            return self._record_writer_warning(draft, stage="difficulty_enhancement_request", error=exc)
+            raise QuestionWriterGenerationError(
+                stage="difficulty_enhancement",
+                reason="llm_generation_error",
+                cause=exc,
+            )
         enhanced_question = self._clean_composed_question(str(parsed.get("question") or "").strip())
         if not enhanced_question:
-            return self._record_writer_warning(
-                draft,
+            raise QuestionWriterGenerationError(
                 stage="difficulty_enhancement_parse",
-                error=ValueError("Model returned an empty difficulty-enhanced question."),
+                reason="empty_enhanced_question",
             )
         metadata = dict(draft.metadata)
         metadata["difficulty_enhancement_payload"] = payload
@@ -3145,6 +3076,7 @@ class QuestionWriter:
         image_label = self._compress_hop_prompt_label(image_content, fallback=incoming_hop.dst_node_id)
         model_client = self.image_bridge_model_client or self.model_client
         model = self.image_bridge_model or self.model
+        trace_label = f"normalize_image_bridge_{incoming_hop.hop_index}_{outgoing_hop.hop_index}"
         diagnostic: dict[str, Any] = {
             "incoming_hop_index": incoming_hop.hop_index,
             "outgoing_hop_index": outgoing_hop.hop_index,
@@ -3156,10 +3088,12 @@ class QuestionWriter:
             "applied": False,
         }
         if model_client is None or not model:
-            return None, diagnostic
+            raise QuestionWriterGenerationError(
+                stage=trace_label,
+                reason="no_model_client",
+            )
 
         image_url = self._target_image_url(image_content)
-        trace_label = f"normalize_image_bridge_{incoming_hop.hop_index}_{outgoing_hop.hop_index}"
         try:
             parsed = self._generate_json(
                 system=PROMPT_NORMALIZE_IMAGE_BRIDGE,
@@ -3175,9 +3109,11 @@ class QuestionWriter:
                 model=model,
             )
         except Exception as exc:
-            diagnostic["reason"] = "image_bridge_model_error"
-            diagnostic["writer_warning"] = self._writer_warning_entry(stage=trace_label, error=exc)
-            return None, diagnostic
+            raise QuestionWriterGenerationError(
+                stage=trace_label,
+                reason="llm_generation_error",
+                cause=exc,
+            )
 
         decision = str(parsed.get("decision") or "").strip().lower()
         reason = str(parsed.get("reason") or "").strip()
@@ -3186,25 +3122,18 @@ class QuestionWriter:
         )
         rewritten_relation = str(parsed.get("rewritten_relation") or "").strip()
         if decision not in {"hide_image", "keep_image"}:
-            decision = "keep_image"
-            if not reason:
-                reason = "unexpected_model_decision"
+            raise QuestionWriterGenerationError(
+                stage=trace_label,
+                reason="invalid_decision",
+            )
 
         diagnostic["decision"] = decision
         diagnostic["reason"] = reason or ("hide_image" if decision == "hide_image" else "keep_image")
         if not rewritten_statement:
-            fallback_statement, fallback_relation = self._fallback_merge_image_bridge(
-                incoming_summary=incoming_summary,
-                outgoing_summary=outgoing_summary,
-                hide_image=(decision == "hide_image"),
+            raise QuestionWriterGenerationError(
+                stage=trace_label,
+                reason="empty_rewritten_statement",
             )
-            rewritten_statement = self._ensure_declarative_statement(fallback_statement)
-            rewritten_relation = rewritten_relation or fallback_relation
-            if not rewritten_statement:
-                diagnostic["decision"] = "keep_image"
-                diagnostic["reason"] = reason or "empty_rewritten_statement"
-                return None, diagnostic
-            diagnostic["fallback_merged_statement_used"] = True
 
         synthetic_summary = {
             "hop_index": incoming_summary.get("hop_index"),
@@ -3237,23 +3166,6 @@ class QuestionWriter:
         diagnostic["applied"] = True
         diagnostic["rewritten_statement"] = rewritten_statement
         return synthetic_summary, diagnostic
-
-    @staticmethod
-    def _fallback_merge_image_bridge(
-        *,
-        incoming_summary: dict[str, Any],
-        outgoing_summary: dict[str, Any],
-        hide_image: bool,
-    ) -> tuple[str, str]:
-        incoming_statement = str(incoming_summary.get("statement") or "").strip()
-        outgoing_statement = str(outgoing_summary.get("statement") or "").strip()
-        if hide_image:
-            merged_statement = outgoing_statement or incoming_statement
-            merged_relation = str(outgoing_summary.get("relation") or "").strip()
-        else:
-            merged_statement = " ".join(item for item in (incoming_statement, outgoing_statement) if item)
-            merged_relation = str(outgoing_summary.get("relation") or incoming_summary.get("relation") or "").strip()
-        return merged_statement, merged_relation
 
     @classmethod
     def _image_bridge_prompt_text(
@@ -3373,6 +3285,7 @@ class QuestionWriter:
         model = self.ask_target_verify_model or self.image_bridge_model or self.model
         question_target_ask = dict(raw_target_ask)
         target_value = str(raw_target_ask.get("answer") or final_hop_summary.get("target") or "").strip()
+        trace_label = f"normalize_image_target_terminal_{final_hop.hop_index}"
         diagnostic: dict[str, Any] = {
             "hop_index": final_hop.hop_index,
             "image_node_id": final_hop.dst_node_id,
@@ -3385,10 +3298,12 @@ class QuestionWriter:
             "raw_answer": target_value,
         }
         if model_client is None or not model:
-            return question_target_ask, None, diagnostic
+            raise QuestionWriterGenerationError(
+                stage=trace_label,
+                reason="no_model_client",
+            )
 
         image_url = self._target_image_url(image_content)
-        trace_label = f"normalize_image_target_terminal_{final_hop.hop_index}"
         try:
             parsed = self._generate_json(
                 system=PROMPT_NORMALIZE_FINAL_IMAGE_TARGET_ASK,
@@ -3403,24 +3318,28 @@ class QuestionWriter:
                 model=model,
             )
         except Exception as exc:
-            diagnostic["reason"] = "image_target_terminal_model_error"
-            diagnostic["writer_warning"] = self._writer_warning_entry(stage=trace_label, error=exc)
-            return question_target_ask, None, diagnostic
+            raise QuestionWriterGenerationError(
+                stage=trace_label,
+                reason="llm_generation_error",
+                cause=exc,
+            )
 
         decision = str(parsed.get("decision") or "").strip().lower()
         reason = str(parsed.get("reason") or "").strip()
         rewritten_ask_target = self._ensure_question(str(parsed.get("rewritten_ask_target") or "").strip())
         if decision not in {"hide_image", "keep_image"}:
-            decision = "keep_image"
-            if not reason:
-                reason = "unexpected_model_decision"
+            raise QuestionWriterGenerationError(
+                stage=trace_label,
+                reason="invalid_decision",
+            )
 
         diagnostic["decision"] = decision
         diagnostic["reason"] = reason or ("hide_image" if decision == "hide_image" else "keep_image")
         if not rewritten_ask_target:
-            if not reason:
-                diagnostic["reason"] = "empty_rewritten_ask_target"
-            return question_target_ask, None, diagnostic
+            raise QuestionWriterGenerationError(
+                stage=trace_label,
+                reason="empty_rewritten_ask_target",
+            )
 
         question_target_ask["ask_target"] = rewritten_ask_target
         question_target_ask["mark"] = "image"
@@ -3523,13 +3442,11 @@ class QuestionWriter:
                 "error": None,
             }
         except Exception as exc:
-            return {
-                "task_name": task_name,
-                "input_payload": payload,
-                "image_attached": bool(image_url),
-                "parsed": None,
-                "error": exc,
-            }
+            raise QuestionWriterGenerationError(
+                stage=f"polish_{task_name}",
+                reason="llm_generation_error",
+                cause=exc,
+            )
 
     @staticmethod
     def _starting_image_url(*, path: PathCandidate, graph: GraphView) -> str | None:
@@ -3591,7 +3508,7 @@ class QuestionWriter:
             return normalized
         lowered = normalized.lower()
         if lowered.startswith(("http://", "https://", "data:")):
-            return normalized
+            return QuestionWriter._rewrite_oss_endpoint(normalized)
         if lowered.startswith("file://"):
             local_path = Path(normalized[7:])
         else:
@@ -3603,6 +3520,69 @@ class QuestionWriter:
             mime_type = "application/octet-stream"
         encoded = base64.b64encode(local_path.read_bytes()).decode("ascii")
         return f"data:{mime_type};base64,{encoded}"
+
+    @staticmethod
+    def _rewrite_oss_endpoint(image_url: str) -> str:
+        """Rewrite configured Alibaba OSS URLs to the acceleration endpoint.
+
+        ``OSS_ENDPOINT_ACCELERATE`` is optional.  When set, only URLs whose
+        host matches ``OSS_ENDPOINT`` (or the configured bucket's OSS-style
+        host when the source endpoint is unavailable) are rewritten.  Other
+        HTTP URLs are returned unchanged.
+        """
+
+        accelerate_value = os.environ.get("OSS_ENDPOINT_ACCELERATE", "").strip()
+        if not accelerate_value:
+            return image_url
+
+        try:
+            source = urlsplit(image_url)
+            accelerated = urlsplit(
+                accelerate_value
+                if "://" in accelerate_value
+                else f"//{accelerate_value}"
+            )
+            source_host = (source.hostname or "").lower()
+            accelerated_host = (accelerated.hostname or "").lower()
+            if not source_host or not accelerated_host:
+                return image_url
+
+            configured_endpoint = os.environ.get("OSS_ENDPOINT", "").strip()
+            configured_endpoint_parts = urlsplit(
+                configured_endpoint
+                if "://" in configured_endpoint
+                else f"//{configured_endpoint}"
+            )
+            configured_host = (configured_endpoint_parts.hostname or "").lower()
+
+            bucket_prefix = ""
+            if configured_host and source_host == configured_host:
+                pass
+            elif configured_host and source_host.endswith(f".{configured_host}"):
+                bucket_prefix = source_host[: -(len(configured_host) + 1)]
+            else:
+                bucket_name = os.environ.get("OSS_BUCKET_NAME", "").strip().lower()
+                if not bucket_name or not source_host.startswith(f"{bucket_name}."):
+                    return image_url
+                # This fallback is intentionally limited to Alibaba-style
+                # bucket hosts so an unrelated URL is not rewritten.
+                if not source_host.endswith((".aliyuncs.com", ".aliyuncs.com.cn")):
+                    return image_url
+                bucket_prefix = bucket_name
+
+            if bucket_prefix and not accelerated_host.startswith(f"{bucket_prefix}."):
+                accelerated_host = f"{bucket_prefix}.{accelerated_host}"
+
+            accelerated_port = accelerated.port
+            new_netloc = accelerated_host
+            if accelerated_port is not None:
+                new_netloc = f"{new_netloc}:{accelerated_port}"
+            scheme = accelerated.scheme or source.scheme
+            return urlunsplit(
+                (scheme, new_netloc, source.path, source.query, source.fragment)
+            )
+        except ValueError:
+            return image_url
 
     @staticmethod
     def _extract_json_object(text: str) -> dict[str, Any]:
@@ -3692,23 +3672,6 @@ class QuestionWriter:
         if not text or text.endswith("?"):
             return text
         return text.rstrip(".!") + "?"
-
-    @staticmethod
-    def _fallback_hide_image_terminal_ask(text: str) -> str:
-        normalized = re.sub(r"\s+", " ", str(text or "")).strip()
-        if not normalized:
-            return ""
-        rewritten = normalized
-        removal_patterns = [
-            r"\b(?:shown|visible|seen)\s+in\s+(?:the|this|that)\s+(?:image|photo|picture)\b",
-            r"\bin\s+(?:the|this|that)\s+(?:image|photo|picture)\b",
-            r"\bfrom\s+(?:the|this|that)\s+(?:image|photo|picture)\b",
-        ]
-        for pattern in removal_patterns:
-            rewritten = re.sub(pattern, "", rewritten, flags=re.IGNORECASE)
-        rewritten = re.sub(r"\s+", " ", rewritten).strip(" ,")
-        rewritten = re.sub(r"\s+([?.!,;:])", r"\1", rewritten)
-        return QuestionWriter._ensure_question(rewritten or normalized)
 
     @staticmethod
     def _ensure_declarative_statement(text: str) -> str:
@@ -4097,55 +4060,6 @@ class QuestionWriter:
 
 
 
-
-    def _fallback_select_source(self, source_node: dict[str, Any], *, forbidden_labels: list[str]) -> str:
-        candidate_texts: list[str] = []
-        for candidate in [source_node.get("summary"), source_node.get("description")]:
-            if candidate:
-                candidate_texts.append(str(candidate))
-        attributes = source_node.get("attributes") or {}
-        if isinstance(attributes, dict):
-            for key, value in attributes.items():
-                if isinstance(value, dict):
-                    value = value.get("value")
-                if isinstance(value, (str, int, float)) and str(value).strip():
-                    normalized_key = self._normalize_label(key)
-                    if normalized_key in {"occupation", "job", "profession", "role"}:
-                        candidate_texts.append(f"the {value}")
-                    else:
-                        candidate_texts.append(f"the one whose {key} is {value}")
-        for candidate in candidate_texts:
-            cleaned = self._remove_forbidden_labels(candidate, forbidden_labels)
-            cleaned = self._shorten_text(cleaned, limit=180) or ""
-            if cleaned and not self._contains_forbidden_label(cleaned, forbidden_labels):
-                return cleaned.rstrip(".")
-        return "the starting subject"
-
-    def _fallback_text_entry_hop(
-        self,
-        *,
-        first_hop: HopContext,
-        target: str,
-        source_node: dict[str, Any],
-        target_aliases: list[str],
-    ) -> dict[str, Any]:
-        clue = self._fallback_select_source(source_node, forbidden_labels=target_aliases)
-        statement = self._ensure_declarative_statement(f"{clue} was {target}")
-        return {
-            "hop_index": 0,
-            "source": "-",
-            "target": target,
-            "statement": statement,
-            "relation": "is",
-            "retrieval_query": "",
-            "edge_id": "",
-            "src_node_id": None,
-            "dst_node_id": first_hop.src_node_id,
-            "entry_kind": "text",
-            "supporting_facts": [clue] if clue else [],
-            "why_relevant": "Fallback entry hop generated from the source node description.",
-        }
-
     @classmethod
     def _valid_text_entry_statement(
         cls,
@@ -4176,16 +4090,6 @@ class QuestionWriter:
     def _renumber_question_hops(hops: list[dict[str, Any]]) -> list[dict[str, Any]]:
         return [{**dict(hop), "hop_index": index} for index, hop in enumerate(hops)]
 
-    @classmethod
-    def _fallback_image_entry_statement(cls, first_hop_summary: dict[str, Any]) -> str:
-        statement = str(first_hop_summary.get("statement") or "").strip()
-        if not statement:
-            return "This image provides the next clue."
-        entry_statement = cls._normalize_image_reference(statement)
-        if not re.search(r"[.?!]$", entry_statement):
-            entry_statement = entry_statement.rstrip(" ,;:") + "."
-        return entry_statement
-
     @staticmethod
     def _normalize_image_reference(text: str) -> str:
         rewritten = str(text or "")
@@ -4198,10 +4102,17 @@ class QuestionWriter:
         return rewritten or "This image provides the next clue."
 
     def _select_image_entry_statement(self, first_hop_summary: dict[str, Any]) -> str:
-        fallback = self._fallback_image_entry_statement(first_hop_summary)
         statement = str(first_hop_summary.get("statement") or "").strip()
-        if self.model_client is None or not statement:
-            return fallback
+        if not statement:
+            raise QuestionWriterGenerationError(
+                stage="rewrite_image_first_hop",
+                reason="empty_input_statement",
+            )
+        if self.model_client is None:
+            raise QuestionWriterGenerationError(
+                stage="rewrite_image_first_hop",
+                reason="no_model_client",
+            )
 
         try:
             parsed = self._generate_json(
@@ -4209,189 +4120,26 @@ class QuestionWriter:
                 user_payload={"statement": statement},
                 trace_label="rewrite_image_first_hop",
             )
-        except Exception:
-            return fallback
+        except Exception as exc:
+            raise QuestionWriterGenerationError(
+                stage="rewrite_image_first_hop",
+                reason="llm_generation_error",
+                cause=exc,
+            )
 
         rewritten = str(parsed.get("rewritten_statement") or "").strip()
         if not rewritten:
-            return fallback
+            raise QuestionWriterGenerationError(
+                stage="rewrite_image_first_hop",
+                reason="empty_rewritten_statement",
+            )
         rewritten = self._normalize_image_reference(rewritten)
-        return rewritten or fallback
-
-    @staticmethod
-    def _fallback_compress_hop(
-        hop: HopContext,
-        *,
-        source_label: str | None = None,
-        target_label: str | None = None,
-    ) -> dict[str, Any]:
-        relation = hop.relation or hop.edge_type or "is connected to"
-        retrieval_query = ""
-        source_label = source_label or QuestionWriter._hop_anchor_label(hop.src_content, fallback=hop.src_node_id)
-        target_label = target_label or QuestionWriter._compress_hop_prompt_label(hop.dst_content, fallback=hop.dst_node_id)
-        if hop.src_modality == "text" and hop.dst_modality == "text":
-            statement = f"{source_label} {relation} {target_label}".strip()
-        elif hop.src_modality == "text" and hop.dst_modality == "image":
-            retrieval_query = QuestionWriter._hop_image_retrieval_query(hop)
-            if relation and not QuestionWriter._looks_like_image_phrase(relation):
-                statement = f"{source_label} is related to a photo that shows {relation}."
-            elif target_label:
-                statement = f"{source_label} is related to {QuestionWriter._image_target_phrase(target_label)}."
-            elif retrieval_query:
-                statement = (
-                    f"{source_label} is related to a photo that can be located using the clue: "
-                    f"{retrieval_query}."
-                )
-            elif relation:
-                statement = f"{source_label} is related to {relation}."
-            else:
-                statement = f"{source_label} is related to an unspecified photo target."
-        elif hop.src_modality == "image" and hop.dst_modality == "text":
-            statement = f"{QuestionWriter._image_clue_label(hop)} refers to {target_label}."
-        else:
-            statement = f"{source_label} {relation} {target_label}".strip()
-        return {
-            "hop_index": hop.hop_index,
-            "statement": statement,
-            "source": source_label,
-            "target": target_label,
-            "relation": relation,
-            "retrieval_query": retrieval_query,
-            "edge_id": hop.edge_id,
-            "src_node_id": hop.src_node_id,
-            "dst_node_id": hop.dst_node_id,
-            **({"mark": "image"} if "image" in {hop.src_modality, hop.dst_modality} else {}),
-        }
-
-    @staticmethod
-    def _image_clue_label(hop: HopContext) -> str:
-        relation = (hop.relation or "").strip()
-        if relation:
-            lowered = relation.lower()
-            if any(token in lowered for token in ("left", "right", "logo", "brand", "person", "player", "wearing")):
-                return relation
-        visual_facts = hop.src_content.get("visual_facts") or []
-        if visual_facts:
-            return str(visual_facts[0])
-        caption = hop.src_content.get("caption")
-        if caption:
-            return f"a clue in the image: {caption}"
-        return "a visual clue in the image"
-
-    def _fallback_select_target(self, target_node: dict[str, Any]) -> dict[str, Any]:
-        node_type = target_node.get("node_type")
-        if node_type == "image":
-            visual_facts = target_node.get("visual_facts") or []
-            answer = ""
-            if visual_facts:
-                answer = str(visual_facts[0])
-            elif target_node.get("caption"):
-                answer = str(target_node["caption"])
-            return {
-                "ask_target": "What is the key visual content in the final image?",
-                "answer": answer or "unknown visual content",
-                "supporting_facts": [answer] if answer else [],
-                "reasoning": "The answer is directly extracted from the final image evidence.",
-                "support": "Selected from the final image caption/visual facts.",
-            }
-
-        attributes = target_node.get("attributes") or {}
-        if isinstance(attributes, dict):
-            for key, value in attributes.items():
-                if isinstance(value, (str, int, float)) and str(value).strip():
-                    return {
-                        "ask_target": f"What is the {key} of the final entity?",
-                        "answer": str(value),
-                        "supporting_facts": [f"{key}: {value}"],
-                        "reasoning": "The answer is directly extracted from the selected attribute.",
-                        "support": f"Selected attribute {key}.",
-                    }
-        description = target_node.get("description") or target_node.get("summary")
-        if description:
-            raise TargetAskGenerationError(
-                stage="fallback_select_target",
-                reason="description_only_fallback_disabled",
+        if not rewritten:
+            raise QuestionWriterGenerationError(
+                stage="rewrite_image_first_hop",
+                reason="invalid_rewritten_statement",
             )
-        return {
-            "ask_target": "What is the identity of the final entity?",
-            "answer": str(target_node.get("title") or "unknown"),
-            "supporting_facts": [str(target_node.get("title"))] if target_node.get("title") else [],
-            "reasoning": "The answer is the title of the final entity.",
-            "support": "Fell back to target title.",
-        }
-
-    @staticmethod
-    def _fallback_compose_question(
-        *,
-        path: PathCandidate,
-        hop_summaries: list[dict[str, Any]],
-        target_ask: dict[str, Any],
-        answer_type: str,
-        raw_target_ask: dict[str, Any] | None = None,
-        raw_hop_summaries: list[dict[str, Any]] | None = None,
-        image_bridge_normalization: list[dict[str, Any]] | None = None,
-        image_target_terminal_normalization: dict[str, Any] | None = None,
-        question_terminal_bridge: dict[str, Any] | None = None,
-        entry_hop: dict[str, Any] | None = None,
-        starting_image_url: str | None = None,
-        writer_context: dict[str, Any] | None = None,
-    ) -> QuestionDraft:
-        del path
-        raw_target_ask = dict(raw_target_ask or target_ask)
-        question_target_ask = dict(target_ask)
-        hop_text = " ".join(str(item.get("statement") or "").strip() for item in hop_summaries if item.get("statement"))
-        ask_target = str(question_target_ask.get("ask_target") or "What is the final answer?")
-        answer = str(raw_target_ask.get("answer") or question_target_ask.get("answer") or "unknown")
-        question = QuestionWriter._clean_composed_question(f"{hop_text} {ask_target}")
-        metadata: dict[str, Any] = {
-            "entry_hop": dict(entry_hop or {}),
-            "target_ask": raw_target_ask,
-            "question_target_ask": question_target_ask,
-        }
-        if "image_target_candidates" in raw_target_ask:
-            metadata["image_target_candidates"] = list(raw_target_ask.get("image_target_candidates") or [])
-        if "image_target_candidate_verification" in raw_target_ask:
-            metadata["image_target_candidate_verification"] = dict(
-                raw_target_ask.get("image_target_candidate_verification") or {}
-            )
-        if "image_target_candidate_evaluation" in raw_target_ask:
-            metadata["image_target_candidate_evaluation"] = dict(
-                raw_target_ask.get("image_target_candidate_evaluation") or {}
-            )
-        if "text_target_candidates" in raw_target_ask:
-            metadata["text_target_candidates"] = list(raw_target_ask.get("text_target_candidates") or [])
-        if "text_target_candidate_verification" in raw_target_ask:
-            metadata["text_target_candidate_verification"] = dict(
-                raw_target_ask.get("text_target_candidate_verification") or {}
-            )
-        if "text_target_candidate_evaluation" in raw_target_ask:
-            metadata["text_target_candidate_evaluation"] = dict(
-                raw_target_ask.get("text_target_candidate_evaluation") or {}
-            )
-        if raw_hop_summaries is not None:
-            metadata["raw_hop_summaries"] = raw_hop_summaries
-        if image_bridge_normalization is not None:
-            metadata["image_bridge_normalization"] = image_bridge_normalization
-        if image_target_terminal_normalization is not None:
-            metadata["image_target_terminal_normalization"] = image_target_terminal_normalization
-        if question_terminal_bridge is not None:
-            metadata["question_terminal_bridge"] = question_terminal_bridge
-        if starting_image_url:
-            metadata["starting_image_url"] = starting_image_url
-        if writer_context is not None:
-            metadata["writer_context"] = writer_context
-        return QuestionDraft(
-            question=question,
-            answer=answer,
-            answer_type=answer_type,
-            reasoning_steps=hop_summaries,
-            used_evidence_ids=[
-                item.get("edge_id", "")
-                for item in (raw_hop_summaries or hop_summaries)
-                if item.get("edge_id")
-            ],
-            metadata=metadata,
-        )
+        return rewritten
 
     @staticmethod
     def _looks_like_chain_narration(question: str) -> bool:

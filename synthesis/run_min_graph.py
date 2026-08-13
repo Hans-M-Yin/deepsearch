@@ -339,7 +339,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--max-nodes",
         type=int,
         default=10,
-        help="Maximum number of text nodes to expand. Pending image tasks continue after this limit is reached.",
+        help="Maximum number of text nodes and image nodes independently. Pending image tasks continue until the image limit is reached.",
     )
     parser.add_argument(
         "--parallel-workers",

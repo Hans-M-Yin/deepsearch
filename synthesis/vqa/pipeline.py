@@ -167,6 +167,15 @@ class VqaGenerationPipeline:
             progress=progress,
             metadata={
                 "writer_warnings": list(shortcut_repaired.metadata.get("writer_warnings") or []),
+                "writer_fallback_used": bool(
+                    shortcut_repaired.metadata.get("writer_fallback_used")
+                ),
+                "writer_fallback_stages": list(
+                    shortcut_repaired.metadata.get("writer_fallback_stages") or []
+                ),
+                "writer_fallback_reason": shortcut_repaired.metadata.get(
+                    "writer_fallback_reason"
+                ),
                 "timings": timing_summary,
             },
         )

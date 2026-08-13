@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
+import tempfile
 import unittest
 from types import SimpleNamespace
 
-from synthesis.vqa.path_sampler import RandomPathSampler, SamplerConfiguration
+from synthesis.vqa.batch_runner import VqaBatchRunner
+from synthesis.vqa.path_sampler import EdgeQualityCache, RandomPathSampler, SamplerConfiguration
 
 
 class HistoryExposureMatchTests(unittest.TestCase):
@@ -145,6 +148,156 @@ class _TraversalGraph:
         return list(self.out_edges.get(node_id, []))
 
 
+class _BacktrackingGraph:
+    def __init__(self) -> None:
+        self.nodes = {
+            node_id: {"node_id": node_id, "node_type": "text", "title": node_id}
+            for node_id in ("A", "B", "C", "D", "E")
+        }
+        self.out_edges = {
+            "A": [self._edge("ab", "A", "B")],
+            # C is a dead end for a 3-hop path; D leads to a valid branch.
+            "B": [self._edge("bc", "B", "C"), self._edge("bd", "B", "D")],
+            "D": [self._edge("de", "D", "E")],
+        }
+
+    @staticmethod
+    def _edge(edge_id: str, src_node_id: str, dst_node_id: str) -> dict:
+        return {
+            "edge_id": edge_id,
+            "edge_type": "wiki_link",
+            "src_node_id": src_node_id,
+            "dst_node_id": dst_node_id,
+            "relation": f"{src_node_id} to {dst_node_id}",
+        }
+
+    def get_node(self, node_id: str):
+        return self.nodes.get(node_id)
+
+    def node_type(self, node_id: str):
+        node = self.get_node(node_id)
+        return node.get("node_type") if node else None
+
+    def neighbors(self, node_id: str):
+        return list(self.out_edges.get(node_id, []))
+
+    def get_edge_id_between(self, src_node_id: str, dst_node_id: str):
+        return next(
+            (
+                edge
+                for edge in self.out_edges.get(src_node_id, [])
+                if edge.get("dst_node_id") == dst_node_id
+            ),
+            None,
+        )
+
+
+class _AlwaysFirstPathSampler(RandomPathSampler):
+    def _weighted_edge_choice(self, neighbors, **kwargs):
+        return neighbors[0]
+
+
+class _FixedThreeHopSampler(_AlwaysFirstPathSampler):
+    def _sample_hop_count(self, rng):
+        return 3
+
+
+class BacktrackingSamplerTests(unittest.TestCase):
+    def test_dead_end_backtracks_to_try_another_branch(self) -> None:
+        sampler = _FixedThreeHopSampler(
+            graph=_BacktrackingGraph(),
+            config=SamplerConfiguration(
+                min_hops=3,
+                max_hops=3,
+                max_samples=1,
+                min_attempts=1,
+                max_attempts_multiplier=1,
+                max_backtracks=4,
+                require_image_in_path=False,
+            ),
+        )
+
+        candidate = sampler.generate_one(start_node_id="A")
+
+        self.assertIsNotNone(candidate)
+        self.assertEqual(candidate.node_ids, ["A", "B", "D", "E"])
+        self.assertGreaterEqual(sampler.last_generation_stats.backtracks, 1)
+
+    def test_dead_end_does_not_downgrade_when_shorter_quota_has_capacity(self) -> None:
+        sampler = _FixedThreeHopSampler(
+            graph=_BacktrackingGraph(),
+            config=SamplerConfiguration(
+                min_hops=2,
+                max_hops=3,
+                max_samples=1,
+                min_attempts=1,
+                max_attempts_multiplier=1,
+                max_backtracks=4,
+                hop_quotas={2: 1, 3: 1},
+                require_image_in_path=False,
+            ),
+        )
+        candidate = sampler.generate_one(start_node_id="A")
+
+        self.assertIsNotNone(candidate)
+        self.assertEqual(candidate.node_ids, ["A", "B", "D", "E"])
+        self.assertEqual(candidate.trajectory.hop_count, 3)
+        self.assertEqual(candidate.metadata["target_hop_count"], 3)
+        self.assertNotIn("hop_downgraded", candidate.metadata)
+
+    def test_dead_end_does_not_downgrade_when_shorter_quota_is_full(self) -> None:
+        sampler = _FixedThreeHopSampler(
+            graph=_BacktrackingGraph(),
+            config=SamplerConfiguration(
+                min_hops=2,
+                max_hops=3,
+                max_samples=1,
+                min_attempts=1,
+                max_attempts_multiplier=1,
+                max_backtracks=4,
+                hop_quotas={2: 1, 3: 1},
+                require_image_in_path=False,
+            ),
+        )
+        sampler.hop_counts[2] = 1
+        candidate = sampler.generate_one(start_node_id="A")
+
+        self.assertIsNotNone(candidate)
+        self.assertEqual(candidate.node_ids, ["A", "B", "D", "E"])
+        self.assertEqual(candidate.trajectory.hop_count, 3)
+        self.assertNotIn("hop_downgraded", candidate.metadata)
+
+    def test_hop_counts_are_in_sampler_state(self) -> None:
+        config = SamplerConfiguration(
+            min_hops=2,
+            max_hops=3,
+            hop_quotas={2: 4, 3: 5},
+            require_image_in_path=False,
+        )
+        sampler = RandomPathSampler(graph=_BacktrackingGraph(), config=config)
+        sampler.hop_counts = {2: 4, 3: 1}
+
+        restored = RandomPathSampler(graph=_BacktrackingGraph(), config=config)
+        restored.load_state(sampler.export_state(), replace=True)
+
+        self.assertEqual(restored.hop_counts, {2: 4, 3: 1})
+        self.assertEqual(restored.config.hop_quotas, {2: 4, 3: 5})
+
+
+class PathOverlapRatioTests(unittest.TestCase):
+    def test_overlap_is_measured_against_longer_path(self) -> None:
+        short_path = frozenset({"a", "b"})
+        long_path = frozenset({"a", "b", "c", "d"})
+
+        self.assertEqual(VqaBatchRunner._overlap_ratio(short_path, long_path), 0.5)
+
+    def test_equal_length_overlap_is_unchanged(self) -> None:
+        left = frozenset({"a", "b", "c"})
+        right = frozenset({"a", "b", "d"})
+
+        self.assertAlmostEqual(VqaBatchRunner._overlap_ratio(left, right), 2 / 3)
+
+
 class ImageUniqueStateTraversalTests(unittest.TestCase):
     @staticmethod
     def sampler(unique_state: str | None) -> RandomPathSampler:
@@ -259,6 +412,25 @@ class EdgeQualityFilterTests(unittest.TestCase):
         self.assertEqual(sampler._edge_quality_rejections([self.wiki_edge]), {})
         self.assertEqual(sampler._edge_quality_rejections([self.wiki_edge]), {})
         self.assertEqual(len(client.requests), 1)
+
+    def test_edge_quality_cache_is_persisted_and_reused_by_new_sampler(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache_path = Path(tmpdir) / "edge_quality_cache.jsonl"
+            first_sampler, first_client = self.sampler(
+                {"evaluations": [
+                    {"edge_id": "wiki_bad", "relevance_ok": False,
+                     "correctness_ok": True, "unambiguous_ok": True, "keep": False},
+                ]}
+            )
+            first_sampler.edge_quality_cache = EdgeQualityCache(cache_path)
+            self.assertEqual(set(first_sampler._edge_quality_rejections([self.wiki_edge])), {"wiki_bad"})
+            self.assertEqual(len(first_client.requests), 1)
+
+            second_sampler, second_client = self.sampler({"evaluations": []})
+            second_sampler.edge_quality_cache = EdgeQualityCache(cache_path)
+            self.assertEqual(set(second_sampler._edge_quality_rejections([self.wiki_edge])), {"wiki_bad"})
+            self.assertEqual(len(second_client.requests), 0)
+            self.assertEqual(len(EdgeQualityCache(cache_path)), 1)
 
 
 if __name__ == "__main__":

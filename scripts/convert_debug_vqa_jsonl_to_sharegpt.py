@@ -23,6 +23,7 @@ import base64
 from collections import Counter
 import hashlib
 import json
+import os
 import re
 import shutil
 import sys
@@ -37,6 +38,7 @@ from urllib.parse import unquote, urlparse
 
 import requests
 from PIL import Image
+from tqdm import tqdm
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -67,6 +69,8 @@ _IMAGE_DOWNLOAD_TIMEOUT_S = 120
 _IMAGE_DOWNLOAD_RETRIES = 60
 _IMAGE_DOWNLOAD_RETRY_DELAY_S = 5
 _RETRYABLE_IMAGE_STATUS_CODES = {408, 425, 429, 500, 502, 503, 504}
+_OSS_BEIJING_HOST = "oss-cn-beijing.aliyuncs.com"
+_OSS_ACCELERATE_HOST = "oss-accelerate.aliyuncs.com"
 
 
 class ConversionError(ValueError):
@@ -83,24 +87,43 @@ class ImageStore:
     paths: list[str] = field(default_factory=list)
     _cache: dict[str, str] = field(default_factory=dict)
     _counter: int = 0
+    timings: dict[str, float] = field(default_factory=dict)
 
     def save(self, source: Any, *, stem: str) -> str:
+        save_started = time.perf_counter()
+        materialize_started = save_started
         payload = _materialize_image(source, base_dir=self.source_base_dir)
+        self.timings["image_materialize_s"] = self.timings.get("image_materialize_s", 0.0) + (
+            time.perf_counter() - materialize_started
+        )
         key = _image_source_key(payload["bytes"], source)
         relative = self._cache.get(key)
         if relative is None:
             self._counter += 1
+            validate_started = time.perf_counter()
             suffix = _image_suffix(payload["bytes"], payload.get("mime_type"), payload.get("hint"))
             digest = hashlib.sha1(payload["bytes"]).hexdigest()[:12]
+            self.timings["image_validate_hash_s"] = self.timings.get("image_validate_hash_s", 0.0) + (
+                time.perf_counter() - validate_started
+            )
             filename = f"{self.sample_key}_{stem}_{self._counter:03d}_{digest}{suffix}"
             absolute = self.output_dir / "images" / filename
+            write_started = time.perf_counter()
             absolute.write_bytes(payload["bytes"])
+            self.timings["image_write_s"] = self.timings.get("image_write_s", 0.0) + (
+                time.perf_counter() - write_started
+            )
             relative = str(Path("images") / filename)
             self._cache[key] = relative
 
         # Do not deduplicate this list: repeated visual observations require
         # repeated ``<image>`` placeholders in exactly the same order.
         self.paths.append(relative)
+        self.timings["image_save_calls"] = self.timings.get("image_save_calls", 0.0) + 1
+        self.timings["image_bytes"] = self.timings.get("image_bytes", 0.0) + len(payload["bytes"])
+        self.timings["image_save_total_s"] = self.timings.get("image_save_total_s", 0.0) + (
+            time.perf_counter() - save_started
+        )
         return relative
 
 
@@ -130,6 +153,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=1,
         help="Number of trajectories to convert concurrently; image downloads are parallelized (default: 1).",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume an existing output directory and skip records already present by sample_id.",
+    )
+    parser.add_argument(
+        "--timing",
+        action="store_true",
+        help="Print detailed timing for input scan, trajectory conversion, image handling, and output writing.",
     )
     return parser
 
@@ -375,7 +408,9 @@ def _convert_record(
     row_index: int,
     output_dir: Path,
     source_base_dir: Path,
+    timing: bool = False,
 ) -> dict[str, Any]:
+    record_started = time.perf_counter()
     question = str(record.get("question") or "").strip()
     if not question:
         raise ConversionError("record has no top-level question")
@@ -443,6 +478,25 @@ def _convert_record(
             raise ConversionError("tool call has no observation")
 
     _validate_conversations(conversations)
+    if timing:
+        timing_values = dict(image_store.timings)
+        timing_values["record_total_s"] = time.perf_counter() - record_started
+        timing_values["image_count"] = len(image_store.paths)
+        timing_values["unique_image_files"] = image_store._counter
+        print(
+            "[convert-timing] "
+            + json.dumps(
+                {
+                    "stage": "trajectory",
+                    "sample_id": record.get("sample_id"),
+                    "question_id": record.get("question_id"),
+                    **timing_values,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+            flush=True,
+        )
     return {
         "id": image_store.sample_key,
         "question_id": record.get("question_id"),
@@ -491,13 +545,17 @@ def _materialize_image(source: Any, *, base_dir: Path) -> dict[str, Any]:
         path = Path(unquote(urlparse(value).path))
         return {"bytes": path.read_bytes(), "mime_type": None, "hint": str(path)}
     if value.startswith(("http://", "https://")):
+        # Use Alibaba OSS transfer acceleration for existing Beijing-region
+        # object URLs. The original URL remains the source hint for
+        # diagnostics and file suffix detection.
+        request_url = value.replace(_OSS_BEIJING_HOST, _OSS_ACCELERATE_HOST)
         response = None
         last_error: Exception | None = None
         max_attempts = _IMAGE_DOWNLOAD_RETRIES + 1
         for attempt in range(1, max_attempts + 1):
             response = None
             try:
-                response = requests.get(value, timeout=_IMAGE_DOWNLOAD_TIMEOUT_S)
+                response = requests.get(request_url, timeout=_IMAGE_DOWNLOAD_TIMEOUT_S)
                 status_code = int(getattr(response, "status_code", 0) or 0)
                 if status_code in _RETRYABLE_IMAGE_STATUS_CODES and attempt < max_attempts:
                     response.close()
@@ -604,6 +662,47 @@ def _write_json(path: Path, value: Any) -> None:
     path.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
+def _write_json_atomic(path: Path, value: Any) -> None:
+    """Write a JSON file through a sibling temporary file and replace atomically."""
+
+    temporary_path = path.with_name(f".{path.name}.tmp")
+    _write_json(temporary_path, value)
+    os.replace(temporary_path, path)
+
+
+def _record_identity(record: dict[str, Any]) -> tuple[str, ...] | None:
+    """Return a stable identity shared by raw and converted records."""
+
+    sample_id = record.get("sample_id")
+    if sample_id:
+        return ("sample_id", str(sample_id))
+    question_id = record.get("question_id")
+    path_id = record.get("path_id")
+    if question_id or path_id:
+        return ("question_path", str(question_id or ""), str(path_id or ""))
+    return None
+
+
+def _load_existing_rows(output_dir: Path) -> tuple[list[dict[str, Any]], set[tuple[str, ...]]]:
+    """Load rows from an existing ShareGPT output for ``--resume``."""
+
+    rows_path = output_dir / "trajectories_sharegpt.json"
+    if not rows_path.is_file():
+        raise FileNotFoundError(f"resume output is missing {rows_path}")
+    try:
+        rows = json.loads(rows_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ConversionError(f"invalid existing ShareGPT JSON: {rows_path}: {exc}") from exc
+    if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+        raise ConversionError(f"existing ShareGPT file must contain a JSON array of objects: {rows_path}")
+    identities = {
+        identity
+        for row in rows
+        if (identity := _record_identity(row)) is not None
+    }
+    return rows, identities
+
+
 def _rejection_reason_type(reason: str) -> str:
     """Map a conversion failure to a stable, summary-friendly category."""
 
@@ -626,6 +725,8 @@ def convert_file(
     offset: int = 0,
     limit: int = 0,
     workers: int = 1,
+    resume: bool = False,
+    timing: bool = False,
 ) -> dict[str, int]:
     """Convert a raw JSONL file and return counts for the CLI/tests."""
 
@@ -639,23 +740,49 @@ def convert_file(
         raise ValueError("workers must be a positive integer")
     if not input_path.is_file():
         raise FileNotFoundError(input_path)
-    if final_dir.exists():
+    total_started = time.perf_counter()
+    if final_dir.exists() and not resume:
         raise FileExistsError(f"output directory already exists; choose a new path: {final_dir}")
     final_dir.parent.mkdir(parents=True, exist_ok=True)
-    stage_dir = Path(tempfile.mkdtemp(prefix=f".{final_dir.name}.tmp-", dir=str(final_dir.parent)))
+    resumed_rows: list[dict[str, Any]] = []
+    resumed_identities: set[tuple[str, ...]] = set()
+    if resume:
+        resumed_rows, resumed_identities = _load_existing_rows(final_dir)
+    owns_stage_dir = not resume
+    stage_dir = (
+        Path(tempfile.mkdtemp(prefix=f".{final_dir.name}.tmp-", dir=str(final_dir.parent)))
+        if owns_stage_dir
+        else final_dir
+    )
     try:
-        (stage_dir / "images").mkdir()
+        (stage_dir / "images").mkdir(exist_ok=True)
         metadata_dir = stage_dir / ".metadata"
-        metadata_dir.mkdir()
-        rows: list[dict[str, Any]] = []
+        metadata_dir.mkdir(exist_ok=True)
+        rows: list[dict[str, Any]] = list(resumed_rows)
         rejected: list[dict[str, Any]] = []
         skipped_incorrect = 0
+        skipped_existing = 0
         records_to_convert: list[tuple[int, int, dict[str, Any]]] = []
-        for row_index, (line_number, record) in enumerate(_load_jsonl(input_path)):
+        input_scan_started = time.perf_counter()
+        input_iterator = _load_jsonl(input_path)
+        if limit:
+            input_iterator = tqdm(
+                input_iterator,
+                desc="Reading trajectories",
+                total=offset + limit,
+                unit="traj",
+            )
+        else:
+            input_iterator = tqdm(input_iterator, desc="Reading trajectories", unit="traj")
+        for row_index, (line_number, record) in enumerate(input_iterator):
             if row_index < offset:
                 continue
             if limit and row_index >= offset + limit:
                 break
+            identity = _record_identity(record)
+            if identity is not None and identity in resumed_identities:
+                skipped_existing += 1
+                continue
             if not include_incorrect and not bool((record.get("answer_judge") or {}).get("is_correct")):
                 skipped_incorrect += 1
                 reason = "answer_judge.is_correct is false"
@@ -670,6 +797,23 @@ def convert_file(
                 continue
             records_to_convert.append((row_index, line_number, record))
 
+        if timing:
+            print(
+                "[convert-timing] "
+                + json.dumps(
+                    {
+                        "stage": "input_scan",
+                        "elapsed_s": round(time.perf_counter() - input_scan_started, 6),
+                        "records_selected": len(records_to_convert),
+                        "records_skipped_existing": skipped_existing,
+                        "records_skipped_incorrect": skipped_incorrect,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
+
         def _convert_one(item: tuple[int, int, dict[str, Any]]) -> tuple[int, dict[str, Any] | None, dict[str, Any] | None]:
             row_index, line_number, record = item
             try:
@@ -678,6 +822,7 @@ def convert_file(
                     row_index=row_index,
                     output_dir=stage_dir,
                     source_base_dir=input_path.parent,
+                    timing=timing,
                 )
                 return row_index, row, None
             except Exception as exc:  # noqa: BLE001 - isolate bad records
@@ -692,6 +837,12 @@ def convert_file(
         # ``executor.map`` preserves input order.  This keeps the generated
         # ShareGPT rows deterministic while allowing independent image
         # downloads/materialization for different trajectories to overlap.
+        conversion_started = time.perf_counter()
+        conversion_progress = tqdm(
+            total=len(records_to_convert),
+            desc="Converting trajectories",
+            unit="traj",
+        )
         if workers == 1:
             converted = map(_convert_one, records_to_convert)
             for _row_index, row, error in converted:
@@ -699,6 +850,7 @@ def convert_file(
                     rows.append(row)
                 if error is not None:
                     rejected.append(error)
+                conversion_progress.update(1)
         else:
             with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="sharegpt-convert") as executor:
                 for _row_index, row, error in executor.map(_convert_one, records_to_convert):
@@ -706,11 +858,29 @@ def convert_file(
                         rows.append(row)
                     if error is not None:
                         rejected.append(error)
+                    conversion_progress.update(1)
+        conversion_progress.close()
+        if timing:
+            print(
+                "[convert-timing] "
+                + json.dumps(
+                    {
+                        "stage": "trajectory_conversion",
+                        "elapsed_s": round(time.perf_counter() - conversion_started, 6),
+                        "records_selected": len(records_to_convert),
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
 
         rejection_reason_counts = Counter(str(item.get("reason_type") or "unknown") for item in rejected)
-        _write_json(stage_dir / "trajectories_sharegpt.json", rows)
-        _write_json(stage_dir / "dataset_info.json", _dataset_info())
-        _write_json(
+        output_started = time.perf_counter()
+        write_json = _write_json_atomic if resume else _write_json
+        write_json(stage_dir / "trajectories_sharegpt.json", rows)
+        write_json(stage_dir / "dataset_info.json", _dataset_info())
+        write_json(
             metadata_dir / "summary.json",
             {
                 "input_jsonl": str(input_path),
@@ -723,21 +893,53 @@ def convert_file(
                 "offset": offset,
                 "limit": limit,
                 "workers": workers,
+                "resume": resume,
+                "resumed_records": len(resumed_rows),
+                "skipped_existing": skipped_existing,
                 "image_count": sum(len(row.get("images") or []) for row in rows),
             },
         )
         with (metadata_dir / "rejected.jsonl").open("w", encoding="utf-8") as handle:
             for item in rejected:
                 handle.write(json.dumps(item, ensure_ascii=False) + "\n")
-        stage_dir.rename(final_dir)
+        if owns_stage_dir:
+            stage_dir.rename(final_dir)
+        if timing:
+            print(
+                "[convert-timing] "
+                + json.dumps(
+                    {
+                        "stage": "output_write",
+                        "elapsed_s": round(time.perf_counter() - output_started, 6),
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
+            print(
+                "[convert-timing] "
+                + json.dumps(
+                    {
+                        "stage": "total",
+                        "elapsed_s": round(time.perf_counter() - total_started, 6),
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
         return {
             "written_records": len(rows),
             "rejected_records": len(rejected),
             "skipped_incorrect": skipped_incorrect,
+            "resumed_records": len(resumed_rows),
+            "skipped_existing": skipped_existing,
             "oss_image_download_timeout_rejected": rejection_reason_counts.get("oss_image_download_timeout", 0),
         }
     except Exception:
-        shutil.rmtree(stage_dir, ignore_errors=True)
+        if owns_stage_dir:
+            shutil.rmtree(stage_dir, ignore_errors=True)
         raise
 
 
@@ -751,6 +953,8 @@ def main(argv: list[str] | None = None) -> int:
             offset=args.offset,
             limit=args.limit,
             workers=args.workers,
+            resume=args.resume,
+            timing=args.timing,
         )
     except Exception as exc:  # noqa: BLE001
         raise SystemExit(str(exc)) from exc
