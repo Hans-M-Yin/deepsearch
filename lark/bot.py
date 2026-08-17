@@ -38,6 +38,8 @@ except ImportError:  # pragma: no cover - environment files are optional
 LOGGER = logging.getLogger("lark_command_bot")
 PROGRESS_INTERVAL_SECONDS = 60
 PROGRESS_LINE_COUNT = 30
+FULL_OUTPUT_CHUNK_CHARS = 8000
+FULL_OUTPUT_FLUSH_INTERVAL_SECONDS = 2.0
 
 
 def _load_environment() -> None:
@@ -253,6 +255,7 @@ def run_shell_command(
     command: str,
     config: Config,
     on_progress: Callable[[str, int], None] | None = None,
+    on_output: Callable[[str, str], None] | None = None,
 ) -> ExecutionResult:
     """Run a command locally and optionally report live output periodically."""
     start_time = time.monotonic()
@@ -335,6 +338,11 @@ def run_shell_command(
                     _append_tail(stdout_tail, chunk, max_bytes)
                 else:
                     _append_tail(stderr_tail, chunk, max_bytes)
+                if on_output is not None:
+                    on_output(
+                        key.data,
+                        chunk.decode("utf-8", errors="replace"),
+                    )
                 consume_lines(key.data, chunk)
 
             maybe_report_progress()
@@ -384,18 +392,67 @@ def _message_text(content: Any) -> str:
     return ""
 
 
-def _parse_command(raw_command: str) -> tuple[str, bool]:
-    """Strip the optional SLICENCE prefix and return its progress mode."""
-    prefix = "SLICENCE"
+def _strip_command_prefix(raw_command: str, prefix: str) -> str | None:
     if raw_command == prefix:
-        return "", True
-
+        return ""
+    if not raw_command.startswith(prefix):
+        return None
     remainder = raw_command[len(prefix) :]
-    if raw_command.startswith(prefix) and remainder and (
-        remainder[0].isspace() or remainder[0] == ":"
-    ):
-        return remainder.lstrip(" \t\r\n:"), True
-    return raw_command, False
+    if not remainder or not (remainder[0].isspace() or remainder[0] == ":"):
+        return None
+    return remainder.lstrip(" \t\r\n:")
+
+
+def _parse_command(raw_command: str) -> tuple[str, str]:
+    """Return the command and one of normal, silent, or full output modes."""
+    for prefix, mode in (("SLICENCE", "silent"), ("FULL", "full")):
+        command = _strip_command_prefix(raw_command, prefix)
+        if command is not None:
+            return command, mode
+    return raw_command, "normal"
+
+
+class FullOutputReporter:
+    """Forward all command output in bounded, rate-limited Feishu messages."""
+
+    def __init__(self, bot: "CommandBot", message_id: str) -> None:
+        self.bot = bot
+        self.message_id = message_id
+        self.pending = ""
+        self.last_flush_at = 0.0
+
+    def append(self, stream_name: str, text: str) -> None:
+        if not text:
+            return
+        self.pending += f"[{stream_name}]\n{text}"
+        now = time.monotonic()
+        flush_due = (
+            not self.last_flush_at
+            or now - self.last_flush_at >= FULL_OUTPUT_FLUSH_INTERVAL_SECONDS
+        )
+        if flush_due and (
+            len(self.pending) >= FULL_OUTPUT_CHUNK_CHARS
+            or now - self.last_flush_at >= FULL_OUTPUT_FLUSH_INTERVAL_SECONDS
+        ):
+            self._flush_one()
+
+    def _flush_one(self) -> None:
+        if not self.pending:
+            return
+        chunk = self.pending[:FULL_OUTPUT_CHUNK_CHARS]
+        self.pending = self.pending[FULL_OUTPUT_CHUNK_CHARS:]
+        self.bot._send_reply(
+            self.message_id,
+            f"实时输出：\n{chunk}",
+        )
+        self.last_flush_at = time.monotonic()
+
+    def finish(self) -> None:
+        while self.pending:
+            elapsed = time.monotonic() - self.last_flush_at
+            if self.last_flush_at and elapsed < FULL_OUTPUT_FLUSH_INTERVAL_SECONDS:
+                time.sleep(FULL_OUTPUT_FLUSH_INTERVAL_SECONDS - elapsed)
+            self._flush_one()
 
 
 class CommandBot:
@@ -437,20 +494,26 @@ class CommandBot:
         )
 
     def _execute_and_report(
-        self, message_id: str, command: str, suppress_progress: bool
+        self, message_id: str, command: str, output_mode: str
     ) -> None:
+        full_reporter = (
+            FullOutputReporter(self, message_id) if output_mode == "full" else None
+        )
         try:
             result = run_shell_command(
                 command,
                 self.config,
                 on_progress=(
                     None
-                    if suppress_progress
+                    if output_mode != "normal"
                     else lambda output, elapsed: self._reply_progress(
                         message_id, output, elapsed
                     )
                 ),
+                on_output=(full_reporter.append if full_reporter else None),
             )
+            if full_reporter:
+                full_reporter.finish()
             if not result.timed_out and result.returncode == 0:
                 LOGGER.info("command succeeded: message_id=%s", message_id)
                 self._send_reply(message_id, "Done!")
@@ -465,12 +528,15 @@ class CommandBot:
                 headline = f"命令执行失败，退出码：{result.returncode}"
 
             output_parts = [headline, f"$ {command}"]
-            if result.stderr.strip():
-                output_parts.append(f"stderr:\n{result.stderr.strip()}")
-            if result.stdout.strip():
-                output_parts.append(f"stdout:\n{result.stdout.strip()}")
-            if len(output_parts) == 2:
-                output_parts.append("命令没有输出。")
+            if output_mode == "full":
+                output_parts.append("完整输出已在前面的消息中发送。")
+            else:
+                if result.stderr.strip():
+                    output_parts.append(f"stderr:\n{result.stderr.strip()}")
+                if result.stdout.strip():
+                    output_parts.append(f"stdout:\n{result.stdout.strip()}")
+                if len(output_parts) == 2:
+                    output_parts.append("命令没有输出。")
 
             self._send_reply(
                 message_id,
@@ -478,6 +544,8 @@ class CommandBot:
             )
         except Exception as exc:
             LOGGER.exception("command execution failed unexpectedly: message_id=%s", message_id)
+            if full_reporter:
+                full_reporter.finish()
             self._send_reply(message_id, f"机器人执行命令时发生异常：{exc}")
 
     def handle_message(self, data: Any) -> None:
@@ -516,7 +584,7 @@ class CommandBot:
                 LOGGER.info("ignored non-text message: message_id=%s", message_id)
                 return
 
-            command, suppress_progress = _parse_command(
+            command, output_mode = _parse_command(
                 _message_text(message.get("content")).strip()
             )
             if not command:
@@ -527,17 +595,17 @@ class CommandBot:
 
             LOGGER.info(
                 "accepted command: tenant_key=%s open_id=%s message_id=%s "
-                "suppress_progress=%s",
+                "output_mode=%s",
                 tenant_key,
                 open_id,
                 message_id,
-                suppress_progress,
+                output_mode,
             )
             self.executor.submit(
                 self._execute_and_report,
                 message_id,
                 command,
-                suppress_progress,
+                output_mode,
             )
         except Exception:
             # Never let malformed input make Feishu retry the event indefinitely.
