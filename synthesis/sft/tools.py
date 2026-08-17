@@ -85,12 +85,39 @@ _URL_KEYWORD_CACHE_LOCK = threading.Lock()
 # this transport-level guard isolated and switchable so it can be removed (or
 # disabled) without changing any tool implementation.
 _WIKIMEDIA_UPLOAD_HOST = "upload.wikimedia.org"
-_WIKIMEDIA_REQUEST_SEMAPHORE = threading.BoundedSemaphore(3)
+_WIKIMEDIA_MAX_CONCURRENCY_ENV = "SFT_WIKIMEDIA_MAX_CONCURRENCY"
+_WIKIMEDIA_DEFAULT_MAX_CONCURRENCY = 3
+
+
+def _configured_wikimedia_max_concurrency() -> int:
+    """Read the per-process Wikimedia media concurrency limit.
+
+    The environment is read during module initialization, so configure
+    ``SFT_WIKIMEDIA_MAX_CONCURRENCY`` before starting the Python process.  A
+    non-positive or malformed value falls back to the historical default
+    instead of disabling the guard accidentally; disable the whole throttle
+    explicitly with ``SFT_WIKIMEDIA_THROTTLE=false`` if that is intended.
+    """
+
+    raw = str(os.environ.get(_WIKIMEDIA_MAX_CONCURRENCY_ENV) or "").strip()
+    if not raw:
+        return _WIKIMEDIA_DEFAULT_MAX_CONCURRENCY
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return _WIKIMEDIA_DEFAULT_MAX_CONCURRENCY
+    return value if value > 0 else _WIKIMEDIA_DEFAULT_MAX_CONCURRENCY
+
+
+_WIKIMEDIA_MAX_CONCURRENCY = _configured_wikimedia_max_concurrency()
+_WIKIMEDIA_REQUEST_SEMAPHORE = threading.BoundedSemaphore(_WIKIMEDIA_MAX_CONCURRENCY)
 _WIKIMEDIA_THROTTLE_LOCK = threading.Lock()
 _WIKIMEDIA_NEXT_REQUEST_AT = 0.0
 _WIKIMEDIA_COOLDOWN_UNTIL = 0.0
 _WIKIMEDIA_ACTIVE_REQUESTS = 0
 _WIKIMEDIA_QUEUED_REQUESTS = 0
+_WIKIMEDIA_CACHE_LOCK = threading.Lock()
+_WIKIMEDIA_CACHE_KEY_LOCKS: dict[str, threading.Lock] = {}
 
 _URL_KEYWORD_NOISE_TOKENS = {
     "image", "images", "img", "upload", "uploads", "static", "media",
@@ -215,8 +242,14 @@ def _acquire_wikimedia_request_slot(url: str) -> bool:
         _WIKIMEDIA_QUEUED_REQUESTS += 1
         queued = _WIKIMEDIA_QUEUED_REQUESTS
         active = _WIKIMEDIA_ACTIVE_REQUESTS
-    if active >= 3 or queued > 1:
-        _wikimedia_throttle_debug("queued", active=active, queued=queued, url=url)
+    if active >= _WIKIMEDIA_MAX_CONCURRENCY or queued > 1:
+        _wikimedia_throttle_debug(
+            "queued",
+            active=active,
+            queued=queued,
+            max_concurrency=_WIKIMEDIA_MAX_CONCURRENCY,
+            url=url,
+        )
 
     semaphore_acquired = False
     try:
@@ -239,6 +272,7 @@ def _acquire_wikimedia_request_slot(url: str) -> bool:
                 "started",
                 active=active,
                 queued=queued,
+                max_concurrency=_WIKIMEDIA_MAX_CONCURRENCY,
                 wait_s=round(wait_s, 3),
                 url=url,
             )
@@ -310,6 +344,26 @@ def _read_url_debug(message: str, **kwargs: Any) -> None:
     details = " ".join(f"{key}={value!r}" for key, value in kwargs.items())
     suffix = f" {details}" if details else ""
     print(f"[read_url debug] {message}{suffix}", file=sys.stderr, flush=True)
+
+
+def _read_url_timing_add(
+    timings: dict[str, float] | None,
+    key: str,
+    elapsed_s: float,
+) -> None:
+    if timings is None:
+        return
+    timings[key] = timings.get(key, 0.0) + max(0.0, float(elapsed_s))
+
+
+def _read_url_timed_sleep(
+    timings: dict[str, float] | None,
+    key: str,
+    sleep_s: float,
+) -> None:
+    started_at = time.monotonic()
+    time.sleep(max(0.0, float(sleep_s)))
+    _read_url_timing_add(timings, key, time.monotonic() - started_at)
 
 
 def _tool_retry_debug(
@@ -510,6 +564,7 @@ def _source_page_image_candidates(
     *,
     max_retries: int | None = None,
     max_429_retries: int | None = None,
+    timings: dict[str, float] | None = None,
 ) -> list[str]:
     """Best-effort og:image/twitter:image extraction from a result page."""
     if resource is None or not resource.source_page_url:
@@ -531,6 +586,8 @@ def _source_page_image_candidates(
             ),
             retry_429_sleep_s=_read_url_429_retry_sleep_s(),
             retry_on_429=True,
+            timings=timings,
+            timing_prefix="image_source_page_http",
         )
         html = response.text
         response.close()
@@ -1134,6 +1191,131 @@ def _sniff_pdf_content_type(payload: bytes) -> str:
     return "application/pdf" if payload.startswith(b"%PDF-") else ""
 
 
+def _wikimedia_cache_root() -> Path:
+    configured = str(os.environ.get("SFT_WIKIMEDIA_CACHE_DIR") or "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    return Path(__file__).resolve().parents[1] / ".ignore" / "wiki_caches"
+
+
+def _wikimedia_cache_paths(url: str) -> tuple[Path, Path]:
+    """Return persistent payload and metadata paths for one exact URL."""
+
+    digest = sha256(str(url).encode("utf-8")).hexdigest()
+    root = _wikimedia_cache_root()
+    shard = root / "objects" / digest[:2]
+    return shard / f"{digest}.bin", shard / f"{digest}.json"
+
+
+def _wikimedia_cache_key_lock(url: str) -> threading.Lock:
+    digest = sha256(str(url).encode("utf-8")).hexdigest()
+    with _WIKIMEDIA_CACHE_LOCK:
+        lock = _WIKIMEDIA_CACHE_KEY_LOCKS.get(digest)
+        if lock is None:
+            lock = threading.Lock()
+            _WIKIMEDIA_CACHE_KEY_LOCKS[digest] = lock
+        return lock
+
+
+def _wikimedia_cache_read(url: str) -> tuple[bytes, str] | None:
+    """Read a cache entry only when its stored URL exactly matches ``url``."""
+
+    if not _is_wikimedia_upload_url(url):
+        return None
+    payload_path, metadata_path = _wikimedia_cache_paths(url)
+    try:
+        if not payload_path.is_file() or not metadata_path.is_file():
+            return None
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        if metadata.get("url") != url:
+            return None
+        content_type = str(metadata.get("content_type") or "")
+        if not content_type.startswith("image/"):
+            return None
+        return payload_path.read_bytes(), content_type
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return None
+
+
+def _wikimedia_cache_atomic_write(path: Path, payload: bytes | str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temporary_path = Path(handle.name)
+            if isinstance(payload, str):
+                payload = payload.encode("utf-8")
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, path)
+    finally:
+        if temporary_path is not None and temporary_path.exists():
+            try:
+                temporary_path.unlink()
+            except OSError:
+                pass
+
+
+def _wikimedia_cache_write(url: str, payload: bytes, content_type: str) -> None:
+    if not _is_wikimedia_upload_url(url):
+        return
+    payload_path, metadata_path = _wikimedia_cache_paths(url)
+    metadata = {
+        "url": url,
+        "content_type": content_type,
+        "byte_count": len(payload),
+        "created_at": time.time(),
+    }
+    try:
+        _wikimedia_cache_atomic_write(payload_path, payload)
+        _wikimedia_cache_atomic_write(
+            metadata_path,
+            json.dumps(metadata, ensure_ascii=False, sort_keys=True),
+        )
+    except OSError as exc:
+        _wikimedia_throttle_debug("cache_write_failed", url=url, error=str(exc))
+
+
+def _download_image_payload_with_cache(
+    url: str,
+    *,
+    fetch: Callable[[], tuple[bytes, str]],
+    content_type_hint: str = "",
+) -> tuple[bytes, str, bool]:
+    """Fetch an image, using a persistent exact-URL Wikimedia cache."""
+
+    if not _is_wikimedia_upload_url(url):
+        payload, downloaded_type = fetch()
+        content_type = downloaded_type or _sniff_image_content_type(payload) or content_type_hint
+        if not content_type.startswith("image/"):
+            raise ValueError(f"downloaded fallback is not an image: {content_type or 'unknown'}")
+        return payload, content_type, False
+
+    # This lock is process-local.  It prevents duplicate downloads for the
+    # same URL from threads in one process; the persistent files are written
+    # atomically for safe reads by other processes.
+    with _wikimedia_cache_key_lock(url):
+        cached = _wikimedia_cache_read(url)
+        if cached is not None:
+            _wikimedia_throttle_debug("cache_hit", url=url)
+            return cached[0], cached[1], True
+
+        payload, downloaded_type = fetch()
+        content_type = downloaded_type or _sniff_image_content_type(payload) or content_type_hint
+        if not content_type.startswith("image/"):
+            raise ValueError(f"downloaded fallback is not an image: {content_type or 'unknown'}")
+        _wikimedia_cache_write(url, payload, content_type)
+        _wikimedia_throttle_debug("cache_store", url=url, byte_count=len(payload))
+        return payload, content_type, False
+
+
 def _should_retry_http_status(status_code: int) -> bool:
     return status_code in {429, 500, 502, 503, 504}
 
@@ -1165,6 +1347,8 @@ def _request_with_retry(
     retry_on_429: bool = True,
     max_429_retries: int | None = 1,
     retry_429_sleep_s: float = TOOL_429_RETRY_SLEEP_S,
+    timings: dict[str, float] | None = None,
+    timing_prefix: str = "http",
     **kwargs: Any,
 ) -> requests.Response:
     last_error: Exception | None = None
@@ -1173,8 +1357,25 @@ def _request_with_retry(
         response: requests.Response | None = None
         wikimedia_slot_acquired = False
         try:
-            wikimedia_slot_acquired = _acquire_wikimedia_request_slot(url)
-            response = requests.request(method, url, timeout=timeout, **kwargs)
+            throttle_started_at = time.monotonic()
+            try:
+                wikimedia_slot_acquired = _acquire_wikimedia_request_slot(url)
+            finally:
+                _read_url_timing_add(
+                    timings,
+                    f"{timing_prefix}_throttle_wait_s",
+                    time.monotonic() - throttle_started_at,
+                )
+
+            request_started_at = time.monotonic()
+            try:
+                response = requests.request(method, url, timeout=timeout, **kwargs)
+            finally:
+                _read_url_timing_add(
+                    timings,
+                    f"{timing_prefix}_request_s",
+                    time.monotonic() - request_started_at,
+                )
             if response.status_code == 429:
                 _note_wikimedia_429(url, response.headers.get("Retry-After"))
             if response.status_code == 429:
@@ -1204,7 +1405,11 @@ def _request_with_retry(
                     method=method,
                     url=url,
                 )
-                time.sleep(sleep_s)
+                _read_url_timed_sleep(
+                    timings,
+                    f"{timing_prefix}_retry_sleep_s",
+                    sleep_s,
+                )
                 continue
             response.raise_for_status()
             return response
@@ -1223,7 +1428,11 @@ def _request_with_retry(
                     method=method,
                     url=url,
                 )
-                time.sleep(sleep_s)
+                _read_url_timed_sleep(
+                    timings,
+                    f"{timing_prefix}_retry_sleep_s",
+                    sleep_s,
+                )
                 continue
             raise
         except requests.HTTPError as exc:
@@ -1263,7 +1472,11 @@ def _request_with_retry(
                     method=method,
                     url=url,
                 )
-                time.sleep(sleep_s)
+                _read_url_timed_sleep(
+                    timings,
+                    f"{timing_prefix}_retry_sleep_s",
+                    sleep_s,
+                )
                 continue
             raise
         except Exception as exc:
@@ -1424,6 +1637,8 @@ def _download_binary(
     retry_on_429: bool = True,
     max_429_retries: int | None = None,
     retry_429_sleep_s: float | None = None,
+    timings: dict[str, float] | None = None,
+    timing_prefix: str = "binary_http",
 ) -> tuple[bytes, str]:
     effective_max_retries = TOOL_TIMEOUT_RETRIES if max_retries is None else max(0, int(max_retries))
     effective_retry_sleep_s = TOOL_RETRY_SLEEP_S if retry_sleep_s is None else max(0, int(retry_sleep_s))
@@ -1441,12 +1656,108 @@ def _download_binary(
         retry_on_429=retry_on_429,
         max_429_retries=effective_max_429_retries,
         retry_429_sleep_s=effective_retry_429_sleep_s,
+        timings=timings,
+        timing_prefix=timing_prefix,
     )
     content_type = response.headers.get("Content-Type", "")
     normalized = content_type.split(";", 1)[0].strip().lower() if content_type else ""
     payload = response.content
     response.close()
     return payload, normalized
+
+
+def _configured_image_download_backend(url: str) -> str:
+    """Choose the image transport without exposing backend state to the agent.
+
+    ``http`` preserves the historical direct-download behavior.  The Firecrawl
+    Browser transport is opt-in while it is being evaluated:
+
+    - ``firecrawl_browser``: Browser only;
+    - ``firecrawl_browser_then_http``: Browser first, direct HTTP only if it
+      fails;
+    - ``http``: direct HTTP only.
+
+    Wikimedia can be configured independently with
+    ``SFT_WIKIMEDIA_IMAGE_DOWNLOAD_BACKEND``.  This lets RL runs move the
+    throttled Wikimedia path to Firecrawl without changing other image hosts.
+    """
+
+    configured = ""
+    if _is_wikimedia_upload_url(url):
+        configured = str(os.environ.get("SFT_WIKIMEDIA_IMAGE_DOWNLOAD_BACKEND") or "").strip()
+    if not configured:
+        configured = str(os.environ.get("SFT_IMAGE_DOWNLOAD_BACKEND") or "http").strip()
+    normalized = configured.lower().replace("-", "_")
+    aliases = {
+        "firecrawl": "firecrawl_browser",
+        "browser": "firecrawl_browser",
+        "firecrawl_browser_fallback": "firecrawl_browser_then_http",
+    }
+    normalized = aliases.get(normalized, normalized)
+    if normalized not in {"http", "firecrawl_browser", "firecrawl_browser_then_http"}:
+        raise ValueError(
+            "Unsupported image download backend "
+            f"{configured!r}; expected http, firecrawl_browser, or firecrawl_browser_then_http."
+        )
+    return normalized
+
+
+def _download_image_with_configured_backend(
+    url: str,
+    *,
+    referer_url: str | None,
+    timeout: int,
+    max_retries: int,
+    retry_sleep_s: int,
+    retry_on_429: bool,
+    max_429_retries: int,
+    retry_429_sleep_s: float,
+    timings: dict[str, float] | None,
+    timing_prefix: str,
+) -> tuple[bytes, str, str]:
+    """Return image bytes, MIME type, and backend name for one candidate URL.
+
+    The Firecrawl Browser implementation owns sessions, key selection, remote
+    Playwright execution, Base64 decoding, and image validation.  This adapter
+    intentionally contains no Browser/session logic so ``read_url`` remains a
+    consumer of an ordinary byte-download interface.
+    """
+
+    backend = _configured_image_download_backend(url)
+    if backend in {"firecrawl_browser", "firecrawl_browser_then_http"}:
+        browser_started_at = time.monotonic()
+        try:
+            from synthesis.firecrawl_client import FirecrawlBrowserImageDownloader
+
+            downloaded = FirecrawlBrowserImageDownloader.from_environment().download(
+                url,
+                referer_url=referer_url,
+                timeout_s=timeout,
+            )
+            return downloaded.payload, downloaded.content_type, "firecrawl_browser"
+        except Exception:
+            if backend == "firecrawl_browser":
+                raise
+        finally:
+            _read_url_timing_add(
+                timings,
+                "image_firecrawl_browser_s",
+                time.monotonic() - browser_started_at,
+            )
+
+    payload, content_type = _download_binary(
+        url,
+        timeout=timeout,
+        referer_url=referer_url,
+        max_retries=max_retries,
+        retry_sleep_s=retry_sleep_s,
+        retry_on_429=retry_on_429,
+        max_429_retries=max_429_retries,
+        retry_429_sleep_s=retry_429_sleep_s,
+        timings=timings,
+        timing_prefix=timing_prefix,
+    )
+    return payload, content_type, "http_fallback" if backend == "firecrawl_browser_then_http" else "http"
 
 
 def _extract_pdf_text(pdf_path: str) -> tuple[str, str]:
@@ -1568,7 +1879,12 @@ def _read_document(url: str) -> dict[str, Any]:
     }
 
 
-def _read_document_with_timeout_retry(url: str) -> dict[str, Any]:
+def _read_document_with_timeout_retry(
+    url: str,
+    *,
+    timings: dict[str, float] | None = None,
+    timing_prefix: str = "enhanced_reader",
+) -> dict[str, Any]:
     """Read via Enhanced Reader, retrying only transport timeouts.
 
     A blocked-page response is a valid reader response and must proceed to the
@@ -1577,6 +1893,7 @@ def _read_document_with_timeout_retry(url: str) -> dict[str, Any]:
     """
 
     for attempt in range(1, TOOL_TIMEOUT_RETRIES + 2):
+        attempt_started_at = time.monotonic()
         try:
             return _read_document(url)
         except Exception as exc:
@@ -1597,7 +1914,17 @@ def _read_document_with_timeout_retry(url: str) -> dict[str, Any]:
                 error=exc,
                 url=url,
             )
-            time.sleep(TOOL_RETRY_SLEEP_S * attempt)
+            _read_url_timed_sleep(
+                timings,
+                f"{timing_prefix}_retry_sleep_s",
+                TOOL_RETRY_SLEEP_S * attempt,
+            )
+        finally:
+            _read_url_timing_add(
+                timings,
+                f"{timing_prefix}_attempt_s",
+                time.monotonic() - attempt_started_at,
+            )
     raise AssertionError("unreachable")
 
 
@@ -1627,10 +1954,15 @@ def _read_via_firecrawl(url: str) -> dict[str, Any]:
     }
 
 
-def _read_via_firecrawl_with_timeout_retry(url: str) -> dict[str, Any]:
+def _read_via_firecrawl_with_timeout_retry(
+    url: str,
+    *,
+    timings: dict[str, float] | None = None,
+) -> dict[str, Any]:
     """Use the fallback reader with the same timeout retry budget as read_url."""
 
     for attempt in range(1, TOOL_TIMEOUT_RETRIES + 2):
+        attempt_started_at = time.monotonic()
         try:
             return _read_via_firecrawl(url)
         except Exception as exc:
@@ -1651,7 +1983,17 @@ def _read_via_firecrawl_with_timeout_retry(url: str) -> dict[str, Any]:
                 error=exc,
                 url=url,
             )
-            time.sleep(TOOL_RETRY_SLEEP_S * attempt)
+            _read_url_timed_sleep(
+                timings,
+                "firecrawl_retry_sleep_s",
+                TOOL_RETRY_SLEEP_S * attempt,
+            )
+        finally:
+            _read_url_timing_add(
+                timings,
+                "firecrawl_attempt_s",
+                time.monotonic() - attempt_started_at,
+            )
     raise AssertionError("unreachable")
 
 
@@ -1666,15 +2008,23 @@ def _read_url_with_firecrawl_fallback(
     assistant_output: str,
     original_title: str = "",
     trigger: str,
+    timings: dict[str, float] | None = None,
 ) -> dict[str, Any]:
     """Read through Firecrawl and summarize after Enhanced Reader is unavailable/blocked."""
+    fallback_started_at = time.monotonic()
     try:
-        firecrawl_document = _read_via_firecrawl_with_timeout_retry(url)
+        firecrawl_document = _read_via_firecrawl_with_timeout_retry(url, timings=timings)
         content = firecrawl_document["content"]
+        summary_started_at = time.monotonic()
         summarized = summarize_with_qwen(
             content=content,
             goal=goal,
             assistant_output=assistant_output,
+        )
+        _read_url_timing_add(
+            timings,
+            "firecrawl_summary_s",
+            time.monotonic() - summary_started_at,
         )
     except Exception as exc:  # pragma: no cover - network bound
         _record_read_url_call(branch="text", success=False)
@@ -1682,6 +2032,12 @@ def _read_url_with_firecrawl_fallback(
             "ok": False,
             "error": f"{trigger}; Firecrawl fallback failed for {url}: {exc}",
         }
+    finally:
+        _read_url_timing_add(
+            timings,
+            "firecrawl_fallback_s",
+            time.monotonic() - fallback_started_at,
+        )
 
     _read_url_debug("firecrawl_fallback_done", url=url, content_chars=len(content))
     _record_read_url_call(branch="text", success=True)
@@ -1702,10 +2058,50 @@ def read_url(
     assistant_output: str = "",
     resource: UrlResource | None = None,
 ) -> dict[str, Any]:
+    """Read a URL and emit one end-of-call timing summary when debug is enabled."""
+
+    started_at = time.monotonic()
+    timings: dict[str, float] = {}
+    result: dict[str, Any] | None = None
+    try:
+        result = _read_url_impl(
+            url,
+            goal=goal,
+            assistant_output=assistant_output,
+            resource=resource,
+            _timings=timings,
+        )
+        return result
+    finally:
+        summary: dict[str, Any] = {
+            "url": (url or "").strip(),
+            "total_s": round(time.monotonic() - started_at, 3),
+            "ok": result.get("ok") if isinstance(result, dict) else None,
+            "resolved_via": result.get("resolved_via") if isinstance(result, dict) else None,
+        }
+        for key in sorted(timings):
+            summary[key if key.endswith("_s") else f"{key}_s"] = round(timings[key], 3)
+        _read_url_debug("timing_summary", **summary)
+
+
+def _read_url_impl(
+    url: str,
+    goal: str = "",
+    assistant_output: str = "",
+    resource: UrlResource | None = None,
+    *,
+    _timings: dict[str, float] | None = None,
+) -> dict[str, Any]:
     """Read a URL as either text content or a downloadable image."""
 
     original_url = (url or "").strip()
+    normalize_started_at = time.monotonic()
     normalized_url = _normalize_request_url(original_url)
+    _read_url_timing_add(
+        _timings,
+        "normalize_s",
+        time.monotonic() - normalize_started_at,
+    )
     if not normalized_url:
         return {"ok": False, "error": "URL is required."}
     _read_url_debug("normalized_url", original_url=original_url, normalized_url=normalized_url)
@@ -1715,10 +2111,18 @@ def read_url(
     # the binary paths; all other URLs are sent directly to Enhanced Reader.
     # This avoids multiplying a single read into several retryable requests
     # (and is especially important for sites returning HTTP 429 to HEAD).
-    content_type, content_type_source, is_image_resource = _classify_read_url_content_type(
-        normalized_url,
-        resource=resource,
-    )
+    classify_started_at = time.monotonic()
+    try:
+        content_type, content_type_source, is_image_resource = _classify_read_url_content_type(
+            normalized_url,
+            resource=resource,
+        )
+    finally:
+        _read_url_timing_add(
+            _timings,
+            "classify_s",
+            time.monotonic() - classify_started_at,
+        )
     _read_url_debug(
         "classified_content_type",
         url=normalized_url,
@@ -1747,43 +2151,84 @@ def read_url(
         while candidate_index < len(candidates):
             candidate_kind, candidate_url, referer_url = candidates[candidate_index]
             candidate_index += 1
+            candidate_started_at = time.monotonic()
             try:
                 temp_dir = tempfile.mkdtemp(prefix="synthesis_sft_read_url_")
                 filename = os.path.basename(urlparse(candidate_url).path) or "downloaded_image"
-                response_content, downloaded_type = _download_binary(
-                    candidate_url,
-                    timeout=TOOL_NETWORK_TIMEOUT_S,
-                    referer_url=referer_url,
-                    max_retries=image_max_retries,
-                    retry_sleep_s=image_retry_sleep_s,
-                    retry_on_429=True,
-                    max_429_retries=image_max_429_retries,
-                    retry_429_sleep_s=image_429_retry_sleep_s,
-                )
-                candidate_content_type = (
-                    downloaded_type
-                    or _sniff_image_content_type(response_content)
-                    or _guess_image_content_type(candidate_url)
-                    or (content_type if content_type != "text/html" else "")
-                )
-                if not candidate_content_type.startswith("image/"):
-                    raise ValueError(f"downloaded fallback is not an image: {candidate_content_type or 'unknown'}")
-                image_bytes, resolved_content_type = _maybe_resize_downloaded_image(
-                    response_content,
-                    content_type=candidate_content_type,
-                )
+                download_backend: dict[str, str] = {}
+                download_started_at = time.monotonic()
+                try:
+                    def _fetch_candidate_image() -> tuple[bytes, str]:
+                        payload, downloaded_type, backend_name = _download_image_with_configured_backend(
+                            candidate_url,
+                            timeout=TOOL_NETWORK_TIMEOUT_S,
+                            referer_url=referer_url,
+                            max_retries=image_max_retries,
+                            retry_sleep_s=image_retry_sleep_s,
+                            retry_on_429=True,
+                            max_429_retries=image_max_429_retries,
+                            retry_429_sleep_s=image_429_retry_sleep_s,
+                            timings=_timings,
+                            timing_prefix="image_http",
+                        )
+                        download_backend["name"] = backend_name
+                        return payload, downloaded_type
+
+                    response_content, candidate_content_type, from_cache = _download_image_payload_with_cache(
+                        candidate_url,
+                        content_type_hint=(
+                            _guess_image_content_type(candidate_url)
+                            or (content_type if content_type != "text/html" else "")
+                        ),
+                        fetch=_fetch_candidate_image,
+                    )
+                finally:
+                    _read_url_timing_add(
+                        _timings,
+                        "image_download_s",
+                        time.monotonic() - download_started_at,
+                    )
+                transform_started_at = time.monotonic()
+                try:
+                    image_bytes, resolved_content_type = _maybe_resize_downloaded_image(
+                        response_content,
+                        content_type=candidate_content_type,
+                    )
+                finally:
+                    _read_url_timing_add(
+                        _timings,
+                        "image_transform_s",
+                        time.monotonic() - transform_started_at,
+                    )
                 extension = mimetypes.guess_extension(resolved_content_type) or os.path.splitext(filename)[1] or ".png"
                 stem = os.path.splitext(filename)[0] or "downloaded_image"
                 filename = f"{stem}{extension}"
                 save_path = os.path.join(temp_dir, filename)
-                with open(save_path, "wb") as handle:
-                    handle.write(image_bytes)
+                save_started_at = time.monotonic()
+                try:
+                    with open(save_path, "wb") as handle:
+                        handle.write(image_bytes)
+                finally:
+                    _read_url_timing_add(
+                        _timings,
+                        "image_save_s",
+                        time.monotonic() - save_started_at,
+                    )
                 _record_read_url_call(branch="image", success=True)
                 return {
                     "ok": True,
                     "url": normalized_url,
                     "resolved_url": candidate_url,
-                    "resolved_via": candidate_kind,
+                    "resolved_via": (
+                        "wikimedia_cache"
+                        if from_cache
+                        else (
+                            candidate_kind
+                            if download_backend.get("name", "http") == "http"
+                            else f"{download_backend.get('name')}:{candidate_kind}"
+                        )
+                    ),
+                    "from_cache": from_cache,
                     "content_type": resolved_content_type,
                     "local_path": save_path,
                 }
@@ -1792,11 +2237,21 @@ def read_url(
                 if not source_page_checked and candidate_index >= len(candidates):
                     source_page_checked = True
                     seen_urls = {url for _, url, _ in candidates}
-                    for page_image_url in _source_page_image_candidates(
-                        resource,
-                        max_retries=image_max_retries,
-                        max_429_retries=image_max_429_retries,
-                    ):
+                    source_page_started_at = time.monotonic()
+                    try:
+                        page_image_candidates = _source_page_image_candidates(
+                            resource,
+                            max_retries=image_max_retries,
+                            max_429_retries=image_max_429_retries,
+                            timings=_timings,
+                        )
+                    finally:
+                        _read_url_timing_add(
+                            _timings,
+                            "image_source_page_candidates_s",
+                            time.monotonic() - source_page_started_at,
+                        )
+                    for page_image_url in page_image_candidates:
                         if page_image_url in seen_urls:
                             continue
                         seen_urls.add(page_image_url)
@@ -1808,6 +2263,12 @@ def read_url(
                             )
                         )
                 continue
+            finally:
+                _read_url_timing_add(
+                    _timings,
+                    "image_candidate_s",
+                    time.monotonic() - candidate_started_at,
+                )
         final_error = failures[-1] if failures else "no download candidates"
         _record_read_url_call(
             branch="image",
@@ -1829,21 +2290,47 @@ def read_url(
                 filename = f"{os.path.splitext(filename)[0] or 'downloaded'}.pdf"
             save_path = os.path.join(temp_dir, filename)
             _read_url_debug("pdf_download_start", url=normalized_url, save_path=save_path)
-            pdf_bytes, _ = _download_binary(
-                normalized_url,
-                timeout=TOOL_NETWORK_TIMEOUT_S,
-                referer_url=resource.source_page_url if resource is not None else None,
-            )
+            pdf_download_started_at = time.monotonic()
+            try:
+                pdf_bytes, _ = _download_binary(
+                    normalized_url,
+                    timeout=TOOL_NETWORK_TIMEOUT_S,
+                    referer_url=resource.source_page_url if resource is not None else None,
+                    timings=_timings,
+                    timing_prefix="pdf_http",
+                )
+            finally:
+                _read_url_timing_add(
+                    _timings,
+                    "pdf_download_s",
+                    time.monotonic() - pdf_download_started_at,
+                )
             _read_url_debug(
                 "pdf_download_done",
                 url=normalized_url,
                 byte_count=len(pdf_bytes),
                 startswith_pdf=pdf_bytes.startswith(b"%PDF-"),
             )
-            with open(save_path, "wb") as handle:
-                handle.write(pdf_bytes)
+            pdf_save_started_at = time.monotonic()
+            try:
+                with open(save_path, "wb") as handle:
+                    handle.write(pdf_bytes)
+            finally:
+                _read_url_timing_add(
+                    _timings,
+                    "pdf_save_s",
+                    time.monotonic() - pdf_save_started_at,
+                )
             _read_url_debug("pdf_extract_start", path=save_path)
-            content, title = _extract_pdf_text(save_path)
+            pdf_extract_started_at = time.monotonic()
+            try:
+                content, title = _extract_pdf_text(save_path)
+            finally:
+                _read_url_timing_add(
+                    _timings,
+                    "pdf_extract_s",
+                    time.monotonic() - pdf_extract_started_at,
+                )
             _read_url_debug(
                 "pdf_extract_done",
                 path=save_path,
@@ -1858,15 +2345,23 @@ def read_url(
                     "ok": False,
                     "error": f"read_url failed for {normalized_url}: PDF text extraction returned empty content.",
                 }
-            summarized_content = (
-                summarize_with_qwen(
-                    content=content,
-                    goal=goal,
-                    assistant_output=assistant_output,
+            pdf_summary_started_at = time.monotonic()
+            try:
+                summarized_content = (
+                    summarize_with_qwen(
+                        content=content,
+                        goal=goal,
+                        assistant_output=assistant_output,
+                    )
+                    if goal or assistant_output
+                    else content[:500]
                 )
-                if goal or assistant_output
-                else content[:500]
-            )
+            finally:
+                _read_url_timing_add(
+                    _timings,
+                    "pdf_summary_s",
+                    time.monotonic() - pdf_summary_started_at,
+                )
             _record_read_url_call(branch="pdf", success=True)
             return {
                 "ok": True,
@@ -1888,7 +2383,19 @@ def read_url(
             # different network path and can return extracted text directly.
             try:
                 _read_url_debug("pdf_reader_fallback_start", url=normalized_url)
-                document = _read_document_with_timeout_retry(normalized_url)
+                pdf_reader_started_at = time.monotonic()
+                try:
+                    document = _read_document_with_timeout_retry(
+                        normalized_url,
+                        timings=_timings,
+                        timing_prefix="pdf_reader",
+                    )
+                finally:
+                    _read_url_timing_add(
+                        _timings,
+                        "pdf_reader_fallback_s",
+                        time.monotonic() - pdf_reader_started_at,
+                    )
                 content = str(document.get("content") or "").strip()
                 _read_url_debug(
                     "pdf_reader_fallback_done",
@@ -1898,15 +2405,23 @@ def read_url(
                     content_preview=content[:200].replace("\n", " "),
                 )
                 if content:
-                    summarized_content = (
-                        summarize_with_qwen(
-                            content=content,
-                            goal=goal,
-                            assistant_output=assistant_output,
+                    pdf_reader_summary_started_at = time.monotonic()
+                    try:
+                        summarized_content = (
+                            summarize_with_qwen(
+                                content=content,
+                                goal=goal,
+                                assistant_output=assistant_output,
+                            )
+                            if goal or assistant_output
+                            else content[:500]
                         )
-                        if goal or assistant_output
-                        else content[:500]
-                    )
+                    finally:
+                        _read_url_timing_add(
+                            _timings,
+                            "pdf_reader_summary_s",
+                            time.monotonic() - pdf_reader_summary_started_at,
+                        )
                     _record_read_url_call(branch="pdf", success=True)
                     return {
                         "ok": True,
@@ -1929,7 +2444,19 @@ def read_url(
 
     try:
         # print(f"############ {normalized_url} ##############")
-        document = _read_document_with_timeout_retry(normalized_url)
+        enhanced_reader_started_at = time.monotonic()
+        try:
+            document = _read_document_with_timeout_retry(
+                normalized_url,
+                timings=_timings,
+                timing_prefix="enhanced_reader",
+            )
+        finally:
+            _read_url_timing_add(
+                _timings,
+                "enhanced_reader_total_s",
+                time.monotonic() - enhanced_reader_started_at,
+            )
         # print(f"############ {document} ##############")
     except Exception as exc:  # pragma: no cover - network bound
         trigger = f"Enhanced Reader failed for {normalized_url}: {exc}"
@@ -1944,16 +2471,25 @@ def read_url(
             goal=goal,
             assistant_output=assistant_output,
             trigger=trigger,
+            timings=_timings,
         )
 
     content = document.get("content", "") or ""
     title = document.get("title", "") or ""
     should_return_summary = bool(goal or assistant_output)
-    reader_summary = summarize_with_qwen(
-        content=content,
-        goal=goal,
-        assistant_output=assistant_output,
-    )
+    reader_summary_started_at = time.monotonic()
+    try:
+        reader_summary = summarize_with_qwen(
+            content=content,
+            goal=goal,
+            assistant_output=assistant_output,
+        )
+    finally:
+        _read_url_timing_add(
+            _timings,
+            "enhanced_reader_summary_s",
+            time.monotonic() - reader_summary_started_at,
+        )
     summarized_content = reader_summary if should_return_summary else content[:500]
     if _is_blocked_summary(reader_summary):
         _read_url_debug("enhanced_reader_blocked", url=normalized_url)
@@ -1963,6 +2499,7 @@ def read_url(
             assistant_output=assistant_output,
             original_title=title,
             trigger=f"Enhanced Reader returned BLOCKED for {normalized_url}",
+            timings=_timings,
         )
     _record_read_url_call(branch="text", success=True)
     result = {

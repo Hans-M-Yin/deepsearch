@@ -6,6 +6,7 @@ The backend is deliberately not wired into the existing readers.  Call
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
@@ -13,6 +14,10 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
+from contextlib import contextmanager
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
@@ -75,6 +80,13 @@ def _local_lock_path_for_state(state_path: Path) -> Path:
     """Keep the lock off the shared state directory used by concurrent workers."""
     state_hash = hashlib.sha256(str(state_path.resolve()).encode("utf-8")).hexdigest()[:16]
     return Path(tempfile.gettempdir()) / f"firecrawl_pool_state_{state_hash}.lock"
+
+
+def _local_browser_lock_path_for_state(state_path: Path) -> Path:
+    """Return a local lock path for Browser state stored on HDFS/shared storage."""
+
+    state_hash = hashlib.sha256(str(state_path.resolve()).encode("utf-8")).hexdigest()[:16]
+    return Path(tempfile.gettempdir()) / f"firecrawl_browser_state_{state_hash}.lock"
 
 
 class FirecrawlApiKeyPool:
@@ -203,6 +215,35 @@ class FirecrawlApiKeyPool:
 
     def status(self) -> dict[str, Any]:
         return self._pool_status(self._with_locked_state(self._initialize_state))
+
+    def active_key_ids(self) -> list[str]:
+        """Return usable key ids in configured order without exposing secrets."""
+
+        def read(state: dict[str, Any]) -> dict[str, Any]:
+            state = self._initialize_state(state)
+            state["_active_key_ids"] = [
+                key_id
+                for key_id in state["key_order"]
+                if not bool(state["keys"][key_id].get("disabled"))
+                and int(state["keys"][key_id].get("remaining_credits") or 0) > 0
+            ]
+            return state
+
+        state = self._with_locked_state(read)
+        return list(state.pop("_active_key_ids", []))
+
+    def key_for_id(self, key_id: str) -> str:
+        """Return a configured secret for an internal key id.
+
+        The id is a SHA-256-derived opaque identifier and is safe to persist in
+        browser-session state.  The secret itself is intentionally kept only in
+        the process configuration.
+        """
+
+        for key in self.keys:
+            if self.key_id(key) == key_id:
+                return key
+        raise KeyError(f"Firecrawl key id is not configured in this process: {key_id}")
 
     def _initialize_state(self, state: dict[str, Any]) -> dict[str, Any]:
         pool = dict(state.get("keys") or {})
@@ -548,6 +589,1090 @@ class FirecrawlClient:
         source_url = metadata.get("sourceURL") or metadata.get("url")
         suffix = f" for {source_url}" if source_url else ""
         return f"Firecrawl scrape returned statusCode {status_code}{suffix}."
+
+
+class FirecrawlBrowserError(RuntimeError):
+    """Base class for failures in the managed Firecrawl Browser image backend."""
+
+    def __init__(self, message: str, *, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
+
+class FirecrawlBrowserSessionError(FirecrawlBrowserError):
+    """A Browser session could not be created or is no longer usable."""
+
+
+class FirecrawlBrowserHttpError(FirecrawlBrowserError):
+    """The remote browser reached the URL but received a non-success status."""
+
+
+class FirecrawlBrowserNonImageError(FirecrawlBrowserError):
+    """The remote URL resolved successfully but did not return image bytes."""
+
+
+@dataclass(slots=True)
+class FirecrawlBrowserImageDownload:
+    """Raw image bytes obtained through one managed Firecrawl Browser session."""
+
+    payload: bytes
+    content_type: str
+    requested_url: str
+    resolved_url: str
+    status_code: int
+    session_id: str
+    key_id: str
+
+
+@dataclass(slots=True)
+class _BrowserSessionLease:
+    manager: "FirecrawlBrowserSessionManager"
+    slot_id: str
+    session_id: str
+    key_id: str
+    lease_id: str
+    request_url: str = ""
+    released: bool = False
+
+    def release(self) -> None:
+        if not self.released:
+            self.manager.release(self)
+            self.released = True
+
+    def invalidate(self, reason: str) -> None:
+        if not self.released:
+            self.manager.invalidate(self, reason=reason)
+            self.released = True
+
+    def __enter__(self) -> "_BrowserSessionLease":
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        del exc_type, exc, traceback
+        self.release()
+
+
+class FirecrawlBrowserSessionManager:
+    """File-backed, lease-based pool of reusable Firecrawl Browser sessions.
+
+    It deliberately owns every Browser concern: session creation, session
+    selection, key assignment, expiry, and best-effort cleanup.  Callers only
+    acquire a short lease and execute an operation.  The JSON registry stores
+    opaque key ids rather than API secrets, so workers sharing the same keys
+    file can reuse sessions without persisting credentials.
+
+    The registry may live on HDFS/shared storage, but its default lock lives on
+    the local filesystem because HDFS does not provide the POSIX ``flock``
+    semantics needed here.  The default therefore coordinates processes on
+    one host.  A multi-host deployment must provide a shared POSIX lock path
+    through ``FIRECRAWL_BROWSER_SESSION_LOCK_FILE`` or put this manager behind
+    one gateway process.
+    """
+
+    _STATE_VERSION = 2
+
+    def __init__(
+        self,
+        *,
+        key_pool: FirecrawlApiKeyPool,
+        app_factory: Callable[..., Any] | None = None,
+        state_path: str | Path | None = None,
+        session_ttl_s: int = 300,
+        activity_ttl_s: int = 300,
+        max_sessions: int = 4,
+        expiry_safety_s: float = 30.0,
+        create_timeout_s: float = 90.0,
+        api_timeout_s: float = 120.0,
+    ) -> None:
+        self.key_pool = key_pool
+        self._app_factory = app_factory
+        configured_path = state_path or os.environ.get("FIRECRAWL_BROWSER_SESSION_STATE_FILE")
+        default_path = _MODULE_DIR / ".ignore" / "firecrawl_browser_sessions.json"
+        self.state_path = Path(configured_path) if configured_path else default_path
+        if not self.state_path.is_absolute():
+            self.state_path = Path.cwd() / self.state_path
+        configured_lock_path = os.environ.get("FIRECRAWL_BROWSER_SESSION_LOCK_FILE")
+        self.lock_path = (
+            Path(configured_lock_path)
+            if configured_lock_path
+            else _local_browser_lock_path_for_state(self.state_path)
+        )
+        if not self.lock_path.is_absolute():
+            self.lock_path = Path.cwd() / self.lock_path
+        self.session_ttl_s = max(30, min(int(session_ttl_s), 3600))
+        self.activity_ttl_s = max(10, min(int(activity_ttl_s), 3600))
+        self.max_sessions = max(1, int(max_sessions))
+        self.expiry_safety_s = max(1.0, float(expiry_safety_s))
+        self.create_timeout_s = max(10.0, float(create_timeout_s))
+        self.api_timeout_s = max(1.0, float(api_timeout_s))
+
+    @classmethod
+    def from_environment(
+        cls,
+        *,
+        api_keys: list[str] | None = None,
+        app_factory: Callable[..., Any] | None = None,
+        pool_state_path: str | Path | None = None,
+        session_state_path: str | Path | None = None,
+    ) -> "FirecrawlBrowserSessionManager":
+        key_pool = (
+            FirecrawlApiKeyPool(keys=api_keys, state_path=pool_state_path)
+            if api_keys is not None
+            else FirecrawlApiKeyPool.from_fixed_pool()
+        )
+        return cls(
+            key_pool=key_pool,
+            app_factory=app_factory,
+            state_path=session_state_path,
+            session_ttl_s=_env_int("FIRECRAWL_BROWSER_SESSION_TTL_S", 300),
+            activity_ttl_s=_env_int("FIRECRAWL_BROWSER_SESSION_ACTIVITY_TTL_S", 300),
+            max_sessions=_env_int("FIRECRAWL_BROWSER_MAX_SESSIONS", 4),
+            expiry_safety_s=_env_float("FIRECRAWL_BROWSER_EXPIRY_SAFETY_S", 30.0),
+            create_timeout_s=_env_float("FIRECRAWL_BROWSER_CREATE_TIMEOUT_S", 90.0),
+            api_timeout_s=_env_float("FIRECRAWL_BROWSER_API_TIMEOUT_S", 120.0),
+        )
+
+    def acquire(
+        self,
+        *,
+        acquire_timeout_s: float,
+        lease_timeout_s: float,
+        request_url: str | None = None,
+    ) -> _BrowserSessionLease:
+        """Lease an active session, creating one lazily when the pool can grow."""
+
+        acquire_timeout_s = max(1.0, float(acquire_timeout_s))
+        deadline = time.monotonic() + acquire_timeout_s
+        lease_timeout_s = max(5.0, float(lease_timeout_s))
+        last_error: Exception | None = None
+        waiter_id = uuid.uuid4().hex
+        self._register_waiter(
+            waiter_id,
+            expires_at=time.time() + acquire_timeout_s + 5.0,
+        )
+        try:
+            while True:
+                reservation = self._reserve(lease_timeout_s=lease_timeout_s)
+                kind = reservation["kind"]
+                if kind == "leased":
+                    lease = self._lease_from_record(reservation["record"], request_url=request_url)
+                    self._remove_waiter(waiter_id)
+                    self._debug_pool_status(
+                        "lease_acquired",
+                        session_id=lease.session_id,
+                        key_id=lease.key_id,
+                        url=lease.request_url,
+                    )
+                    return lease
+                if kind == "create":
+                    try:
+                        lease = self._create_reserved_session(reservation["record"], request_url=request_url)
+                        self._remove_waiter(waiter_id)
+                        self._debug_pool_status(
+                            "session_created_and_leased",
+                            session_id=lease.session_id,
+                            key_id=lease.key_id,
+                            url=lease.request_url,
+                        )
+                        return lease
+                    except Exception as exc:
+                        last_error = exc
+                        if time.monotonic() >= deadline:
+                            raise FirecrawlBrowserSessionError(
+                                f"Firecrawl Browser session creation failed: {exc}",
+                                status_code=_status_code_from_exception(exc),
+                            ) from exc
+                elif kind == "no_key":
+                    raise FirecrawlBrowserSessionError("No active Firecrawl API key is available for Browser sessions.")
+
+                if time.monotonic() >= deadline:
+                    suffix = f"; last_error={last_error}" if last_error is not None else ""
+                    raise FirecrawlBrowserSessionError(
+                        f"Timed out waiting for an idle Firecrawl Browser session{suffix}"
+                    )
+                time.sleep(0.1)
+        finally:
+            self._remove_waiter(waiter_id)
+
+    def execute(self, lease: _BrowserSessionLease, *, code: str, timeout_s: float) -> dict[str, Any]:
+        """Execute code using a leased Browser session and normalize SDK output."""
+
+        timeout_s = max(1, min(int(timeout_s), 300))
+        try:
+            response = self._app(lease.key_id).browser_execute(
+                lease.session_id,
+                code,
+                language="node",
+                timeout=timeout_s,
+            )
+            raw = FirecrawlClient._response_as_dict(response)
+        except Exception as exc:
+            self._record_key_result(lease.key_id, success=False, error=str(exc), exc=exc)
+            raise FirecrawlBrowserSessionError(
+                f"Firecrawl Browser execute failed: {exc}",
+                status_code=_status_code_from_exception(exc),
+            ) from exc
+        if raw.get("success") is False or raw.get("error") or int(raw.get("exit_code") or raw.get("exitCode") or 0) != 0:
+            error = str(raw.get("error") or raw.get("stderr") or "browser code execution failed")
+            self._record_key_result(lease.key_id, success=False, error=error)
+            raise FirecrawlBrowserSessionError(error)
+        self._record_key_result(lease.key_id, success=True)
+        return raw
+
+    def release(self, lease: _BrowserSessionLease) -> None:
+        """Return a lease to the pool and retire sessions near their hard TTL."""
+
+        retire = self._release_or_remove(lease, reason=None)
+        if retire is not None:
+            credits_billed = self._delete_remote_session(retire["session_id"], retire["key_id"])
+            self._record_session_retired(retire, credits_billed=credits_billed)
+        self._debug_pool_status(
+            "lease_released",
+            session_id=lease.session_id,
+            key_id=lease.key_id,
+            url=lease.request_url,
+        )
+
+    def invalidate(self, lease: _BrowserSessionLease, *, reason: str) -> None:
+        """Remove a broken session before another worker can lease it."""
+
+        retired = self._release_or_remove(lease, reason=reason)
+        if retired is not None:
+            credits_billed = self._delete_remote_session(retired["session_id"], retired["key_id"])
+            self._record_session_retired(retired, credits_billed=credits_billed)
+        self._debug_pool_status(
+            "lease_invalidated",
+            session_id=lease.session_id,
+            key_id=lease.key_id,
+            url=lease.request_url,
+            reason=reason,
+        )
+
+    def _reserve(self, *, lease_timeout_s: float) -> dict[str, Any]:
+        now = time.time()
+        owner = f"pid={os.getpid()}:thread={threading.get_ident()}"
+
+        def update(state: dict[str, Any]) -> dict[str, Any]:
+            self._cleanup_state(state, now=now)
+            sessions = state["sessions"]
+            for record in sessions:
+                if record.get("state") != "idle":
+                    continue
+                if float(record.get("expires_at") or 0.0) <= now + self.expiry_safety_s:
+                    continue
+                lease_id = uuid.uuid4().hex
+                record.update(
+                    {
+                        "state": "leased",
+                        "lease_id": lease_id,
+                        "lease_owner": owner,
+                        "lease_until": now + lease_timeout_s,
+                        "last_used_at": now,
+                    }
+                )
+                self._record_session_metric(state, key_id=str(record.get("key_id") or ""), metric="leases")
+                self._record_session_metric(state, key_id=str(record.get("key_id") or ""), metric="reuses")
+                return {"kind": "leased", "record": dict(record)}
+
+            active_count = sum(
+                record.get("state") in {"idle", "leased", "creating"}
+                for record in sessions
+            )
+            if active_count >= self.max_sessions:
+                return {"kind": "wait"}
+
+            active_key_ids = self.key_pool.active_key_ids()
+            if not active_key_ids:
+                return {"kind": "no_key"}
+            offset = int(state.get("next_key_index") or 0) % len(active_key_ids)
+            key_id = active_key_ids[offset]
+            state["next_key_index"] = (offset + 1) % len(active_key_ids)
+            lease_id = uuid.uuid4().hex
+            record = {
+                "slot_id": uuid.uuid4().hex,
+                "state": "creating",
+                "key_id": key_id,
+                "creation_token": uuid.uuid4().hex,
+                "create_until": now + self.create_timeout_s,
+                "lease_id": lease_id,
+                "lease_owner": owner,
+                "lease_until": now + lease_timeout_s,
+                "created_at": now,
+                "last_used_at": now,
+            }
+            sessions.append(record)
+            return {"kind": "create", "record": dict(record)}
+
+        return self._with_locked_state(update)
+
+    def _create_reserved_session(
+        self,
+        reservation: dict[str, Any],
+        *,
+        request_url: str | None = None,
+    ) -> _BrowserSessionLease:
+        key_id = str(reservation["key_id"])
+        creation_token = str(reservation["creation_token"])
+        try:
+            response = self._app(key_id).browser(
+                ttl=self.session_ttl_s,
+                activity_ttl=self.activity_ttl_s,
+                stream_web_view=False,
+            )
+            raw = FirecrawlClient._response_as_dict(response)
+            if raw.get("success") is False or not raw.get("id"):
+                raise FirecrawlBrowserSessionError(str(raw.get("error") or "Browser session creation returned no id."))
+        except Exception as exc:
+            self._record_key_result(key_id, success=False, error=str(exc), exc=exc)
+            self._drop_creation(creation_token)
+            raise
+
+        session_id = str(raw["id"])
+        expires_at = _browser_expiry_timestamp(raw.get("expires_at") or raw.get("expiresAt"))
+        expires_at = expires_at if expires_at is not None else time.time() + self.session_ttl_s
+
+        def publish(state: dict[str, Any]) -> dict[str, Any] | None:
+            self._cleanup_state(state, now=time.time())
+            for record in state["sessions"]:
+                if record.get("creation_token") != creation_token:
+                    continue
+                record.update(
+                    {
+                        "state": "leased",
+                        "session_id": session_id,
+                        "expires_at": expires_at,
+                        "created_at": time.time(),
+                        "last_used_at": time.time(),
+                    }
+                )
+                record.pop("creation_token", None)
+                record.pop("create_until", None)
+                return dict(record)
+            return None
+
+        published = self._with_locked_state(publish)
+        if published is None:
+            # The creator lost its reservation (for example after a long pause).
+            # Do not leak the new remote session.
+            self._delete_remote_session(session_id, key_id)
+            raise FirecrawlBrowserSessionError("Browser session reservation expired before it could be published.")
+        self._record_session_metric_for_key(key_id, metric="created")
+        self._record_session_metric_for_key(key_id, metric="leases")
+        self._record_key_result(key_id, success=True)
+        return self._lease_from_record(published, request_url=request_url)
+
+    def _drop_creation(self, creation_token: str) -> None:
+        def update(state: dict[str, Any]) -> None:
+            state["sessions"] = [
+                record
+                for record in state["sessions"]
+                if record.get("creation_token") != creation_token
+            ]
+            return None
+
+        self._with_locked_state(update)
+
+    def _release_or_remove(
+        self,
+        lease: _BrowserSessionLease,
+        *,
+        reason: str | None,
+    ) -> dict[str, str] | None:
+        now = time.time()
+
+        def update(state: dict[str, Any]) -> dict[str, str] | None:
+            self._cleanup_state(state, now=now)
+            for index, record in enumerate(state["sessions"]):
+                if record.get("slot_id") != lease.slot_id or record.get("lease_id") != lease.lease_id:
+                    continue
+                if reason or float(record.get("expires_at") or 0.0) <= now + self.expiry_safety_s:
+                    state["sessions"].pop(index)
+                    return {
+                        "session_id": str(record.get("session_id") or ""),
+                        "key_id": str(record.get("key_id") or ""),
+                        "reason": reason or "expiry_safety_window",
+                    }
+                record.update(
+                    {
+                        "state": "idle",
+                        "last_used_at": now,
+                    }
+                )
+                record.pop("lease_id", None)
+                record.pop("lease_owner", None)
+                record.pop("lease_until", None)
+                return None
+            return None
+
+        return self._with_locked_state(update)
+
+    def _cleanup_state(self, state: dict[str, Any], *, now: float) -> None:
+        normalized = self._normalize_state(state)
+        kept: list[dict[str, Any]] = []
+        for record in normalized["sessions"]:
+            status = str(record.get("state") or "")
+            expires_at = float(record.get("expires_at") or 0.0)
+            if status == "creating":
+                if float(record.get("create_until") or 0.0) > now:
+                    kept.append(record)
+                else:
+                    self._record_session_metric(
+                        normalized,
+                        key_id=str(record.get("key_id") or ""),
+                        metric="creation_abandoned",
+                    )
+                continue
+            if status == "leased" and float(record.get("lease_until") or 0.0) <= now:
+                if expires_at > now + self.expiry_safety_s:
+                    record.update({"state": "idle", "last_used_at": now})
+                    record.pop("lease_id", None)
+                    record.pop("lease_owner", None)
+                    record.pop("lease_until", None)
+                    kept.append(record)
+                else:
+                    self._record_session_metric(
+                        normalized,
+                        key_id=str(record.get("key_id") or ""),
+                        metric="expired",
+                    )
+                continue
+            if status == "idle" and expires_at > now + self.expiry_safety_s:
+                kept.append(record)
+                continue
+            if status == "leased":
+                # Do not delete a still-leased session merely because it crossed
+                # the nominal TTL; the lease owner is allowed to finish its
+                # bounded execute call and will retire it on release.
+                kept.append(record)
+            elif status == "idle":
+                self._record_session_metric(
+                    normalized,
+                    key_id=str(record.get("key_id") or ""),
+                    metric="expired",
+                )
+        normalized["sessions"] = kept
+        normalized["waiters"] = [
+            waiter
+            for waiter in normalized["waiters"]
+            if float(waiter.get("expires_at") or 0.0) > now
+        ]
+        state.clear()
+        state.update(normalized)
+
+    @staticmethod
+    def _normalize_state(state: dict[str, Any]) -> dict[str, Any]:
+        normalized = dict(state or {})
+        sessions = normalized.get("sessions")
+        normalized["sessions"] = [dict(record) for record in sessions if isinstance(record, dict)] if isinstance(sessions, list) else []
+        waiters = normalized.get("waiters")
+        normalized["waiters"] = [dict(waiter) for waiter in waiters if isinstance(waiter, dict)] if isinstance(waiters, list) else []
+        metrics = dict(normalized.get("metrics") or {})
+        metrics.setdefault("created", 0)
+        metrics.setdefault("leases", 0)
+        metrics.setdefault("reuses", 0)
+        metrics.setdefault("retired", 0)
+        metrics.setdefault("expired", 0)
+        metrics.setdefault("creation_abandoned", 0)
+        metrics.setdefault("credits_billed", 0)
+        metrics.setdefault("credit_reports", 0)
+        metrics["by_key"] = dict(metrics.get("by_key") or {})
+        normalized["metrics"] = metrics
+        normalized["version"] = FirecrawlBrowserSessionManager._STATE_VERSION
+        normalized.setdefault("next_key_index", 0)
+        normalized["updated_at"] = time.time()
+        return normalized
+
+    @staticmethod
+    def _record_session_metric(
+        state: dict[str, Any],
+        *,
+        key_id: str,
+        metric: str,
+        amount: int = 1,
+    ) -> None:
+        """Update persistent aggregate and per-key Browser session metrics."""
+
+        metrics = state.setdefault("metrics", {})
+        amount = max(0, int(amount))
+        metrics[metric] = max(0, int(metrics.get(metric) or 0)) + amount
+        if not key_id:
+            return
+        by_key = metrics.setdefault("by_key", {})
+        key_metrics = dict(by_key.get(key_id) or {})
+        key_metrics[metric] = max(0, int(key_metrics.get(metric) or 0)) + amount
+        by_key[key_id] = key_metrics
+
+    def _record_session_metric_for_key(self, key_id: str, *, metric: str, amount: int = 1) -> None:
+        def update(state: dict[str, Any]) -> None:
+            self._cleanup_state(state, now=time.time())
+            self._record_session_metric(state, key_id=key_id, metric=metric, amount=amount)
+            return None
+
+        self._with_locked_state(update)
+
+    def _record_session_retired(
+        self,
+        retired: dict[str, str],
+        *,
+        credits_billed: int | None,
+    ) -> None:
+        key_id = str(retired.get("key_id") or "")
+
+        def update(state: dict[str, Any]) -> None:
+            self._cleanup_state(state, now=time.time())
+            self._record_session_metric(state, key_id=key_id, metric="retired")
+            if credits_billed is not None:
+                self._record_session_metric(
+                    state,
+                    key_id=key_id,
+                    metric="credits_billed",
+                    amount=credits_billed,
+                )
+                self._record_session_metric(state, key_id=key_id, metric="credit_reports")
+            return None
+
+        self._with_locked_state(update)
+
+    def _register_waiter(self, waiter_id: str, *, expires_at: float) -> None:
+        owner = f"pid={os.getpid()}:thread={threading.get_ident()}"
+
+        def update(state: dict[str, Any]) -> None:
+            self._cleanup_state(state, now=time.time())
+            state["waiters"] = [
+                waiter
+                for waiter in state["waiters"]
+                if waiter.get("waiter_id") != waiter_id
+            ]
+            state["waiters"].append(
+                {
+                    "waiter_id": waiter_id,
+                    "owner": owner,
+                    "created_at": time.time(),
+                    "expires_at": expires_at,
+                }
+            )
+            return None
+
+        self._with_locked_state(update)
+
+    def _remove_waiter(self, waiter_id: str) -> None:
+        def update(state: dict[str, Any]) -> None:
+            self._cleanup_state(state, now=time.time())
+            state["waiters"] = [
+                waiter
+                for waiter in state["waiters"]
+                if waiter.get("waiter_id") != waiter_id
+            ]
+            return None
+
+        self._with_locked_state(update)
+
+    def pool_snapshot(self) -> dict[str, Any]:
+        """Return a cross-worker view of sessions, queue depth, and credits."""
+
+        def read(state: dict[str, Any]) -> dict[str, Any]:
+            self._cleanup_state(state, now=time.time())
+            sessions = list(state["sessions"])
+            metrics = dict(state["metrics"])
+            return {
+                "max_sessions": self.max_sessions,
+                "in_use": sum(record.get("state") == "leased" for record in sessions),
+                "idle": sum(record.get("state") == "idle" for record in sessions),
+                "creating": sum(record.get("state") == "creating" for record in sessions),
+                "waiting": len(state["waiters"]),
+                "metrics": metrics,
+            }
+
+        snapshot = self._with_locked_state(read)
+        snapshot["key_pool"] = self.key_pool.status()
+        return snapshot
+
+    def _debug_pool_status(self, event: str, **details: object) -> None:
+        if not _firecrawl_browser_debug_enabled():
+            return
+        snapshot = self.pool_snapshot()
+        metrics = snapshot["metrics"]
+        key_pool = snapshot["key_pool"]
+        by_key = metrics.get("by_key") if isinstance(metrics.get("by_key"), dict) else {}
+        per_key = ",".join(
+            f"{key_id[:8]}:created={int(values.get('created') or 0)},"
+            f"retired={int(values.get('retired') or 0)},"
+            f"billed={int(values.get('credits_billed') or 0)}"
+            for key_id, values in sorted(by_key.items())
+            if isinstance(values, dict)
+        ) or "-"
+        context = " ".join(f"{key}={value!r}" for key, value in details.items())
+        suffix = f" {context}" if context else ""
+        print(
+            "[firecrawl-browser] "
+            f"event={event} in_use={snapshot['in_use']}/{snapshot['max_sessions']} "
+            f"idle={snapshot['idle']} creating={snapshot['creating']} waiting={snapshot['waiting']} "
+            f"created={int(metrics.get('created') or 0)} leases={int(metrics.get('leases') or 0)} "
+            f"reuses={int(metrics.get('reuses') or 0)} retired={int(metrics.get('retired') or 0)} "
+            f"expired={int(metrics.get('expired') or 0)} "
+            f"browser_credits_billed={int(metrics.get('credits_billed') or 0)} "
+            f"pool_credits_consumed={int(key_pool.get('credits_consumed') or 0)} "
+            f"pool_credits_remaining={int(key_pool.get('remaining_credits_total') or 0)} "
+            f"key_usage='{per_key}'{suffix}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+    def _lease_from_record(
+        self,
+        record: dict[str, Any],
+        *,
+        request_url: str | None = None,
+    ) -> _BrowserSessionLease:
+        session_id = str(record.get("session_id") or "")
+        if not session_id:
+            raise FirecrawlBrowserSessionError("Leased Browser session has no session id.")
+        return _BrowserSessionLease(
+            manager=self,
+            slot_id=str(record["slot_id"]),
+            session_id=session_id,
+            key_id=str(record["key_id"]),
+            lease_id=str(record["lease_id"]),
+            request_url=str(request_url or ""),
+        )
+
+    def _app(self, key_id: str) -> Any:
+        api_key = self.key_pool.key_for_id(key_id)
+        if self._app_factory is not None:
+            return self._app_factory(api_key=api_key)
+        try:
+            from firecrawl.v2 import FirecrawlClient as FirecrawlV2Client
+        except ImportError as exc:
+            raise RuntimeError(
+                "Firecrawl Browser requires SDK v2 support. Install or upgrade the firecrawl package. "
+                f"Original ImportError: {exc}"
+            ) from exc
+        return FirecrawlV2Client(api_key=api_key, timeout=self.api_timeout_s)
+
+    def _record_key_result(
+        self,
+        key_id: str,
+        *,
+        success: bool,
+        error: str | None = None,
+        exc: BaseException | None = None,
+        credits_used: int = 0,
+    ) -> None:
+        status_code = _status_code_from_exception(exc) if exc is not None else None
+        self.key_pool.record_result(
+            key_id,
+            success=success,
+            error=error,
+            credits_used=max(0, int(credits_used)),
+            status_code=status_code,
+            key_auth_failed=status_code == 401,
+        )
+
+    def _delete_remote_session(self, session_id: str, key_id: str) -> int | None:
+        if not session_id or not key_id:
+            return None
+        try:
+            response = self._app(key_id).delete_browser(session_id)
+            raw = FirecrawlClient._response_as_dict(response)
+            if raw.get("success") is False:
+                return None
+            credits_billed = _non_negative_int(raw.get("credits_billed", raw.get("creditsBilled")))
+            self._record_key_result(key_id, success=True, credits_used=credits_billed or 0)
+            return credits_billed
+        except Exception as exc:
+            # Session cleanup is best-effort: it may already have expired, and
+            # a cleanup failure must not make image evidence unavailable.
+            self._record_key_result(key_id, success=False, error=f"Browser session cleanup failed: {exc}", exc=exc)
+            return None
+
+    @contextmanager
+    def _state_lock(self):
+        self.lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.lock_path.open("a+", encoding="utf-8") as handle:
+            if fcntl is not None:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                if fcntl is not None:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+    def _with_locked_state(self, callback: Callable[[dict[str, Any]], Any]) -> Any:
+        with self._state_lock():
+            state = self._read_state()
+            result = callback(state)
+            self._write_state(state)
+            return result
+
+    def _read_state(self) -> dict[str, Any]:
+        try:
+            raw = json.loads(self.state_path.read_text(encoding="utf-8")) if self.state_path.exists() else {}
+        except (OSError, json.JSONDecodeError):
+            raw = {}
+        return self._normalize_state(raw if isinstance(raw, dict) else {})
+
+    def _write_state(self, state: dict[str, Any]) -> None:
+        self.state_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=self.state_path.parent,
+                prefix=f".{self.state_path.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as handle:
+                temporary_path = Path(handle.name)
+                json.dump(state, handle, ensure_ascii=False, sort_keys=True)
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary_path, self.state_path)
+        finally:
+            if temporary_path is not None and temporary_path.exists():
+                try:
+                    temporary_path.unlink()
+                except OSError:
+                    pass
+
+
+class FirecrawlBrowserImageDownloader:
+    """Download raw image bytes through a reusable Firecrawl Browser pool.
+
+    This is the only image-facing interface exposed by the Firecrawl backend.
+    Agent code receives ordinary ``bytes`` and a MIME type; it never manages a
+    key, session id, Browser API request, or Base64 payload.
+    """
+
+    def __init__(
+        self,
+        *,
+        session_manager: FirecrawlBrowserSessionManager,
+        max_image_bytes: int = 20 * 1024 * 1024,
+        acquire_timeout_s: float = 120.0,
+        retries: int = 1,
+        retry_sleep_s: float = 0.5,
+    ) -> None:
+        self.session_manager = session_manager
+        self.max_image_bytes = max(1024, int(max_image_bytes))
+        self.acquire_timeout_s = max(1.0, float(acquire_timeout_s))
+        self.retries = max(0, int(retries))
+        self.retry_sleep_s = max(0.0, float(retry_sleep_s))
+
+    @classmethod
+    def from_environment(
+        cls,
+        *,
+        api_keys: list[str] | None = None,
+        app_factory: Callable[..., Any] | None = None,
+        pool_state_path: str | Path | None = None,
+        session_state_path: str | Path | None = None,
+    ) -> "FirecrawlBrowserImageDownloader":
+        return cls(
+            session_manager=FirecrawlBrowserSessionManager.from_environment(
+                api_keys=api_keys,
+                app_factory=app_factory,
+                pool_state_path=pool_state_path,
+                session_state_path=session_state_path,
+            ),
+            max_image_bytes=_env_int("FIRECRAWL_BROWSER_IMAGE_MAX_BYTES", 20 * 1024 * 1024),
+            acquire_timeout_s=_env_float("FIRECRAWL_BROWSER_POOL_ACQUIRE_TIMEOUT_S", 120.0),
+            retries=_env_int("FIRECRAWL_BROWSER_IMAGE_RETRIES", 1),
+            retry_sleep_s=_env_float("FIRECRAWL_BROWSER_IMAGE_RETRY_SLEEP_S", 0.5),
+        )
+
+    def download(
+        self,
+        url: str,
+        *,
+        referer_url: str | None = None,
+        timeout_s: float = 120.0,
+    ) -> FirecrawlBrowserImageDownload:
+        target_url = str(url or "").strip()
+        if not target_url:
+            raise FirecrawlBrowserError("Image URL is required.")
+        timeout_s = max(1.0, min(float(timeout_s), 300.0))
+        last_error: Exception | None = None
+        for attempt in range(self.retries + 1):
+            lease: _BrowserSessionLease | None = None
+            try:
+                lease = self.session_manager.acquire(
+                    acquire_timeout_s=self.acquire_timeout_s,
+                    lease_timeout_s=timeout_s + 30.0,
+                    request_url=target_url,
+                )
+                response = self.session_manager.execute(
+                    lease,
+                    code=self._download_code(
+                        target_url,
+                        referer_url=referer_url,
+                        request_timeout_ms=int(timeout_s * 1000),
+                    ),
+                    timeout_s=timeout_s,
+                )
+                result = self._decode_download_response(
+                    response,
+                    requested_url=target_url,
+                    session_id=lease.session_id,
+                    key_id=lease.key_id,
+                )
+                self.session_manager._debug_pool_status(
+                    "download_succeeded",
+                    session_id=lease.session_id,
+                    key_id=lease.key_id,
+                    url=target_url,
+                    attempt=attempt + 1,
+                    http_status=result.status_code,
+                    content_type=result.content_type,
+                    byte_count=len(result.payload),
+                    resolved_url=result.resolved_url,
+                )
+                lease.release()
+                return result
+            except Exception as exc:
+                last_error = exc
+                status_code = getattr(exc, "status_code", None)
+                will_retry = attempt < self.retries and self._is_retryable(exc)
+                self.session_manager._debug_pool_status(
+                    "download_failed",
+                    session_id=lease.session_id if lease is not None else "",
+                    key_id=lease.key_id if lease is not None else "",
+                    url=target_url,
+                    attempt=attempt + 1,
+                    http_status=status_code,
+                    error_type=type(exc).__name__,
+                    error=str(exc)[:500],
+                    will_retry=will_retry,
+                )
+                if lease is not None:
+                    if status_code in {401, 404, 410, 502, 503} or isinstance(exc, FirecrawlBrowserSessionError):
+                        lease.invalidate(reason=str(exc))
+                    else:
+                        lease.release()
+                if not will_retry:
+                    raise
+                time.sleep(self.retry_sleep_s * (attempt + 1))
+        assert last_error is not None
+        raise last_error
+
+    def _download_code(
+        self,
+        url: str,
+        *,
+        referer_url: str | None,
+        request_timeout_ms: int,
+    ) -> str:
+        payload = json.dumps(
+            {
+                "url": url,
+                "referer": str(referer_url or ""),
+                "timeoutMs": max(1000, min(int(request_timeout_ms), 300000)),
+            },
+            ensure_ascii=False,
+        )
+        return f"""
+await (async () => {{
+const input = {payload};
+const headers = {{
+  "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+  "Accept-Language": "en-US,en;q=0.9",
+}};
+if (input.referer) headers["Referer"] = input.referer;
+const response = await page.request.get(input.url, {{
+  failOnStatusCode: false,
+  headers,
+  timeout: input.timeoutMs,
+}});
+const responseHeaders = response.headers();
+const contentType = String(responseHeaders["content-type"] || "").split(";", 1)[0].trim().toLowerCase();
+const status = response.status();
+const resolvedUrl = response.url();
+const declaredLength = Number(responseHeaders["content-length"] || 0);
+const maxBytes = {self.max_image_bytes};
+const likelyImage = contentType.startsWith("image/") || !contentType || contentType === "application/octet-stream" || contentType === "binary/octet-stream";
+const output = {{
+  status,
+  resolved_url: resolvedUrl,
+  content_type: contentType,
+  body_base64: null,
+  byte_count: 0,
+  error: null,
+}};
+try {{
+  if (status < 200 || status >= 300) {{
+    output.error = `http_status_${{status}}`;
+  }} else if (!likelyImage) {{
+    output.error = "non_image_content_type";
+  }} else if (Number.isFinite(declaredLength) && declaredLength > maxBytes) {{
+    output.error = "image_too_large";
+  }} else {{
+    const body = await response.body();
+    output.byte_count = body.length;
+    if (body.length > maxBytes) {{
+      output.error = "image_too_large";
+    }} else {{
+      output.body_base64 = body.toString("base64");
+    }}
+  }}
+}} finally {{
+  await response.dispose();
+}}
+return JSON.stringify(output);
+}})();
+""".strip()
+
+    def _decode_download_response(
+        self,
+        response: dict[str, Any],
+        *,
+        requested_url: str,
+        session_id: str,
+        key_id: str,
+    ) -> FirecrawlBrowserImageDownload:
+        raw_output = response.get("result") or response.get("stdout") or response.get("output")
+        if isinstance(raw_output, dict):
+            payload = raw_output
+        else:
+            try:
+                payload = json.loads(str(raw_output or ""))
+            except json.JSONDecodeError as exc:
+                raise FirecrawlBrowserSessionError(
+                    f"Firecrawl Browser returned an unparseable image response: {raw_output!r}"
+                ) from exc
+        if not isinstance(payload, dict):
+            raise FirecrawlBrowserSessionError("Firecrawl Browser returned a non-object image response.")
+        try:
+            status_code = int(payload.get("status") or 0)
+        except (TypeError, ValueError):
+            status_code = 0
+        resolved_url = str(payload.get("resolved_url") or requested_url)
+        content_type = _normalized_content_type(payload.get("content_type"))
+        error = str(payload.get("error") or "")
+        if status_code < 200 or status_code >= 300:
+            raise FirecrawlBrowserHttpError(
+                f"Firecrawl Browser image request returned HTTP {status_code} for {requested_url}",
+                status_code=status_code or None,
+            )
+        if error == "non_image_content_type":
+            raise FirecrawlBrowserNonImageError(
+                f"Firecrawl Browser URL did not return an image ({content_type or 'unknown'}): {requested_url}",
+                status_code=status_code,
+            )
+        if error:
+            raise FirecrawlBrowserError(
+                f"Firecrawl Browser image download failed for {requested_url}: {error}",
+                status_code=status_code or None,
+            )
+        encoded = payload.get("body_base64")
+        if not isinstance(encoded, str) or not encoded:
+            raise FirecrawlBrowserNonImageError(
+                f"Firecrawl Browser returned no image payload for {requested_url}",
+                status_code=status_code,
+            )
+        if len(encoded) > ((self.max_image_bytes + 2) // 3) * 4 + 8:
+            raise FirecrawlBrowserError(
+                f"Firecrawl Browser Base64 payload exceeds configured image limit for {requested_url}",
+                status_code=status_code,
+            )
+        try:
+            image_bytes = base64.b64decode(encoded, validate=True)
+        except (ValueError, TypeError) as exc:
+            raise FirecrawlBrowserSessionError(
+                f"Firecrawl Browser returned invalid Base64 image data for {requested_url}"
+            ) from exc
+        if not image_bytes:
+            raise FirecrawlBrowserNonImageError(
+                f"Firecrawl Browser returned an empty image payload for {requested_url}",
+                status_code=status_code,
+            )
+        sniffed_content_type = _sniff_image_content_type(image_bytes)
+        if not content_type.startswith("image/"):
+            content_type = sniffed_content_type
+        if not content_type.startswith("image/"):
+            raise FirecrawlBrowserNonImageError(
+                f"Firecrawl Browser payload is not a recognized image for {requested_url}",
+                status_code=status_code,
+            )
+        return FirecrawlBrowserImageDownload(
+            payload=image_bytes,
+            content_type=content_type,
+            requested_url=requested_url,
+            resolved_url=resolved_url,
+            status_code=status_code,
+            session_id=session_id,
+            key_id=key_id,
+        )
+
+    @staticmethod
+    def _is_retryable(exc: Exception) -> bool:
+        if isinstance(exc, FirecrawlBrowserNonImageError):
+            return False
+        status_code = getattr(exc, "status_code", None)
+        return status_code is None or status_code in {408, 429, 500, 502, 503, 504}
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(str(os.environ.get(name) or default))
+    except (TypeError, ValueError):
+        return int(default)
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(str(os.environ.get(name) or default))
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _firecrawl_browser_debug_enabled() -> bool:
+    """Whether to emit one structured pool line per Browser lease lifecycle."""
+
+    raw = str(os.environ.get("FIRECRAWL_BROWSER_DEBUG") or "1").strip().lower()
+    return raw not in {"0", "false", "no", "off"}
+
+
+def _non_negative_int(value: object) -> int | None:
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _browser_expiry_timestamp(value: object) -> float | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        normalized = text.replace("Z", "+00:00")
+        parsed = datetime.fromisoformat(normalized)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.timestamp()
+    except ValueError:
+        return None
+
+
+def _normalized_content_type(value: object) -> str:
+    return str(value or "").split(";", 1)[0].strip().lower()
+
+
+def _sniff_image_content_type(payload: bytes) -> str:
+    if payload.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if payload.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if payload.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif"
+    if payload.startswith(b"BM"):
+        return "image/bmp"
+    if len(payload) >= 12 and payload.startswith(b"RIFF") and payload[8:12] == b"WEBP":
+        return "image/webp"
+    stripped = payload.lstrip().lower()
+    if stripped.startswith(b"<svg") or b"<svg" in stripped[:256]:
+        return "image/svg+xml"
+    return ""
 
 
 def acquire_firecrawl_api_key() -> tuple[str, dict[str, Any]]:

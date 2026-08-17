@@ -2,14 +2,22 @@
 
 from __future__ import annotations
 
+import base64
 import json
+import time
 from io import StringIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
 from unittest import mock
 
-from synthesis.firecrawl_client import FirecrawlClient
+from synthesis.firecrawl_client import (
+    FirecrawlApiKeyPool,
+    FirecrawlBrowserImageDownloader,
+    FirecrawlBrowserNonImageError,
+    FirecrawlBrowserSessionManager,
+    FirecrawlClient,
+)
 
 
 class _FakeFirecrawl:
@@ -29,6 +37,39 @@ class _FakeFirecrawl:
             "success": True,
             "data": {"markdown": "page", "metadata": {"creditsUsed": 14, "statusCode": 200}},
         }
+
+
+class _FakeBrowserFirecrawl:
+    browser_calls: list[tuple[str, dict]] = []
+    execute_calls: list[tuple[str, str, str, dict]] = []
+    delete_calls: list[tuple[str, str]] = []
+    response_payload: dict = {}
+    next_session_id = 0
+
+    def __init__(self, *, api_key: str) -> None:
+        self.api_key = api_key
+
+    @classmethod
+    def reset(cls, *, payload: dict) -> None:
+        cls.browser_calls = []
+        cls.execute_calls = []
+        cls.delete_calls = []
+        cls.response_payload = payload
+        cls.next_session_id = 0
+
+    def browser(self, **kwargs: object) -> dict:
+        type(self).next_session_id += 1
+        session_id = f"browser-{type(self).next_session_id}"
+        type(self).browser_calls.append((self.api_key, dict(kwargs)))
+        return {"success": True, "id": session_id}
+
+    def browser_execute(self, session_id: str, code: str, **kwargs: object) -> dict:
+        type(self).execute_calls.append((self.api_key, session_id, code, dict(kwargs)))
+        return {"success": True, "result": json.dumps(type(self).response_payload)}
+
+    def delete_browser(self, session_id: str) -> dict:
+        type(self).delete_calls.append((self.api_key, session_id))
+        return {"success": True, "creditsBilled": 7}
 
 
 class FirecrawlClientTest(unittest.TestCase):
@@ -232,6 +273,128 @@ class FirecrawlClientTest(unittest.TestCase):
             record = json.loads(state_path.read_text(encoding="utf-8"))["keys"][client.key_pool.key_id("one-key")]
             self.assertEqual(record["remaining_credits"], 9986)
             self.assertEqual(record["last_status_code"], 200)
+
+    def test_browser_image_download_reuses_one_session_and_returns_raw_bytes(self) -> None:
+        jpeg = b"\xff\xd8\xff" + b"image-data"
+        _FakeBrowserFirecrawl.reset(
+            payload={
+                "status": 200,
+                "resolved_url": "https://upload.wikimedia.org/resolved.jpg",
+                "content_type": "image/jpeg",
+                "body_base64": base64.b64encode(jpeg).decode("ascii"),
+                "byte_count": len(jpeg),
+                "error": None,
+            }
+        )
+        with TemporaryDirectory() as directory:
+            pool = FirecrawlApiKeyPool(
+                keys=["first-key", "second-key"],
+                state_path=Path(directory) / "pool.json",
+            )
+            manager = FirecrawlBrowserSessionManager(
+                key_pool=pool,
+                app_factory=_FakeBrowserFirecrawl,
+                state_path=Path(directory) / "sessions.json",
+                session_ttl_s=300,
+                activity_ttl_s=120,
+                max_sessions=2,
+            )
+            downloader = FirecrawlBrowserImageDownloader(
+                session_manager=manager,
+                retries=0,
+            )
+
+            first = downloader.download("https://upload.wikimedia.org/example.jpg")
+            second = downloader.download("https://upload.wikimedia.org/other.jpg")
+
+            self.assertEqual(first.payload, jpeg)
+            self.assertEqual(first.content_type, "image/jpeg")
+            self.assertEqual(second.payload, jpeg)
+            self.assertEqual(len(_FakeBrowserFirecrawl.browser_calls), 1)
+            self.assertEqual(len(_FakeBrowserFirecrawl.execute_calls), 2)
+            self.assertEqual(_FakeBrowserFirecrawl.browser_calls[0][0], "first-key")
+            self.assertEqual(
+                _FakeBrowserFirecrawl.execute_calls[0][1],
+                _FakeBrowserFirecrawl.execute_calls[1][1],
+            )
+            self.assertIn("page.request.get", _FakeBrowserFirecrawl.execute_calls[0][2])
+            self.assertIn("body.toString(\"base64\")", _FakeBrowserFirecrawl.execute_calls[0][2])
+            self.assertIn("await (async () => {", _FakeBrowserFirecrawl.execute_calls[0][2])
+            self.assertIn("return JSON.stringify(output);", _FakeBrowserFirecrawl.execute_calls[0][2])
+            self.assertNotIn("screenshot", _FakeBrowserFirecrawl.execute_calls[0][2].lower())
+            state = json.loads((Path(directory) / "sessions.json").read_text(encoding="utf-8"))
+            self.assertEqual(state["sessions"][0]["state"], "idle")
+
+    def test_browser_image_download_rejects_non_image_response(self) -> None:
+        _FakeBrowserFirecrawl.reset(
+            payload={
+                "status": 200,
+                "resolved_url": "https://example.com/login",
+                "content_type": "text/html",
+                "body_base64": None,
+                "byte_count": 0,
+                "error": "non_image_content_type",
+            }
+        )
+        with TemporaryDirectory() as directory:
+            pool = FirecrawlApiKeyPool(keys=["one-key"], state_path=Path(directory) / "pool.json")
+            manager = FirecrawlBrowserSessionManager(
+                key_pool=pool,
+                app_factory=_FakeBrowserFirecrawl,
+                state_path=Path(directory) / "sessions.json",
+            )
+            downloader = FirecrawlBrowserImageDownloader(session_manager=manager, retries=0)
+            with self.assertRaises(FirecrawlBrowserNonImageError):
+                downloader.download("https://example.com/not-an-image")
+
+    def test_browser_pool_rotates_keys_only_when_new_sessions_are_created(self) -> None:
+        _FakeBrowserFirecrawl.reset(payload={})
+        with TemporaryDirectory() as directory:
+            pool = FirecrawlApiKeyPool(
+                keys=["first-key", "second-key"],
+                state_path=Path(directory) / "pool.json",
+            )
+            manager = FirecrawlBrowserSessionManager(
+                key_pool=pool,
+                app_factory=_FakeBrowserFirecrawl,
+                state_path=Path(directory) / "sessions.json",
+                max_sessions=2,
+            )
+
+            first = manager.acquire(acquire_timeout_s=1, lease_timeout_s=60)
+            second = manager.acquire(acquire_timeout_s=1, lease_timeout_s=60)
+            first.release()
+            second.release()
+
+            self.assertEqual(
+                [key for key, _ in _FakeBrowserFirecrawl.browser_calls],
+                ["first-key", "second-key"],
+            )
+
+    def test_browser_pool_reports_waiting_and_retired_session_credits(self) -> None:
+        _FakeBrowserFirecrawl.reset(payload={})
+        with TemporaryDirectory() as directory:
+            pool = FirecrawlApiKeyPool(keys=["one-key"], state_path=Path(directory) / "pool.json")
+            manager = FirecrawlBrowserSessionManager(
+                key_pool=pool,
+                app_factory=_FakeBrowserFirecrawl,
+                state_path=Path(directory) / "sessions.json",
+            )
+            lease = manager.acquire(acquire_timeout_s=1, lease_timeout_s=60)
+            manager._register_waiter("test-waiter", expires_at=time.time() + 60)
+
+            queued_snapshot = manager.pool_snapshot()
+            self.assertEqual(queued_snapshot["in_use"], 1)
+            self.assertEqual(queued_snapshot["waiting"], 1)
+
+            manager._remove_waiter("test-waiter")
+            lease.invalidate("test close")
+            retired_snapshot = manager.pool_snapshot()
+
+            self.assertEqual(retired_snapshot["in_use"], 0)
+            self.assertEqual(retired_snapshot["metrics"]["retired"], 1)
+            self.assertEqual(retired_snapshot["metrics"]["credits_billed"], 7)
+            self.assertEqual(retired_snapshot["key_pool"]["credits_consumed"], 7)
 
 
 if __name__ == "__main__":

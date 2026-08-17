@@ -197,3 +197,40 @@ vllm: error: unrecognized arguments:  f
 INFO 06-04 01:36:27 [__init__.py:216] Automatically detected platform cuda.
 usage: vllm [-h] [-v] {chat,complete,serve,bench,collect-env,run-batch} ...
 vllm: error: unrecognized arguments:  
+Serper relay listening on [fdbd:dccd:cde2:1701:3e21:640a:cbaf:b8a3]:18080; upstream=https://google.serper.dev; token_required=False
+[serper-relay-upstream] path='/search' elapsed_s=0.586 status_code=200 response_bytes=4174
+[serper-relay] fdbd:dccd:cdc2:1289:0:4c:: "POST /search HTTP/1.1" 200 -
+[serper-relay-upstream] path='/search' elapsed_s=0.795 status_code=200 response_bytes=3594
+[serper-relay] fdbd:dccd:cdc2:1289:0:4c:: "POST /search HTTP/1.1" 200 -
+[serper-relay-upstream] path='/search' elapsed_s=0.845 status_code=200 response_bytes=3697
+[serper-relay] fdbd:dccd:cdc2:1289:0:4c:: "POST /search HTTP/1.1" 200 -
+[serper-relay-upstream] path='/search' elapsed_s=0.648 status_code=200 response_bytes=3640
+[serper-relay] fdbd:dccd:cdc2:1289:0:4c:: "POST /search HTTP/1.1" 200 -
+[serper-relay-upstream] path='/images' elapsed_s=1.626 status_code=200 response_bytes=9761
+[serper-relay] fdbd:dccd:cdc2:1289:0:4c:: "POST /images HTTP/1.1" 200 -
+[serper-relay-upstream] path='/images' elapsed_s=0.963 status_code=200 response_bytes=10072
+[serper-relay] fdbd:dccd:cdc2:1289:0:4c:: "POST /images HTTP/1.1" 200 -
+[serper-relay-upstream] path='/search' elapsed_s=0.792 status_code=200 response_bytes=4421
+[serper-relay] fdbd:dccd:cdc2:1289:0:4c:: "POST /search HTTP/1.1" 200 -
+[serper-relay-upstream] path='/search' elapsed_s=0.976 status_code=200 response_bytes=3572
+[serper-relay] fdbd:dccd:cdc2:1289:0:4c:: "POST /search HTTP/1.1" 200 -
+[serper-relay-upstream] path='/search' elapsed_s=0.554 status_code=200 response_bytes=3590
+[serper-relay] fdbd:dccd:cdc2:1289:0:4c:: "POST /search HTTP/1.1" 200 -
+[serper-relay-upstream] path='/search' elapsed_s=0.828 status_code=200 response_bytes=3523
+[serper-relay] fdbd:dccd:cdc2:1289:0:4c:: "POST /search HTTP/1.1" 200 -
+[serper-relay-upstream] path='/search' elapsed_s=1.299 status_code=200 response_bytes=4131
+[serper-relay] fdbd:dccd:cdc2:1289:0:4c:: "POST /search HTTP/1.1" 200 -
+[serper-relay-upstream] path='/images' elapsed_s=0.788 status_code=200 response_bytes=10628
+[serper-relay] fdbd:dccd:cdc2:1289:0:4c:: "POST /images HTTP/1.1" 200 -
+[serper-relay-upstream] path='/images' elapsed_s=0.828 status_code=200 response_bytes=10289
+[serper-relay] fdbd:dccd:cdc2:1289:0:4c:: "POST /images HTTP/1.1" 200 -
+[serper-relay-upstream] path='/images' elapsed_s=2.955 status_code=200 response_bytes=9911
+[serper-relay] fdbd:dccd:cdc2:1289:0:4c:: "POST /images HTTP/1.1" 200 -
+[serper-relay-upstream] path='/images' elapsed_s=1.545 status_code=200 response_bytes=9461
+[serper-relay] fdbd:dccd:cdc2:1289:0:4c:: "POST /images HTTP/1.1" 200 -
+[serper-relay-upstream] path='/search' elapsed_s=0.962 status_code=200 response_bytes=3904
+[serper-relay] fdbd:dccd:cdc2:1289:0:4c:: "POST /search HTTP/1.1" 200 -
+[serper-relay-upstream] path='/images' elapsed_s=0.862 status_code=200 response_bytes=8649
+[serper-relay] fdbd:dccd:cdc2:1289:0:4c:: "POST /images HTTP/1.1" 200 -
+
+Stopping Serper relay.

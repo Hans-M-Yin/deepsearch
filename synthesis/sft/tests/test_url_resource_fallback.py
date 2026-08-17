@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import os
 import tempfile
 import unittest
 from unittest import mock
 
+from synthesis.firecrawl_client import FirecrawlBrowserImageDownload
 from synthesis.sft import tools
 from synthesis.sft.api_tools import ToolRuntimeContext
 
@@ -87,6 +89,84 @@ class UrlResourceFallbackTests(unittest.TestCase):
         download.assert_called_once()
         reader.assert_not_called()
         firecrawl.assert_not_called()
+
+    def test_image_read_uses_firecrawl_browser_backend_when_configured(self) -> None:
+        resource = tools.UrlResource(
+            primary_url="https://upload.wikimedia.org/wikipedia/commons/example.jpg",
+            kind="image",
+            image_url="https://upload.wikimedia.org/wikipedia/commons/example.jpg",
+        )
+        jpeg = b"\xff\xd8\xff" + b"firecrawl-image"
+
+        class FakeBrowserDownloader:
+            calls: list[tuple[str, str | None, float]] = []
+
+            def download(self, url: str, *, referer_url: str | None, timeout_s: float):
+                self.calls.append((url, referer_url, timeout_s))
+                return FirecrawlBrowserImageDownload(
+                    payload=jpeg,
+                    content_type="image/jpeg",
+                    requested_url=url,
+                    resolved_url=url,
+                    status_code=200,
+                    session_id="session-1",
+                    key_id="key-1",
+                )
+
+        fake_downloader = FakeBrowserDownloader()
+        with (
+            tempfile.TemporaryDirectory() as cache_dir,
+            mock.patch.dict(
+                os.environ,
+                {
+                    "SFT_WIKIMEDIA_IMAGE_DOWNLOAD_BACKEND": "firecrawl_browser",
+                    "SFT_WIKIMEDIA_CACHE_DIR": cache_dir,
+                },
+                clear=False,
+            ),
+            mock.patch(
+                "synthesis.firecrawl_client.FirecrawlBrowserImageDownloader.from_environment",
+                return_value=fake_downloader,
+            ),
+            mock.patch.object(tools, "_download_binary") as direct_download,
+            mock.patch.object(tools, "_maybe_resize_downloaded_image", return_value=(jpeg, "image/jpeg")),
+        ):
+            result = tools.read_url(resource.primary_url, resource=resource)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["resolved_via"], "firecrawl_browser:requested")
+        self.assertEqual(len(fake_downloader.calls), 1)
+        direct_download.assert_not_called()
+
+    def test_wikimedia_cache_requires_exact_full_url(self) -> None:
+        url = "https://upload.wikimedia.org/wikipedia/commons/example.jpg?width=640"
+        other_url = "https://upload.wikimedia.org/wikipedia/commons/example.jpg?width=960"
+        jpeg = b"\xff\xd8\xff" + b"x" * 20
+        with tempfile.TemporaryDirectory() as cache_dir, mock.patch.dict(
+            os.environ,
+            {"SFT_WIKIMEDIA_CACHE_DIR": cache_dir},
+            clear=False,
+        ), mock.patch.object(
+            tools,
+            "_download_binary",
+            return_value=(jpeg, "image/jpeg"),
+        ) as download, mock.patch.object(
+            tools,
+            "_maybe_resize_downloaded_image",
+            return_value=(jpeg, "image/jpeg"),
+        ):
+            first = tools.read_url(url)
+            second = tools.read_url(url)
+            third = tools.read_url(other_url)
+
+        self.assertTrue(first["ok"])
+        self.assertFalse(first["from_cache"])
+        self.assertTrue(second["ok"])
+        self.assertTrue(second["from_cache"])
+        self.assertEqual(second["resolved_via"], "wikimedia_cache")
+        self.assertTrue(third["ok"])
+        self.assertFalse(third["from_cache"])
+        self.assertEqual(download.call_count, 2)
 
 
 if __name__ == "__main__":
