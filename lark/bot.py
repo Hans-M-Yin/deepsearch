@@ -1,8 +1,7 @@
 """Minimal single-user Feishu bot for executing commands on a Linux host.
 
 The process uses Feishu's long-connection mode to receive messages and calls
-the Feishu HTTP API only when it needs to report a failed command. Successful
-commands are intentionally silent.
+the Feishu HTTP API to send periodic progress, completion, or failure replies.
 
 This first version executes commands on the host where this process runs. If
 your cluster uses Slurm, Kubernetes, or another scheduler, replace
@@ -20,10 +19,11 @@ import sqlite3
 import subprocess
 import threading
 import time
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import quote
 
 import lark_oapi as lark
@@ -36,6 +36,8 @@ except ImportError:  # pragma: no cover - environment files are optional
 
 
 LOGGER = logging.getLogger("lark_command_bot")
+PROGRESS_INTERVAL_SECONDS = 60
+PROGRESS_LINE_COUNT = 30
 
 
 def _load_environment() -> None:
@@ -247,9 +249,14 @@ def _terminate_process_group(process: subprocess.Popen[bytes]) -> None:
         process.wait(timeout=5)
 
 
-def run_shell_command(command: str, config: Config) -> ExecutionResult:
-    """Run a command locally and retain only the tail of each output stream."""
+def run_shell_command(
+    command: str,
+    config: Config,
+    on_progress: Callable[[str, int], None] | None = None,
+) -> ExecutionResult:
+    """Run a command locally and optionally report live output periodically."""
     start_time = time.monotonic()
+    deadline = start_time + config.command_timeout_seconds
     process = subprocess.Popen(
         ["/bin/bash", "-lc", command],
         cwd=config.command_cwd,
@@ -262,7 +269,44 @@ def run_shell_command(command: str, config: Config) -> ExecutionResult:
     max_bytes = config.max_output_chars * 4
     stdout_tail = bytearray()
     stderr_tail = bytearray()
+    line_buffers = {"stdout": bytearray(), "stderr": bytearray()}
+    latest_lines: deque[str] = deque(maxlen=PROGRESS_LINE_COUNT)
+    next_progress_at = start_time + PROGRESS_INTERVAL_SECONDS
     timed_out = False
+
+    def consume_lines(stream_name: str, chunk: bytes) -> None:
+        buffer = line_buffers[stream_name]
+        buffer.extend(chunk)
+        if len(buffer) > max_bytes:
+            del buffer[: len(buffer) - max_bytes]
+
+        while b"\n" in buffer:
+            raw_line, _, remaining = buffer.partition(b"\n")
+            line_buffers[stream_name] = bytearray(remaining)
+            line = raw_line.decode("utf-8", errors="replace").rstrip("\r")
+            latest_lines.append(f"[{stream_name}] {line}")
+            buffer = line_buffers[stream_name]
+
+    def progress_snapshot() -> str:
+        lines = list(latest_lines)
+        for stream_name, buffer in line_buffers.items():
+            if buffer:
+                partial = buffer.decode("utf-8", errors="replace")
+                lines.append(f"[{stream_name}] {partial}")
+        if not lines:
+            return "暂无输出。"
+        return "\n".join(lines[-PROGRESS_LINE_COUNT:])
+
+    def maybe_report_progress() -> None:
+        nonlocal next_progress_at
+        if on_progress is None or process.poll() is not None:
+            return
+        now = time.monotonic()
+        if now < next_progress_at:
+            return
+        elapsed_seconds = int(now - start_time)
+        on_progress(progress_snapshot(), elapsed_seconds)
+        next_progress_at = time.monotonic() + PROGRESS_INTERVAL_SECONDS
 
     with selectors.DefaultSelector() as selector:
         assert process.stdout is not None
@@ -272,7 +316,7 @@ def run_shell_command(command: str, config: Config) -> ExecutionResult:
 
         while selector.get_map():
             if process.poll() is None:
-                remaining = config.command_timeout_seconds - time.monotonic() + start_time
+                remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     timed_out = True
                     _terminate_process_group(process)
@@ -291,6 +335,9 @@ def run_shell_command(command: str, config: Config) -> ExecutionResult:
                     _append_tail(stdout_tail, chunk, max_bytes)
                 else:
                     _append_tail(stderr_tail, chunk, max_bytes)
+                consume_lines(key.data, chunk)
+
+            maybe_report_progress()
 
     if process.poll() is None:
         process.wait()
@@ -337,6 +384,20 @@ def _message_text(content: Any) -> str:
     return ""
 
 
+def _parse_command(raw_command: str) -> tuple[str, bool]:
+    """Strip the optional SLICENCE prefix and return its progress mode."""
+    prefix = "SLICENCE"
+    if raw_command == prefix:
+        return "", True
+
+    remainder = raw_command[len(prefix) :]
+    if raw_command.startswith(prefix) and remainder and (
+        remainder[0].isspace() or remainder[0] == ":"
+    ):
+        return remainder.lstrip(" \t\r\n:"), True
+    return raw_command, False
+
+
 class CommandBot:
     def __init__(
         self, config: Config, state: MessageState, lark_api: LarkApi
@@ -356,17 +417,43 @@ class CommandBot:
             return False
         return True
 
-    def _reply_failure(self, message_id: str, text: str) -> None:
+    def _send_reply(self, message_id: str, text: str) -> None:
         try:
             self.lark_api.reply_text(message_id, text)
         except Exception:
-            LOGGER.exception("failed to send Feishu error reply: message_id=%s", message_id)
+            LOGGER.exception("failed to send Feishu reply: message_id=%s", message_id)
 
-    def _execute_and_report(self, message_id: str, command: str) -> None:
+    def _reply_progress(
+        self, message_id: str, output: str, elapsed_seconds: int
+    ) -> None:
+        progress_text = (
+            f"运行中（已运行 {elapsed_seconds} 秒）\n"
+            f"最近 {PROGRESS_LINE_COUNT} 行输出：\n"
+            f"{output}"
+        )
+        self._send_reply(
+            message_id,
+            _tail_text(progress_text, self.config.max_output_chars),
+        )
+
+    def _execute_and_report(
+        self, message_id: str, command: str, suppress_progress: bool
+    ) -> None:
         try:
-            result = run_shell_command(command, self.config)
+            result = run_shell_command(
+                command,
+                self.config,
+                on_progress=(
+                    None
+                    if suppress_progress
+                    else lambda output, elapsed: self._reply_progress(
+                        message_id, output, elapsed
+                    )
+                ),
+            )
             if not result.timed_out and result.returncode == 0:
                 LOGGER.info("command succeeded: message_id=%s", message_id)
+                self._send_reply(message_id, "Done!")
                 return
 
             if result.timed_out:
@@ -385,13 +472,13 @@ class CommandBot:
             if len(output_parts) == 2:
                 output_parts.append("命令没有输出。")
 
-            self._reply_failure(
+            self._send_reply(
                 message_id,
                 _tail_text("\n\n".join(output_parts), self.config.max_output_chars),
             )
         except Exception as exc:
             LOGGER.exception("command execution failed unexpectedly: message_id=%s", message_id)
-            self._reply_failure(message_id, f"机器人执行命令时发生异常：{exc}")
+            self._send_reply(message_id, f"机器人执行命令时发生异常：{exc}")
 
     def handle_message(self, data: Any) -> None:
         """Receive one SDK event and return quickly; execution is asynchronous."""
@@ -429,20 +516,29 @@ class CommandBot:
                 LOGGER.info("ignored non-text message: message_id=%s", message_id)
                 return
 
-            command = _message_text(message.get("content")).strip()
+            command, suppress_progress = _parse_command(
+                _message_text(message.get("content")).strip()
+            )
             if not command:
                 self.executor.submit(
-                    self._reply_failure, message_id, "没有收到可执行的命令。"
+                    self._send_reply, message_id, "没有收到可执行的命令。"
                 )
                 return
 
             LOGGER.info(
-                "accepted command: tenant_key=%s open_id=%s message_id=%s",
+                "accepted command: tenant_key=%s open_id=%s message_id=%s "
+                "suppress_progress=%s",
                 tenant_key,
                 open_id,
                 message_id,
+                suppress_progress,
             )
-            self.executor.submit(self._execute_and_report, message_id, command)
+            self.executor.submit(
+                self._execute_and_report,
+                message_id,
+                command,
+                suppress_progress,
+            )
         except Exception:
             # Never let malformed input make Feishu retry the event indefinitely.
             LOGGER.exception("failed to process Feishu message event")
