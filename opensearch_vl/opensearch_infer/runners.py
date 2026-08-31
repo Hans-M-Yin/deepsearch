@@ -49,8 +49,13 @@ logger = logging.getLogger(__name__)
 class InferenceConfig:
     """Tunables shared across runners."""
 
-    temperature: float = 0.0
-    max_tokens: int = 32768
+    temperature: float = 0.7
+    # Qwen3-VL official VL generation defaults.
+    max_tokens: int = 16384
+    top_p: float = 0.8
+    top_k: int = 20
+    repetition_penalty: float = 1.0
+    presence_penalty: float = 1.5
     enable_thinking: bool = False
 
 
@@ -81,7 +86,72 @@ class BaseRunner:
         raise NotImplementedError
 
 
-def _empty_response(model_version: str, error: str) -> Dict[str, Any]:
+def _truncate_for_log(value: object, max_chars: int = 8000) -> str:
+    """Return a bounded, single-value representation suitable for logs."""
+
+    text = str(value)
+    if len(text) <= max_chars:
+        return text
+    return f"{text[:max_chars]}... <truncated {len(text) - max_chars} chars>"
+
+
+def _openai_request_summary(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Summarize an OpenAI request without logging prompts or image payloads."""
+
+    messages_payload = payload.get("messages") or []
+    image_parts = 0
+    text_chars = 0
+    roles: List[str] = []
+
+    for item in messages_payload:
+        if not isinstance(item, dict):
+            continue
+        role = item.get("role")
+        if role is not None:
+            roles.append(str(role))
+        content = item.get("content")
+        if isinstance(content, str):
+            text_chars += len(content)
+            continue
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            part_type = part.get("type")
+            if part_type == "text":
+                text_chars += len(str(part.get("text") or ""))
+            elif part_type == "image_url" or "image_url" in part:
+                image_parts += 1
+
+    return {
+        "model": payload.get("model"),
+        "message_count": len(messages_payload),
+        "roles": roles,
+        "image_parts": image_parts,
+        "text_chars": text_chars,
+        "temperature": payload.get("temperature"),
+        "max_tokens": payload.get("max_tokens"),
+        "top_p": payload.get("top_p"),
+        "top_k": payload.get("top_k"),
+        "repetition_penalty": payload.get("repetition_penalty"),
+        "presence_penalty": payload.get("presence_penalty"),
+    }
+
+
+def _empty_response(
+    model_version: str,
+    error: str,
+    error_details: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    error_record: Dict[str, Any] = {"message": error}
+    if error_details:
+        error_record.update(error_details)
+
+    raw_response: Dict[str, Any] = {"error": error}
+    if error_details:
+        raw_response["error_details"] = error_details
+
     return {
         "candidates": [
             {
@@ -91,7 +161,8 @@ def _empty_response(model_version: str, error: str) -> Dict[str, Any]:
         ],
         "usageMetadata": {},
         "modelVersion": model_version,
-        "raw_response": {"error": error},
+        "raw_response": raw_response,
+        "inference_error": error_record,
     }
 
 
@@ -244,9 +315,19 @@ class OpenAICompatibleRunner(BaseRunner):
             "messages": messages.to_openai_messages(contents, system_instruction),
             "temperature": cfg.temperature,
             "max_tokens": cfg.max_tokens,
+            "top_p": cfg.top_p,
+            "top_k": cfg.top_k,
+            "repetition_penalty": cfg.repetition_penalty,
+            "presence_penalty": cfg.presence_penalty,
         }
-        if cfg.temperature > 0:
-            payload["top_p"] = 0.8
+        if self.spec.family.startswith("qwen3_vl"):
+            # Qwen3's native template has a separate hidden <think> mode.  The
+            # active SFT template is qwen3_vl_nothink; keep the API backend on
+            # the same setting while retaining the explicit <thinking> tags in
+            # the agent's visible response.
+            payload["chat_template_kwargs"] = {
+                "enable_thinking": bool(cfg.enable_thinking)
+            }
 
         headers = {"Content-Type": "application/json"}
         if self.api_key:
@@ -254,7 +335,10 @@ class OpenAICompatibleRunner(BaseRunner):
 
         url = f"{self.base_url}/chat/completions"
         last_error: Optional[Exception] = None
+        last_error_details: Optional[Dict[str, Any]] = None
+        request_summary = _openai_request_summary(payload)
         for attempt in range(1, self.max_retries + 1):
+            response = None
             try:
                 response = requests.post(
                     url,
@@ -303,11 +387,71 @@ class OpenAICompatibleRunner(BaseRunner):
                 }
             except Exception as exc:
                 last_error = exc
+                error_response = getattr(exc, "response", None) or response
+                response_body = None
+                response_headers: Dict[str, str] = {}
+                status_code = None
+                if error_response is not None:
+                    status_code = getattr(error_response, "status_code", None)
+                    response_body = _truncate_for_log(
+                        getattr(error_response, "text", "") or ""
+                    )
+                    headers = getattr(error_response, "headers", {}) or {}
+                    for header_name in (
+                        "x-request-id",
+                        "request-id",
+                        "trace-id",
+                        "retry-after",
+                        "content-type",
+                    ):
+                        header_value = headers.get(header_name)
+                        if header_value:
+                            response_headers[header_name] = str(header_value)
+                last_error_details = {
+                    "error_type": type(exc).__name__,
+                    "message": str(exc),
+                    "url": url,
+                    "attempt": attempt,
+                    "max_attempts": self.max_retries,
+                    "status_code": status_code,
+                    "response_body": response_body,
+                    "response_headers": response_headers,
+                    "request_summary": request_summary,
+                }
                 if attempt < self.max_retries:
                     time.sleep(min(2 ** (attempt - 1), 8))
 
-        logger.error("OpenAI-compatible inference failed: %s", last_error)
-        return _empty_response(self.display_name, str(last_error))
+        assert last_error is not None
+        details = last_error_details or {
+            "error_type": type(last_error).__name__,
+            "message": str(last_error),
+            "url": url,
+            "attempt": self.max_retries,
+            "max_attempts": self.max_retries,
+            "status_code": None,
+            "response_body": None,
+            "response_headers": {},
+            "request_summary": request_summary,
+        }
+        logger.error(
+            "OpenAI-compatible inference failed after %d attempt(s): "
+            "url=%s model=%s status_code=%s error_type=%s "
+            "response_body=%s response_headers=%s request_summary=%s error=%s",
+            self.max_retries,
+            url,
+            self.model,
+            details.get("status_code"),
+            details.get("error_type"),
+            details.get("response_body") or "<empty>",
+            details.get("response_headers") or "{}",
+            details.get("request_summary") or "{}",
+            details.get("message") or str(last_error),
+        )
+        return _empty_response(
+            self.display_name,
+            str(last_error),
+            error_details=details,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -577,7 +721,7 @@ class Qwen3VLRunner(BaseRunner):
         try:
             qwen_messages = messages.to_qwen3vl_messages(contents)
             qwen_messages = self._prepend_system(qwen_messages, system_instruction)
-            inputs = self._build_inputs(qwen_messages)
+            inputs = self._build_inputs(qwen_messages, cfg)
             output_text, prompt_len, gen_len = self._generate(inputs, cfg)
         except Exception as exc:
             logger.error("Qwen3-VL inference failed: %s", exc, exc_info=True)
@@ -629,10 +773,23 @@ class Qwen3VLRunner(BaseRunner):
             *msgs,
         ]
 
-    def _build_inputs(self, qwen_messages: List[Dict[str, Any]]):
-        text = self._processor.apply_chat_template(
-            qwen_messages, tokenize=False, add_generation_prompt=True
-        )
+    def _build_inputs(
+        self,
+        qwen_messages: List[Dict[str, Any]],
+        cfg: Optional[InferenceConfig] = None,
+    ):
+        cfg = cfg or InferenceConfig()
+        try:
+            text = self._processor.apply_chat_template(
+                qwen_messages,
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=bool(cfg.enable_thinking),
+            )
+        except TypeError:  # compatibility with older processors/templates
+            text = self._processor.apply_chat_template(
+                qwen_messages, tokenize=False, add_generation_prompt=True
+            )
         if self._uses_old_api:
             image_inputs, video_inputs = self._process_vision_info(qwen_messages)
             return self._processor(
@@ -712,11 +869,12 @@ class Qwen3VLRunner(BaseRunner):
         gen_kwargs: Dict[str, Any] = {
             "max_new_tokens": cfg.max_tokens,
             "do_sample": cfg.temperature > 0,
+            "repetition_penalty": cfg.repetition_penalty,
         }
         if cfg.temperature > 0:
             gen_kwargs["temperature"] = cfg.temperature
-            gen_kwargs["top_p"] = 0.8
-            gen_kwargs["top_k"] = 20
+            gen_kwargs["top_p"] = cfg.top_p
+            gen_kwargs["top_k"] = cfg.top_k
 
         with torch.no_grad():
             if model_dtype == torch.bfloat16 and device.type == "cuda":

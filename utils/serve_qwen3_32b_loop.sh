@@ -6,7 +6,7 @@ set -uo pipefail
 # Usage:
 #   bash utils/serve_qwen3_32b_loop.sh 2 true
 # Optional: RESTART_DELAY_S=0 bash utils/serve_qwen3_32b_loop.sh 2 true
-PORT=6659
+PORT=6658
 TENSOR_PARALLEL_SIZE="${1:-${TENSOR_PARALLEL_SIZE:-8}}"
 USE_VL="${2:-${USE_VL:-false}}"
 RESTART_DELAY_S="${RESTART_DELAY_S:-1}"

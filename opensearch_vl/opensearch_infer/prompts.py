@@ -1,5 +1,9 @@
 """System prompt helpers for the OpenSearch-VL inference adapter."""
 
+import json
+
+from synthesis.sft.qwen3_vl_template import format_sft_qwen_tool_prompt
+
 _SYSTEM_PROMPT_BODY = """
 You are a multimodal research agent. Solve the user request through explicit step-by-step reasoning and tool use.
 
@@ -9,6 +13,8 @@ Requirements:
 3. Use at most one tool call per turn.
 4. Prefer tool use whenever identification, external knowledge, or webpage inspection is needed.
 5. Use at most 45 tool calls in total for one case; when the evidence is sufficient, stop using tools and provide the final answer.
+6. `resource_id` values use the format `page_` or `image_` followed by 8 hexadecimal hash characters; copy them exactly from tool output and never construct them from Image numbers or search-result indices.
+7. Throughout the investigation, keep the original question, target entity, and requested attribute in mind; treat each identified object as provisional until it is verified against the image and all question constraints, and if any evidence contradicts the candidate, explicitly reject it and search for a new candidate instead of continuing to search for supporting evidence.
 
 Available tools are provided inside `<tools></tools>`.
 
@@ -56,10 +62,16 @@ The answer is ...
 
 
 def build_system_prompt(tools_schema: str) -> str:
-    """Return the full system prompt with an explicit ``<tools>`` block."""
+    """Return the system prompt with SFT's Qwen tool-schema formatting."""
 
-    tools_block = f"<tools>\n{tools_schema}\n</tools>"
-    return _SYSTEM_PROMPT_BODY.rstrip() + "\n\n" + tools_block
+    try:
+        tools = json.loads(tools_schema)
+        tools_block = format_sft_qwen_tool_prompt(tools)
+    except (TypeError, json.JSONDecodeError):
+        # Keep a readable fallback for callers that provide a preformatted
+        # schema string rather than the normal JSON array.
+        tools_block = f"\n\n# Tools\n\n<tools>\n{tools_schema}\n</tools>"
+    return _SYSTEM_PROMPT_BODY.rstrip() + "\n" + tools_block
 
 
 SYSTEM_PROMPT = _SYSTEM_PROMPT_BODY

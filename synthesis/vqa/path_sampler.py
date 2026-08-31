@@ -489,6 +489,7 @@ class SamplerGenerationStats:
     rejected_duplicate_exact: int = 0
     rejected_modality_switch: int = 0
     rejected_image_requirement: int = 0
+    rejected_mid_image_requirement: int = 0
     rejected_start_type: int = 0
     rejected_end_type: int = 0
     accepted_start_node_id: str | None = None
@@ -635,6 +636,7 @@ class RandomPathSampler(PathSampler):
                 aggregate.rejected_duplicate_exact += one_stats.rejected_duplicate_exact
                 aggregate.rejected_modality_switch += one_stats.rejected_modality_switch
                 aggregate.rejected_image_requirement += one_stats.rejected_image_requirement
+                aggregate.rejected_mid_image_requirement += one_stats.rejected_mid_image_requirement
                 aggregate.rejected_start_type += one_stats.rejected_start_type
                 aggregate.rejected_end_type += one_stats.rejected_end_type
             if candidate is None:
@@ -887,6 +889,12 @@ class RandomPathSampler(PathSampler):
             trajectory.starts_with_image or trajectory.ends_with_image or trajectory.has_mid_image
         ):
             return None, "image_position_requirement"
+        # Current VQA sampling policy intentionally keeps only paths with at
+        # least one image node strictly between the start and end nodes.  This
+        # is a fixed hard filter (rather than the soft image-spacing weight
+        # below) so endpoint-only image paths are not emitted.
+        if self.config.require_image_in_path and not trajectory.has_mid_image:
+            return None, "mid_image_requirement"
         if not self._valid_end_type(node_types[-1]):
             return None, "end_type"
         exact_signature = "|".join(node_ids)
@@ -2109,6 +2117,8 @@ class RandomPathSampler(PathSampler):
             stats.rejected_modality_switch += 1
         elif reject_reason == "image_position_requirement":
             stats.rejected_image_requirement += 1
+        elif reject_reason == "mid_image_requirement":
+            stats.rejected_mid_image_requirement += 1
         elif reject_reason == "end_type":
             stats.rejected_end_type += 1
 

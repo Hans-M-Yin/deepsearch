@@ -38,6 +38,8 @@ import sys
 import traceback
 from typing import Any, Optional
 
+from tqdm.auto import tqdm
+
 from opensearch_infer import config
 
 
@@ -155,7 +157,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--max-tokens",
         type=int,
-        default=32768,
+        default=16384,
         help="Per-turn generation cap.",
     )
     parser.add_argument(
@@ -182,9 +184,13 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--temperature",
         type=float,
-        default=0.0,
-        help="Sampling temperature (0 disables sampling).",
+        default=0.7,
+        help="Sampling temperature (Qwen3-VL VL default: 0.7; 0 disables sampling).",
     )
+    parser.add_argument("--top-p", type=float, default=0.8)
+    parser.add_argument("--top-k", type=int, default=20)
+    parser.add_argument("--repetition-penalty", type=float, default=1.0)
+    parser.add_argument("--presence-penalty", type=float, default=1.5)
     parser.add_argument(
         "--log-level",
         type=str,
@@ -289,6 +295,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     inference_cfg = InferenceConfig(
         temperature=args.temperature,
         max_tokens=args.max_tokens,
+        top_p=args.top_p,
+        top_k=args.top_k,
+        repetition_penalty=args.repetition_penalty,
+        presence_penalty=args.presence_penalty,
     )
 
     workers = max(1, int(args.parallel_workers))
@@ -300,8 +310,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         )
 
     def _run_one(idx: int) -> tuple[int, bool, Optional[str]]:
+        row = df.iloc[idx]
+        case_id = _row_to_case_id(row, idx)
+        timing = pipeline.InferenceTiming() if logger.isEnabledFor(logging.DEBUG) else None
+        status = "failed"
         try:
-            row = df.iloc[idx]
             pipeline.process_single_case(
                 row=row,
                 runner=runner,
@@ -309,12 +322,17 @@ def main(argv: Optional[list[str]] = None) -> int:
                 case_idx=idx,
                 dataset_type=args.dataset,
                 inference_cfg=inference_cfg,
+                timing=timing,
             )
+            status = "completed"
             return idx, True, None
         except Exception as exc:
             logger.error("Case %d failed: %s", idx, exc)
             traceback.print_exc()
             return idx, False, str(exc)
+        finally:
+            if timing is not None:
+                timing.emit(case_id=case_id, case_idx=idx, status=status)
 
     success, failure, skipped = 0, 0, 0
     completed_case_ids = _completed_case_ids(args.output_dir)
@@ -335,32 +353,34 @@ def main(argv: Optional[list[str]] = None) -> int:
         )
 
     if workers == 1:
-        for idx in indices:
+        for idx in tqdm(indices, desc="Inference", unit="case"):
             _, ok, _ = _run_one(idx)
             success += int(ok)
             failure += int(not ok)
     else:
         with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
             futures = {executor.submit(_run_one, idx): idx for idx in indices}
-            for future in concurrent.futures.as_completed(futures):
-                idx, ok, error = future.result()
-                success += int(ok)
-                failure += int(not ok)
-                if ok:
-                    logger.info(
-                        "Case %d completed (%d/%d)",
-                        idx,
-                        success + failure,
-                        len(indices),
-                    )
-                else:
-                    logger.error(
-                        "Case %d failed (%d/%d): %s",
-                        idx,
-                        success + failure,
-                        len(indices),
-                        error,
-                    )
+            with tqdm(total=len(futures), desc="Inference", unit="case") as progress:
+                for future in concurrent.futures.as_completed(futures):
+                    idx, ok, error = future.result()
+                    success += int(ok)
+                    failure += int(not ok)
+                    progress.update(1)
+                    if ok:
+                        logger.info(
+                            "Case %d completed (%d/%d)",
+                            idx,
+                            success + failure,
+                            len(indices),
+                        )
+                    else:
+                        logger.error(
+                            "Case %d failed (%d/%d): %s",
+                            idx,
+                            success + failure,
+                            len(indices),
+                            error,
+                        )
 
     logger.info(
         "Done. success=%d failure=%d skipped=%d output=%s",

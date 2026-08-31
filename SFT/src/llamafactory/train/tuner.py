@@ -14,11 +14,14 @@
 
 import os
 import shutil
+import sys
 import time
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 import torch.distributed as dist
+import yaml
 from transformers import EarlyStoppingCallback, PreTrainedModel
 
 from ..data import get_template_and_fix_tokenizer
@@ -59,6 +62,56 @@ if TYPE_CHECKING:
 
 
 logger = logging.get_logger(__name__)
+
+
+def _save_experiment_config_snapshot(args: Any) -> None:
+    """Save the effective training config next to the experiment outputs.
+
+    CLI YAML files are parsed before the Ray/torchrun workers are started, but
+    LlamaFactory does not otherwise preserve the complete input config.  Keep
+    both the merged effective config and, when available, an exact copy of the
+    source YAML so an experiment can be reproduced after the working config is
+    edited.  Only the driver/rank zero writes the snapshot to avoid concurrent
+    writes under torchrun.
+    """
+    if os.environ.get("RANK") not in (None, "0"):
+        return
+    if not isinstance(args, dict):
+        # Positional CLI arguments do not have a single source YAML to copy;
+        # parsed TrainingArguments are still persisted by Trainer.
+        return
+
+    output_dir = args.get("output_dir")
+    if not output_dir:
+        return
+
+    output_path = Path(str(output_dir)).expanduser().absolute()
+    try:
+        output_path.mkdir(parents=True, exist_ok=True)
+
+        # This is the effective config after OmegaConf has applied command-line
+        # overrides, which is the configuration actually used for training.
+        effective_path = output_path / "experiment_config.yaml"
+        effective_tmp = output_path / ".experiment_config.yaml.tmp"
+        with effective_tmp.open("w", encoding="utf-8") as file:
+            yaml.safe_dump(args, file, allow_unicode=True, sort_keys=False, default_flow_style=False)
+        os.replace(effective_tmp, effective_path)
+
+        # Preserve the exact source YAML as well, when the CLI was invoked with
+        # a YAML path. This lets users distinguish the source file from merged
+        # command-line overrides.
+        if len(sys.argv) > 1 and str(sys.argv[1]).lower().endswith((".yaml", ".yml")):
+            source_path = Path(sys.argv[1]).expanduser().absolute()
+            if source_path.is_file() and source_path != effective_path:
+                shutil.copy2(source_path, output_path / "experiment_config_source.yaml")
+    except Exception as exc:
+        # A snapshot must never prevent a training job from starting (for
+        # example, when output_dir is on a temporarily unavailable filesystem).
+        try:
+            effective_tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+        logger.warning("Failed to save experiment config snapshot: %s", exc)
 
 
 def _wait_for_placement_group(pg: "Any", num_workers: int, bundle: dict[str, Any], timeout_s: int = 600) -> None:
@@ -171,6 +224,7 @@ def _training_function(config: dict[str, Any]) -> None:
 
 def run_exp(args: Optional[dict[str, Any]] = None, callbacks: Optional[list["TrainerCallback"]] = None) -> None:
     args = read_args(args)
+    _save_experiment_config_snapshot(args)
     if "-h" in args or "--help" in args:
         get_train_args(args)
 

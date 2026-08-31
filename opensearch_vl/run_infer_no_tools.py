@@ -13,6 +13,8 @@ import sys
 import traceback
 from typing import Optional
 
+from tqdm.auto import tqdm
+
 from run_infer import (
     _build_arg_parser,
     _completed_case_ids,
@@ -124,32 +126,34 @@ def main(argv: Optional[list[str]] = None) -> int:
         )
 
     if workers == 1:
-        for idx in indices:
+        for idx in tqdm(indices, desc="No-tools inference", unit="case"):
             _, ok, _ = _run_one(idx)
             success += int(ok)
             failure += int(not ok)
     else:
         with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
             futures = {executor.submit(_run_one, idx): idx for idx in indices}
-            for future in concurrent.futures.as_completed(futures):
-                idx, ok, error = future.result()
-                success += int(ok)
-                failure += int(not ok)
-                if ok:
-                    logger.info(
-                        "Case %d completed (%d/%d)",
-                        idx,
-                        success + failure,
-                        len(indices),
-                    )
-                else:
-                    logger.error(
-                        "Case %d failed (%d/%d): %s",
-                        idx,
-                        success + failure,
-                        len(indices),
-                        error,
-                    )
+            with tqdm(total=len(futures), desc="No-tools inference", unit="case") as progress:
+                for future in concurrent.futures.as_completed(futures):
+                    idx, ok, error = future.result()
+                    success += int(ok)
+                    failure += int(not ok)
+                    progress.update(1)
+                    if ok:
+                        logger.info(
+                            "Case %d completed (%d/%d)",
+                            idx,
+                            success + failure,
+                            len(indices),
+                        )
+                    else:
+                        logger.error(
+                            "Case %d failed (%d/%d): %s",
+                            idx,
+                            success + failure,
+                            len(indices),
+                            error,
+                        )
 
     logger.info(
         "Done. success=%d failure=%d skipped=%d output=%s",

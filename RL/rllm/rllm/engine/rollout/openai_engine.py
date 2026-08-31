@@ -9,6 +9,10 @@ from rllm.globals import THOUGHT_DELIMITER_END, THOUGHT_DELIMITER_START
 from rllm.parser import ChatTemplateParser
 from rllm.tools.tool_base import Tool
 from rllm.workflows import TerminationEvent, TerminationReason
+from synthesis.sft.qwen3_vl_template import (
+    add_sft_image_placeholders,
+    interleave_sft_image_parts,
+)
 
 import base64
 from io import BytesIO
@@ -24,33 +28,31 @@ def process_messages_for_api(original_messages):
         # 检查是否包含 'images' 字段且不为空
         if 'images' in new_msg and new_msg['images']:
             pil_images = new_msg.pop('images')  # 取出并从字典中删除 'images' 键
-            original_text = new_msg['content']
+            original_text = str(new_msg.get('content') or '')
+
+            # Use the same logical multimodal convention as SFT: image
+            # placeholders live in the text, while the image payloads remain
+            # separate until the transport-specific conversion below.
+            original_text = add_sft_image_placeholders(original_text, len(pil_images))
+            logical_parts = interleave_sft_image_parts(
+                [("text", original_text), *(('image', image) for image in pil_images)]
+            )
 
             # 构造符合 OpenAI Vision 格式的 content 列表
             content_list = []
 
-            # 1. 先放入文本
-            if original_text:
-                content_list.append({
-                    "type": "text",
-                    "text": original_text
-                })
+            for kind, value in logical_parts:
+                if kind == "text":
+                    if value:
+                        content_list.append({"type": "text", "text": value})
+                    continue
 
-            # 2. 再放入图片
-            for img in pil_images:
-                # 将 PIL 图片转换为 Base64
-                buffered = BytesIO()
-                # 注意: 建议转换为 JPEG 以减小体积，除非你需要 PNG 的透明通道
-                img.save(buffered, format="JPEG")
-                img_b64_str = base64.b64encode(
-                    buffered.getvalue()).decode('utf-8')
-
-                content_list.append({
-                    "type": "image_url",
-                    "image_url": {
-                        "url": f"data:image/jpeg;base64,{img_b64_str}"
-                    }
-                })
+                image_url = _image_to_data_url(value)
+                if image_url:
+                    content_list.append({
+                        "type": "image_url",
+                        "image_url": {"url": image_url},
+                    })
 
             # 更新 content
             new_msg['content'] = content_list
@@ -58,6 +60,42 @@ def process_messages_for_api(original_messages):
         new_messages.append(new_msg)
 
     return new_messages
+
+
+def _image_to_data_url(image) -> str | None:
+    """Convert a PIL/path/bytes image used by RL into an API data URL."""
+
+    if isinstance(image, dict):
+        if image.get("bytes") is not None:
+            image = image["bytes"]
+        else:
+            image = image.get("path") or image.get("image") or image.get("url")
+
+    if isinstance(image, str):
+        if image.startswith("data:image/"):
+            return image
+        try:
+            with open(image, "rb") as handle:
+                image = handle.read()
+        except OSError:
+            # A remote URL is already valid OpenAI image content.  Do not
+            # download it a second time in the rollout transport.
+            if image.startswith(("http://", "https://")):
+                return image
+            return None
+
+    if isinstance(image, (bytes, bytearray, memoryview)):
+        payload = bytes(image)
+        img_b64_str = base64.b64encode(payload).decode("ascii")
+        return f"data:image/jpeg;base64,{img_b64_str}"
+
+    if isinstance(image, Image.Image):
+        buffered = BytesIO()
+        image.save(buffered, format="JPEG")
+        img_b64_str = base64.b64encode(buffered.getvalue()).decode("ascii")
+        return f"data:image/jpeg;base64,{img_b64_str}"
+
+    return None
 
 class OpenAIEngine(RolloutEngine):
     def __init__(self, model: str = "", tokenizer=None, max_prompt_length: int = 4096, max_response_length: int = 4096, max_model_length: int | None = None, api_retries: int = 3, base_url: str = "https://api.openai.com/v1", api_key: str = os.getenv("OPENAI_API_KEY"), sampling_params: dict | None = None, tools: list[Tool | dict] = None, accumulate_reasoning: bool = False, **kwargs):

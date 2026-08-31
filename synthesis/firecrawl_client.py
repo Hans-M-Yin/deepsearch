@@ -1,7 +1,10 @@
-"""Standalone Firecrawl URL-scraping backend with a shared API-key pool.
+"""Firecrawl URL-scraping backend with a shared API-key pool and optional Relay.
 
-The backend is deliberately not wired into the existing readers.  Call
-``FirecrawlClient.scrape`` directly when Firecrawl's managed browser is needed.
+``FirecrawlClient.scrape`` uses the local SDK by default.  Set
+``FIRECRAWL_RELAY_URL`` to send text-scrape and Browser requests through
+``debug/firecrawl_relay.py`` when the worker cannot reach Firecrawl directly.
+Set ``FIRECRAWL_BROWSER_RELAY_URL`` only when Browser traffic should use a
+different Relay endpoint.
 """
 
 from __future__ import annotations
@@ -20,6 +23,10 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
+from urllib.error import HTTPError
+from urllib.request import Request, urlopen
+
+from synthesis.url_utils import normalize_http_referer, normalize_http_url
 
 try:
     import fcntl
@@ -32,6 +39,8 @@ _FIXED_FIRECRAWL_KEYS_FILE = _MODULE_DIR / "firecrawl_keys.txt"
 _FIXED_FIRECRAWL_POOL_STATE_FILE = _MODULE_DIR / "firecrawl_state.json"
 _FIXED_FIRECRAWL_POOL_DEFAULT_CREDITS = 10000
 _FIXED_FIRECRAWL_KEY_POOL: "FirecrawlApiKeyPool | None" = None
+_DEFAULT_FIRECRAWL_RELAY_TIMEOUT_S = 120.0
+_DEFAULT_FIRECRAWL_BROWSER_RELAY_TIMEOUT_S = 300.0
 _PROCESS_USAGE_LOCK = threading.Lock()
 _PROCESS_USAGE: dict[str, int] = {
     "requests": 0,
@@ -68,6 +77,17 @@ def _record_process_usage(*, success: bool, credits_used: int = 0) -> None:
         _PROCESS_USAGE["requests"] += 1
         _PROCESS_USAGE["successful_requests" if success else "failed_requests"] += 1
         _PROCESS_USAGE["credits_used"] += max(0, int(credits_used))
+
+
+def _firecrawl_error_debug(event: str, **details: object) -> None:
+    """Emit Firecrawl backend context only when a call fails."""
+
+    suffix = " ".join(f"{key}={value!r}" for key, value in details.items())
+    print(
+        f"[firecrawl] {event}{(' ' + suffix) if suffix else ''}",
+        file=sys.stderr,
+        flush=True,
+    )
 
 
 def get_firecrawl_usage_snapshot() -> dict[str, int]:
@@ -388,7 +408,7 @@ class FirecrawlApiKeyPool:
 
 
 class FirecrawlClient:
-    """Synchronous Firecrawl scraper that rotates keys before every request."""
+    """Synchronous Firecrawl scraper with local key rotation and optional Relay."""
 
     def __init__(
         self,
@@ -426,12 +446,26 @@ class FirecrawlClient:
         if formats is not None:
             request_kwargs["formats"] = formats
         request_kwargs.update(kwargs)
-        print(f"[firecrawl] scrape_start url={url}", file=sys.stderr, flush=True)
         try:
-            result = self._app(api_key).scrape(url, **request_kwargs)
+            relay_url = self._relay_url()
+            if relay_url:
+                result = self._scrape_via_relay(
+                    relay_url,
+                    api_key=api_key,
+                    request_kwargs={"url": url, **request_kwargs},
+                )
+            else:
+                result = self._app(api_key).scrape(url, **request_kwargs)
             raw = self._response_as_dict(result)
         except Exception as exc:  # SDK transport and provider exceptions are recorded identically.
             api_status_code = _status_code_from_exception(exc)
+            _firecrawl_error_debug(
+                "scrape_failed",
+                url=url,
+                error_type=exc.__class__.__name__,
+                status_code=api_status_code,
+                error=str(exc),
+            )
             self.key_pool.record_result(
                 pool_metadata["key_id"],
                 success=False,
@@ -444,6 +478,12 @@ class FirecrawlClient:
         root_status_code = self._root_status_code(raw)
         if root_status_code == 401:
             error = str(raw.get("error") or "Firecrawl API authentication failed")
+            _firecrawl_error_debug(
+                "scrape_failed",
+                url=url,
+                status_code=root_status_code,
+                error=error,
+            )
             self.key_pool.record_result(
                 pool_metadata["key_id"],
                 success=False,
@@ -460,14 +500,15 @@ class FirecrawlClient:
         status_code = self._non_negative_int(
             response_metadata.get("statusCode", response_metadata.get("status_code"))
         )
-        print(
-            f"[firecrawl] scrape_done url={url} markdown_chars={self._markdown_length(raw)} "
-            f"credits_used={credits_used} status_code={status_code}",
-            file=sys.stderr,
-            flush=True,
-        )
         if status_code is not None and status_code != 200:
             error = self._status_code_error(raw, response_metadata, status_code)
+            _firecrawl_error_debug(
+                "scrape_failed",
+                url=url,
+                status_code=status_code,
+                credits_used=credits_used,
+                error=error,
+            )
             self.key_pool.record_result(
                 pool_metadata["key_id"],
                 success=False,
@@ -489,6 +530,13 @@ class FirecrawlClient:
             _record_process_usage(success=True, credits_used=credits_used)
             return raw
         error = str(raw.get("error") or "Firecrawl returned an unsuccessful response")
+        _firecrawl_error_debug(
+            "scrape_failed",
+            url=url,
+            status_code=status_code,
+            credits_used=credits_used,
+            error=error,
+        )
         self.key_pool.record_result(
             pool_metadata["key_id"],
             success=False,
@@ -498,6 +546,94 @@ class FirecrawlClient:
         )
         _record_process_usage(success=False, credits_used=credits_used)
         return raw
+
+    @staticmethod
+    def _relay_url() -> str:
+        """Return the configured Firecrawl Relay endpoint, if any.
+
+        The value may be either a Relay base URL (``http://relay:18081``) or
+        the complete ``/v2/scrape`` endpoint.  Keeping this switch here means
+        SFT and RL callers can opt into the Relay without changing their tool
+        implementations.
+        """
+
+        return str(os.environ.get("FIRECRAWL_RELAY_URL") or "").strip().rstrip("/")
+
+    @staticmethod
+    def _relay_scrape_url(relay_url: str) -> str:
+        normalized = relay_url.rstrip("/")
+        if normalized.endswith("/v2/scrape"):
+            return normalized
+        return f"{normalized}/v2/scrape"
+
+    @staticmethod
+    def _relay_timeout_s() -> float:
+        raw = str(os.environ.get("FIRECRAWL_RELAY_TIMEOUT_S") or "").strip()
+        if not raw:
+            return _DEFAULT_FIRECRAWL_RELAY_TIMEOUT_S
+        try:
+            return max(1.0, float(raw))
+        except ValueError:
+            return _DEFAULT_FIRECRAWL_RELAY_TIMEOUT_S
+
+    @classmethod
+    def _scrape_via_relay(
+        cls,
+        relay_url: str,
+        *,
+        api_key: str,
+        request_kwargs: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Send one Firecrawl scrape request through a trusted Relay.
+
+        The Relay forwards the request to Firecrawl.  The API key remains in
+        the existing local key pool and is forwarded to the upstream API by
+        the Relay.
+        """
+
+        payload = json.dumps(request_kwargs, ensure_ascii=False).encode("utf-8")
+        headers = {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "X-API-KEY": api_key,
+            "Authorization": f"Bearer {api_key}",
+        }
+        request = Request(
+            cls._relay_scrape_url(relay_url),
+            data=payload,
+            headers=headers,
+            method="POST",
+        )
+        try:
+            with urlopen(request, timeout=cls._relay_timeout_s()) as response:
+                response_body = response.read()
+                status_code = int(response.getcode() or 200)
+        except HTTPError as exc:
+            # Preserve provider errors as a normal Firecrawl-shaped response
+            # so the existing status/credit/key handling remains unchanged.
+            response_body = exc.read()
+            try:
+                error_payload = json.loads(response_body.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                error_payload = {"error": response_body.decode("utf-8", errors="replace")[:4000]}
+            if not isinstance(error_payload, dict):
+                error_payload = {"error": str(error_payload)}
+            error_payload.setdefault("statusCode", int(exc.code))
+            return error_payload
+
+        try:
+            response_payload = json.loads(response_body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise RuntimeError(
+                f"Firecrawl Relay returned non-JSON response (HTTP {status_code})."
+            ) from exc
+        if not isinstance(response_payload, dict):
+            raise TypeError(
+                f"Firecrawl Relay returned {type(response_payload).__name__}, expected an object."
+            )
+        if status_code != 200:
+            response_payload.setdefault("statusCode", status_code)
+        return response_payload
 
     def _app(self, api_key: str) -> Any:
         if self._app_factory is not None:
@@ -599,6 +735,10 @@ class FirecrawlBrowserError(RuntimeError):
         self.status_code = status_code
 
 
+class FirecrawlBrowserTransportError(FirecrawlBrowserError):
+    """A Browser API/relay request failed without proving the session is broken."""
+
+
 class FirecrawlBrowserSessionError(FirecrawlBrowserError):
     """A Browser session could not be created or is no longer usable."""
 
@@ -609,6 +749,127 @@ class FirecrawlBrowserHttpError(FirecrawlBrowserError):
 
 class FirecrawlBrowserNonImageError(FirecrawlBrowserError):
     """The remote URL resolved successfully but did not return image bytes."""
+
+
+class _FirecrawlRelayHttpError(RuntimeError):
+    """HTTP failure returned by the local Firecrawl Relay."""
+
+    def __init__(self, message: str, *, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
+
+class _FirecrawlRelayBrowserClient:
+    """Small v2 Browser client that talks to the Firecrawl Relay over HTTP.
+
+    The regular Firecrawl SDK is intentionally not given the Relay URL: its
+    Browser methods construct the official API endpoints themselves.  This
+    adapter mirrors only the three v2 Browser operations needed by the
+    session manager and keeps the agent-facing interface unchanged.
+    """
+
+    def __init__(self, *, api_key: str, relay_url: str, timeout_s: float) -> None:
+        self.api_key = api_key
+        self.relay_url = relay_url.rstrip("/")
+        if self.relay_url.endswith("/v2/scrape"):
+            self.relay_url = self.relay_url[: -len("/v2/scrape")].rstrip("/")
+        self.timeout_s = max(1.0, float(timeout_s))
+
+    def browser(self, **kwargs: object) -> dict[str, Any]:
+        payload: dict[str, Any] = {}
+        for source, target in {
+            "ttl": "ttl",
+            "activity_ttl": "activityTtl",
+            "stream_web_view": "streamWebView",
+            "profile": "profile",
+        }.items():
+            if kwargs.get(source) is not None:
+                payload[target] = kwargs[source]
+        profile = payload.get("profile")
+        if isinstance(profile, dict):
+            profile = dict(profile)
+            if "save_changes" in profile and "saveChanges" not in profile:
+                profile["saveChanges"] = profile.pop("save_changes")
+            payload["profile"] = profile
+        return self._request("POST", "/v2/browser", payload=payload, request_type="browser_create")
+
+    def browser_execute(
+        self,
+        session_id: str,
+        code: str,
+        *,
+        language: str = "bash",
+        timeout: int | None = None,
+        request_type: str = "browser_execute",
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {"code": code, "language": language}
+        if timeout is not None:
+            payload["timeout"] = timeout
+        return self._request(
+            "POST",
+            f"/v2/browser/{session_id}/execute",
+            payload=payload,
+            request_type=request_type,
+        )
+
+    def delete_browser(self, session_id: str) -> dict[str, Any]:
+        return self._request(
+            "DELETE",
+            f"/v2/browser/{session_id}",
+            request_type="browser_delete",
+        )
+
+    def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        payload: dict[str, Any] | None = None,
+        request_type: str,
+    ) -> dict[str, Any]:
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8") if payload is not None else None
+        headers = {
+            "Accept": "application/json",
+            "X-API-KEY": self.api_key,
+            "Authorization": f"Bearer {self.api_key}",
+            "X-Firecrawl-Relay-Request-Type": request_type,
+        }
+        if body is not None:
+            headers["Content-Type"] = "application/json"
+        request = Request(
+            f"{self.relay_url}{path}",
+            data=body,
+            headers=headers,
+            method=method,
+        )
+        try:
+            with urlopen(request, timeout=self.timeout_s) as response:
+                status_code = int(response.getcode() or 200)
+                response_body = response.read()
+        except HTTPError as exc:
+            response_body = exc.read()
+            status_code = int(exc.code)
+
+        try:
+            normalized = json.loads(response_body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise _FirecrawlRelayHttpError(
+                f"Firecrawl Relay returned non-JSON response for {method} {path} "
+                f"(HTTP {status_code}).",
+                status_code=status_code,
+            ) from exc
+        if not isinstance(normalized, dict):
+            raise _FirecrawlRelayHttpError(
+                f"Firecrawl Relay returned {type(normalized).__name__} for {method} {path}; expected an object.",
+                status_code=status_code,
+            )
+        if status_code < 200 or status_code >= 300:
+            detail = normalized.get("error") or normalized.get("detail") or "request failed"
+            raise _FirecrawlRelayHttpError(
+                f"Firecrawl Relay request failed with HTTP {status_code} for {method} {path}: {detail}",
+                status_code=status_code,
+            )
+        return normalized
 
 
 @dataclass(slots=True)
@@ -683,6 +944,7 @@ class FirecrawlBrowserSessionManager:
         expiry_safety_s: float = 30.0,
         create_timeout_s: float = 90.0,
         api_timeout_s: float = 120.0,
+        relay_timeout_s: float = 180.0,
     ) -> None:
         self.key_pool = key_pool
         self._app_factory = app_factory
@@ -705,6 +967,7 @@ class FirecrawlBrowserSessionManager:
         self.expiry_safety_s = max(1.0, float(expiry_safety_s))
         self.create_timeout_s = max(10.0, float(create_timeout_s))
         self.api_timeout_s = max(1.0, float(api_timeout_s))
+        self.relay_timeout_s = max(1.0, float(relay_timeout_s))
 
     @classmethod
     def from_environment(
@@ -730,6 +993,13 @@ class FirecrawlBrowserSessionManager:
             expiry_safety_s=_env_float("FIRECRAWL_BROWSER_EXPIRY_SAFETY_S", 30.0),
             create_timeout_s=_env_float("FIRECRAWL_BROWSER_CREATE_TIMEOUT_S", 90.0),
             api_timeout_s=_env_float("FIRECRAWL_BROWSER_API_TIMEOUT_S", 120.0),
+            relay_timeout_s=_env_float(
+                "FIRECRAWL_BROWSER_RELAY_TIMEOUT_S",
+                max(
+                    _DEFAULT_FIRECRAWL_BROWSER_RELAY_TIMEOUT_S,
+                    _env_float("FIRECRAWL_RELAY_TIMEOUT_S", 0.0),
+                ),
+            ),
         )
 
     def acquire(
@@ -794,28 +1064,40 @@ class FirecrawlBrowserSessionManager:
         finally:
             self._remove_waiter(waiter_id)
 
-    def execute(self, lease: _BrowserSessionLease, *, code: str, timeout_s: float) -> dict[str, Any]:
+    def execute(
+        self,
+        lease: _BrowserSessionLease,
+        *,
+        code: str,
+        timeout_s: float,
+        request_type: str = "browser_execute",
+    ) -> dict[str, Any]:
         """Execute code using a leased Browser session and normalize SDK output."""
 
         timeout_s = max(1, min(int(timeout_s), 300))
         try:
-            response = self._app(lease.key_id).browser_execute(
-                lease.session_id,
-                code,
-                language="node",
-                timeout=timeout_s,
-            )
+            app = self._app(lease.key_id)
+            execute_kwargs: dict[str, Any] = {
+                "language": "node",
+                "timeout": timeout_s,
+            }
+            if isinstance(app, _FirecrawlRelayBrowserClient):
+                execute_kwargs["request_type"] = request_type
+            response = app.browser_execute(lease.session_id, code, **execute_kwargs)
             raw = FirecrawlClient._response_as_dict(response)
         except Exception as exc:
             self._record_key_result(lease.key_id, success=False, error=str(exc), exc=exc)
-            raise FirecrawlBrowserSessionError(
-                f"Firecrawl Browser execute failed: {exc}",
-                status_code=_status_code_from_exception(exc),
-            ) from exc
+            status_code = _status_code_from_exception(exc)
+            message = f"Firecrawl Browser execute failed: {exc}"
+            if _is_browser_session_failure(status_code=status_code, message=message):
+                raise FirecrawlBrowserSessionError(message, status_code=status_code) from exc
+            raise FirecrawlBrowserTransportError(message, status_code=status_code) from exc
         if raw.get("success") is False or raw.get("error") or int(raw.get("exit_code") or raw.get("exitCode") or 0) != 0:
             error = str(raw.get("error") or raw.get("stderr") or "browser code execution failed")
             self._record_key_result(lease.key_id, success=False, error=error)
-            raise FirecrawlBrowserSessionError(error)
+            if _is_browser_session_failure(status_code=None, message=error):
+                raise FirecrawlBrowserSessionError(error)
+            raise FirecrawlBrowserTransportError(error)
         self._record_key_result(lease.key_id, success=True)
         return raw
 
@@ -1188,6 +1470,10 @@ class FirecrawlBrowserSessionManager:
         return snapshot
 
     def _debug_pool_status(self, event: str, **details: object) -> None:
+        # Suppress normal session/lease lifecycle noise. Only broken leases or
+        # failed downloads should expose the pool snapshot.
+        if event not in {"lease_invalidated", "download_failed"}:
+            return
         if not _firecrawl_browser_debug_enabled():
             return
         snapshot = self.pool_snapshot()
@@ -1240,6 +1526,17 @@ class FirecrawlBrowserSessionManager:
         api_key = self.key_pool.key_for_id(key_id)
         if self._app_factory is not None:
             return self._app_factory(api_key=api_key)
+        relay_url = str(
+            os.environ.get("FIRECRAWL_BROWSER_RELAY_URL")
+            or FirecrawlClient._relay_url()
+            or ""
+        ).strip()
+        if relay_url:
+            return _FirecrawlRelayBrowserClient(
+                api_key=api_key,
+                relay_url=relay_url,
+                timeout_s=self.relay_timeout_s,
+            )
         try:
             from firecrawl.v2 import FirecrawlClient as FirecrawlV2Client
         except ImportError as exc:
@@ -1378,8 +1675,12 @@ class FirecrawlBrowserImageDownloader:
             ),
             max_image_bytes=_env_int("FIRECRAWL_BROWSER_IMAGE_MAX_BYTES", 20 * 1024 * 1024),
             acquire_timeout_s=_env_float("FIRECRAWL_BROWSER_POOL_ACQUIRE_TIMEOUT_S", 120.0),
+            # The Relay retries the idempotent image execution upstream.  A
+            # single worker-side retry is enough to acquire a fresh session
+            # after a confirmed remote-session failure, without multiplying
+            # every transient error into many upstream requests.
             retries=_env_int("FIRECRAWL_BROWSER_IMAGE_RETRIES", 1),
-            retry_sleep_s=_env_float("FIRECRAWL_BROWSER_IMAGE_RETRY_SLEEP_S", 0.5),
+            retry_sleep_s=_env_float("FIRECRAWL_BROWSER_IMAGE_RETRY_SLEEP_S", 2.0),
         )
 
     def download(
@@ -1392,6 +1693,10 @@ class FirecrawlBrowserImageDownloader:
         target_url = str(url or "").strip()
         if not target_url:
             raise FirecrawlBrowserError("Image URL is required.")
+        try:
+            target_url = normalize_http_url(target_url)
+        except (TypeError, ValueError, UnicodeError) as exc:
+            raise FirecrawlBrowserError("Image URL is invalid.") from exc
         timeout_s = max(1.0, min(float(timeout_s), 300.0))
         last_error: Exception | None = None
         for attempt in range(self.retries + 1):
@@ -1399,7 +1704,10 @@ class FirecrawlBrowserImageDownloader:
             try:
                 lease = self.session_manager.acquire(
                     acquire_timeout_s=self.acquire_timeout_s,
-                    lease_timeout_s=timeout_s + 30.0,
+                    lease_timeout_s=max(
+                        timeout_s + 30.0,
+                        self.session_manager.relay_timeout_s + 30.0,
+                    ),
                     request_url=target_url,
                 )
                 response = self.session_manager.execute(
@@ -1410,6 +1718,7 @@ class FirecrawlBrowserImageDownloader:
                         request_timeout_ms=int(timeout_s * 1000),
                     ),
                     timeout_s=timeout_s,
+                    request_type="browser_image",
                 )
                 result = self._decode_download_response(
                     response,
@@ -1446,7 +1755,17 @@ class FirecrawlBrowserImageDownloader:
                     will_retry=will_retry,
                 )
                 if lease is not None:
-                    if status_code in {401, 404, 410, 502, 503} or isinstance(exc, FirecrawlBrowserSessionError):
+                    # FirecrawlBrowserHttpError represents the target image's
+                    # HTTP status. A target 404/502 must not destroy an
+                    # otherwise reusable Browser session. Only an error that
+                    # identifies the Browser session itself warrants
+                    # invalidation. A relay/client timeout is also
+                    # invalidated because the remote execution may still be
+                    # in flight after the worker stopped waiting.
+                    if isinstance(exc, FirecrawlBrowserSessionError) or (
+                        isinstance(exc, FirecrawlBrowserTransportError)
+                        and _is_timeout_message(str(exc))
+                    ):
                         lease.invalidate(reason=str(exc))
                     else:
                         lease.release()
@@ -1463,13 +1782,18 @@ class FirecrawlBrowserImageDownloader:
         referer_url: str | None,
         request_timeout_ms: int,
     ) -> str:
+        # Referer is optional. If it contains raw Unicode or control
+        # characters, omit it instead of making Playwright reject the whole
+        # request and incorrectly treating the Browser session as broken.
+        safe_referer = normalize_http_referer(referer_url) or ""
+        safe_url = normalize_http_url(url)
         payload = json.dumps(
             {
-                "url": url,
-                "referer": str(referer_url or ""),
+                "url": safe_url,
+                "referer": safe_referer,
                 "timeoutMs": max(1000, min(int(request_timeout_ms), 300000)),
             },
-            ensure_ascii=False,
+            ensure_ascii=True,
         )
         return f"""
 await (async () => {{
@@ -1609,6 +1933,14 @@ return JSON.stringify(output);
         if isinstance(exc, FirecrawlBrowserNonImageError):
             return False
         status_code = getattr(exc, "status_code", None)
+        # A destroyed remote session is reported as a 410 by the Browser
+        # execute endpoint.  This is not the target image's HTTP 410 and can
+        # succeed on a newly acquired session.  Keep ordinary target 410s
+        # non-retryable.
+        if isinstance(exc, FirecrawlBrowserSessionError):
+            message = str(exc).lower()
+            if "session destroyed" in message or "browser session" in message and "destroyed" in message:
+                return True
         return status_code is None or status_code in {408, 429, 500, 502, 503, 504}
 
 
@@ -1652,6 +1984,24 @@ def _browser_expiry_timestamp(value: object) -> float | None:
         return parsed.timestamp()
     except ValueError:
         return None
+
+
+def _is_browser_session_failure(*, status_code: int | None, message: str) -> bool:
+    """Distinguish a dead remote Browser session from a transient transport error."""
+
+    if status_code in {401, 404, 410}:
+        return True
+    normalized = str(message or "").lower()
+    return (
+        "session destroyed" in normalized
+        or "browser session has been destroyed" in normalized
+        or ("browser session" in normalized and "not found" in normalized)
+    )
+
+
+def _is_timeout_message(message: str) -> bool:
+    normalized = str(message or "").lower()
+    return "timeout" in normalized or "timed out" in normalized
 
 
 def _normalized_content_type(value: object) -> str:

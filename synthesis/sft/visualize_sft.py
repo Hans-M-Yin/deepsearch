@@ -5,6 +5,7 @@ Examples:
     python -m synthesis.sft.visualize_sft data.jsonl --id sample_path_abc
     python -m synthesis.sft.visualize_sft data.jsonl --index 12
     python -m synthesis.sft.visualize_sft data.jsonl --samples 5 --seed 42
+    python -m synthesis.sft.visualize_sft data.jsonl --offset 100 --samples 5 --seed 42
 
 ``--index`` is zero-based.  IDs are matched against ``sample_id``,
 ``question_id``, and ``path_id`` in that order.
@@ -132,19 +133,24 @@ def sample_records(
     path: str | Path,
     *,
     samples: int,
+    offset: int = 0,
     seed: int | None = None,
 ) -> list[tuple[int, dict[str, Any]]]:
-    """Randomly select distinct records and retain their physical line indexes."""
+    """Skip ``offset`` records, then randomly select distinct records."""
 
     if samples <= 0:
         raise ValueError("samples must be positive")
+    if offset < 0:
+        raise ValueError("offset must be non-negative")
 
     records = list(_iter_jsonl(Path(path)))
-    if samples > len(records):
+    candidates = records[offset:]
+    if samples > len(candidates):
         raise ValueError(
-            f"Requested {samples} samples, but the JSONL contains only {len(records)} records"
+            f"Requested {samples} samples after offset {offset}, but only "
+            f"{len(candidates)} records remain"
         )
-    return random.Random(seed).sample(records, samples)
+    return random.Random(seed).sample(candidates, samples)
 
 
 def format_trajectory(record: dict[str, Any]) -> str:
@@ -190,13 +196,26 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         help="Optional random seed for reproducible --samples output",
     )
+    parser.add_argument(
+        "--offset",
+        type=int,
+        default=0,
+        help="Zero-based record offset applied before --samples (default: 0)",
+    )
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.offset < 0:
+        raise SystemExit("--offset must be non-negative")
     if args.samples is not None:
-        selected = sample_records(args.jsonl, samples=args.samples, seed=args.seed)
+        selected = sample_records(
+            args.jsonl,
+            samples=args.samples,
+            offset=args.offset,
+            seed=args.seed,
+        )
         for sample_number, (physical_index, record) in enumerate(selected, start=1):
             if sample_number > 1:
                 print("\n\n")
@@ -207,6 +226,8 @@ def main(argv: list[str] | None = None) -> int:
             )
             print(format_trajectory(record))
     else:
+        if args.offset:
+            raise SystemExit("--offset can only be used together with --samples")
         record = find_record(args.jsonl, record_id=args.record_id, index=args.index)
         print(format_trajectory(record))
     return 0

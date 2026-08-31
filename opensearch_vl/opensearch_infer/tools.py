@@ -240,6 +240,45 @@ def _register_search_resources(
                 registry[key] = resource
 
 
+def _postprocess_search_result(
+    registry: dict[str, sft_tools.UrlResource],
+    *,
+    tool_name: str,
+    output: dict,
+) -> dict:
+    """Expose the same compact search-result IDs used during training.
+
+    The synthesis tool definitions promise ``source_page_id``/``image_id``
+    references, while the low-level Serper functions return raw provider
+    results.  Keep full URLs private in ``registry`` and expose only the
+    compact, resolvable representation to the model.
+    """
+
+    compact, resources = sft_tools.postprocess_search_output(
+        tool_name=tool_name,
+        output=output,
+        extract_url_keywords=False,
+    )
+    for resource in resources:
+        for candidate in (
+            resource.primary_url,
+            resource.resource_id,
+            resource.result_id,
+            resource.source_page_url,
+            resource.image_url,
+            resource.thumbnail_url,
+        ):
+            if candidate:
+                registry[str(candidate)] = resource
+        # Backward compatibility for checkpoints that learned to refer to a
+        # search result by its displayed rank ("1", "2", ...).  New tool
+        # outputs expose stable hash IDs, but resolving rank aliases prevents
+        # older checkpoints from entering an avoidable read_url error loop.
+        if resource.rank is not None:
+            registry[str(resource.rank)] = resource
+    return compact
+
+
 def _resolve_registered_resource(
     registry: dict[str, sft_tools.UrlResource],
     alias: object,
@@ -508,7 +547,9 @@ def execute_tool(
             top_k=int(params.get("top_k", sft_tools.DEFAULT_SEARCH_TOP_K)),
         )
         if isinstance(result, dict) and result.get("ok"):
-            _register_search_resources(resource_registry, tool_name="t2t_search", output=result)
+            result = _postprocess_search_result(
+                resource_registry, tool_name="t2t_search", output=result
+            )
         return json.dumps(result, ensure_ascii=False, indent=2), {}
 
     if name == "t2i_search":
@@ -521,7 +562,9 @@ def execute_tool(
             top_k=int(params.get("top_k", sft_tools.DEFAULT_SEARCH_TOP_K)),
         )
         if isinstance(result, dict) and result.get("ok"):
-            _register_search_resources(resource_registry, tool_name="t2i_search", output=result)
+            result = _postprocess_search_result(
+                resource_registry, tool_name="t2i_search", output=result
+            )
         return json.dumps(result, ensure_ascii=False, indent=2), {}
 
     if name == "i2i_search":
@@ -563,7 +606,9 @@ def execute_tool(
             top_k=int(params.get("top_k", sft_tools.DEFAULT_SEARCH_TOP_K)),
         )
         if isinstance(result, dict) and result.get("ok"):
-            _register_search_resources(resource_registry, tool_name="i2i_search", output=result)
+            result = _postprocess_search_result(
+                resource_registry, tool_name="i2i_search", output=result
+            )
         return json.dumps(result, ensure_ascii=False, indent=2), new_images
 
     if name == "read_url":

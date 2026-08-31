@@ -6,6 +6,10 @@ from copy import deepcopy
 import torch
 
 from rllm.tools.tool_base import Tool, ToolCall, ToolOutput
+from synthesis.sft.qwen3_vl_template import (
+    IMAGE_PLACEHOLDER,
+    format_sft_qwen_tool_prompt,
+)
 
 from .utils import PARSER_TEST_MESSAGES
 
@@ -353,12 +357,14 @@ class QwenChatTemplateParser(ChatTemplateParser):
         super().__init__(tokenizer, processor=processor)
         self.bos_token = tokenizer.bos_token
         self.eos_token = tokenizer.eos_token
+        self.thinking_start_token = "<thinking>"
+        self.thinking_end_token = "</thinking>"
         self.eot_token = "<|im_end|>\n"
         self.system_token = "<|im_start|>system\n"
         self.user_token = "<|im_start|>user\n"
         self.assistant_token = "<|im_start|>assistant\n"
         if disable_thinking:
-            self.assistant_token += "<think>\n\n</think>\n\n"
+            self.assistant_token += f"{self.thinking_start_token}\n\n{self.thinking_end_token}\n\n"
         self.generation_prompt = self.assistant_token
         self.image_token = "<|image_pad|>"
         self.vision_start_token = "<|vision_start|>"
@@ -370,28 +376,19 @@ class QwenChatTemplateParser(ChatTemplateParser):
 
     def parse(self, messages: list[dict], add_generation_prompt: bool = False, is_first_msg: bool = False, tools: list[Tool] = None, accumulate_reasoning: bool = False, **kwargs) -> str:
         tools = tools or []
-        tools_prompt_str = ""
-        if tools:
-            try:
-                tool_schema_strs = []
-                for tool in tools:
-                    if isinstance(tool, Tool):
-                        tool_schema_str = json.dumps(tool.json)
-                    elif isinstance(tool, dict):
-                        tool_schema_str = json.dumps(tool)
-                    else:
-                        tool_schema_str = tool
-                    tool_schema_strs.append(tool_schema_str)
-                tools_schema_str = "\n".join(tool_schema_strs)
-                tools_prompt_str = self.tool_parser.get_tool_prompt(tools_schema_str)
-            except Exception as e:
-                logger.error(f"Failed to format tools: {e}")
+        try:
+            tools_prompt_str = format_sft_qwen_tool_prompt(tools) if tools else ""
+        except Exception as e:
+            logger.error(f"Failed to format tools: {e}")
+            tools_prompt_str = ""
 
         result = ""
 
-        # if the first message is not a system message, add the system message
-        if is_first_msg and messages[0]["role"] != "system":
-            result += self.system_token + "You are Qwen, created by Alibaba Cloud. You are a helpful assistant." + tools_prompt_str + self.eot_token
+        # qwen3_vl_nothink has no implicit default system message.  Only add a
+        # system turn here when the caller supplied tools without a system
+        # message, matching Template._encode in LLaMA-Factory.
+        if is_first_msg and messages and messages[0]["role"] != "system" and tools_prompt_str:
+            result += self.system_token + tools_prompt_str + self.eot_token
 
         for message in messages:
             if message["role"] == "system":
@@ -412,22 +409,34 @@ class QwenChatTemplateParser(ChatTemplateParser):
     def parse_system(self, message, tools_prompt_str=""):
         content = message["content"]
 
-        if "# Tools" not in content and tools_prompt_str:
+        if "<tools>" not in content and tools_prompt_str:
             content += tools_prompt_str
 
         return self.system_token + content + self.eot_token
 
     def parse_user(self, message):
-        if "images" in message and message["images"] is not None:
-            assert isinstance(message["images"], list), "images must be a list"
-            n_imgs = len(message["images"])
-            content = message["content"]
-            if message["content"].startswith("<image>"):
-                content = content[len("<image>") :]
-            vision_tokens = (self.vision_start_token + self.image_token + self.vision_end_token) * n_imgs
-            return self.user_token + vision_tokens + content + self.eot_token
+        images = message.get("images")
+        content = str(message.get("content") or "")
+        if images is None:
+            return self.user_token + content + self.eot_token
 
-        return self.user_token + message["content"] + self.eot_token
+        assert isinstance(images, list), "images must be a list"
+        n_imgs = len(images)
+        if n_imgs and IMAGE_PLACEHOLDER not in content:
+            # Match SFT's inference fallback when image objects are supplied
+            # separately but the logical message has no placeholder.
+            content = IMAGE_PLACEHOLDER * n_imgs + content
+
+        marker_count = content.count(IMAGE_PLACEHOLDER)
+        if marker_count != n_imgs:
+            raise ValueError(
+                f"Qwen3-VL message has {n_imgs} images but {marker_count} "
+                f"{IMAGE_PLACEHOLDER!r} placeholders."
+            )
+
+        vision_tokens = self.vision_start_token + self.image_token + self.vision_end_token
+        rendered = content.replace(IMAGE_PLACEHOLDER, vision_tokens)
+        return self.user_token + rendered + self.eot_token
 
     def parse_assistant(self, message, accumulate_reasoning=False):
         content = (message.get("content", None) or "").strip()
@@ -441,7 +450,7 @@ class QwenChatTemplateParser(ChatTemplateParser):
             result = self.assistant_token
 
             if reasoning and accumulate_reasoning:
-                result += "<think>\n" + reasoning + "\n</think>\n\n"
+                result += self.thinking_start_token + "\n" + reasoning + "\n" + self.thinking_end_token + "\n\n"
 
             if content:
                 result += content
@@ -503,10 +512,10 @@ class QwenChatTemplateParser(ChatTemplateParser):
     def parse_completion(self, completion_ids):
         completion_text = self.tokenizer.decode(completion_ids, skip_special_tokens=False)
 
-        if completion_text.count("</think>") == 1:
-            reasoning, _, content = completion_text.partition("</think>")
-            if reasoning.startswith("<think>"):
-                reasoning = reasoning[len("<think>") :]
+        if completion_text.count(self.thinking_end_token) == 1:
+            reasoning, _, content = completion_text.partition(self.thinking_end_token)
+            if reasoning.startswith(self.thinking_start_token):
+                reasoning = reasoning[len(self.thinking_start_token) :]
             if content.endswith(self.eos_token):
                 content = content[: -len(self.eos_token)]
             if content.endswith(self.eot_token):
@@ -516,8 +525,8 @@ class QwenChatTemplateParser(ChatTemplateParser):
         else:
             reasoning = None
             content = completion_text
-            if content.startswith("<think>"):
-                content = content[len("<think>") :]
+            if content.startswith(self.thinking_start_token):
+                content = content[len(self.thinking_start_token) :]
             if content.endswith(self.eos_token):
                 content = content[: -len(self.eos_token)]
             if content.endswith(self.eot_token):
@@ -546,9 +555,9 @@ class QwenChatTemplateParser(ChatTemplateParser):
             if "images" in message and message["images"] is not None:
                 assert isinstance(message["images"], list), "images must be a list"
                 images = message["images"]
-                if not images or images[0] is None:
-                    continue
                 for image in images:
+                    if image is None:
+                        continue
                     image_dict = image if isinstance(image, dict) else {"image": image}
                     processed_image = fetch_image(image_dict, image_patch_size=self.processor.image_processor.patch_size)  # PIL.Image.Image
                     image_data.append(processed_image)

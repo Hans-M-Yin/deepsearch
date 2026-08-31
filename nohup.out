@@ -234,3 +234,57 @@ Serper relay listening on [fdbd:dccd:cde2:1701:3e21:640a:cbaf:b8a3]:18080; upstr
 [serper-relay] fdbd:dccd:cdc2:1289:0:4c:: "POST /images HTTP/1.1" 200 -
 
 Stopping Serper relay.
+/usr/local/lib/python3.12/dist-packages/requests/__init__.py:113: RequestsDependencyWarning: urllib3 (1.26.20) or chardet (7.5.1)/charset_normalizer (3.4.3) doesn't match a supported version!
+  warnings.warn(
+warning: The `fitz` API is deprecated and will be removed in future. Use `import pymupdf` instead.
+usage: build_refined_training_dataset.py [-h] --input INPUT --output-dir
+                                         OUTPUT_DIR
+                                         [--filter-model-alias FILTER_MODEL_ALIAS]
+                                         [--rewrite-model-alias REWRITE_MODEL_ALIAS]
+                                         [--verification-model-alias VERIFICATION_MODEL_ALIAS]
+                                         [--visual-vqa-model-alias VISUAL_VQA_MODEL_ALIAS]
+                                         [--vqa-dir VQA_DIR]
+                                         [--graph-dir GRAPH_DIR]
+                                         [--filter-max-tokens FILTER_MAX_TOKENS]
+                                         [--rewrite-max-tokens REWRITE_MAX_TOKENS]
+                                         [--verification-max-tokens VERIFICATION_MAX_TOKENS]
+                                         [--verification-max-turns VERIFICATION_MAX_TURNS]
+                                         [--filter-workers FILTER_WORKERS]
+                                         [--rewrite-workers REWRITE_WORKERS]
+                                         [--queue-size QUEUE_SIZE]
+                                         [--debug-output {full,verification_only,silence,slience}]
+                                         [--verbose] [--compare]
+                                         [--limit LIMIT]
+                                         [--offset OFFSET | --start START]
+                                         [--sample-id SAMPLE_IDS]
+                                         [--dataset-name DATASET_NAME]
+                                         [--dry-run] [--resume]
+                                         [--checkpoint-every CHECKPOINT_EVERY]
+build_refined_training_dataset.py: error: unrecognized arguments: /tmp/output_0820.log
+/usr/local/lib/python3.12/dist-packages/requests/__init__.py:113: RequestsDependencyWarning: urllib3 (1.26.20) or chardet (7.5.1)/charset_normalizer (3.4.3) doesn't match a supported version!
+  warnings.warn(
+warning: The `fitz` API is deprecated and will be removed in future. Use `import pymupdf` instead.
+usage: expand_trajectory_reasoning.py [-h] --input INPUT [--output OUTPUT]
+                                      [--audit-jsonl AUDIT_JSONL]
+                                      [--model-alias MODEL_ALIAS]
+                                      [--verification-model-alias VERIFICATION_MODEL_ALIAS]
+                                      [--visual-vqa-model-alias VISUAL_VQA_MODEL_ALIAS]
+                                      [--vqa-dir VQA_DIR]
+                                      [--graph-dir GRAPH_DIR]
+                                      [--visual-evidence-workdir VISUAL_EVIDENCE_WORKDIR]
+                                      [--max-tokens MAX_TOKENS]
+                                      [--history-window-turns HISTORY_WINDOW_TURNS]
+                                      [--verification-max-tokens VERIFICATION_MAX_TOKENS]
+                                      [--verification-max-turns VERIFICATION_MAX_TURNS]
+                                      [--verification-workdir VERIFICATION_WORKDIR]
+                                      [--debug-output {full,verification_only,silence,slience}]
+                                      [--verbose] [--no-action] [--compare]
+                                      [--verification-debug-turns VERIFICATION_DEBUG_TURNS]
+                                      [--workers WORKERS] [--limit LIMIT]
+                                      [--sample-id SAMPLE_IDS]
+                                      [--start START | --offset OFFSET]
+                                      [--dry-run] [--resume]
+                                      [--force-overwrite-state]
+                                      [--state-dir STATE_DIR]
+                                      [--checkpoint-every CHECKPOINT_EVERY]
+expand_trajectory_reasoning.py: error: unrecognized arguments: t /tmp/output_0821_2.log

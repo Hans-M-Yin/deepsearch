@@ -17,6 +17,7 @@ from .pipeline import (
     _strip_base64_payloads,
 )
 from .runners import BaseRunner, InferenceConfig
+from synthesis.sft.qwen3_vl_template import add_sft_image_placeholders
 
 
 logger = logging.getLogger(__name__)
@@ -61,6 +62,8 @@ def process_single_case(
     image_paths_dict, initial_parts = _bootstrap_images(
         row, case_id, case_idx, filename_prefix, image_urls_dict
     )
+    initial_image_count = sum(1 for part in initial_parts if "image_url" in part or "inline_data" in part)
+    prompt_text = add_sft_image_placeholders(prompt_text, initial_image_count)
     initial_parts.append({"text": prompt_text})
 
     gemini_contents: List[Dict[str, Any]] = [{"role": "user", "parts": initial_parts}]

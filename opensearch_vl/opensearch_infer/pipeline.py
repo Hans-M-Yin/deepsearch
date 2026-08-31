@@ -6,6 +6,7 @@ import io
 import json
 import logging
 import os
+import time
 from datetime import datetime
 from typing import Any, Callable, Dict, Iterable, List, Optional
 
@@ -15,9 +16,53 @@ from PIL import Image
 from . import config, image_io, tools
 from .runners import BaseRunner, InferenceConfig
 from .prompts import build_system_prompt
+from synthesis.sft.qwen3_vl_template import add_sft_image_placeholders
 
 
 logger = logging.getLogger(__name__)
+
+
+class InferenceTiming:
+    """Collect per-sample wall-clock timings for debug diagnostics."""
+
+    def __init__(self) -> None:
+        self.started_at = time.perf_counter()
+        self._modules: Dict[str, Dict[str, float | int]] = {}
+
+    def record(self, module: str, elapsed_s: float) -> None:
+        stats = self._modules.setdefault(module, {"calls": 0, "total_s": 0.0})
+        stats["calls"] = int(stats["calls"]) + 1
+        stats["total_s"] = float(stats["total_s"]) + elapsed_s
+
+    def emit(self, *, case_id: str, case_idx: int, status: str) -> None:
+        """Write one summary plus one line per module at DEBUG level only."""
+
+        if not logger.isEnabledFor(logging.DEBUG):
+            return
+
+        elapsed_s = time.perf_counter() - self.started_at
+        logger.debug(
+            "[inference-timing] case_id=%s case_idx=%s status=%s "
+            "total_elapsed_s=%.3f modules=%d",
+            case_id,
+            case_idx,
+            status,
+            elapsed_s,
+            len(self._modules),
+        )
+        for module, stats in self._modules.items():
+            calls = int(stats["calls"])
+            total_s = float(stats["total_s"])
+            average_s = total_s / calls if calls else 0.0
+            logger.debug(
+                "[inference-timing] case_id=%s module=%s calls=%d "
+                "total_s=%.3f average_s=%.3f",
+                case_id,
+                module,
+                calls,
+                total_s,
+                average_s,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -240,6 +285,44 @@ def _row_to_dict(row: Any) -> Dict[str, Any]:
     return {}
 
 
+def _format_inference_error(details: Any, turn_num: int) -> str:
+    """Make a runner-level error actionable in logs and failure artifacts."""
+
+    if not isinstance(details, dict):
+        return f"Model request failed on turn {turn_num}: {details}"
+
+    status_code = details.get("status_code")
+    url = details.get("url") or "<unknown>"
+    attempt = details.get("attempt")
+    max_attempts = details.get("max_attempts")
+    response_body = details.get("response_body") or "<empty>"
+    error_type = details.get("error_type") or "<unknown>"
+    message = details.get("message") or "<empty>"
+    request_summary = details.get("request_summary") or {}
+    return (
+        f"Model request failed on turn {turn_num}: "
+        f"url={url} status_code={status_code} error_type={error_type} "
+        f"attempt={attempt}/{max_attempts} response_body={response_body} "
+        f"request_summary={request_summary} error={message}"
+    )
+
+
+def _tool_name(tool_call: Any) -> str:
+    """Extract a stable tool label for timing output."""
+
+    call = tool_call
+    if isinstance(tool_call, str):
+        try:
+            call = json.loads(tool_call)
+        except (TypeError, ValueError):
+            return "unknown"
+    if isinstance(call, dict):
+        name = call.get("name")
+        if name:
+            return str(name)
+    return "unknown"
+
+
 def _first_present(
     row: Dict[str, Any], keys: Iterable[str], default: Any = None
 ) -> Any:
@@ -280,6 +363,7 @@ def process_single_case(
     dataset_type: str = "train",
     visual_lookup: Optional[Callable[..., object]] = None,
     inference_cfg: Optional[InferenceConfig] = None,
+    timing: Optional[InferenceTiming] = None,
 ) -> Dict[str, Any]:
     """Drive one benchmark example through the agent."""
 
@@ -315,6 +399,11 @@ def process_single_case(
 
     tools_schema = tools.get_tools_definition()
     system_prompt = build_system_prompt(tools_schema)
+    initial_image_count = sum(1 for part in initial_parts if "image_url" in part or "inline_data" in part)
+    prompt_text = add_sft_image_placeholders(prompt_text, initial_image_count)
+    # Keep the logical message in the same form as SFT data: question text
+    # followed by one <image> marker per supplied image.  The runner-specific
+    # converter places the actual image payload at those marker positions.
     initial_parts.append({"text": prompt_text})
 
     gemini_contents: List[Dict[str, Any]] = [
@@ -354,6 +443,7 @@ def process_single_case(
             logger.error("Could not save failure trajectory: %s", save_exc, exc_info=True)
 
     for turn_num in range(config.MAX_TURNS):
+        llm_started_at = time.perf_counter() if timing is not None else 0.0
         try:
             response = runner.infer(
                 contents=gemini_contents,
@@ -364,6 +454,9 @@ def process_single_case(
             logger.error("Inference failed on turn %d: %s", turn_num, exc, exc_info=True)
             persist_failure("inference_error", str(exc), turn_num)
             raise RuntimeError(f"Inference failed on turn {turn_num}: {exc}") from exc
+        finally:
+            if timing is not None:
+                timing.record("llm", time.perf_counter() - llm_started_at)
 
         response_text = ""
         for cand in response.get("candidates", []) or []:
@@ -377,6 +470,24 @@ def process_single_case(
             "response_text": response_text,
         }
         trajectory["turns"].append(turn_record)
+
+        # OpenAI-compatible runners return a synthetic ERROR response after
+        # exhausting retries so that the common Gemini-shaped contract is
+        # preserved.  Detect that marker before parsing the text; otherwise a
+        # backend HTTP 4xx/5xx is misleadingly reported as a missing answer.
+        if response.get("inference_error"):
+            reason = _format_inference_error(
+                response["inference_error"], turn_num
+            )
+            logger.error(
+                "Model request failed: case_id=%s case_idx=%s turn=%d details=%s",
+                case_id,
+                case_idx,
+                turn_num,
+                reason,
+            )
+            persist_failure("inference_error", reason, turn_num)
+            raise RuntimeError(reason)
 
         candidates = response.get("candidates", []) or []
         if candidates:
@@ -414,6 +525,8 @@ def process_single_case(
             raise RuntimeError(reason)
 
         os.makedirs(intermediate_dir, exist_ok=True)
+        tool_started_at = time.perf_counter() if timing is not None else 0.0
+        tool_module = _tool_name(tool_call_json)
         try:
             tool_message, new_images = tools.execute_tool(
                 tool_call_json,
@@ -429,6 +542,9 @@ def process_single_case(
         except Exception as exc:
             persist_failure("tool_execution_error", str(exc), turn_num)
             raise
+        finally:
+            if timing is not None:
+                timing.record(tool_module, time.perf_counter() - tool_started_at)
         observation_text = f"<tool_response>\n{tool_message}\n</tool_response>"
         turn_record["tool_output"] = observation_text
 

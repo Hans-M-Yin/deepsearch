@@ -10,10 +10,10 @@ retry behavior.
 from __future__ import annotations
 
 import copy
-import json
 from typing import Any
 
 from synthesis.sft import tools as sft_tools
+from synthesis.sft.qwen3_vl_template import format_sft_qwen_tool_prompt
 
 
 class SFTToolAdapter:
@@ -79,20 +79,12 @@ def build_sft_react_system_prompt() -> str:
     """
 
     definitions = get_tool_definitions()
-    tool_lines = [
-        json.dumps(definition["function"], ensure_ascii=False, indent=2)
-        for definition in definitions
-    ]
+    qwen_tool_prompt = format_sft_qwen_tool_prompt(definitions)
     return """You are a visual research agent. Answer the question with evidence and do not guess.
 
 Before every action, write a concise analysis inside <thinking>...</thinking>.
 Use exactly one tool call per turn and wait for its observation:
 <tool_call>{{"name":"tool_name","arguments":{{...}}}}</tool_call>
-
-Available tools are the following SFT tools:
-<tools>
-{tools}
-</tools>
 
 Tool rules:
 1. t2t_search searches text/web pages. Use its returned source_page_id with read_url.
@@ -105,7 +97,7 @@ When enough evidence has been collected, finish with:
 <answer>final answer</answer>
 
 Do not call tools not listed above. Do not emit more than one tool call in a turn.
-""".format(tools="\n\n".join(tool_lines))
+""" + "\n\n" + qwen_tool_prompt
 
 
 __all__ = [

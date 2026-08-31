@@ -138,7 +138,9 @@ def run_sft(
     # Training
     if training_args.do_train:
         train_result = trainer.train(resume_from_checkpoint=training_args.resume_from_checkpoint)
+        logger.info_rank0("Starting final trainer.save_model() to %s", training_args.output_dir)
         trainer.save_model()
+        logger.info_rank0("Final trainer.save_model() completed successfully: %s", training_args.output_dir)
         if finetuning_args.include_effective_tokens_per_second:
             train_result.metrics["effective_tokens_per_sec"] = calculate_tps(
                 dataset_module["train_dataset"], train_result.metrics, stage="sft"

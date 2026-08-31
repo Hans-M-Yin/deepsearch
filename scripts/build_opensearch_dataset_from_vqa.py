@@ -4,6 +4,7 @@
 Example:
     python scripts/build_opensearch_dataset_from_vqa.py --vqa-dir /path/to/vqa_run
     python scripts/build_opensearch_dataset_from_vqa.py --vqa-dir /path/to/vqa_run --output /path/to/questions.parquet
+    python scripts/build_opensearch_dataset_from_vqa.py --vqa-dir /path/to/vqa_run --offset 100 --limit 300 --seed 42
 """
 
 from __future__ import annotations
@@ -11,6 +12,7 @@ from __future__ import annotations
 import argparse
 import io
 import json
+import random
 from pathlib import Path
 from typing import Any
 
@@ -86,6 +88,33 @@ def _build_rows(records: list[dict[str, Any]]) -> list[dict[str, object]]:
     return [_build_row(record) for record in records]
 
 
+def _select_records(
+    records: list[dict[str, Any]],
+    *,
+    offset: int = 0,
+    limit: int = 0,
+    seed: int | None = None,
+) -> list[dict[str, Any]]:
+    """Skip ``offset`` records, then randomly sample up to ``limit`` records.
+
+    ``offset`` is a zero-based position in the original ``questions.jsonl``
+    order. A zero ``limit`` keeps all records after the offset. When a
+    seed is supplied, the selected benchmark is reproducible.
+    """
+
+    if offset < 0:
+        raise ValueError("offset must be non-negative")
+    if limit < 0:
+        raise ValueError("limit must be non-negative; use 0 for all remaining records")
+
+    candidates = records[offset:]
+    if limit == 0 or limit >= len(candidates):
+        return candidates
+
+    sampler = random.Random(seed)
+    return sampler.sample(candidates, k=limit)
+
+
 def write_parquet(rows: list[dict[str, object]], output_path: Path) -> None:
     try:
         import pandas as pd
@@ -135,7 +164,30 @@ def main() -> None:
         default="parquet",
         help="Dataset format to write.",
     )
+    parser.add_argument(
+        "--offset",
+        type=int,
+        default=0,
+        help="Zero-based start position in questions.jsonl. Defaults to 0.",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=0,
+        help="Number of records to randomly sample after offset. 0 keeps all remaining records.",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Optional random seed for reproducible benchmark sampling.",
+    )
     args = parser.parse_args()
+
+    if args.offset < 0:
+        parser.error("--offset must be non-negative")
+    if args.limit < 0:
+        parser.error("--limit must be non-negative; use 0 for all remaining records")
 
     vqa_dir = Path(args.vqa_dir).expanduser().resolve()
     questions_path = vqa_dir / "questions.jsonl"
@@ -149,7 +201,13 @@ def main() -> None:
         output_path = vqa_dir / f"opensearch_questions.{suffix}"
 
     records = _load_jsonl(questions_path)
-    rows = _build_rows(records)
+    selected_records = _select_records(
+        records,
+        offset=args.offset,
+        limit=args.limit,
+        seed=args.seed,
+    )
+    rows = _build_rows(selected_records)
     if args.format == "json":
         write_json(rows, output_path)
     else:

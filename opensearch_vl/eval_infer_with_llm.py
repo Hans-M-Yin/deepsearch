@@ -5,6 +5,8 @@
 Examples:
     python opensearch_vl/eval_infer_with_llm.py --traj-dir /path/to/output_dir
     python opensearch_vl/eval_infer_with_llm.py --traj-dir /path/to/output_dir --answer-file /path/to/dataset.parquet
+    python opensearch_vl/eval_infer_with_llm.py --traj-dir /path/to/output_dir \
+        --prompt-style official --rerun
 """
 
 from __future__ import annotations
@@ -24,32 +26,77 @@ from synthesis.model_worker import LLM_WORKER, ModelMessage, ModelRequest
 
 JUDGE_MODEL_ALIAS = os.environ.get("JUDGE_MODEL_ALIAS", "gpt54_internal_azure")
 JUDGE_MAX_TOKENS = int(os.environ.get("JUDGE_MAX_TOKENS", "1024"))
+DEFAULT_JUDGE_PROMPT_STYLE = os.environ.get("JUDGE_PROMPT_STYLE", "official").strip().lower()
 
 
-JUDGE_PROMPT = (
-    "You are an impartial judge evaluating whether an extracted final answer matches the "
-    "reference answer for a visual question answering task.\n\n"
+LOCAL_JUDGE_PROMPT = (
+    "You are an impartial evaluator for a visual question answering benchmark.\n\n"
     "[Question]\n{question}\n\n"
     "[Reference Answer]\n{correct_answer}\n\n"
-    "[Extracted Final Answer]\n{response}\n\n"
-    "Task: Determine whether the extracted final answer is correct.\n\n"
-    "Instructions:\n"
-    "0. The question and reference answer are verified ground truth and must be treated as correct. "
-    "Do not fact-check, reinterpret, or challenge either of them.\n"
-    "1. The extracted final answer comes only from the content inside <answer></answer>.\n"
-    "2. Ignore any reasoning, tool calls, or other text that may exist elsewhere in the original response.\n"
-    "3. Judge semantic correctness, not surface form.\n"
-    "4. Accept paraphrases that preserve the same meaning.\n"
-    "5. Reject answers that are incomplete, contradictory, overly vague, or unsupported.\n"
-    "6. If the extracted final answer is empty, judge it as incorrect.\n"
-    "7. A refusal or claim that the question/image is unanswerable is incorrect unless it is semantically "
-    "equivalent to the reference answer. Do not treat factual claims made by the extracted answer as evidence "
-    "against the question or reference answer.\n"
-    "8. Provide a short reason.\n\n"
+    "[Model Answer]\n{response}\n\n"
+    "Task: Determine whether the model provides the correct answer to the question.\n\n"
+    "Evaluation rules:\n"
+    "1. Treat the reference answer as the ground truth. Do not fact-check, reinterpret, or challenge it.\n"
+    "2. Evaluate the model's final substantive answer, not the quality of its reasoning process.\n"
+    "3. Ignore search descriptions, citations, intermediate reasoning, and extra context unless they "
+    "directly change or contradict the final answer.\n"
+    "4. Accept paraphrases, aliases, reordered names, capitalization differences, punctuation differences, "
+    "unit conversions, and equivalent date formats.\n"
+    "5. If the model gives a more specific answer that logically includes or entails the reference answer, "
+    "mark it correct. For example, '6,500 light-years' satisfies 'over 2,900 light-years'.\n"
+    "6. Do not require exact numerical string matching when the answer is an approximation, bound, range, "
+    "or equivalent measurement. Reject materially different numerical values when exactness is required.\n"
+    "7. Additional relevant information does not make an answer incorrect. Mark it incorrect only if the "
+    "additional information contradicts the reference answer or changes the answer to the question.\n"
+    "8. If the model gives a clear final answer but its surrounding explanation contains unrelated or minor "
+    "factual errors, judge the final answer itself. Mark it incorrect only if the explanation creates a direct "
+    "contradiction or makes the intended answer ambiguous.\n"
+    "9. If the question is invalid or based on a false premise, the model must identify that invalidity; "
+    "confidently answering it as an ordinary factual question is incorrect.\n"
+    "10. Mark an answer incorrect if it gives the wrong entity, wrong attribute, wrong relation, materially "
+    "wrong number/date, incomplete required items, or an answer that is too vague to answer the question.\n"
+    "11. If the model answer is empty, evasive, or says the answer cannot be determined, mark it incorrect "
+    "unless the reference answer itself indicates an invalid or unanswerable question.\n"
+    "12. Provide a brief reason focused on the final answer.\n\n"
     "Output format:\n"
     "correct: [yes/no]\n"
     "reasoning: [your explanation]"
 )
+
+
+# Canonical prompt used by the official OpenSearch-VL evaluator:
+# https://github.com/shawn0728/OpenSearch-VL/blob/main/opensearch_vl/eval_with_gpt4o.py
+OFFICIAL_JUDGE_PROMPT = (
+    "You are an impartial judge evaluating whether a deep research report contains the correct answer.\n\n"
+    "[Question]\n{question}\n\n"
+    "[Correct Answer]\n{correct_answer}\n\n"
+    "[Deep Research Report]\n{response}\n\n"
+    "Task: Determine if the deep research report contains the correct answer anywhere in its content.\n\n"
+    "Instructions:\n"
+    "1. Read through the entire research report carefully\n"
+    "2. Look for the correct answer anywhere in the report (it may be embedded in paragraphs, tables, or sections)\n"
+    "3. Check if the information in the report is consistent with the correct answer\n"
+    "4. The answer does NOT need to be in a specific format or labeled as \"final answer\"\n"
+    "5. Provide your reasoning\n"
+    "6. Answer with \"yes\" if the report contains the correct answer, \"no\" if it doesn't or contradicts it\n\n"
+    "Output format:\n"
+    "correct: [yes/no]\n"
+    "reasoning: [your explanation]"
+)
+
+
+JUDGE_PROMPTS = {
+    "local": LOCAL_JUDGE_PROMPT,
+    "official": OFFICIAL_JUDGE_PROMPT,
+}
+
+
+def get_judge_prompt(prompt_style: str) -> str:
+    style = str(prompt_style or "").strip().lower()
+    if style not in JUDGE_PROMPTS:
+        choices = ", ".join(sorted(JUDGE_PROMPTS))
+        raise ValueError(f"Unknown judge prompt style {prompt_style!r}; choose one of: {choices}")
+    return JUDGE_PROMPTS[style]
 
 
 def call_judge(
@@ -128,8 +175,9 @@ def judge_answer(
     *,
     judge_model_alias: str = JUDGE_MODEL_ALIAS,
     judge_max_tokens: int = JUDGE_MAX_TOKENS,
+    prompt_style: str = DEFAULT_JUDGE_PROMPT_STYLE,
 ) -> dict[str, Any]:
-    prompt = JUDGE_PROMPT.format(
+    prompt = get_judge_prompt(prompt_style).format(
         question=question,
         correct_answer=correct_answer,
         response=response[:4000],
@@ -211,7 +259,9 @@ def process_single_trajectory(
     answer_map: dict[str, str],
     judge_model_alias: str,
     judge_max_tokens: int,
+    prompt_style: str = DEFAULT_JUDGE_PROMPT_STYLE,
 ) -> dict[str, Any]:
+    prompt_style = str(prompt_style or DEFAULT_JUDGE_PROMPT_STYLE).strip().lower()
     traj = load_trajectory(path)
     case_id = str(traj.get("case_id") or path.stem)
     question = _extract_question(traj)
@@ -225,12 +275,14 @@ def process_single_trajectory(
         model_answer,
         judge_model_alias=judge_model_alias,
         judge_max_tokens=judge_max_tokens,
+        prompt_style=prompt_style,
     )
     return {
         "case_id": case_id,
         "question": question,
         "correct_answer": correct_answer,
         "model_answer": model_answer,
+        "judge_prompt_style": prompt_style,
         **judge_result,
     }
 
@@ -289,7 +341,12 @@ def run_eval(
     limit: int = 0,
     judge_model_alias: str = JUDGE_MODEL_ALIAS,
     judge_max_tokens: int = JUDGE_MAX_TOKENS,
+    prompt_style: str = DEFAULT_JUDGE_PROMPT_STYLE,
+    rerun: bool = False,
 ) -> dict[str, Any]:
+    prompt_style = str(prompt_style or "").strip().lower()
+    get_judge_prompt(prompt_style)  # Validate before starting any judge requests.
+
     traj_files = sorted(Path(traj_dir).glob("*_trajectory.json"))
     if not traj_files:
         raise FileNotFoundError(f"No trajectory files found in {traj_dir}")
@@ -302,24 +359,35 @@ def run_eval(
     details_path = Path(output_path.replace(".json", "_details.jsonl"))
 
     answer_map = load_answer_map(answer_file) if answer_file else {}
-    results_by_case = _load_existing_results(details_path)
-    completed_case_ids = {
-        case_id
-        for case_id, item in results_by_case.items()
-        if not item.get("error")
-    }
-    pending_files = [
-        path for path in traj_files if _trajectory_case_id(path) not in completed_case_ids
-    ]
-
-    if completed_case_ids:
+    if rerun:
+        # Explicitly discard the old result index. This reruns judging only; trajectories
+        # are read from traj_dir and no inference/model rollout is started here.
+        results_by_case: dict[str, dict[str, Any]] = {}
+        pending_files = list(traj_files)
         print(
-            f"[resume] Reusing {len(completed_case_ids)} completed evaluation result(s) "
-            f"from {details_path}"
+            f"[rerun] Ignoring existing evaluation results and judging "
+            f"{len(pending_files)} trajectory file(s) from scratch"
         )
+    else:
+        results_by_case = _load_existing_results(details_path)
+        completed_case_ids = {
+            case_id
+            for case_id, item in results_by_case.items()
+            if not item.get("error")
+        }
+        pending_files = [
+            path for path in traj_files if _trajectory_case_id(path) not in completed_case_ids
+        ]
+
+        if completed_case_ids:
+            print(
+                f"[resume] Reusing {len(completed_case_ids)} completed evaluation result(s) "
+                f"from {details_path}"
+            )
 
     if pending_files:
-        with details_path.open("a", encoding="utf-8") as append_handle:
+        details_mode = "w" if rerun else "a"
+        with details_path.open(details_mode, encoding="utf-8") as append_handle:
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 future_map = {
                     executor.submit(
@@ -328,6 +396,7 @@ def run_eval(
                         answer_map,
                         judge_model_alias,
                         judge_max_tokens,
+                        prompt_style,
                     ): path
                     for path in pending_files
                 }
@@ -341,6 +410,7 @@ def run_eval(
                             "acc": 0,
                             "reasoning": "",
                             "raw_judge": "",
+                            "judge_prompt_style": prompt_style,
                             "error": str(exc),
                         }
                     results_by_case[str(result.get("case_id", ""))] = result
@@ -363,6 +433,8 @@ def run_eval(
         "correct": correct,
         "accuracy": f"{accuracy:.2f}%",
         "judge_model": judge_model_alias,
+        "judge_prompt_style": prompt_style,
+        "rerun": rerun,
         "error_count": error_count,
         "label_distribution": dict(acc_counter),
     }
@@ -395,6 +467,19 @@ def main() -> None:
         default=JUDGE_MAX_TOKENS,
         help="Max tokens for the judge model response.",
     )
+    parser.add_argument(
+        "--prompt-style",
+        "--judge-prompt",
+        dest="prompt_style",
+        choices=sorted(JUDGE_PROMPTS),
+        default=DEFAULT_JUDGE_PROMPT_STYLE,
+        help="Judge prompt to use: local (current custom prompt) or official (OpenSearch-VL canonical prompt).",
+    )
+    parser.add_argument(
+        "--rerun",
+        action="store_true",
+        help="Ignore existing *_details.jsonl results and re-score every trajectory from scratch; does not run inference.",
+    )
     args = parser.parse_args()
 
     report = run_eval(
@@ -405,6 +490,8 @@ def main() -> None:
         limit=args.limit,
         judge_model_alias=args.judge_model_alias,
         judge_max_tokens=args.judge_max_tokens,
+        prompt_style=args.prompt_style,
+        rerun=args.rerun,
     )
     print(json.dumps(report, ensure_ascii=False, indent=2))
 

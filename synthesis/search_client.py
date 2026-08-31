@@ -206,7 +206,9 @@ def _serper_debug_enabled() -> bool:
 
 
 def _serper_debug(event: str, **kwargs: Any) -> None:
-    if not _serper_debug_enabled():
+    # Suppress normal request lifecycle output. Keep only failure diagnostics
+    # so failed calls retain their request/response context.
+    if event not in {"http_error", "url_error", "key_credits_exhausted"}:
         return
     details = " ".join(f"{key}={value!r}" for key, value in kwargs.items())
     suffix = f" {details}" if details else ""
@@ -248,20 +250,9 @@ def _log_serper_success_qpm(
     """Print the rolling process-local QPM after a successful Serper call."""
 
     current_qpm = _record_serper_success_qpm()
-    if not _serper_qpm_debug_enabled():
-        return
-    print(
-        "[serper-qpm]"
-        f" pid={os.getpid()}"
-        f" url={url!r}"
-        f" status_code={status_code}"
-        f" current_qpm={current_qpm}"
-        f" successful_calls_last_60s={current_qpm}"
-        f" elapsed_s={elapsed_s:.3f}"
-        f" response_chars={response_chars}",
-        file=sys.stderr,
-        flush=True,
-    )
+    # Success-path QPM diagnostics are intentionally disabled. Keep recording
+    # the rolling count above for in-process rate accounting.
+    del url, status_code, elapsed_s, response_chars, current_qpm
 
 
 def _serper_dns_debug(url: str) -> dict[str, Any] | None:

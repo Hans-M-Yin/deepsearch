@@ -12,6 +12,10 @@ from collections import Counter
 import json5
 from synthesis.sft import api_tools as sft_api
 from synthesis.sft.api_tools import ToolRuntimeContext
+from synthesis.sft.qwen3_vl_template import (
+    add_sft_image_placeholders,
+    render_sft_qwen3_vl_text,
+)
 
 # rLLM imports
 from rllm.engine.rollout import RolloutEngine
@@ -261,28 +265,8 @@ def build_text_completion_prompt(
     Returns:
         Formatted prompt string
     """
-    im_start = "<|im_start|>"
-    im_end = "<|im_end|>"
-
-    prompt_parts = []
-
-    # Handle system message
-    if messages and messages[0]["role"] == "system":
-        sys_content = messages[0]["content"]
-        prompt_parts.append(f"{im_start}system\n{sys_content}{im_end}")
-        messages = messages[1:]
-
-    # Ensure chat completes with assistant
-    if messages and messages[-1]["role"] != "assistant":
-        messages = messages + [{"role": "assistant", "content": ""}]
-
-    # Format each message
-    for msg in messages:
-        role = msg["role"]
-        content = msg["content"]
-        prompt_parts.append(f"{im_start}{role}\n{content}{im_end}")
-
-    return "\n".join(prompt_parts)
+    del allow_special  # retained for compatibility with the old helper API
+    return render_sft_qwen3_vl_text(messages)
 
 
 class MultiTurnReactAgent:
@@ -317,7 +301,7 @@ class MultiTurnReactAgent:
         # async rollout event loop.
         self.executor = kwargs.get("executor")
         self._sft_context: ToolRuntimeContext | None = None
-        self._pending_sft_attachment: dict[str, Any] | None = None
+        self._pending_sft_images: list[Any] = []
         # Configuration from original DeepResearch
         self.max_llm_calls = MAX_LLM_CALL_PER_RUN
         self.default_max_tries = default_max_tries
@@ -483,12 +467,12 @@ class MultiTurnReactAgent:
         if initial_image is not None:
             self._sft_context.image_registry["img_1"] = initial_image
             self._sft_context._image_counter = 1
-        self._pending_sft_attachment = None
+        self._pending_sft_images = []
 
         if images:
             user_message = {
                 "role": "user",
-                "content": question,
+                "content": add_sft_image_placeholders(question, len(images)),
                 "images": images,
             }
         else:
@@ -603,14 +587,21 @@ class MultiTurnReactAgent:
                 if tool_error:
                     assistant_message["step_error"] = True
 
-                tool_response = f"<tool_response>\n{result}\n</tool_response>"
-                messages.append({"role": "user", "content": tool_response})
-                if self._pending_sft_attachment is not None:
-                    # Match synthesis.sft.api_tools: an image returned by
-                    # read_url becomes a separate multimodal user message for
-                    # the next model turn, not merely a textual path.
-                    messages.append(self._pending_sft_attachment)
-                    self._pending_sft_attachment = None
+                observation_body = str(result)
+                if self._pending_sft_images:
+                    # SFT keeps the observation text and image placeholder in
+                    # one user-turn content string.  Image objects are carried
+                    # separately in the same order as the placeholders.
+                    observation_body = (
+                        f"{observation_body}\nThe image is shown below:\n"
+                        + "\n".join(["<image>"] * len(self._pending_sft_images))
+                    )
+                tool_response = f"<tool_response>\n{observation_body}\n</tool_response>"
+                observation_message = {"role": "user", "content": tool_response}
+                if self._pending_sft_images:
+                    observation_message["images"] = self._pending_sft_images
+                messages.append(observation_message)
+                self._pending_sft_images = []
                 if assistant_message["step_error"]:
                     consecutive_bad_steps += 1
                 else:
@@ -743,6 +734,8 @@ class MultiTurnReactAgent:
         of blocking the async rollout event loop.
         """
 
+        self._pending_sft_images = []
+
         if tool_name not in self.tools:
             available_tools = list(self.tools.keys())
             return f"Tool {tool_name} not found. Available tools: {available_tools}"
@@ -768,17 +761,14 @@ class MultiTurnReactAgent:
                     assistant_text=assistant_text,
                     tool_goal=tool_goal,
                 )
-                attachment = None
-                if execution.new_images:
-                    attachment = sft_api._read_url_image_attachment(execution, context)
-                return execution, attachment
+                return execution
 
             loop = asyncio.get_running_loop()
-            execution, attachment = await loop.run_in_executor(
+            execution = await loop.run_in_executor(
                 self.executor,
                 execute_sft_tool,
             )
-            self._pending_sft_attachment = attachment
+            self._pending_sft_images = list((execution.new_images or {}).values())
             return execution.output_text
 
         # Compatibility path for a caller that supplies a legacy non-SFT tool.

@@ -16,17 +16,17 @@ deepspeed: /mnt/hdfs/byte_ai_sales/user/user/yinzhihan/agent/OpenSearch-VL/SFT/e
 
 ### dataset
 dataset: opensearch_vl_sft
-dataset_dir: /mnt/hdfs/byte_ai_sales/user/user/yinzhihan/agent/OpenSearch-VL/data/sharegpt_dataset_final
+dataset_dir: /mnt/hdfs/byte_ai_sales/user/user/yinzhihan/agent/OpenSearch-VL/data/sharegpt_dataset_part3_part4
 template: qwen3_vl_nothink
 cutoff_len: 32768
 overwrite_cache: true
 preprocessing_num_workers: 16
 dataloader_num_workers: 4
-tokenized_path: /mnt/hdfs/byte_ai_sales/user/user/yinzhihan/cache/opensearch_sft_tokenized_final_nothink_32768_v1
+tokenized_path: /mnt/hdfs/byte_ai_sales/user/user/yinzhihan/cache/opensearch_sft_tokenized_part3_part4_nothink_32768_v2
 data_shared_file_system: true
 
 ### output
-output_dir: saves/qwen3_vl_8b/full/data_final_2node16gpu
+output_dir: saves/qwen3_vl_8b/full/data_part3_part4_2node16gpu_lr_2e_5_slow_cosine_epoch3_v2
 logging_steps: 1
 save_steps: 400
 plot_loss: true
@@ -34,7 +34,7 @@ overwrite_output_dir: true
 save_only_model: false
 report_to: wandb
 project: mmdeepsearch
-run_name: 0805_8b_2node_16gpus_data_test
+run_name: 0819_8b_2node_16gpus_part3_part4_lr_2e_5_slow_cosine_epoch3_v2
 
 ### ray
 ray_num_workers: 16
@@ -71,8 +71,10 @@ per_device_train_batch_size: 1
 gradient_accumulation_steps: 16
 gradient_checkpointing: true
 learning_rate: 2.0e-5
-num_train_epochs: 2.0
+num_train_epochs: 3.0
 lr_scheduler_type: cosine
+lr_scheduler_kwargs:
+  num_cycles: 0.25
 warmup_ratio: 0.1
 bf16: true
 ddp_timeout: 1800

@@ -19,7 +19,7 @@ from hashlib import sha256
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Callable
-from urllib.parse import quote, unquote, urlparse, urlsplit, urlunparse
+from urllib.parse import unquote, urlparse, urlsplit
 
 import requests
 from PIL import Image, ImageOps
@@ -43,6 +43,7 @@ from synthesis.wiki_text_builder import EnhancedReaderClient
 from synthesis.model_worker import LLM_WORKER
 from synthesis.model_worker import ModelMessage
 from synthesis.model_worker import ModelRequest
+from synthesis.url_utils import normalize_http_referer, normalize_http_url
 logger = logging.getLogger(__name__)
 MAX_SEARCH_RESULTS = 5
 TOOL_NETWORK_TIMEOUT_S = 120
@@ -53,6 +54,11 @@ TOOL_NETWORK_TIMEOUT_S = 120
 TOOL_TIMEOUT_RETRIES = 5
 TOOL_RETRY_SLEEP_S = 5
 TOOL_429_RETRY_SLEEP_S = 60
+# ``read_url`` intentionally gives Enhanced Reader one short retry before
+# switching to Firecrawl. Keep this separate from the generic HTTP retry
+# budget so unrelated tools cannot silently lengthen this fallback boundary.
+ENHANCED_READER_RETRIES = 1
+ENHANCED_READER_RETRY_SLEEP_S = 5
 MAX_DOWNLOADED_IMAGE_LONG_EDGE = 1920
 MAX_DOWNLOADED_IMAGE_SHORT_EDGE = 1080
 RESIZED_IMAGE_LONG_EDGE = 1200
@@ -405,35 +411,10 @@ def _normalize_request_url(url: str) -> str:
     delimiters and existing percent escapes.
     """
 
-    raw_url = str(url or "").strip()
-    if not raw_url:
-        return raw_url
-    if not raw_url.startswith(("http://", "https://")):
-        raw_url = f"https://{raw_url}"
-    parsed = urlparse(raw_url)
-    scheme = parsed.scheme or "https"
-    hostname = parsed.hostname or ""
-    try:
-        hostname = hostname.encode("idna").decode("ascii")
-    except UnicodeError:
-        hostname = parsed.hostname or ""
-    netloc = hostname
-    if parsed.port is not None:
-        netloc = f"{netloc}:{parsed.port}"
-    if parsed.username:
-        userinfo = quote(unquote(parsed.username), safe="")
-        if parsed.password:
-            userinfo += ":" + quote(unquote(parsed.password), safe="")
-        netloc = f"{userinfo}@{netloc}"
-    path = quote(unquote(parsed.path or "/"), safe="/%:@!$&'()*+,;=-._~")
-    query = quote(unquote(parsed.query or ""), safe="=&?/:@!$'()*+,;%-._~")
-    fragment = quote(unquote(parsed.fragment or ""), safe="=&?/:@!$'()*+,;%-._~")
-    return urlunparse((scheme, netloc, path, "", query, fragment))
+    return normalize_http_url(url)
 
 
 DEFAULT_SEARCH_TOP_K = _env_int("SEARCH_TOP_K", MAX_SEARCH_RESULTS)
-TOOL_STATS_PRINT_EVERY = max(1, _env_int("SFT_TOOL_STATS_PRINT_EVERY", 4))
-
 _TOOL_STATS_LOCK = threading.Lock()
 _TOOL_STATS: dict[str, Any] = {
     "total_calls": 0,
@@ -481,7 +462,7 @@ def _record_search_tool_call(tool_name: str, *, success: bool, result_count: int
         tool_stats[key] += 1
         tool_stats["total_results"] += max(0, int(result_count))
         _TOOL_STATS["total_calls"] += 1
-        if _TOOL_STATS["total_calls"] % TOOL_STATS_PRINT_EVERY == 0:
+        if not success:
             snapshot_text = _tool_stats_snapshot_text()
     if snapshot_text:
         print(snapshot_text, file=sys.stderr, flush=True)
@@ -513,7 +494,7 @@ def _record_read_url_call(
             status_counts = read_stats["image_http_statuses"]
             status_counts[status_key] = int(status_counts.get(status_key) or 0) + 1
         _TOOL_STATS["total_calls"] += 1
-        if _TOOL_STATS["total_calls"] % TOOL_STATS_PRINT_EVERY == 0:
+        if not success:
             snapshot_text = _tool_stats_snapshot_text()
     if snapshot_text:
         print(snapshot_text, file=sys.stderr, flush=True)
@@ -530,7 +511,9 @@ def _web_request_headers(*, referer_url: str | None = None) -> dict[str, str]:
         "Accept-Language": "en-US,en;q=0.9",
     }
     if referer_url:
-        headers["Referer"] = referer_url
+        safe_referer = normalize_http_referer(referer_url)
+        if safe_referer:
+            headers["Referer"] = safe_referer
     return headers
 
 
@@ -965,6 +948,7 @@ def postprocess_search_output(
     tool_name: str,
     output: dict[str, Any],
     url_keyword_model: str | None = None,
+    extract_url_keywords: bool = True,
 ) -> tuple[dict[str, Any], list[UrlResource]]:
     """Convert search results into compact agent output plus private resources.
 
@@ -985,24 +969,25 @@ def postprocess_search_output(
         if url
     }
     hints: dict[str, str] = {}
-    resolved_url_keyword_model = url_keyword_model or get_sft_qwen_model_alias()
-    max_workers = len(unique_urls)
-    if max_workers:
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_url = {
-                executor.submit(
-                    extract_url_semantic_keywords,
-                    url,
-                    model_alias=resolved_url_keyword_model,
-                ): url
-                for url in unique_urls
-            }
-            for future in as_completed(future_to_url):
-                url = future_to_url[future]
-                try:
-                    hints[url] = future.result()
-                except Exception:
-                    hints[url] = ""
+    if extract_url_keywords:
+        resolved_url_keyword_model = url_keyword_model or get_sft_qwen_model_alias()
+        max_workers = len(unique_urls)
+        if max_workers:
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_to_url = {
+                    executor.submit(
+                        extract_url_semantic_keywords,
+                        url,
+                        model_alias=resolved_url_keyword_model,
+                    ): url
+                    for url in unique_urls
+                }
+                for future in as_completed(future_to_url):
+                    url = future_to_url[future]
+                    try:
+                        hints[url] = future.result()
+                    except Exception:
+                        hints[url] = ""
 
     resources: list[UrlResource] = []
     agent_results: list[dict[str, Any]] = []
@@ -1868,6 +1853,10 @@ def _read_document(url: str) -> dict[str, Any]:
     reader = EnhancedReaderClient(
         base_url=reader_base,
         timeout_s=TOOL_NETWORK_TIMEOUT_S,
+        # The read_url wrapper owns the single retry and the Firecrawl
+        # fallback. Disable the client's legacy 502 retry here so a 502 does
+        # not receive an additional hidden 15-second retry.
+        retry_502=False,
     )
     document = reader.read(url)
     return {
@@ -1879,45 +1868,47 @@ def _read_document(url: str) -> dict[str, Any]:
     }
 
 
-def _read_document_with_timeout_retry(
+def _read_document_with_retry(
     url: str,
     *,
     timings: dict[str, float] | None = None,
     timing_prefix: str = "enhanced_reader",
 ) -> dict[str, Any]:
-    """Read via Enhanced Reader, retrying only transport timeouts.
+    """Read via Enhanced Reader once, then retry once before Firecrawl.
 
     A blocked-page response is a valid reader response and must proceed to the
-    normal Firecrawl fallback; only a timeout benefits from retrying the same
-    backend.
+    normal Firecrawl fallback. Any exception from the first request gets one
+    retry after a fixed five-second delay; any exception from that retry is
+    propagated to the caller, which performs the Firecrawl fallback.
     """
 
-    for attempt in range(1, TOOL_TIMEOUT_RETRIES + 2):
+    max_attempts = ENHANCED_READER_RETRIES + 1
+    for attempt in range(1, max_attempts + 1):
         attempt_started_at = time.monotonic()
         try:
             return _read_document(url)
         except Exception as exc:
-            if not _is_timeout_error(exc) or attempt > TOOL_TIMEOUT_RETRIES:
+            if attempt > ENHANCED_READER_RETRIES:
                 raise
             _read_url_debug(
-                "enhanced_reader_timeout_retry",
+                "enhanced_reader_retry",
                 url=url,
                 attempt=attempt,
-                max_retries=TOOL_TIMEOUT_RETRIES,
+                max_retries=ENHANCED_READER_RETRIES,
                 error=str(exc),
             )
             _tool_retry_debug(
                 "enhanced_reader",
                 attempt=attempt,
-                max_attempts=TOOL_TIMEOUT_RETRIES + 1,
-                sleep_seconds=TOOL_RETRY_SLEEP_S * attempt,
+                max_attempts=max_attempts,
+                sleep_seconds=ENHANCED_READER_RETRY_SLEEP_S,
                 error=exc,
                 url=url,
             )
             _read_url_timed_sleep(
                 timings,
                 f"{timing_prefix}_retry_sleep_s",
-                TOOL_RETRY_SLEEP_S * attempt,
+                ENHANCED_READER_RETRY_SLEEP_S,
             )
         finally:
             _read_url_timing_add(
@@ -2385,7 +2376,7 @@ def _read_url_impl(
                 _read_url_debug("pdf_reader_fallback_start", url=normalized_url)
                 pdf_reader_started_at = time.monotonic()
                 try:
-                    document = _read_document_with_timeout_retry(
+                    document = _read_document_with_retry(
                         normalized_url,
                         timings=_timings,
                         timing_prefix="pdf_reader",
@@ -2446,7 +2437,7 @@ def _read_url_impl(
         # print(f"############ {normalized_url} ##############")
         enhanced_reader_started_at = time.monotonic()
         try:
-            document = _read_document_with_timeout_retry(
+            document = _read_document_with_retry(
                 normalized_url,
                 timings=_timings,
                 timing_prefix="enhanced_reader",

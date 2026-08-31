@@ -111,9 +111,9 @@ class _JsonlBatchWriter:
         del exc_type, exc_value, traceback_value
         self.flush()
 
-    def append(self, record: dict[str, Any]) -> None:
+    def append(self, record: dict[str, Any], *, flush: bool = False) -> None:
         self._records.append(record)
-        if len(self._records) >= self.batch_size:
+        if flush or len(self._records) >= self.batch_size:
             self.flush()
 
     def flush(self) -> None:
@@ -428,6 +428,41 @@ class VqaBatchRunner:
         started_at: float | None = None,
         target_total: int | None = None,
     ) -> None:
+        def advance_progress(*, failed_attempt: bool) -> None:
+            """Refresh progress once the current writer attempt is durable.
+
+            The debug VQA runner advances its bar for both successful and
+            failed input records.  This runner can retry after a writer
+            failure, so failed attempts are added to the bar's total first;
+            the bar still finishes at 100% when the requested number of
+            successful samples has been generated.
+            """
+
+            generated_total = summary.existing_samples + summary.completed
+            remaining_total = max(0, (target_total or generated_total) - generated_total)
+            elapsed_s = time.perf_counter() - started_at if started_at is not None else 0.0
+            if progress is not None:
+                if failed_attempt:
+                    progress.total = int(progress.total or 0) + 1
+                progress.update(1)
+                progress.set_postfix(
+                    generated=generated_total,
+                    failed=summary.failed,
+                    remaining=remaining_total,
+                    elapsed=f"{elapsed_s:.1f}s",
+                    verified=summary.verified,
+                    rejected=summary.rejected,
+                )
+                return
+            print(
+                "[vqa-progress] "
+                f"generated={generated_total} failed={summary.failed} "
+                f"remaining={remaining_total} "
+                f"elapsed_s={elapsed_s:.1f} "
+                f"verified={summary.verified} rejected={summary.rejected}",
+                flush=True,
+            )
+
         try:
             sample = future.result()
         except Exception as exc:
@@ -451,6 +486,7 @@ class VqaBatchRunner:
                 error_record["underlying_error_type"] = underlying_cause.__class__.__name__
                 error_record["underlying_error"] = str(underlying_cause)
             self._append_jsonl(errors_file, error_record, flush=True)
+            advance_progress(failed_attempt=True)
             return
 
         summary.completed += 1
@@ -478,25 +514,6 @@ class VqaBatchRunner:
             used_exact_signatures=persisted_signatures,
             edge_usage_counts=persisted_edge_usage_counts,
         )
-        elapsed_s = time.perf_counter() - started_at if started_at is not None else 0.0
-        generated_total = summary.existing_samples + summary.completed
-        remaining_total = max(0, (target_total or generated_total) - generated_total)
-        if progress is not None:
-            progress.update(1)
-            progress.set_postfix(
-                generated=generated_total,
-                remaining=remaining_total,
-                elapsed=f"{elapsed_s:.1f}s",
-                verified=summary.verified,
-                rejected=summary.rejected,
-            )
-        else:
-            print(
-                "[vqa-progress] "
-                f"generated={generated_total} remaining={remaining_total} "
-                f"elapsed_s={elapsed_s:.1f} verified={summary.verified} rejected={summary.rejected}",
-                flush=True,
-            )
         self._print_sample_timing(sample)
 
         for warning in sample.metadata.get("writer_warnings") or []:
@@ -511,6 +528,10 @@ class VqaBatchRunner:
                 },
                 flush=True,
             )
+
+        # Count the attempt only after all records associated with it,
+        # including warnings, have been published.
+        advance_progress(failed_attempt=False)
 
     def _record_sampler_failure(
         self,
@@ -1563,7 +1584,11 @@ class VqaBatchRunner:
     def _append_jsonl(handle, record: dict[str, Any], *, flush: bool = False) -> None:
         """Append one record and close path-backed writers to publish through HDFS-FUSE."""
         if isinstance(handle, _JsonlBatchWriter):
-            handle.append(record)
+            # ``flush=True`` is used for every completed sample/error in the
+            # streaming runner.  Previously this flag was silently discarded
+            # here, so the batch writer retained up to 100 records in memory
+            # and an interruption could leave no resumable output at all.
+            handle.append(record, flush=flush)
             return
         if isinstance(handle, (str, Path)):
             path = Path(handle)

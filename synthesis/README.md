@@ -36,6 +36,47 @@ result = client.scrape(
 )
 ```
 
+### Firecrawl Relay
+
+When a worker cannot reach `api.firecrawl.dev` directly, run
+`debug/firecrawl_relay.py` on a node with public egress.  The worker can then
+use the existing Firecrawl key pool through the Relay without changing SFT or
+RL tool code.  The same Relay proxies both text scrape and Browser session
+requests, so Browser image downloads also use the public-egress node:
+
+```bash
+# On the public-egress node
+python debug/firecrawl_relay.py --bind 0.0.0.0 --port 18081 --max-inflight 8 \
+  --browser-timeout-s 150 --browser-image-attempts 2
+
+# On the worker
+export FIRECRAWL_RELAY_URL='http://[fdbd:dccd:cde2:1701:3e21:640a:cbaf:b8a3]:18081'
+export FIRECRAWL_RELAY_TIMEOUT_S=180
+export FIRECRAWL_BROWSER_RELAY_TIMEOUT_S=300
+```
+
+The Relay exposes `GET /healthz`, `POST /v2/scrape`, and the Browser lifecycle
+routes `POST /v2/browser`, `POST /v2/browser/{session_id}/execute`, and
+`DELETE /v2/browser/{session_id}`.  The worker still selects and accounts for
+the Firecrawl API key locally; the Relay only forwards the request.  Browser
+image execution is marked as idempotent and receives its own retry budget;
+session creation defaults to one attempt to avoid duplicate remote sessions
+after an ambiguous timeout.  Relay authentication is intentionally disabled;
+use a private network, firewall, or HTTPS if the endpoint is not meant to be
+openly reachable, because the Firecrawl API key is sent from the worker to the
+Relay.
+
+Retry controls:
+
+* text: `--text-upstream-attempts`, `--text-timeout-s`,
+  `--text-retry-delay-s`;
+* Browser image execution: `--browser-image-attempts`;
+* other Browser execute calls: `--browser-execute-attempts`;
+* Browser session creation/deletion: `--browser-create-attempts`,
+  `--browser-delete-attempts`;
+* Browser request timeout/backoff: `--browser-timeout-s`,
+  `--browser-retry-delay-s`.
+
 
 除了以上节点类以外，我们定义`Edge`类来描述节点之间的关系，
 

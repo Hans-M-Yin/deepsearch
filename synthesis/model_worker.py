@@ -31,6 +31,8 @@ _ADAPTIVE_QPM_ERROR_WINDOW_S = 60.0
 _ADAPTIVE_QPM_RECOVERY_INTERVAL_S = 60.0
 _ADAPTIVE_QPM_RECOVERY_UTILIZATION = 0.8
 _ADAPTIVE_QPM_COOLDOWN_S = 30.0
+_RAW_INPUT_ENV = "LLM_WORKER_PRINT_RAW_INPUT"
+_RAW_OUTPUT_ENV = "LLM_WORKER_PRINT_RAW_OUTPUT"
 
 
 def _adaptive_qpm_enabled() -> bool:
@@ -42,6 +44,61 @@ def _adaptive_qpm_enabled() -> bool:
         "yes",
         "on",
     }
+
+
+def _debug_env_enabled(name: str) -> bool:
+    """Return whether one of the opt-in, potentially verbose worker logs is enabled."""
+
+    return str(os.environ.get(name) or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _redact_base64_images_for_debug(value: Any, *, image_context: bool = False) -> Any:
+    """Copy a request payload while replacing inline image bytes with a marker.
+
+    Remote image URLs remain visible because they are useful for debugging
+    multimodal routing.  Inline ``data:image/...;base64,...`` URLs and bare
+    image ``data``/``base64`` fields are deliberately not emitted.
+    """
+
+    if isinstance(value, dict):
+        block_type = str(value.get("type") or "").strip().lower()
+        is_image_block = image_context or block_type in {"image", "image_url", "input_image"}
+        redacted: dict[Any, Any] = {}
+        for key, item in value.items():
+            key_text = str(key).strip().lower()
+            if is_image_block and key_text in {"data", "base64", "b64_json"} and isinstance(item, str):
+                redacted[key] = f"<omitted base64 image bytes: {len(item)} chars>"
+            else:
+                redacted[key] = _redact_base64_images_for_debug(item, image_context=is_image_block)
+        return redacted
+    if isinstance(value, list):
+        return [_redact_base64_images_for_debug(item, image_context=image_context) for item in value]
+    if isinstance(value, tuple):
+        return [_redact_base64_images_for_debug(item, image_context=image_context) for item in value]
+    if isinstance(value, str) and value.lstrip().lower().startswith("data:image/"):
+        return f"<omitted inline base64 image: {len(value)} chars>"
+    return value
+
+
+def _print_raw_model_input(*, alias: str, request: ModelRequest | ResponsesModelRequest) -> None:
+    """Emit the routed request exactly as seen by the provider client when enabled.
+
+    This intentionally includes multimodal message blocks and tool definitions,
+    but strips inline base64 image bytes.  It is therefore still opt-in: inputs
+    can be large and may contain signed URLs or other task data that should not
+    normally be placed in a shared log.
+    """
+
+    if not _debug_env_enabled(_RAW_INPUT_ENV):
+        return
+    print(
+        f"[llm-raw-input] alias={alias} model={request.model or ''}\n"
+        "--- begin routed request ---\n"
+        f"{json.dumps(_redact_base64_images_for_debug(request.to_dict()), ensure_ascii=False, indent=2, default=str)}\n"
+        "--- end routed request ---",
+        file=sys.stderr,
+        flush=True,
+    )
 
 
 def _jsonify(value: Any) -> Any:
@@ -403,7 +460,14 @@ class OpenAIModelWorkerClient:
         if request.temperature is not None:
             kwargs["temperature"] = request.temperature
         if request.max_tokens is not None:
-            kwargs["max_tokens"] = request.max_tokens
+            # Newer GPT deployments (including GPT-5.x behind Azure/OpenAI
+            # compatible gateways) use ``max_completion_tokens``.  Some
+            # gateways silently accept the legacy ``max_tokens`` field but do
+            # not enforce it, which can make a short JSON task generate many
+            # thousands of tokens.  Keep the legacy field for non-GPT models
+            # such as vLLM/Qwen endpoints.
+            token_key = "max_completion_tokens" if _is_gpt_model_name(request.model or self.model) else "max_tokens"
+            kwargs[token_key] = request.max_tokens
         if request.response_format is not None:
             kwargs["response_format"] = request.response_format
         reasoning_effort = request.metadata.get("reasoning_effort")
@@ -562,7 +626,11 @@ class AzureOpenAIModelWorkerClient:
         if request.temperature is not None:
             kwargs["temperature"] = request.temperature
         if request.max_tokens is not None:
-            kwargs["max_tokens"] = request.max_tokens
+            # See OpenAIModelWorkerClient.generate: GPT-5.x expects the
+            # modern completion-budget field, while non-GPT compatible APIs
+            # generally still expect max_tokens.
+            token_key = "max_completion_tokens" if _is_gpt_model_name(request.model or self.model) else "max_tokens"
+            kwargs[token_key] = request.max_tokens
         if request.response_format is not None:
             kwargs["response_format"] = request.response_format
         reasoning_effort = request.metadata.get("reasoning_effort")
@@ -655,7 +723,7 @@ class ModelRouterWorkerClient:
         self._qpm_windows: dict[str, deque[float]] = {}
         self._adaptive_qpm_states: dict[str, _AdaptiveQpmState] = {}
         self._token_totals_lock = threading.Lock()
-        self._token_totals: dict[str, dict[str, int]] = {}
+        self._token_totals: dict[str, dict[str, int | float]] = {}
         if self.config_path is not None and self.config_path.exists():
             self.load_config(self.config_path)
 
@@ -769,13 +837,13 @@ class ModelRouterWorkerClient:
         extra_body = dict(request.metadata.get("extra_body") or {})
         reasoning_effort = request.metadata.get("reasoning_effort")
         routed_temperature = sampling_params.pop("temperature", request.temperature)
-        routed_max_tokens = request.max_tokens
-        if routed_max_tokens is None:
-            out_seq_length = sampling_params.pop("out_seq_length", None)
-            max_tokens = sampling_params.pop("max_tokens", None)
-            chosen_max_tokens = out_seq_length if out_seq_length is not None else max_tokens
-            if chosen_max_tokens is not None:
-                routed_max_tokens = int(chosen_max_tokens)
+        # Completion budgets are an alias-level policy.  Do not let an
+        # individual caller silently override it: if the alias has no budget,
+        # omit the provider parameter entirely and let that deployment decide.
+        out_seq_length = sampling_params.pop("out_seq_length", None)
+        max_tokens = sampling_params.pop("max_tokens", None)
+        chosen_max_tokens = out_seq_length if out_seq_length is not None else max_tokens
+        routed_max_tokens = int(chosen_max_tokens) if chosen_max_tokens is not None else None
         if reasoning_effort is None and _is_gpt_model_name(config.get("served_model")):
             reasoning_effort = sampling_params.pop("reasoning_effort", "medium")
         else:
@@ -794,12 +862,18 @@ class ModelRouterWorkerClient:
             response_format=request.response_format,
             metadata=routed_metadata,
         )
+        _print_raw_model_input(alias=alias, request=routed_request)
+        started_at = time.perf_counter()
         response = self._generate_with_retry(
             alias=alias,
             config=config,
             client=client,
             request=routed_request,
         )
+        # This is end-to-end worker latency: it includes local QPM waiting and
+        # retry backoff as well as the upstream model request.  That is the
+        # useful number when diagnosing throughput of a post-processing run.
+        response.metadata["worker_elapsed_s"] = time.perf_counter() - started_at
         response.metadata.update(
             {
                 "model_alias": alias,
@@ -846,13 +920,14 @@ class ModelRouterWorkerClient:
         if reasoning_effort is not None and "effort" not in routed_reasoning:
             routed_reasoning["effort"] = _normalize_reasoning_effort(reasoning_effort)
 
-        routed_max_output_tokens = request.max_output_tokens
-        if routed_max_output_tokens is None:
-            for key in ("max_output_tokens", "out_seq_length", "max_tokens"):
-                value = sampling_params.pop(key, None)
-                if value is not None:
-                    routed_max_output_tokens = int(value)
-                    break
+        # Same alias-only completion-budget rule as chat completions above.
+        # In particular, do not forward a caller-local ``max_output_tokens``.
+        routed_max_output_tokens = None
+        for key in ("max_output_tokens", "out_seq_length", "max_tokens"):
+            value = sampling_params.pop(key, None)
+            if value is not None:
+                routed_max_output_tokens = int(value)
+                break
 
         routed_temperature = sampling_params.pop("temperature", request.temperature)
         routed_parallel_tool_calls = request.parallel_tool_calls
@@ -884,12 +959,15 @@ class ModelRouterWorkerClient:
             temperature=routed_temperature,
             metadata=routed_metadata,
         )
+        _print_raw_model_input(alias=alias, request=routed_request)
+        started_at = time.perf_counter()
         response = self._responses_generate_with_retry(
             alias=alias,
             config=config,
             client=client,
             request=routed_request,
         )
+        response.metadata["worker_elapsed_s"] = time.perf_counter() - started_at
         response.metadata.update(
             {
                 "model_alias": alias,
@@ -1275,6 +1353,7 @@ class ModelRouterWorkerClient:
             _get_usage_value({"usage": usage}, "usage", "prompt_tokens_details", "cached_tokens")
             or _get_usage_value({"usage": usage}, "usage", "input_tokens_details", "cached_tokens")
         )
+        worker_elapsed_s = float(response.metadata.get("worker_elapsed_s") or 0.0)
         # #### END Response 0720 ####
         if total_tokens <= 0:
             total_tokens = prompt_tokens + completion_tokens
@@ -1288,6 +1367,7 @@ class ModelRouterWorkerClient:
                     "total_tokens": 0,
                     "reasoning_tokens": 0,
                     "cached_tokens": 0,
+                    "elapsed_s": 0.0,
                 },
             )
             totals["calls"] += 1
@@ -1296,6 +1376,7 @@ class ModelRouterWorkerClient:
             totals["total_tokens"] += total_tokens
             totals["reasoning_tokens"] += reasoning_tokens
             totals["cached_tokens"] += cached_tokens
+            totals["elapsed_s"] += worker_elapsed_s
             snapshot = dict(totals)
         print(
             "[llm-usage]"
@@ -1314,10 +1395,34 @@ class ModelRouterWorkerClient:
             f" cumulative_completion_tokens={snapshot['completion_tokens']}"
             f" cumulative_total_tokens={snapshot['total_tokens']}"
             f" cumulative_reasoning_tokens={snapshot['reasoning_tokens']}"
-            f" cumulative_cached_tokens={snapshot['cached_tokens']}",
+            f" cumulative_cached_tokens={snapshot['cached_tokens']}"
+            f" call_elapsed_s={worker_elapsed_s:.3f}"
+            f" cumulative_elapsed_s={float(snapshot.get('elapsed_s', 0.0)):.3f}",
             file=sys.stderr,
             flush=True,
         )
+        if _debug_env_enabled(_RAW_OUTPUT_ENV):
+            print(
+                f"[llm-raw-output] alias={alias} model={response.model or ''}\n"
+                "--- begin response.content ---\n"
+                f"{response.content}\n"
+                "--- end response.content ---",
+                file=sys.stderr,
+                flush=True,
+            )
+        # Empty content is never a usable writer response.  Unlike normal raw
+        # output logging, always surface the provider payload for this rare
+        # failure: it distinguishes a genuinely empty completion from a parser
+        # incompatibility or a provider-side reasoning/refusal response.
+        if not str(response.content or "").strip():
+            print(
+                f"[llm-empty-output] alias={alias} model={response.model or ''}\n"
+                "--- begin provider raw_response ---\n"
+                f"{json.dumps(response.raw_response, ensure_ascii=False, indent=2, default=str)}\n"
+                "--- end provider raw_response ---",
+                file=sys.stderr,
+                flush=True,
+            )
 
 
 LLM_WORKER = ModelRouterWorkerClient.from_env()

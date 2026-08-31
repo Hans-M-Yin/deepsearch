@@ -14,6 +14,7 @@ from PIL import Image
 
 from . import config
 from . import image_io
+from synthesis.sft.qwen3_vl_template import interleave_sft_image_parts
 
 
 logger = logging.getLogger(__name__)
@@ -78,6 +79,7 @@ def to_claude_messages(contents: Iterable[Dict[str, Any]]) -> List[Dict[str, Any
         role = item.get("role", "user")
         parts = item.get("parts", []) or []
         block: List[Dict[str, Any]] = []
+        logical_parts: list[tuple[str, Any]] = []
         for part in parts:
             if "image_url" in part:
                 value = part["image_url"]
@@ -85,23 +87,30 @@ def to_claude_messages(contents: Iterable[Dict[str, Any]]) -> List[Dict[str, Any
                 if url:
                     url = _normalize_image_url_reference(url)
                     url = _maybe_inline_local_image_url(url)
-                    block.append({"type": "image_url", "value": url})
+                    logical_parts.append(("image", {"type": "image_url", "value": url}))
             elif "inline_data" in part:
                 data = part["inline_data"]
                 payload = data.get("data", "")
                 mime = data.get("mime_type", "") or image_io.detect_image_format(payload)
-                block.append(
-                    {
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": mime,
-                            "data": payload,
+                logical_parts.append(
+                    (
+                        "image",
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": mime,
+                                "data": payload,
+                            },
                         },
-                    }
+                    )
                 )
             elif "text" in part:
-                block.append({"type": "text", "text": part["text"]})
+                logical_parts.append(("text", {"type": "text", "text": part["text"]}))
+        for kind, value in interleave_sft_image_parts(
+            [("image", value) if kind == "image" else ("text", value["text"]) for kind, value in logical_parts]
+        ):
+            block.append(value if kind == "image" else {"type": "text", "text": value})
         if block:
             claude_role = "assistant" if role == "model" else role
             messages.append({"role": claude_role, "content": block})
@@ -158,6 +167,7 @@ def to_qwen3vl_messages(contents: Iterable[Dict[str, Any]]) -> List[Dict[str, An
         role = item.get("role", "user")
         parts = item.get("parts", []) or []
         block: List[Dict[str, Any]] = []
+        logical_parts: list[tuple[str, Any]] = []
         for part in parts:
             if "inline_data" in part:
                 data = part["inline_data"]
@@ -166,10 +176,10 @@ def to_qwen3vl_messages(contents: Iterable[Dict[str, Any]]) -> List[Dict[str, An
                     payload = payload.split("base64,", 1)[1]
                 try:
                     pil_image = Image.open(io.BytesIO(base64.b64decode(payload)))
-                    block.append({"type": "image", "image": pil_image})
+                    logical_parts.append(("image", {"type": "image", "image": pil_image}))
                 except Exception as exc:
                     logger.warning("Failed to decode inline base64 image: %s", exc)
-                    block.append({"type": "image", "image": payload})
+                    logical_parts.append(("image", {"type": "image", "image": payload}))
             elif "image_url" in part:
                 value = part["image_url"]
                 url = value.get("url", "") if isinstance(value, dict) else str(value)
@@ -178,9 +188,17 @@ def to_qwen3vl_messages(contents: Iterable[Dict[str, Any]]) -> List[Dict[str, An
                 url = _normalize_image_url_reference(url)
                 pil_image = _resolve_image_url_to_pil(url)
                 if pil_image is not None:
-                    block.append({"type": "image", "image": pil_image})
+                    logical_parts.append(("image", {"type": "image", "image": pil_image}))
             elif "text" in part:
-                block.append({"type": "text", "text": part["text"]})
+                logical_parts.append(("text", str(part["text"])))
+
+        for kind, value in interleave_sft_image_parts(
+            [
+                ("image", value["image"]) if kind == "image" else ("text", value)
+                for kind, value in logical_parts
+            ]
+        ):
+            block.append({"type": "image", "image": value} if kind == "image" else {"type": "text", "text": value})
         if block:
             qwen_role = "assistant" if role == "model" else role
             messages.append({"role": qwen_role, "content": block})
@@ -206,6 +224,7 @@ def to_openai_messages(
         role = item.get("role", "user")
         parts = item.get("parts", []) or []
         block: List[Dict[str, Any]] = []
+        logical_parts: list[tuple[str, Any]] = []
         for part in parts:
             if "image_url" in part:
                 value = part["image_url"]
@@ -213,9 +232,7 @@ def to_openai_messages(
                 if url:
                     url = _normalize_image_url_reference(url)
                     url = _maybe_inline_local_image_url(url)
-                    block.append(
-                        {"type": "image_url", "image_url": {"url": url}}
-                    )
+                    logical_parts.append(("image", {"url": url}))
             elif "inline_data" in part:
                 data = part["inline_data"]
                 payload = data.get("data", "")
@@ -225,11 +242,15 @@ def to_openai_messages(
                     )
                     if not payload.startswith("data:"):
                         payload = f"data:{mime};base64,{payload}"
-                    block.append(
-                        {"type": "image_url", "image_url": {"url": payload}}
-                    )
+                    logical_parts.append(("image", {"url": payload}))
             elif "text" in part:
-                block.append({"type": "text", "text": str(part["text"])})
+                logical_parts.append(("text", str(part["text"])))
+
+        for kind, value in interleave_sft_image_parts(logical_parts):
+            if kind == "image":
+                block.append({"type": "image_url", "image_url": value})
+            else:
+                block.append({"type": "text", "text": value})
         if block:
             openai_role = "assistant" if role == "model" else role
             openai_messages.append({"role": openai_role, "content": block})

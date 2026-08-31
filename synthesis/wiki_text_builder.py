@@ -396,9 +396,11 @@ class EnhancedReaderClient:
         *,
         base_url: str = "http://127.0.0.1:8004",
         timeout_s: float = 180.0,
+        retry_502: bool = True,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.timeout_s = timeout_s
+        self.retry_502 = bool(retry_502)
 
     def read(self, url: str, **kwargs: Any) -> ReaderDocument:
         del kwargs
@@ -413,7 +415,7 @@ class EnhancedReaderClient:
             with urlopen(request, timeout=self.timeout_s) as response:
                 payload = response.read().decode("utf-8")
         except HTTPError as exc:
-            if exc.code != 502:
+            if exc.code != 502 or not self.retry_502:
                 raise
             _reader_retry_debug(target=target, sleep_seconds=15, error=exc)
             _trace_timing(f"[reader] phase=retry_502 target={target!r} sleep_s=15")

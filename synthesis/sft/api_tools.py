@@ -333,6 +333,65 @@ i2i_search returns compact reverse-image-search records with image_id and source
 Use read_url with image_id before making visual claims.
 """.strip()
 
+RESPONSES_SYSTEM_PROMPT_V3 = """
+You are writing a complete solution for a multi-hop knowledge question. Specifically, based on the question provided to you, you need to produce a full problem-solving process that includes scientifically rigorous and logically coherent reasoning steps. This solution process should include analysis and reasoning about the question, native tool calls, analysis and reflection on tool results, replanning of the solution steps, multiple search attempts when necessary, and a final accurate answer.
+
+Requirements:
+1. Ensure that the solution process is strictly logical. You need to break the question down step by step and solve each part in sequence, so that a reader can understand your reasoning clearly just by reading the written solution process.
+2. In the solution you write, the following logic must be made explicitly visible: before every use of a tool, first write a detailed and substantive progress update. This update should analyze what the latest tool observation has actually established, what uncertainties still remain, what tool should be called next to resolve the problem, and why that function and those parameters are appropriate. If you encounter difficulties in making progress, you should use detailed language to reason, reflect, summarize, and verify, and write all of this out in an explicit and concrete manner. Each such section must be no fewer than 100 words.
+3. In the solution you write, every factual statement must be grounded in evidence from the question, the image, or tool-returned results. Do not introduce any fact, entity, date, name, or relationship unless it is directly supported by the available evidence. As for non-evidential content, such as intermediate answers and the final answer provided to you separately, those must never appear or even be mentioned anywhere in your response process.
+4. For widely known common knowledge or very easily identifiable visual content—such as recognizing a flag in an image—you may skip search and reason directly. However, to ensure accuracy and avoid hallucinations, this should be limited to knowledge that is truly universally familiar or to visual entities that are extremely clear and easy to identify. To be safe, you should make the logic explicit: first make a tentative guess based on common knowledge, and then search for clues to verify it. Note that this “guess first, verify later” approach does not apply to any intermediate statements or final answers.
+5. Pay attention to the pace of reasoning: once you believe the evidence is sufficient and no unclear or uncertain points remain, you should provide the final answer directly and must not call any more tools. During the response process, when the evidence in the main reasoning chain is sufficient, do not keep searching repeatedly just to eliminate minor local ambiguities; the core objective is to solve the final question, not to remove every small ambiguity in the process.
+6. While writing the solution, you must not search specific websites such as Wikipedia or Wiki Commons directly. However, if such sources appear in search results, you may freely read them.
+7. Analyze the task carefully and choose the most appropriate tool. For any sub-question, you may either search for textual clues directly, or use t2i_search to find relevant images and then inspect those images for clues. Therefore, you should judge whether the evidence needed is more likely to appear in webpage text or to be found more easily through related images, and then choose the tool that is most likely to produce useful evidence. For example, when a question refers to a specific scene, group photo, or event, it is usually better to use t2i_search first to look for relevant images and then examine them for clues. As another example, if you need to determine which province lies directly to the west of Guizhou Province in China, you could use t2i_search to look for a map of China’s administrative divisions. Note that the images returned by the search may not be the exact ones you need, so you may need to look for other images or switch to a different line of reasoning.
+8. Intermediate factual statements related to the question, as well as the final answer, will be provided to you separately. Before you obtain search evidence, you must not mention or reveal any of that content, nor even mention the name of any entity contained in it. These provided items are only for checking whether your current step-by-step solution process is correct. If your search and analysis results conflict with those provided factual statements, that means there is a problem in your current search results or reasoning, or that the question has clearly been designed with misleading interference. In that case, you should promptly reflect a process of re-examination, self-correction, and renewed checking in your written solution, and continue analyzing and searching for new clues, eliminating incorrect options until the answer is correct. If you do not find any problem in your reasoning, then you should trust your reasoning and continue moving forward. Do not directly search for the content of those provided statements without good reason. You must also not use the following kind of logic: first searching for a claim that is not yet supported by evidence but comes from an intermediate statement, and only afterward trying to verify it. Your response must not contain the following pattern: improperly anchoring the reasoning process to an intermediate statement—for example, seeing the name of an entity mentioned in an intermediate statement in the search results and then directly assuming that entity is correct without any substantive evidence or analysis.
+9. The separately provided intermediate statements and final answer are not evidence and must remain completely isolated from the reasoning process unless independently established through tool-grounded evidence. They must not influence query formulation, candidate selection, source preference, conflict resolution, confidence calibration, or final answer wording. After repeated low-information searches, never narrow a query with unverified candidate details. Replan from the last evidence-supported unresolved variable using a broader, open-ended query. A query string must contain ONLY tokens that already appear in the question, the image, or in evidence you have already obtained from a prior tool result in this trajectory. It is strictly forbidden to place the wording of the intermediate/final answer — in whole or in part, verbatim or lightly paraphrased — into any query, especially into an exact-phrase ("...") search, when that wording has not yet appeared in any inspected tool result.
+10. In the solution you write, you should include at least once the following logic: “propose a preliminary candidate and explain why it seems plausible -> continue searching and discover a contradiction -> look for a different candidate until the reasoning gets back on track.” This pattern helps make the solution process feel more realistic, non-linear, and reflective. Note that when you believe a certain incorrect candidate—for example, a search result—may be deceptive or misleading, you may use this logic: first choose the wrong target, then continue searching until you uncover the contradiction, rather than directly locking onto the correct target based on the intermediate answers provided to you. If the search results are consistent and there are no misleading or ambiguous candidates at all, then this requirement can be ignored.
+11. Close the chain, then stop. Treat each hop as closed the moment one inspected source establishes it. Do not open additional "more authoritative" sources to re-confirm a hop that is already grounded (this is redundant even when harmless). Escalate to a second source ONLY when the first is truncated/blocked/ambiguous, or when the question's wording demands a stricter form of the fact (e.g. it asks "founded" but you only have "co-editor") — and say explicitly which of these triggers the extra step.
+12. The answer is provided to verify whether your reasoning arrives at the correct endpoint — it is not a target you must reproduce word for word. As long as your response completely and correctly addresses what the question itself asks for, the task is considered complete; you do not need to match the answer verbatim in wording, dates, numbers, or other specific expressions (but you must ensure your answer is factually correct). Do not treat details that appear only in the answer — and that are not surfaced by the question or by the tool results you have already obtained (e.g., a specific year, a particular phrasing) — as search targets to be repeatedly verified. The criterion for whether a detail is worth continuing to investigate is "whether it is naturally raised by the question or by the evidence already obtained," not "whether it is mentioned in the answer."
+Note: the solution must not mention any of the above writing requirements. In every round of solution writing, you must check one by one that the above requirements are satisfied.
+
+Tool-use tips:
+1. t2t_search returns compact records with title, snippet, and source_page_id. Use read_url with source_page_id to inspect a promising page before treating page content as verified evidence.
+2. t2i_search returns compact image-search records with image_id and source_page_id. The images are not visible yet. Use read_url with image_id to inspect an image or source_page_id to inspect its page before making visual claims.
+3. i2i_search returns compact reverse-image-search records with image_id and source_page_id. Matches may be noisy. Use titles, sources, and URL-derived keyword hints to select the most appropriate image_id or source_page_id for the next read_url call; verify the selected resource before making factual claims.
+4. After i2i_search or t2i_search, do not claim that you have seen a returned image unless a successful read_url call with its image_id has downloaded/read that image. Search metadata and URL-derived keyword hints help select which resource ID to read, but a successful read_url inspection is still required before making visual claims.
+5. Use search tools **flexibly**. If a particular query fails to find the information you need, try searching for related pages indirectly instead. For example, if you cannot find results by searching for a delegation with 108 athletes at a certain Olympic Games, you may first search for statistics on delegation sizes by country for that edition of the Olympics. In that case, the query does not contain the key detail “108,” but the retrieved pages may be more likely to contain useful clues once you read them. When you believe a specific detail is difficult to search for directly, you should analyze the problem carefully and plan your search strategy according to this logic. Do not use the same query over and over again. Two failed searches on the same sub-goal → stop refining wording; reason why the direct path fails, then pivot to a different angle (intermediate entity, record-keeper, specific date, or raw data).
+6. For i2i_search, region coordinates are x-first normalized coordinates on a 0-1000 scale in the order [x1, y1, x2, y2]. x increases left-to-right and y increases top-to-bottom. Use [0, 0, 1000, 1000] for the full image.
+7. For read_url, use a source_page_id or image_id returned by search whenever available. A source_page_id reads the webpage; an image_id downloads the image. Legacy raw URLs are supported only for direct links already available in the conversation. The tool cannot see your prior reasoning history, so clearly state what evidence you need in goal.
+
+Next, I will provide some excerpted examples, and you can learn from them how to write a high-quality answer process. The examples use native function calls, so the written text shows the public progress update before the call and then names the intended native function call.
+
+** Example 1: Avoid using internal knowledge or other fabricated evidence.
+
+Bad writing:
+
+Based on the text and watermarks visible in the provided image, the stock photography agency is Alamy. The question asks about a specific photograph from a different media repository that Alamy is known to source content from. My first step is to identify this repository. I will call t2t_search with query: "Alamy sources content from Wikimedia Commons".
+
+Good writing:
+
+Based on the text and watermarks visible in the provided image, the stock photography agency is Alamy. The question asks about a specific photograph from a different media repository that Alamy is known to source content from. My first step is to identify this repository. I should first search which repository Alamy sources content from, without assuming the repository name in advance. I will call t2t_search with query: "The large repository Alamy sources content from".
+
+Discuss: In the bad version, the query target 'Wiki Commons' comes from nowhere, which is a typical knowledge leakage of the writer model. In good version, the answer is more logically rigorous, the reasoning is more careful, and there are no clues appearing from nowhere.
+
+** Example 2: Effective Tool Use/Coordination
+
+Original question: In 2022, Messi, as captain, lifted the World Cup trophy on the podium, surrounded by his teammates. How many goals did the player standing immediately to Messi's left score in the 2016-17 season?
+
+Good writing:
+To determine the goal total of the player standing to Messi's left on the World Cup final podium, we can search for a photo of the full Argentina team on the podium at the 2022 World Cup final award ceremony. Then I can inspect the player standing to Messi's left in the image and identify who he is. Once I know his identity, we can search his career history and find how many goals he scored in the 2016-17 season. Next, I will call t2i_search with query: "2022 World Cup final Argentina team award ceremony photo".
+(...tool result omitted...)
+The tool returned several compact image-search records. Among them, the titles of the first, second, and fourth results mention Argentina winning the World Cup, so they are plausible candidates. However, search metadata is not visual evidence. Next, I will inspect the first candidate image using its image_id to check whether it is the target image and whether it can provide clues for the question.
+(... tool result omitted ...)
+The image has been successfully downloaded, and it is indeed a photo of the full Argentina team during the trophy presentation. In the image, Messi is wearing a black bisht and lifting the World Cup trophy. The player on his left is wearing the number 21 shirt. From this image alone, I cannot be fully certain who he is. My next step should be to use i2i_search, crop out this player, and see whether I can find similar images to determine his identity. In addition, since the image shows that he is wearing number 21, if i2i_search does not produce a satisfactory result, I can also directly search who wore number 21 for Argentina in the 2022 World Cup squad. I will call i2i_search with region [420, 340, 520, 370].
+(... tool result omitted ...)
+Several of the search result titles mention Dybala, which suggests that this player is very likely Dybala. However, I still cannot be certain, because it is possible that the retrieved images are not actually of the same person as the cropped player. Therefore, I should download another image and compare it with the person in the original image to see whether they are indeed the same individual. So I will use read_url to download a new image. If it does turn out to be the same person, then I will only need to search Dybala's historical goal records, and by reading the relevant sources I will be able to determine his goal total for the 2016-17 season.
+(... omitted below ...)
+
+Discuss: In the example above, the solution first analyzes the question and then describes the target image in a detailed and precise way, rather than simply searching for something like "Argentina championship celebration photo," which could return many different images that fit that description. It then opens a returned image resource by image_id and confirms that it is indeed the target photo. After that, it uses i2i_search on that photo for identification, and read_url with another result ID to further verify an unfamiliar person. The whole process is natural and rigorous, and it does not reveal any internal knowledge.
+""".strip()
+
+
 # #### START Response 0720 ####
 RESPONSES_SYSTEM_PROMPT = """
 You are writing a complete solution for a multi-hop knowledge question. Specifically, based on the question provided to you, you need to produce a full problem-solving process that includes scientifically rigorous and logically coherent reasoning steps. This solution process should include analysis and reasoning about the question, native tool calls, analysis and reflection on tool results, replanning of the solution steps, multiple search attempts when necessary, and a final accurate answer.
@@ -771,6 +830,9 @@ class OpenAIToolAgentConfig:
     default_headers: dict[str, str] | None = None
     extra_body: dict[str, Any] | None = None
     max_turns: int = 8
+    # ``max_turns`` limits model responses; this separate cap limits executed
+    # tools and lets callers reserve a final response after the last tool.
+    max_tool_calls: int | None = None
     print_rounds: bool = True
     # #### START Response 0720 ####
     responses_reasoning_effort: str | None = None
@@ -2496,6 +2558,21 @@ class OpenAIToolAgent:
                 stop_reason = "finish_action"
                 break
 
+            if (
+                self.config.max_tool_calls is not None
+                and len(tool_results) >= self.config.max_tool_calls
+            ):
+                conversation_messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            f"The tool-call budget of {self.config.max_tool_calls} is exhausted. "
+                            "Do not call any more tools; now give the final answer."
+                        ),
+                    }
+                )
+                continue
+
             result = execute_tool_call(
                 step.action,
                 execution_action_input,
@@ -2601,6 +2678,23 @@ class OpenAIToolAgent:
                 stop_reason = "no_tool_calls"
                 break
             assistant_content = assistant_message.content or ""
+            if (
+                self.config.max_tool_calls is not None
+                and len(tool_results) + len(tool_calls) > self.config.max_tool_calls
+            ):
+                # Keep the model's reasoning, but never record a tool call that
+                # was not executed.  The next reserved model turn must finish.
+                conversation_messages.append({"role": "assistant", "content": assistant_content})
+                conversation_messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            f"The tool-call budget of {self.config.max_tool_calls} is exhausted. "
+                            "Do not call any more tools; now give the final YES or NO."
+                        ),
+                    }
+                )
+                continue
             followup_tool_calls: list[dict[str, Any]] = []
             execution_payloads: list[tuple[str, dict[str, Any], str]] = []
             for tool_call in tool_calls:
@@ -2822,6 +2916,63 @@ class OpenAIToolAgent:
                 generation_status = "finished"
                 stop_reason = "no_tool_calls"
                 break
+
+            if (
+                self.config.max_tool_calls is not None
+                and len(tool_results) + len(assistant_tool_calls) > self.config.max_tool_calls
+            ):
+                # A Responses API function_call is a protocol obligation: even
+                # when we intentionally decline to execute it because the
+                # local tool budget is exhausted, the next Responses request
+                # must include a function_call_output for every call ID.  A
+                # bare user reminder here leaves the provider with an
+                # unresolved call and produces "No tool output found".
+                conversation_messages.append(
+                    _assistant_message_for_followup_from_dict(
+                        content=assistant_content,
+                        tool_calls=assistant_tool_calls,
+                        phase="commentary",
+                    )
+                )
+                skipped_output = (
+                    f"Tool call was not executed because the tool-call budget of "
+                    f"{self.config.max_tool_calls} is exhausted. Provide the final YES or NO "
+                    "using the evidence already available."
+                )
+                skipped_call_outputs: list[dict[str, Any]] = []
+                for tool_call in assistant_tool_calls:
+                    tool_call_id = str(tool_call.get("id") or "")
+                    tool_name = str((tool_call.get("function") or {}).get("name") or "")
+                    conversation_messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tool_call_id,
+                            "name": tool_name,
+                            "content": skipped_output,
+                            "type": "function",
+                        }
+                    )
+                    skipped_call_outputs.append(
+                        {
+                            "type": "function_call_output",
+                            "call_id": tool_call_id,
+                            "output": skipped_output,
+                        }
+                    )
+                budget_message = {
+                    "role": "user",
+                    "content": (
+                        f"The tool-call budget of {self.config.max_tool_calls} is exhausted. "
+                        "Do not call any more tools; now give the final YES or NO."
+                    ),
+                }
+                conversation_messages.append(budget_message)
+                current_input = (
+                    [*skipped_call_outputs, *_conversation_messages_to_responses_input([budget_message])]
+                    if use_previous_response_id
+                    else _conversation_messages_to_responses_input(conversation_messages)
+                )
+                continue
 
             followup_tool_calls: list[dict[str, Any]] = []
             execution_payloads: list[tuple[str, dict[str, Any], str]] = []

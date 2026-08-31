@@ -27,6 +27,8 @@ from urllib.request import Request, urlopen
 
 
 MAX_BODY_BYTES = 2 * 1024 * 1024
+UPSTREAM_MAX_ATTEMPTS = 2
+UPSTREAM_RETRY_DELAY_S = 5.0
 
 
 def _log_upstream(*, path: str, status_code: int | None = None, elapsed_s: float, response_chars: int | None = None, error: Exception | None = None) -> None:
@@ -110,40 +112,85 @@ class SerperRelayHandler(BaseHTTPRequestHandler):
             },
             method="POST",
         )
-        upstream_started_at = time.perf_counter()
-        try:
-            with urlopen(upstream_request, timeout=float(self.server.timeout_s)) as response:
-                response_body = response.read()
-                status_code = int(response.getcode() or 200)
-                content_type = response.headers.get("Content-Type", "application/json")
-            _log_upstream(
-                path=path,
-                status_code=status_code,
-                elapsed_s=time.perf_counter() - upstream_started_at,
-                response_chars=len(response_body),
-            )
-        except HTTPError as exc:
-            response_body = exc.read()
-            status_code = int(exc.code)
-            content_type = exc.headers.get("Content-Type", "application/json")
-            _log_upstream(
-                path=path,
-                status_code=status_code,
-                elapsed_s=time.perf_counter() - upstream_started_at,
-                response_chars=len(response_body),
-            )
-        except (URLError, TimeoutError, OSError) as exc:
-            _log_upstream(
-                path=path,
-                elapsed_s=time.perf_counter() - upstream_started_at,
-                error=exc,
-            )
+        response_body: bytes | None = None
+        status_code = 502
+        content_type = "application/json"
+        transport_error: Exception | None = None
+
+        for attempt in range(1, UPSTREAM_MAX_ATTEMPTS + 1):
+            upstream_started_at = time.perf_counter()
+            try:
+                with urlopen(upstream_request, timeout=float(self.server.timeout_s)) as response:
+                    response_body = response.read()
+                    status_code = int(response.getcode() or 200)
+                    content_type = response.headers.get("Content-Type", "application/json")
+                _log_upstream(
+                    path=path,
+                    status_code=status_code,
+                    elapsed_s=time.perf_counter() - upstream_started_at,
+                    response_chars=len(response_body),
+                )
+                break
+            except HTTPError as exc:
+                response_body = exc.read()
+                status_code = int(exc.code)
+                content_type = exc.headers.get("Content-Type", "application/json")
+                _log_upstream(
+                    path=path,
+                    status_code=status_code,
+                    elapsed_s=time.perf_counter() - upstream_started_at,
+                    response_chars=len(response_body),
+                )
+                # Retry transient upstream failures, but forward permanent
+                # client/authentication errors immediately.
+                if status_code >= 500 and attempt < UPSTREAM_MAX_ATTEMPTS:
+                    print(
+                        f"[serper-relay-upstream] retrying path={path!r} "
+                        f"attempt={attempt + 1}/{UPSTREAM_MAX_ATTEMPTS} "
+                        f"after_s={UPSTREAM_RETRY_DELAY_S}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    time.sleep(UPSTREAM_RETRY_DELAY_S)
+                    continue
+                break
+            except (URLError, TimeoutError, OSError) as exc:
+                transport_error = exc
+                _log_upstream(
+                    path=path,
+                    elapsed_s=time.perf_counter() - upstream_started_at,
+                    error=exc,
+                )
+                if attempt < UPSTREAM_MAX_ATTEMPTS:
+                    print(
+                        f"[serper-relay-upstream] retrying path={path!r} "
+                        f"attempt={attempt + 1}/{UPSTREAM_MAX_ATTEMPTS} "
+                        f"after_s={UPSTREAM_RETRY_DELAY_S}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    time.sleep(UPSTREAM_RETRY_DELAY_S)
+                    continue
+                self._write_json(
+                    502,
+                    {
+                        "error": "upstream_serper_request_failed",
+                        "error_type": exc.__class__.__name__,
+                        "detail": str(getattr(exc, "reason", exc)),
+                    },
+                )
+                return
+
+        if response_body is None:
+            # This is defensive: all normal loop exits either produce a
+            # response body or return the 502 transport error above.
+            error = transport_error or RuntimeError("upstream request produced no response")
             self._write_json(
                 502,
                 {
                     "error": "upstream_serper_request_failed",
-                    "error_type": exc.__class__.__name__,
-                    "detail": str(getattr(exc, "reason", exc)),
+                    "error_type": error.__class__.__name__,
+                    "detail": str(getattr(error, "reason", error)),
                 },
             )
             return

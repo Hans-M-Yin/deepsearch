@@ -18,7 +18,7 @@ from typing import Any
 
 from synthesis.firecrawl_client import get_firecrawl_usage_snapshot
 
-from .api_tools import RESPONSES_SYSTEM_PROMPT_V2
+from .api_tools import RESPONSES_SYSTEM_PROMPT_V2, RESPONSES_SYSTEM_PROMPT_V3
 
 try:
     from tqdm.auto import tqdm
@@ -323,7 +323,10 @@ def _print_record_result(result: dict[str, Any]) -> None:
 
 
 _SFT_FSYNC_WARNING_EMITTED = False
-_SFT_JSONL_FLUSH_EVERY = 50
+# A completed trajectory must be resumable immediately.  Keeping a batch in
+# memory means an interruption before the batch boundary loses all of those
+# completed trajectories, so the batch size is intentionally one.
+_SFT_JSONL_FLUSH_EVERY = 1
 
 
 def _write_jsonl_records(handle: Any, records: list[dict[str, Any]]) -> None:
@@ -859,6 +862,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "Only valid with --api-mode responses and cannot be combined with --system-prompt."
         ),
     )
+    parser.add_argument(
+        "--responses-system-prompt-v3",
+        action="store_true",
+        help=(
+            "Use api_tools.RESPONSES_SYSTEM_PROMPT_V3 for the primary agent. "
+            "Only valid with --api-mode responses and cannot be combined with "
+            "--responses-system-prompt-v2 or --system-prompt."
+        ),
+    )
     parser.add_argument("--responses-parallel-tool-calls", action="store_true", help="Allow parallel Responses tool calls. Defaults to false.")
     parser.add_argument("--responses-i2i-wrapper", action="store_true", help="Enable the legacy i2i wrapper rewrite in Responses mode.")
     # #### END Response 0720 ####
@@ -1140,8 +1152,14 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--model-alias is required in single-question mode unless SFT_OPENAI_MODEL / OPENAI_MODEL is set.")
     if args.responses_system_prompt_v2 and args.api_mode != "responses":
         parser.error("--responses-system-prompt-v2 requires --api-mode responses.")
+    if args.responses_system_prompt_v3 and args.api_mode != "responses":
+        parser.error("--responses-system-prompt-v3 requires --api-mode responses.")
+    if args.responses_system_prompt_v2 and args.responses_system_prompt_v3:
+        parser.error("--responses-system-prompt-v2 and --responses-system-prompt-v3 are mutually exclusive.")
     if args.responses_system_prompt_v2 and args.system_prompt:
         parser.error("--responses-system-prompt-v2 cannot be combined with --system-prompt.")
+    if args.responses_system_prompt_v3 and args.system_prompt:
+        parser.error("--responses-system-prompt-v3 cannot be combined with --system-prompt.")
     if (args.vqa_dir or args.question_list) and not args.model_alias:
         parser.error("--model-alias is required in batch mode unless SFT_OPENAI_MODEL / OPENAI_MODEL is set.")
     if args.workers <= 0:
@@ -1172,7 +1190,11 @@ def main(argv: list[str] | None = None) -> int:
             record["image_urls"] = list(args.image_url or [])
 
     primary_system_prompt = (
-        RESPONSES_SYSTEM_PROMPT_V2 if args.responses_system_prompt_v2 else args.system_prompt
+        RESPONSES_SYSTEM_PROMPT_V3
+        if args.responses_system_prompt_v3
+        else RESPONSES_SYSTEM_PROMPT_V2
+        if args.responses_system_prompt_v2
+        else args.system_prompt
     )
     agent_config = _config_from_model_arg(
         model_arg=args.model_alias,

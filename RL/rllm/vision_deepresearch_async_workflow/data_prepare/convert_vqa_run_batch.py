@@ -117,6 +117,19 @@ def _download_image(
     url_hash = hashlib.sha1(url.encode("utf-8")).hexdigest()[:10]
     prefix = _safe_filename(sample_id)
 
+    # The destination name is content-addressed by the source URL.  Reuse a
+    # valid existing file so rerunning the converter (or resuming a failed
+    # conversion) does not issue another remote request.
+    for existing in sorted(output_dir.glob(f"{prefix}_{url_hash}.*")):
+        if existing.name.endswith(".part") or not existing.is_file():
+            continue
+        try:
+            with Image.open(existing) as image:
+                image.verify()
+            return str(existing.resolve())
+        except Exception:
+            continue
+
     last_error: Exception | None = None
     for attempt in range(retries + 1):
         try:

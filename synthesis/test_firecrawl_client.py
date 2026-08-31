@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import time
 from io import StringIO
 from pathlib import Path
@@ -13,11 +14,13 @@ from unittest import mock
 
 from synthesis.firecrawl_client import (
     FirecrawlApiKeyPool,
+    FirecrawlBrowserHttpError,
     FirecrawlBrowserImageDownloader,
     FirecrawlBrowserNonImageError,
     FirecrawlBrowserSessionManager,
     FirecrawlClient,
 )
+from synthesis.url_utils import normalize_http_referer, normalize_http_url
 
 
 class _FakeFirecrawl:
@@ -73,6 +76,98 @@ class _FakeBrowserFirecrawl:
 
 
 class FirecrawlClientTest(unittest.TestCase):
+    def test_shared_url_helpers_quote_unicode_and_drop_invalid_referer(self) -> None:
+        self.assertEqual(
+            normalize_http_url("https://example.com/Kościół"),
+            "https://example.com/Ko%C5%9Bci%C3%B3%C5%82",
+        )
+        self.assertEqual(
+            normalize_http_referer("https://example.com/Kościół"),
+            "https://example.com/Ko%C5%9Bci%C3%B3%C5%82",
+        )
+        self.assertIsNone(
+            normalize_http_referer("https://example.com/a" + chr(10) + "bad")
+        )
+
+    def test_browser_download_code_omits_invalid_referer(self) -> None:
+        manager = mock.Mock()
+        downloader = FirecrawlBrowserImageDownloader(session_manager=manager)
+        code = downloader._download_code(
+            "https://example.com/Kościół.png",
+            referer_url="https://example.com/source" + chr(13) + "bad",
+            request_timeout_ms=10_000,
+        )
+
+        self.assertIn('"referer": ""', code)
+        self.assertNotIn("source\\rbad", code)
+        self.assertIn("Ko%C5%9Bci%C3%B3%C5%82.png", code)
+
+    def test_scrape_uses_firecrawl_relay_without_constructing_sdk(self) -> None:
+        captured: dict[str, object] = {}
+
+        class RelayResponse:
+            def __enter__(self) -> "RelayResponse":
+                return self
+
+            def __exit__(self, *args: object) -> None:
+                del args
+
+            def getcode(self) -> int:
+                return 200
+
+            def read(self) -> bytes:
+                return json.dumps(
+                    {
+                        "success": True,
+                        "data": {
+                            "markdown": "relay page",
+                            "metadata": {"creditsUsed": 2, "statusCode": 200},
+                        },
+                    }
+                ).encode("utf-8")
+
+        def fake_urlopen(request: object, *, timeout: float) -> RelayResponse:
+            captured["request"] = request
+            captured["timeout"] = timeout
+            return RelayResponse()
+
+        def unexpected_sdk(**kwargs: object) -> None:
+            raise AssertionError(f"SDK should not be constructed through Relay: {kwargs}")
+
+        with TemporaryDirectory() as directory:
+            state_path = Path(directory) / "state.json"
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "FIRECRAWL_RELAY_URL": "http://relay.example:18081",
+                    "FIRECRAWL_RELAY_TIMEOUT_S": "17",
+                },
+                clear=False,
+            ), mock.patch("synthesis.firecrawl_client.urlopen", side_effect=fake_urlopen):
+                client = FirecrawlClient(
+                    api_keys=["relay-key"],
+                    pool_state_path=state_path,
+                    app_factory=unexpected_sdk,
+                )
+                result = client.scrape(
+                    "https://example.com/relay",
+                    formats=["markdown"],
+                )
+
+            self.assertTrue(result["success"])
+            request = captured["request"]
+            self.assertEqual(request.full_url, "http://relay.example:18081/v2/scrape")
+            self.assertEqual(request.get_header("X-api-key"), "relay-key")
+            self.assertIsNone(request.get_header("X-firecrawl-relay-token"))
+            body = json.loads(request.data.decode("utf-8"))
+            self.assertEqual(body["url"], "https://example.com/relay")
+            self.assertEqual(body["formats"], ["markdown"])
+            self.assertEqual(captured["timeout"], 17.0)
+            record = json.loads(state_path.read_text(encoding="utf-8"))["keys"][
+                client.key_pool.key_id("relay-key")
+            ]
+            self.assertEqual(record["remaining_credits"], 9998)
+
     def test_round_robin_and_result_state(self) -> None:
         _FakeFirecrawl.calls = []
         with TemporaryDirectory() as directory:
@@ -85,9 +180,9 @@ class FirecrawlClientTest(unittest.TestCase):
 
             with mock.patch("sys.stderr", new_callable=StringIO) as stderr:
                 self.assertTrue(client.scrape("https://example.com/first", formats=["markdown"])["success"])
-            self.assertIn("url=https://example.com/first", stderr.getvalue())
-            self.assertIn("markdown_chars=4", stderr.getvalue())
-            self.assertIn("credits_used=14", stderr.getvalue())
+            # Successful Firecrawl calls intentionally stay quiet; the
+            # backend emits structured debug output only for failures.
+            self.assertEqual(stderr.getvalue(), "")
             with self.assertRaisesRegex(RuntimeError, "Unauthorized"):
                 client.scrape("https://example.com/second")
             self.assertTrue(client.scrape("https://example.com/third")["success"])
@@ -324,6 +419,107 @@ class FirecrawlClientTest(unittest.TestCase):
             self.assertNotIn("screenshot", _FakeBrowserFirecrawl.execute_calls[0][2].lower())
             state = json.loads((Path(directory) / "sessions.json").read_text(encoding="utf-8"))
             self.assertEqual(state["sessions"][0]["state"], "idle")
+
+    def test_browser_image_download_uses_firecrawl_relay(self) -> None:
+        jpeg = b"\xff\xd8\xff" + b"relay-image"
+        responses = [
+            {
+                "success": True,
+                "id": "relay-browser-1",
+                "expiresAt": "2099-01-01T00:00:00Z",
+            },
+            {
+                "success": True,
+                "result": json.dumps(
+                    {
+                        "status": 200,
+                        "resolved_url": "https://upload.wikimedia.org/resolved.jpg",
+                        "content_type": "image/jpeg",
+                        "body_base64": base64.b64encode(jpeg).decode("ascii"),
+                        "byte_count": len(jpeg),
+                        "error": None,
+                    }
+                ),
+            },
+        ]
+        captured: list[tuple[str, object, float]] = []
+
+        class RelayResponse:
+            def __init__(self, payload: dict) -> None:
+                self.payload = payload
+                self.headers = {"Content-Type": "application/json"}
+
+            def __enter__(self) -> "RelayResponse":
+                return self
+
+            def __exit__(self, *args: object) -> None:
+                del args
+
+            def getcode(self) -> int:
+                return 200
+
+            def read(self) -> bytes:
+                return json.dumps(self.payload).encode("utf-8")
+
+        def fake_urlopen(request: object, *, timeout: float) -> RelayResponse:
+            captured.append((request.full_url, request, timeout))
+            return RelayResponse(responses.pop(0))
+
+        with TemporaryDirectory() as directory, mock.patch.dict(
+            os.environ,
+            {
+                "FIRECRAWL_RELAY_URL": "http://relay.example:18081",
+                "FIRECRAWL_BROWSER_RELAY_TIMEOUT_S": "181",
+            },
+            clear=False,
+        ), mock.patch("synthesis.firecrawl_client.urlopen", side_effect=fake_urlopen):
+            pool = FirecrawlApiKeyPool(keys=["relay-key"], state_path=Path(directory) / "pool.json")
+            manager = FirecrawlBrowserSessionManager(
+                key_pool=pool,
+                state_path=Path(directory) / "sessions.json",
+                session_ttl_s=300,
+                api_timeout_s=120,
+                relay_timeout_s=181,
+            )
+            downloader = FirecrawlBrowserImageDownloader(session_manager=manager, retries=0)
+            result = downloader.download("https://upload.wikimedia.org/example.jpg")
+
+        self.assertEqual(result.payload, jpeg)
+        self.assertEqual([item[0] for item in captured], [
+            "http://relay.example:18081/v2/browser",
+            "http://relay.example:18081/v2/browser/relay-browser-1/execute",
+        ])
+        self.assertEqual(captured[0][2], 181.0)
+        self.assertEqual(captured[1][1].get_header("X-firecrawl-relay-request-type"), "browser_image")
+        create_body = json.loads(captured[0][1].data.decode("utf-8"))
+        self.assertEqual(create_body["ttl"], 300)
+        execute_body = json.loads(captured[1][1].data.decode("utf-8"))
+        self.assertEqual(execute_body["language"], "node")
+
+    def test_target_image_http_error_releases_but_does_not_destroy_session(self) -> None:
+        _FakeBrowserFirecrawl.reset(
+            payload={
+                "status": 502,
+                "resolved_url": "https://upload.wikimedia.org/broken.jpg",
+                "content_type": "image/jpeg",
+                "body_base64": None,
+                "byte_count": 0,
+                "error": "http_status_502",
+            }
+        )
+        with TemporaryDirectory() as directory:
+            pool = FirecrawlApiKeyPool(keys=["one-key"], state_path=Path(directory) / "pool.json")
+            manager = FirecrawlBrowserSessionManager(
+                key_pool=pool,
+                app_factory=_FakeBrowserFirecrawl,
+                state_path=Path(directory) / "sessions.json",
+            )
+            downloader = FirecrawlBrowserImageDownloader(session_manager=manager, retries=0)
+            with self.assertRaises(FirecrawlBrowserHttpError):
+                downloader.download("https://upload.wikimedia.org/broken.jpg")
+            state = json.loads((Path(directory) / "sessions.json").read_text(encoding="utf-8"))
+            self.assertEqual(state["sessions"][0]["state"], "idle")
+            self.assertEqual(_FakeBrowserFirecrawl.delete_calls, [])
 
     def test_browser_image_download_rejects_non_image_response(self) -> None:
         _FakeBrowserFirecrawl.reset(
