@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 
 PPO_RAY_RUNTIME_ENV = {
     "env_vars": {
@@ -34,7 +35,57 @@ FORWARD_PREFIXES = [
     "CUDNN_",
     "NV_",
     "NVIDIA_",
+    # OpenSearch-VL synthesis/SFT tool and reward configuration.
+    "SERPER_",
+    "SERPAPI_",
+    "FIRECRAWL_",
+    "ENHANCED_",
+    "OSS_",
+    "JUDGE_",
+    "SFT_",
+    "SYNTHESIS_",
+    "WIKI_",
+    "IMAGE_",
+    "VISUAL_",
+    "TEXT_",
+    # Multimodal RL diagnostics (RLLM_MM_DEBUG, log path, rank filter, etc.).
+    "RLLM_MM_",
 ]
+
+# ``synthesis`` is a repository package rather than an installed wheel.  The
+# driver launch script adds these directories to PYTHONPATH, but Ray's
+# runtime_env does not inherit arbitrary environment variables unless they are
+# explicitly forwarded below.
+FORWARD_ENV_NAMES = {"PYTHONPATH"}
+
+
+def _repository_pythonpath() -> str:
+    """Return a deduplicated PYTHONPATH usable by Ray workers.
+
+    The workflow imports both the repository-level ``synthesis`` package and
+    the editable-installed ``rllm`` package.  Adding both roots makes the
+    remote TaskRunner independent of the driver's current working directory.
+    """
+
+    # .../OpenSearch-VL/RL/rllm/rllm/trainer/verl/ray_runtime_env.py
+    rllm_root = Path(__file__).resolve().parents[3]
+    project_root = rllm_root.parents[1]
+
+    # ``verl`` is a source checkout nested below ``RL/rllm/verl`` rather than
+    # directly below ``RL/rllm``.  Put this path before any site-installed or
+    # user-checkout version so Ray workers cannot mix verl modules from two
+    # different installations.
+    verl_root = rllm_root / "verl"
+    entries = [str(project_root), str(rllm_root), str(verl_root)]
+    entries.extend(item for item in os.environ.get("PYTHONPATH", "").split(os.pathsep) if item)
+
+    deduplicated: list[str] = []
+    seen: set[str] = set()
+    for entry in entries:
+        if entry not in seen:
+            seen.add(entry)
+            deduplicated.append(entry)
+    return os.pathsep.join(deduplicated)
 
 
 def _get_forwarded_env_vars():
@@ -64,7 +115,17 @@ def _get_forwarded_env_vars():
         else:
             exclude_vars.add(name)
 
-    forwarded = {k: v for k, v in os.environ.items() if any(k.startswith(p) for p in forward_prefix) and k not in exclude_vars}
+    forwarded = {
+        k: v
+        for k, v in os.environ.items()
+        if (k in FORWARD_ENV_NAMES or any(k.startswith(p) for p in forward_prefix))
+        and k not in exclude_vars
+    }
+    # Always provide the repository roots.  This is intentionally done after
+    # the generic forwarding logic so a stale/incomplete driver PYTHONPATH
+    # cannot make ``synthesis`` disappear inside the Ray worker.
+    if "PYTHONPATH" not in exclude_vars:
+        forwarded["PYTHONPATH"] = _repository_pythonpath()
     return forwarded
 
 

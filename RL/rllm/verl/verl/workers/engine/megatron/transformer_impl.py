@@ -523,7 +523,7 @@ class EngineTrainModeCtx:
 
 @EngineRegistry.register(model_type="language_model", backend="megatron")
 class MegatronEngineWithLMHead(MegatronEngine):
-    def prepare_model_inputs(self, batch: TensorDict):
+    def prepare_model_inputs(self, batch: TensorDict, forward_only: bool | None = None):
         batch = batch.to(get_device_id())
         batch = batch.contiguous()
         input_ids = batch["input_ids"]
@@ -549,6 +549,70 @@ class MegatronEngineWithLMHead(MegatronEngine):
 
             indices = batch.get("multi_modal_inputs_idx", None)
             multi_modal_inputs = extract_multi_modal_inputs(batch["multi_modal_inputs"], indices)
+
+        from rllm.utils.multimodal_debug import (
+            abort_on_missing_payload,
+            count_token,
+            event,
+            token_ids_text,
+            token_positions,
+        )
+
+        hf_config = getattr(self.model_config, "hf_config", None)
+        image_token_id = getattr(hf_config, "image_token_id", None)
+        if isinstance(multi_modal_inputs, dict):
+            multimodal_keys = sorted(multi_modal_inputs.keys())
+            has_visual_payload = any(
+                multi_modal_inputs.get(key) is not None
+                for key in ("pixel_values", "image_grid_thw")
+            )
+            pixel_values_shape = getattr(multi_modal_inputs.get("pixel_values"), "shape", None)
+            image_grid_thw_shape = getattr(multi_modal_inputs.get("image_grid_thw"), "shape", None)
+        else:
+            multimodal_keys = []
+            has_visual_payload = False
+            pixel_values_shape = None
+            image_grid_thw_shape = None
+        print_token_ids = os.getenv("RLLM_MM_DEBUG_PRINT_TOKEN_IDS", "0").lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        input_ids_token_ids = token_ids_text(input_ids[0]) if print_token_ids else None
+        if print_token_ids:
+            # Keep this explicit print in addition to the JSONL event below.
+            # Ray forwards worker stdout, which makes the update-side sequence
+            # visible in the training terminal as well as in rl_test.log.
+            print(
+                "[RLLM_MM_UPDATE][token_ids] "
+                f"forward_only={forward_only} "
+                f"image_token_count={count_token(input_ids[0], image_token_id)} "
+                f"image_token_positions={token_positions(input_ids[0], image_token_id)} "
+                f"multimodal_keys={multimodal_keys} "
+                f"has_visual_payload={has_visual_payload} "
+                f"token_ids={input_ids_token_ids}",
+                flush=True,
+            )
+        event(
+            "megatron_prepare_model_inputs",
+            input_ids_shape=getattr(input_ids, "shape", None),
+            forward_only=forward_only,
+            image_token_count=count_token(input_ids, image_token_id),
+            image_token_positions=token_positions(input_ids[0], image_token_id),
+            multimodal_keys=multimodal_keys,
+            has_visual_payload=has_visual_payload,
+            pixel_values_shape=pixel_values_shape,
+            image_grid_thw_shape=image_grid_thw_shape,
+            input_ids_token_ids=input_ids_token_ids,
+        )
+        image_token_count = count_token(input_ids, image_token_id)
+        if abort_on_missing_payload() and image_token_count and not has_visual_payload:
+            raise RuntimeError(
+                "[RLLM_MM_DEBUG] multimodal payload is missing at "
+                f"megatron_prepare_model_inputs: image_token_count={image_token_count}, "
+                f"keys={multimodal_keys}"
+            )
 
         return {
             "input_ids": input_ids,
@@ -576,7 +640,7 @@ class MegatronEngineWithLMHead(MegatronEngine):
         pad_mode = tu.get_non_tensor_data(batch, key="pad_mode", default=DatasetPadMode.NO_PADDING)
         temperature = batch["temperature"]
 
-        model_inputs = self.prepare_model_inputs(batch)
+        model_inputs = self.prepare_model_inputs(batch, forward_only=postprocess_micro_batch_func.keywords.get("forward_only"))
         input_ids = model_inputs["input_ids"]
         multi_modal_inputs = model_inputs["multi_modal_inputs"]
 

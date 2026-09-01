@@ -10,7 +10,7 @@ from PIL import Image
 
 from vision_deepresearch_async_workflow.deepresearch_agent import DeepResearchAgent
 from rllm.agents.agent import Action, Episode, Step, Trajectory
-from rllm.engine.rollout import RolloutEngine
+from rllm.engine.rollout import ModelOutput, RolloutEngine
 from rllm.rewards.reward_fn import RewardFunction
 from rllm.workflows.workflow import TerminationReason, Workflow
 
@@ -549,9 +549,6 @@ class DeepResearchWorkflow(Workflow):
             )
             is_fatal = fatal_step_index is not None
 
-            ACCURACY_WEIGHT = 0.8
-            QUERY_WEIGHT = 0.2
-
             num_turns = sum(
                 len(t.steps) for t in episode.trajectories
             )
@@ -592,25 +589,12 @@ class DeepResearchWorkflow(Workflow):
                 else:
                     r_format = 0.0
 
-                query_steps = (
-                    all_steps[:fatal_step_index]
-                    if is_fatal and fatal_step_index < len(all_steps)
-                    else all_steps
-                )
-                try:
-                    r_query = await _judge_query_utility(
-                        question=question,
-                        ground_truth=answer,
-                        prediction=prediction,
-                        steps=query_steps,
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    print(f"[QueryUtilityReward] Exception: {exc}")
-                    r_query = 0.0
-
-                total_reward = r_format * (
-                    QUERY_WEIGHT * r_query + ACCURACY_WEIGHT * r_accuracy
-                )
+                # Query-utility/quality reward is intentionally disabled for
+                # the current experiment.  Keep the metric field at 0.0 for
+                # backward-compatible logging, but do not issue an additional
+                # LLM judge request and do not include it in policy reward.
+                r_query = 0.0
+                total_reward = r_format * r_accuracy
 
                 for trajectory in episode.trajectories:
                     trajectory.reward = total_reward
@@ -661,6 +645,8 @@ class DeepResearchWorkflow(Workflow):
 
     def _convert_result_to_episode(self, result: dict, task: dict, uid: str) -> Episode:
         messages = result.get("messages", [])
+        model_outputs = result.get("model_outputs", [])
+        last_model_output = result.get("last_model_output")
         prediction = result.get("prediction", "")
         termination = result.get("termination", "unknown")
         rounds = result.get("rounds", 0)
@@ -668,6 +654,15 @@ class DeepResearchWorkflow(Workflow):
 
         trajectories: list[Trajectory] = []
         steps: list[Step] = []
+        assistant_output_index = 0
+        assistant_message_indices = [
+            index
+            for index, message in enumerate(messages)
+            if message.get("role") == "assistant"
+        ]
+        last_assistant_message_index = (
+            assistant_message_indices[-1] if assistant_message_indices else None
+        )
 
         i = 0
         while i < len(messages):
@@ -684,7 +679,27 @@ class DeepResearchWorkflow(Workflow):
                     observation=observation,
                     reward=0.0,
                 )
-                step.model_output = None
+                # Stage 1 stores the exact ModelOutput returned by the
+                # multimodal rollout engine for each assistant generation.
+                # Legacy and cumulative modes do not populate this list and
+                # therefore keep the historical ``None`` behavior.
+                candidate_output = (
+                    model_outputs[assistant_output_index]
+                    if assistant_output_index < len(model_outputs)
+                    else None
+                )
+                if (
+                    candidate_output is None
+                    and i == last_assistant_message_index
+                    and isinstance(last_model_output, ModelOutput)
+                ):
+                    candidate_output = last_model_output
+                step.model_output = (
+                    candidate_output
+                    if isinstance(candidate_output, ModelOutput)
+                    else None
+                )
+                assistant_output_index += 1
                 if msg.get("step_error"):
                     step.info["step_error"] = True
                 if _has_tool_error_observation(observation):

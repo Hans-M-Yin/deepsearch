@@ -8,7 +8,7 @@ set -xeuo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RLLM_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../../../.." && pwd)"
-export PYTHONPATH="${PROJECT_ROOT}:${RLLM_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
+export PYTHONPATH="${PROJECT_ROOT}:${RLLM_ROOT}:${RLLM_ROOT}/verl${PYTHONPATH:+:${PYTHONPATH}}"
 cd "${RLLM_ROOT}"
 
 # Load RL credentials when present.  Serper/Reader variables can also be
@@ -32,8 +32,8 @@ echo "Using Python: ${PYTHON_BIN}"
 "${PYTHON_BIN}" -c "import transformer_engine.pytorch as te; print('transformer_engine: ok')"
 
 # ========= user-overridable paths / data =========
-MODEL_PATH=${MODEL_PATH:-Qwen/Qwen3-VL-8B-Instruct}
-DATASET_NAME=${DATASET_NAME:-Vision-DeepResearch-QA}
+MODEL_PATH=${MODEL_PATH:-/mnt/hdfs/byte_ai_sales/user/user/yinzhihan/agent/OpenSearch-VL/SFT/saves/qwen3_vl_8b/full/data_final_nothink_v2_2node16gpu_lr_2e_5_cosine_to_zero_epoch3}
+DATASET_NAME=${DATASET_NAME:-Vision-DeepResearch-QA-rl-combined-5871}
 TRAIN_SPLIT=${TRAIN_SPLIT:-train}
 VAL_SPLIT=${VAL_SPLIT:-test}
 PROJECT_NAME=${PROJECT_NAME:-vision-deepresearch}
@@ -53,11 +53,11 @@ kl_loss_coef=0.001
 clip_ratio_high=0.28
 
 # ========= batch / workflow =========
-train_prompt_bsz=256
+train_prompt_bsz=192
 n_resp_per_prompt=8
 train_prompt_mini_bsz=64
 n_parallel_tasks=256
-n_parallel_tools=2048
+n_parallel_tools=256
 
 # ========= length =========
 max_prompt_length=4096
@@ -186,5 +186,6 @@ N_GPUS_PER_NODE=8
     trainer.nnodes=${NNODES} \
     trainer.save_freq=50 \
     trainer.test_freq=10 \
-    trainer.total_epochs=100 \
+    trainer.resume_mode=disable \
+    trainer.total_epochs=3 \
     trainer.default_local_dir="${CKPTS_DIR}"

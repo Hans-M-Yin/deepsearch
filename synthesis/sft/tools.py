@@ -13,6 +13,7 @@ import sys
 import tempfile
 import threading
 import time
+from contextvars import copy_context
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
 from hashlib import sha256
@@ -29,6 +30,11 @@ try:
 except ImportError:  # pragma: no cover - optional dependency
     fitz = None
 
+try:
+    import cairosvg
+except ImportError:  # pragma: no cover - optional dependency
+    cairosvg = None
+
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     __package__ = "synthesis.sft"
@@ -43,8 +49,12 @@ from synthesis.wiki_text_builder import EnhancedReaderClient
 from synthesis.model_worker import LLM_WORKER
 from synthesis.model_worker import ModelMessage
 from synthesis.model_worker import ModelRequest
+from synthesis.retry_monitor import retry_reason_from_exception, tracked_sleep
 from synthesis.url_utils import normalize_http_referer, normalize_http_url
 logger = logging.getLogger(__name__)
+RawDocumentFetcher = Callable[
+    [str, str, Callable[[], dict[str, Any]]], dict[str, Any]
+]
 MAX_SEARCH_RESULTS = 5
 TOOL_NETWORK_TIMEOUT_S = 120
 # A request is attempted once initially, then at most this many additional
@@ -54,6 +64,8 @@ TOOL_NETWORK_TIMEOUT_S = 120
 TOOL_TIMEOUT_RETRIES = 5
 TOOL_RETRY_SLEEP_S = 5
 TOOL_429_RETRY_SLEEP_S = 60
+FIRECRAWL_ERROR_RETRIES = 1
+FIRECRAWL_ERROR_RETRY_SLEEP_S = 5
 # ``read_url`` intentionally gives Enhanced Reader one short retry before
 # switching to Firecrawl. Keep this separate from the generic HTTP retry
 # budget so unrelated tools cannot silently lengthen this fallback boundary.
@@ -62,6 +74,8 @@ ENHANCED_READER_RETRY_SLEEP_S = 5
 MAX_DOWNLOADED_IMAGE_LONG_EDGE = 1920
 MAX_DOWNLOADED_IMAGE_SHORT_EDGE = 1080
 RESIZED_IMAGE_LONG_EDGE = 1200
+MAX_SVG_BYTES = 10 * 1024 * 1024
+MAX_RENDERED_SVG_PIXELS = 20_000_000
 AMBIGUOUS_CONTENT_TYPES = {
     "",
     "application/octet-stream",
@@ -72,6 +86,10 @@ PDF_CONTENT_TYPES = {
     "application/pdf",
     "application/x-pdf",
 }
+_COMPACT_RESOURCE_ID_RE = re.compile(
+    r"^(?:page|image)_[0-9a-f]{8}$",
+    flags=re.IGNORECASE,
+)
 T2T_BLOCKED_SEARCH_DOMAINS: tuple[str, ...] = ()
 T2I_BLOCKED_IMAGE_SEARCH_DOMAINS = (
     # TikTok image-search results are often video-thumbnail endpoints or signed
@@ -205,6 +223,17 @@ def _is_wikimedia_upload_url(url: str) -> bool:
         return False
 
 
+def is_compact_resource_id(value: object) -> bool:
+    """Return whether ``value`` looks like a search-result resource ID.
+
+    Resource IDs are opaque and only meaningful inside the per-trajectory
+    registry. Keep this check strict so an ordinary bare hostname remains a
+    direct URL for legacy callers.
+    """
+
+    return bool(_COMPACT_RESOURCE_ID_RE.fullmatch(str(value or "").strip()))
+
+
 def _wikimedia_throttle_enabled() -> bool:
     return _env_flag("SFT_WIKIMEDIA_THROTTLE", True)
 
@@ -267,7 +296,15 @@ def _acquire_wikimedia_request_slot(url: str) -> bool:
             _WIKIMEDIA_NEXT_REQUEST_AT = scheduled_at + _wikimedia_min_interval_s()
         wait_s = scheduled_at - now
         if wait_s > 0:
-            time.sleep(wait_s)
+            tracked_sleep(
+                wait_s,
+                reason="wikimedia_throttle_wait",
+                tool="wikimedia",
+                url=url,
+                error_type="WikimediaThrottleWait",
+                kind="resource_wait",
+                fallback_sleep=time.sleep,
+            )
         with _WIKIMEDIA_THROTTLE_LOCK:
             _WIKIMEDIA_QUEUED_REQUESTS = max(0, _WIKIMEDIA_QUEUED_REQUESTS - 1)
             _WIKIMEDIA_ACTIVE_REQUESTS += 1
@@ -366,9 +403,25 @@ def _read_url_timed_sleep(
     timings: dict[str, float] | None,
     key: str,
     sleep_s: float,
+    *,
+    reason: str = "retry",
+    tool: str = "read_url",
+    error: object | None = None,
+    url: str = "",
+    error_type: str | None = None,
+    kind: str = "retry",
 ) -> None:
     started_at = time.monotonic()
-    time.sleep(max(0.0, float(sleep_s)))
+    tracked_sleep(
+        sleep_s,
+        reason=reason,
+        tool=tool,
+        error=error,
+        url=url,
+        error_type=error_type,
+        kind=kind,
+        fallback_sleep=time.sleep,
+    )
     _read_url_timing_add(timings, key, time.monotonic() - started_at)
 
 
@@ -418,6 +471,10 @@ DEFAULT_SEARCH_TOP_K = _env_int("SEARCH_TOP_K", MAX_SEARCH_RESULTS)
 _TOOL_STATS_LOCK = threading.Lock()
 _TOOL_STATS: dict[str, Any] = {
     "total_calls": 0,
+    "cache": {
+        "hits": 0,
+        "misses": 0,
+    },
     "tools": {
         "t2t_search": {"success": 0, "failure": 0, "total_results": 0},
         "t2i_search": {"success": 0, "failure": 0, "total_results": 0},
@@ -438,6 +495,15 @@ _TOOL_STATS: dict[str, Any] = {
 def _tool_stats_snapshot_text() -> str:
     stats = _TOOL_STATS
     lines = [f"[tool-stats] total_calls={stats['total_calls']}"]
+    cache_stats = stats["cache"]
+    cache_lookups = cache_stats["hits"] + cache_stats["misses"]
+    if cache_lookups:
+        cache_hit_rate = cache_stats["hits"] / cache_lookups
+        lines.append(
+            f"[tool-stats] cache hits={cache_stats['hits']} "
+            f"misses={cache_stats['misses']} "
+            f"hit_rate={cache_hit_rate:.2%}"
+        )
     for tool_name in ("t2t_search", "t2i_search", "i2i_search"):
         tool_stats = stats["tools"][tool_name]
         lines.append(
@@ -452,6 +518,15 @@ def _tool_stats_snapshot_text() -> str:
         f"image_http_statuses={json.dumps(read_stats['image_http_statuses'], ensure_ascii=False, sort_keys=True)}"
     )
     return "\n".join(lines)
+
+
+def _record_tool_cache_event(tool_name: str, hit: bool) -> None:
+    """Record cache usage reported by an explicitly injected RL cache."""
+
+    with _TOOL_STATS_LOCK:
+        cache_stats = _TOOL_STATS["cache"]
+        key = "hits" if hit else "misses"
+        cache_stats[key] += 1
 
 
 def _record_search_tool_call(tool_name: str, *, success: bool, result_count: int = 0) -> None:
@@ -976,6 +1051,7 @@ def postprocess_search_output(
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 future_to_url = {
                     executor.submit(
+                        copy_context().run,
                         extract_url_semantic_keywords,
                         url,
                         model_alias=resolved_url_keyword_model,
@@ -1214,10 +1290,13 @@ def _wikimedia_cache_read(url: str) -> tuple[bytes, str] | None:
         metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
         if metadata.get("url") != url:
             return None
-        content_type = str(metadata.get("content_type") or "")
+        payload = payload_path.read_bytes()
+        # Prefer the bytes over stored/remote metadata. Some image hosts
+        # incorrectly label SVG responses as image/jpeg.
+        content_type = _sniff_image_content_type(payload) or str(metadata.get("content_type") or "")
         if not content_type.startswith("image/"):
             return None
-        return payload_path.read_bytes(), content_type
+        return payload, content_type
     except (OSError, ValueError, TypeError, json.JSONDecodeError):
         return None
 
@@ -1278,7 +1357,7 @@ def _download_image_payload_with_cache(
 
     if not _is_wikimedia_upload_url(url):
         payload, downloaded_type = fetch()
-        content_type = downloaded_type or _sniff_image_content_type(payload) or content_type_hint
+        content_type = _sniff_image_content_type(payload) or downloaded_type or content_type_hint
         if not content_type.startswith("image/"):
             raise ValueError(f"downloaded fallback is not an image: {content_type or 'unknown'}")
         return payload, content_type, False
@@ -1293,7 +1372,7 @@ def _download_image_payload_with_cache(
             return cached[0], cached[1], True
 
         payload, downloaded_type = fetch()
-        content_type = downloaded_type or _sniff_image_content_type(payload) or content_type_hint
+        content_type = _sniff_image_content_type(payload) or downloaded_type or content_type_hint
         if not content_type.startswith("image/"):
             raise ValueError(f"downloaded fallback is not an image: {content_type or 'unknown'}")
         _wikimedia_cache_write(url, payload, content_type)
@@ -1320,6 +1399,66 @@ def _is_timeout_error(exc: BaseException) -> bool:
         return True
     message = str(exc).lower()
     return "timeout" in message or "timed out" in message
+
+
+def _is_retryable_firecrawl_error(exc: BaseException) -> bool:
+    """Return whether one Firecrawl application error merits one retry.
+
+    Firecrawl can return HTTP 200 with an error payload when its own browser
+    proxy cannot establish a tunnel. Those errors are transient in practice,
+    but authentication, quota, validation, and missing-dependency failures
+    are deterministic and should not consume another request.
+    """
+
+    message = str(exc or "").lower()
+    status_code = getattr(exc, "status_code", None)
+    response = getattr(exc, "response", None)
+    if status_code is None and response is not None:
+        status_code = getattr(response, "status_code", None)
+    try:
+        status_code = int(status_code) if status_code is not None else None
+    except (TypeError, ValueError):
+        status_code = None
+    if status_code is None:
+        # Firecrawl application errors are commonly wrapped in RuntimeError
+        # with a JSON payload, e.g. ``statusCode": 403``.
+        status_match = re.search(
+            r"(?:statuscode|status_code|status\s+code)\s*[\"']?\s*"
+            r"[:=]\s*[\"']?(\d{3})\b"
+            r"|http(?:\s+error)?\s*[:=]?\s*(\d{3})\b",
+            message,
+        )
+        if status_match:
+            status_code = int(status_match.group(1) or status_match.group(2))
+    if status_code == 403:
+        return False
+    non_retryable_markers = (
+        "401",
+        "unauthorized",
+        "authentication",
+        "invalid api key",
+        "api key is invalid",
+        "not enough credits",
+        "insufficient credits",
+        "credit balance",
+        "invalid url",
+        "url is required",
+        "bad request",
+        "validation error",
+        "no active firecrawl api key",
+        "firecrawl sdk import failed",
+        "install the firecrawl package",
+    )
+    return not any(marker in message for marker in non_retryable_markers)
+
+
+def _response_body(response: requests.Response) -> str:
+    """Read a response body for retry diagnostics without raising again."""
+
+    try:
+        return str(getattr(response, "text", "") or "")
+    except Exception as exc:  # pragma: no cover - defensive
+        return f"<unable to read response body: {exc!r}>"
 
 
 def _request_with_retry(
@@ -1371,6 +1510,11 @@ def _request_with_retry(
                 can_retry_status = True
             should_retry_status = _should_retry_http_status(response.status_code) and can_retry_status
             if should_retry_status and attempt < attempts:
+                response_status = response.status_code
+                retry_error = (
+                    f"HTTP {response_status} {response.reason or ''}\n"
+                    f"response_body:\n{_response_body(response)}"
+                )
                 retry_after = response.headers.get("Retry-After")
                 if response.status_code == 429:
                     try:
@@ -1386,7 +1530,7 @@ def _request_with_retry(
                     attempt=attempt,
                     max_attempts=attempts,
                     sleep_seconds=sleep_s,
-                    error=f"HTTP {response.status_code}",
+                    error=retry_error,
                     method=method,
                     url=url,
                 )
@@ -1394,6 +1538,11 @@ def _request_with_retry(
                     timings,
                     f"{timing_prefix}_retry_sleep_s",
                     sleep_s,
+                    reason=f"http_status_{response_status}",
+                    tool="http_request",
+                    error=retry_error,
+                    url=url,
+                    error_type="HTTPStatusError",
                 )
                 continue
             response.raise_for_status()
@@ -1417,6 +1566,11 @@ def _request_with_retry(
                     timings,
                     f"{timing_prefix}_retry_sleep_s",
                     sleep_s,
+                    reason=retry_reason_from_exception(exc, default="http_connection_error"),
+                    tool="http_request",
+                    error=exc,
+                    url=url,
+                    error_type=type(exc).__name__,
                 )
                 continue
             raise
@@ -1461,6 +1615,11 @@ def _request_with_retry(
                     timings,
                     f"{timing_prefix}_retry_sleep_s",
                     sleep_s,
+                    reason=f"http_status_{exc.response.status_code}",
+                    tool="http_request",
+                    error=exc,
+                    url=url,
+                    error_type=type(exc).__name__,
                 )
                 continue
             raise
@@ -1770,17 +1929,41 @@ def _maybe_resize_downloaded_image(
     *,
     content_type: str,
 ) -> tuple[bytes, str]:
+    actual_content_type = _sniff_image_content_type(payload)
+    if actual_content_type == "image/svg+xml":
+        if len(payload) > MAX_SVG_BYTES:
+            raise ValueError(
+                f"SVG image exceeds the {MAX_SVG_BYTES} byte safety limit"
+            )
+        if cairosvg is None:
+            raise RuntimeError(
+                "CairoSVG is required to convert SVG images in read_url. "
+                "Install it with `pip install cairosvg`."
+            )
+        try:
+            payload = cairosvg.svg2png(bytestring=payload, unsafe=False)
+        except Exception as exc:
+            raise ValueError(f"SVG to PNG conversion failed: {exc}") from exc
+        if not payload:
+            raise ValueError("SVG to PNG conversion returned an empty payload")
+        content_type = "image/png"
+
     try:
         with Image.open(BytesIO(payload)) as image:
             normalized = ImageOps.exif_transpose(image)
+            normalized.load()
             width, height = normalized.size
+            if actual_content_type == "image/svg+xml" and width * height > MAX_RENDERED_SVG_PIXELS:
+                raise ValueError(
+                    "Rasterized SVG exceeds the rendered pixel safety limit"
+                )
             long_edge = max(width, height)
             short_edge = min(width, height)
             if (
                 long_edge <= MAX_DOWNLOADED_IMAGE_LONG_EDGE
                 and short_edge <= MAX_DOWNLOADED_IMAGE_SHORT_EDGE
             ):
-                return payload, content_type
+                return payload, _sniff_image_content_type(payload) or content_type
 
             resized = normalized.copy()
             resized.thumbnail(
@@ -1806,8 +1989,8 @@ def _maybe_resize_downloaded_image(
 
             resized.save(output, format="JPEG", quality=90, optimize=True)
             return output.getvalue(), "image/jpeg"
-    except Exception:
-        return payload, content_type
+    except Exception as exc:
+        raise ValueError(f"Downloaded image is not a valid raster image: {exc}") from exc
 
 
 def _read_via_jina(url: str) -> str:
@@ -1897,6 +2080,10 @@ def _read_document_with_retry(
                 max_retries=ENHANCED_READER_RETRIES,
                 error=str(exc),
             )
+            reader_retry_reason = retry_reason_from_exception(
+                exc,
+                default="enhanced_reader_error",
+            )
             _tool_retry_debug(
                 "enhanced_reader",
                 attempt=attempt,
@@ -1904,11 +2091,17 @@ def _read_document_with_retry(
                 sleep_seconds=ENHANCED_READER_RETRY_SLEEP_S,
                 error=exc,
                 url=url,
+                retry_reason=reader_retry_reason,
             )
             _read_url_timed_sleep(
                 timings,
                 f"{timing_prefix}_retry_sleep_s",
                 ENHANCED_READER_RETRY_SLEEP_S,
+                reason=f"enhanced_reader_{reader_retry_reason}",
+                tool="enhanced_reader",
+                error=exc,
+                url=url,
+                error_type=type(exc).__name__,
             )
         finally:
             _read_url_timing_add(
@@ -1931,7 +2124,12 @@ def _read_via_firecrawl(url: str) -> dict[str, Any]:
         formats=["markdown"],
     )
     if response.get("error"):
-        raise RuntimeError(str(response["error"]))
+        raise RuntimeError(
+            "Firecrawl response error: "
+            f"{response['error']}\n"
+            "full_response:\n"
+            f"{json.dumps(response, ensure_ascii=False, default=str)}"
+        )
     payload = response.get("data") if isinstance(response.get("data"), dict) else response
     markdown = str(payload.get("markdown") or "").strip()
     if not markdown:
@@ -1950,34 +2148,70 @@ def _read_via_firecrawl_with_timeout_retry(
     *,
     timings: dict[str, float] | None = None,
 ) -> dict[str, Any]:
-    """Use the fallback reader with the same timeout retry budget as read_url."""
+    """Read through Firecrawl with bounded timeout and provider-error retries.
 
-    for attempt in range(1, TOOL_TIMEOUT_RETRIES + 2):
+    Timeout/transport errors retain the existing timeout retry budget. Other
+    Firecrawl application errors, including ``ERR_TUNNEL_CONNECTION_FAILED``,
+    receive at most one additional attempt. The two budgets are tracked
+    independently because a retryable provider error can be followed by a
+    timeout on the next attempt.
+    """
+
+    timeout_retries = 0
+    firecrawl_error_retries = 0
+    attempt = 0
+    while True:
+        attempt += 1
         attempt_started_at = time.monotonic()
         try:
             return _read_via_firecrawl(url)
         except Exception as exc:
-            if not _is_timeout_error(exc) or attempt > TOOL_TIMEOUT_RETRIES:
-                raise
+            is_timeout = _is_timeout_error(exc)
+            if is_timeout:
+                if timeout_retries >= TOOL_TIMEOUT_RETRIES:
+                    raise
+                timeout_retries += 1
+                sleep_s = TOOL_RETRY_SLEEP_S * timeout_retries
+                retry_kind = "timeout"
+                retry_attempt = timeout_retries
+                max_retries = TOOL_TIMEOUT_RETRIES
+            else:
+                if (
+                    not _is_retryable_firecrawl_error(exc)
+                    or firecrawl_error_retries >= FIRECRAWL_ERROR_RETRIES
+                ):
+                    raise
+                firecrawl_error_retries += 1
+                sleep_s = FIRECRAWL_ERROR_RETRY_SLEEP_S * firecrawl_error_retries
+                retry_kind = "error"
+                retry_attempt = firecrawl_error_retries
+                max_retries = FIRECRAWL_ERROR_RETRIES
+
             _read_url_debug(
-                "firecrawl_timeout_retry",
+                f"firecrawl_{retry_kind}_retry",
                 url=url,
-                attempt=attempt,
-                max_retries=TOOL_TIMEOUT_RETRIES,
+                attempt=retry_attempt,
+                max_retries=max_retries,
                 error=str(exc),
             )
             _tool_retry_debug(
                 "firecrawl",
-                attempt=attempt,
-                max_attempts=TOOL_TIMEOUT_RETRIES + 1,
-                sleep_seconds=TOOL_RETRY_SLEEP_S * attempt,
+                attempt=retry_attempt,
+                max_attempts=max_retries + 1,
+                sleep_seconds=sleep_s,
                 error=exc,
                 url=url,
+                retry_reason=retry_kind,
             )
             _read_url_timed_sleep(
                 timings,
-                "firecrawl_retry_sleep_s",
-                TOOL_RETRY_SLEEP_S * attempt,
+                f"firecrawl_{retry_kind}_retry_sleep_s",
+                sleep_s,
+                reason=f"firecrawl_{retry_kind}",
+                tool="firecrawl",
+                error=exc,
+                url=url,
+                error_type=type(exc).__name__,
             )
         finally:
             _read_url_timing_add(
@@ -1985,7 +2219,6 @@ def _read_via_firecrawl_with_timeout_retry(
                 "firecrawl_attempt_s",
                 time.monotonic() - attempt_started_at,
             )
-    raise AssertionError("unreachable")
 
 
 def _is_blocked_summary(content: str) -> bool:
@@ -2000,11 +2233,19 @@ def _read_url_with_firecrawl_fallback(
     original_title: str = "",
     trigger: str,
     timings: dict[str, float] | None = None,
+    raw_document_fetcher: RawDocumentFetcher | None = None,
 ) -> dict[str, Any]:
     """Read through Firecrawl and summarize after Enhanced Reader is unavailable/blocked."""
     fallback_started_at = time.monotonic()
     try:
-        firecrawl_document = _read_via_firecrawl_with_timeout_retry(url, timings=timings)
+        compute_document = lambda: _read_via_firecrawl_with_timeout_retry(
+            url, timings=timings
+        )
+        firecrawl_document = (
+            raw_document_fetcher("firecrawl", url, compute_document)
+            if raw_document_fetcher is not None
+            else compute_document()
+        )
         content = firecrawl_document["content"]
         summary_started_at = time.monotonic()
         summarized = summarize_with_qwen(
@@ -2048,6 +2289,7 @@ def read_url(
     goal: str = "",
     assistant_output: str = "",
     resource: UrlResource | None = None,
+    raw_document_fetcher: RawDocumentFetcher | None = None,
 ) -> dict[str, Any]:
     """Read a URL and emit one end-of-call timing summary when debug is enabled."""
 
@@ -2061,6 +2303,7 @@ def read_url(
             assistant_output=assistant_output,
             resource=resource,
             _timings=timings,
+            raw_document_fetcher=raw_document_fetcher,
         )
         return result
     finally:
@@ -2082,6 +2325,7 @@ def _read_url_impl(
     resource: UrlResource | None = None,
     *,
     _timings: dict[str, float] | None = None,
+    raw_document_fetcher: RawDocumentFetcher | None = None,
 ) -> dict[str, Any]:
     """Read a URL as either text content or a downloadable image."""
 
@@ -2437,10 +2681,17 @@ def _read_url_impl(
         # print(f"############ {normalized_url} ##############")
         enhanced_reader_started_at = time.monotonic()
         try:
-            document = _read_document_with_retry(
+            compute_document = lambda: _read_document_with_retry(
                 normalized_url,
                 timings=_timings,
                 timing_prefix="enhanced_reader",
+            )
+            document = (
+                raw_document_fetcher(
+                    "enhanced_reader", normalized_url, compute_document
+                )
+                if raw_document_fetcher is not None
+                else compute_document()
             )
         finally:
             _read_url_timing_add(
@@ -2463,6 +2714,7 @@ def _read_url_impl(
             assistant_output=assistant_output,
             trigger=trigger,
             timings=_timings,
+            raw_document_fetcher=raw_document_fetcher,
         )
 
     content = document.get("content", "") or ""
@@ -2491,6 +2743,7 @@ def _read_url_impl(
             original_title=title,
             trigger=f"Enhanced Reader returned BLOCKED for {normalized_url}",
             timings=_timings,
+            raw_document_fetcher=raw_document_fetcher,
         )
     _record_read_url_call(branch="text", success=True)
     result = {
@@ -2507,6 +2760,8 @@ def _read_url_impl(
 def _run_search_with_timeout_retry(
     tool_name: str,
     request: Callable[[], Any],
+    *,
+    request_url: str = "",
 ) -> Any:
     """Run a search backend request with bounded timeout-only retries."""
 
@@ -2523,7 +2778,15 @@ def _run_search_with_timeout_retry(
                 sleep_seconds=TOOL_RETRY_SLEEP_S * attempt,
                 error=exc,
             )
-            time.sleep(TOOL_RETRY_SLEEP_S * attempt)
+            tracked_sleep(
+                TOOL_RETRY_SLEEP_S * attempt,
+                reason=retry_reason_from_exception(exc, default=f"{tool_name}_timeout"),
+                tool=tool_name,
+                error=exc,
+                url=request_url,
+                error_type=type(exc).__name__,
+                fallback_sleep=time.sleep,
+            )
     raise AssertionError("unreachable")
 
 
@@ -2540,6 +2803,7 @@ def t2t_search(query: str, lang: str = "en", top_k: int = DEFAULT_SEARCH_TOP_K) 
                 limit=fetch_limit,
                 hl=lang,
             ),
+            request_url=os.environ.get("SERPER_SEARCH_URL") or "https://google.serper.dev/search",
         )
         results: list[dict[str, Any]] = []
         for item in response.results:
@@ -2579,6 +2843,7 @@ def t2i_search(query: str, lang: str = "en", top_k: int = DEFAULT_SEARCH_TOP_K) 
                 limit=fetch_limit,
                 hl=lang,
             ),
+            request_url=os.environ.get("SERPER_IMAGES_URL") or "https://google.serper.dev/images",
         )
         results: list[dict[str, Any]] = []
         for item in response.results:
@@ -2712,7 +2977,14 @@ def i2i_search(
                     error="empty result",
                     retry_reason="empty_result",
                 )
-                time.sleep(5)
+                tracked_sleep(
+                    5,
+                    reason="empty_result",
+                    tool="i2i_search",
+                    url=image_url,
+                    error_type="EmptySearchResult",
+                    fallback_sleep=time.sleep,
+                )
                 continue
             _record_search_tool_call("i2i_search", success=True, result_count=result_count)
             return {
@@ -2732,7 +3004,15 @@ def i2i_search(
                     error=exc,
                     retry_reason="timeout",
                 )
-                time.sleep(sleep_s)
+                tracked_sleep(
+                    sleep_s,
+                    reason=retry_reason_from_exception(exc, default="i2i_timeout"),
+                    tool="i2i_search",
+                    error=exc,
+                    url=image_url,
+                    error_type=type(exc).__name__,
+                    fallback_sleep=time.sleep,
+                )
             elif not _is_timeout_error(exc):
                 break
             attempt += 1

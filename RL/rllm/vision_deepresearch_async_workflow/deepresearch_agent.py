@@ -19,6 +19,7 @@ from synthesis.sft.qwen3_vl_template import (
 
 # rLLM imports
 from rllm.engine.rollout import RolloutEngine
+from rllm.utils.multimodal_debug import sequence_mode
 
 from vision_deepresearch_async_workflow.deepresearch_tools_async_executor import (
     SFTToolAdapter,
@@ -306,9 +307,22 @@ class MultiTurnReactAgent:
         self.max_llm_calls = MAX_LLM_CALL_PER_RUN
         self.default_max_tries = default_max_tries
 
-        # Smart context management using actual API consumption
+        # Token accounting is reset at the start of every trajectory.  The
+        # rollout engine reports the fully rendered prompt length for each
+        # model call, including the previous tool observations.
         self.total_prompt_tokens = 0
         self.total_completion_tokens = 0
+        self.last_prompt_tokens = 0
+        self.last_completion_tokens = 0
+        self.prompt_tokens_by_call: list[int] = []
+        self.completion_tokens_by_call: list[int] = []
+        self.model_call_count = 0
+        # Stage 1 keeps the processor output of every model call so the
+        # stepwise DataProto path can carry visual payloads into update.  Do
+        # not retain these large tensors in the default/legacy path.
+        self._sequence_mode = sequence_mode()
+        self.model_outputs_by_round: list[Any] = []
+        self.last_model_output: Any | None = None
 
         self.max_prompt_tokens = MAX_PROMPT_LENGTH_PER_RUN
         self.max_response_tokens = MAX_RESPONSE_LENGTH_PER_RUN
@@ -334,36 +348,42 @@ class MultiTurnReactAgent:
                 messages=messages, **kwargs
             )
 
-            if hasattr(response, "prompt_length") and hasattr(
-                response, "completion_length"
-            ):
-                self.total_prompt_tokens += response.prompt_length
-                self.total_completion_tokens += response.completion_length
-
             return response
         except Exception as exc:  # noqa: BLE001
             print(f"call_server failed: {exc}")
             raise
 
     def record_token_usage(self, response) -> None:
-        """Record the latest prompt/completion token count from rollout engine."""
+        """Record per-call and cumulative token usage for this trajectory.
+
+        A later prompt contains the earlier assistant messages and tool
+        observations.  Thus ``total_prompt_tokens`` is the cumulative request
+        cost, while ``last_prompt_tokens`` is the final full conversation
+        context length before the latest model response.
+        """
         prompt_tokens = getattr(response, "prompt_length", None)
         completion_tokens = getattr(response, "completion_length", None)
 
         if prompt_tokens is not None:
             try:
-                self.total_prompt_tokens = int(prompt_tokens)
+                self.last_prompt_tokens = int(prompt_tokens)
             except (TypeError, ValueError):  # noqa: PERF203
-                self.total_prompt_tokens = 0
+                self.last_prompt_tokens = 0
 
         if completion_tokens is not None:
             try:
-                self.total_completion_tokens = int(completion_tokens)
+                self.last_completion_tokens = int(completion_tokens)
             except (TypeError, ValueError):  # noqa: PERF203
-                self.total_completion_tokens = 0
+                self.last_completion_tokens = 0
+
+        self.total_prompt_tokens += self.last_prompt_tokens
+        self.total_completion_tokens += self.last_completion_tokens
+        self.prompt_tokens_by_call.append(self.last_prompt_tokens)
+        self.completion_tokens_by_call.append(self.last_completion_tokens)
+        self.model_call_count += 1
 
     def get_total_tokens_used(self) -> int:
-        """Return the latest prompt + completion token usage reported by the engine."""
+        """Return cumulative prompt + completion tokens for this trajectory."""
         return self.total_prompt_tokens + self.total_completion_tokens
 
     def _estimate_prompt_tokens(self, messages: list[dict]) -> int:
@@ -403,9 +423,26 @@ class MultiTurnReactAgent:
         # next_prompt_tokens: int | None = None,
     ) -> dict:
         """Assemble result payload with token usage metadata."""
+        trajectory_prompt_tokens = self.total_prompt_tokens
+        trajectory_completion_tokens = self.total_completion_tokens
+        trajectory_total_tokens = trajectory_prompt_tokens + trajectory_completion_tokens
+        # The latest request prompt contains the initial prompt, all previous
+        # assistant turns, and all tool observations.  Adding the latest
+        # completion gives the final trajectory context length without
+        # repeatedly counting prefixes from earlier requests.
+        trajectory_context_tokens = self.last_prompt_tokens + self.last_completion_tokens
         token_usage = {
-            "prompt": self.total_prompt_tokens,
-            "completion": self.total_completion_tokens,
+            # ``prompt``/``completion`` are now cumulative over the trajectory.
+            "prompt": trajectory_prompt_tokens,
+            "completion": trajectory_completion_tokens,
+            "total": trajectory_total_tokens,
+            "trajectory_context": trajectory_context_tokens,
+            "trajectory_prompt_requests": trajectory_prompt_tokens,
+            "model_calls": self.model_call_count,
+            "last_prompt": self.last_prompt_tokens,
+            "last_completion": self.last_completion_tokens,
+            "prompt_by_call": self.prompt_tokens_by_call,
+            "completion_by_call": self.completion_tokens_by_call,
             "max_prompt": self.max_prompt_tokens,
         }
 
@@ -419,6 +456,15 @@ class MultiTurnReactAgent:
             "time_taken": time.time() - start_time,
             "token_usage": token_usage,
         }
+        if self._sequence_mode == "stepwise":
+            # ModelOutput contains the processor-expanded prompt ids and the
+            # corresponding pixel_values/image_grid_thw.  It is consumed by
+            # DeepResearchWorkflow before the result leaves the worker.
+            result["model_outputs"] = self.model_outputs_by_round
+        elif self._sequence_mode == "cumulative" and self.last_model_output is not None:
+            # Stage 2 only needs the final call's already-processed context;
+            # keeping every round would duplicate large visual tensors.
+            result["last_model_output"] = self.last_model_output
         return result
 
     async def _run(
@@ -437,6 +483,24 @@ class MultiTurnReactAgent:
         dictionary that maps ``img_1``, ``img_2``, … to local paths / URLs.
         """
         start_time = time.time()
+        # RL may inject a sample-scoped cache.  Remove it before forwarding
+        # kwargs to the model client; it is only for tool execution.
+        tool_cache = kwargs.pop("tool_cache", None)
+
+        # A workflow object may be reused by the execution engine.  Keep
+        # token statistics scoped to this individual trajectory.
+        self.total_prompt_tokens = 0
+        self.total_completion_tokens = 0
+        self.last_prompt_tokens = 0
+        self.last_completion_tokens = 0
+        self.prompt_tokens_by_call = []
+        self.completion_tokens_by_call = []
+        self.model_call_count = 0
+        self.model_outputs_by_round = []
+        self.last_model_output = None
+        # Read this at run time as well as construction time so a workflow
+        # object reused by a test/worker observes the current exported mode.
+        self._sequence_mode = sequence_mode()
 
         effective_system_prompt = (
             system_prompt or self.system_prompt or DEEPRESEARCH_SYSTEM_PROMPT
@@ -510,6 +574,10 @@ class MultiTurnReactAgent:
                 )
 
             self.record_token_usage(response)
+            if self._sequence_mode in {"stepwise", "cumulative"}:
+                self.last_model_output = response
+            if self._sequence_mode == "stepwise":
+                self.model_outputs_by_round.append(response)
 
             content = (
                 response.text if hasattr(response, "text") and response.text else ""
@@ -579,6 +647,7 @@ class MultiTurnReactAgent:
                                 question_text=question,
                                 assistant_text=content,
                                 tool_goal=str(tool_args.get("goal") or ""),
+                                tool_cache=tool_cache,
                             )
                         except Exception as exc:  # noqa: BLE001
                             result = f"Tool execution error: {type(exc).__name__}: {exc}"
@@ -718,9 +787,13 @@ class MultiTurnReactAgent:
         print(f"   Time: {result['time_taken']:.1f}s")
         print(f"   Termination: {termination}")
         print(
-            "   Token usage: prompt={prompt}, completion={completion}, max_prompt={max_prompt}".format(
+            "   Token usage: trajectory_context={context}, prompt_requests={prompt}, "
+            "completion={completion}, total={total}, model_calls={calls}, max_prompt={max_prompt}".format(
+                context=self.last_prompt_tokens + self.last_completion_tokens,
                 prompt=self.total_prompt_tokens,
                 completion=self.total_completion_tokens,
+                total=self.total_prompt_tokens + self.total_completion_tokens,
+                calls=self.model_call_count,
                 max_prompt=self.max_prompt_tokens,
             )
         )
@@ -760,6 +833,7 @@ class MultiTurnReactAgent:
                     question_text=question_text,
                     assistant_text=assistant_text,
                     tool_goal=tool_goal,
+                    tool_cache=kwargs.get("tool_cache"),
                 )
                 return execution
 

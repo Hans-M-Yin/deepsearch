@@ -543,6 +543,81 @@ class MegatronPPOActor(BasePPOActor):
 
                 indices = batch.get("multi_modal_inputs_idx", None)
                 multi_modal_inputs = extract_multi_modal_inputs(batch["multi_modal_inputs"], indices)
+
+            # Diagnostics for the actual Megatron actor forward path.  The
+            # actor update does not go through
+            # ``workers.engine.megatron.transformer_impl``; it calls the
+            # mcore forward function directly below.  Keep this block purely
+            # observational: it must not modify the batch or alter control
+            # flow in the training path.
+            print_token_ids = os.getenv("RLLM_MM_DEBUG_PRINT_TOKEN_IDS", "0").lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }
+            debug_enabled = os.getenv("RLLM_MM_DEBUG", "0").lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }
+            if debug_enabled or print_token_ids:
+                from verl.utils.multimodal_debug import (
+                    count_token,
+                    event,
+                    token_ids_text,
+                    token_positions,
+                )
+
+                image_token_id = getattr(self.hf_config, "image_token_id", None)
+                if isinstance(multi_modal_inputs, dict):
+                    multimodal_keys = sorted(multi_modal_inputs.keys())
+                    has_visual_payload = any(
+                        multi_modal_inputs.get(key) is not None
+                        for key in ("pixel_values", "image_grid_thw")
+                    )
+                    pixel_values_shape = getattr(multi_modal_inputs.get("pixel_values"), "shape", None)
+                    image_grid_thw_shape = getattr(multi_modal_inputs.get("image_grid_thw"), "shape", None)
+                else:
+                    multimodal_keys = []
+                    has_visual_payload = False
+                    pixel_values_shape = None
+                    image_grid_thw_shape = None
+
+                first_input_ids = input_ids[0]
+                image_token_count = count_token(first_input_ids, image_token_id)
+                input_ids_token_ids = token_ids_text(first_input_ids) if print_token_ids else None
+                if print_token_ids:
+                    print(
+                        "[RLLM_MM_UPDATE][token_ids] "
+                        f"path=megatron_actor.forward_step "
+                        f"forward_only={forward_only} "
+                        f"use_fused_kernels={self.use_fused_kernels} "
+                        f"image_token_count={image_token_count} "
+                        f"image_token_positions={token_positions(first_input_ids, image_token_id)} "
+                        f"multimodal_keys={multimodal_keys} "
+                        f"has_visual_payload={has_visual_payload} "
+                        f"pixel_values_shape={pixel_values_shape} "
+                        f"image_grid_thw_shape={image_grid_thw_shape} "
+                        f"token_ids={input_ids_token_ids}",
+                        flush=True,
+                    )
+
+                event(
+                    "megatron_actor_forward_inputs",
+                    path="megatron_actor.forward_step",
+                    input_ids_shape=getattr(input_ids, "shape", None),
+                    forward_only=forward_only,
+                    use_fused_kernels=self.use_fused_kernels,
+                    image_token_count=image_token_count,
+                    image_token_positions=token_positions(first_input_ids, image_token_id),
+                    multimodal_keys=multimodal_keys,
+                    has_visual_payload=has_visual_payload,
+                    pixel_values_shape=pixel_values_shape,
+                    image_grid_thw_shape=image_grid_thw_shape,
+                    input_ids_token_ids=input_ids_token_ids,
+                )
             responses = batch["responses"]
             response_length = responses.size(1)
             label = position_ids.clone()

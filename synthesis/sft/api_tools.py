@@ -37,6 +37,7 @@ from synthesis.model_worker import ModelRequest
 # #### START Response 0720 ####
 from synthesis.model_worker import ResponsesModelRequest
 # #### END Response 0720 ####
+from synthesis.retry_monitor import tracked_sleep
 from . import tools
 import sys
 
@@ -1620,7 +1621,7 @@ def _try_upload_pil_image(
                 return uploaded_url
             error = "uploader returned an empty URL"
         except Exception as exc:  # pragma: no cover - optional dependency
-            error = str(exc)
+            error = exc
         if attempt >= _COS_UPLOAD_RETRIES + 1:
             logger.warning(
                 "COS upload failed for %s after %d attempt(s): %s",
@@ -1645,7 +1646,14 @@ def _try_upload_pil_image(
             _COS_UPLOAD_RETRY_DELAY_S * attempt,
             error,
         )
-        time.sleep(_COS_UPLOAD_RETRY_DELAY_S * attempt)
+        tracked_sleep(
+            _COS_UPLOAD_RETRY_DELAY_S * attempt,
+            reason="cos_upload_error",
+            tool="cos_upload",
+            error=error,
+            error_type=(type(error).__name__ if isinstance(error, BaseException) else "EmptyUploadURL"),
+            fallback_sleep=time.sleep,
+        )
     return None
 
 
@@ -2110,6 +2118,19 @@ def _public_read_url_text_observation(
     }
 
 
+def _call_with_optional_cache(
+    tool_cache: Any | None,
+    tool_name: str,
+    arguments: dict[str, Any],
+    compute: Callable[[], Any],
+) -> Any:
+    """Use an explicitly injected cache without adding shared cache state."""
+
+    if tool_cache is None:
+        return compute()
+    return tool_cache.get_or_compute(tool_name, arguments, compute)
+
+
 def _execute_tool_call(
     name: str,
     arguments: dict[str, Any],
@@ -2117,20 +2138,32 @@ def _execute_tool_call(
     question_text: str = "",
     assistant_text: str = "",
     tool_goal: str = "",
+    tool_cache: Any | None = None,
 ) -> ToolExecutionResult:
     """Execute one tool call against the runtime context."""
 
     params = tools.normalize_tool_arguments(name, arguments)
+    if tool_cache is not None:
+        set_stats_callback = getattr(tool_cache, "set_stats_callback", None)
+        stats_callback = getattr(tools, "_record_tool_cache_event", None)
+        if callable(set_stats_callback) and callable(stats_callback):
+            set_stats_callback(stats_callback)
 
     if name == "t2t_search":
         query = params.get("query") or params.get("q") or ""
         if not query:
             output = {"ok": False, "error": "query is required for t2t_search"}
         else:
-            output = tools.t2t_search(
-                query=query,
-                lang=params.get("lang") or params.get("hl") or "en",
-                top_k=int(params.get("top_k", tools.DEFAULT_SEARCH_TOP_K)),
+            search_arguments = {
+                "query": query,
+                "lang": params.get("lang") or params.get("hl") or "en",
+                "top_k": int(params.get("top_k", tools.DEFAULT_SEARCH_TOP_K)),
+            }
+            output = _call_with_optional_cache(
+                tool_cache,
+                name,
+                search_arguments,
+                lambda: tools.t2t_search(**search_arguments),
             )
         if isinstance(output, dict) and output.get("ok"):
             output = context.postprocess_search_output("t2t_search", output)
@@ -2141,10 +2174,16 @@ def _execute_tool_call(
         if not query:
             output = {"ok": False, "error": "query is required for t2i_search"}
         else:
-            output = tools.t2i_search(
-                query=query,
-                lang=params.get("lang") or params.get("hl") or "en",
-                top_k=int(params.get("top_k", tools.DEFAULT_SEARCH_TOP_K)),
+            search_arguments = {
+                "query": query,
+                "lang": params.get("lang") or params.get("hl") or "en",
+                "top_k": int(params.get("top_k", tools.DEFAULT_SEARCH_TOP_K)),
+            }
+            output = _call_with_optional_cache(
+                tool_cache,
+                name,
+                search_arguments,
+                lambda: tools.t2i_search(**search_arguments),
             )
         if isinstance(output, dict) and output.get("ok"):
             output = context.postprocess_search_output("t2i_search", output)
@@ -2153,6 +2192,12 @@ def _execute_tool_call(
     if name == "read_url":
         resource_id = str(params.get("resource_id") or "").strip()
         direct_url = str(params.get("url") or params.get("URL") or "").strip()
+        # Older/model-generated calls occasionally put a compact search
+        # resource ID in ``url``. Treat it as an ID before the low-level URL
+        # normalizer can turn it into ``https://image_.../``.
+        if not resource_id and tools.is_compact_resource_id(direct_url):
+            resource_id = direct_url
+            direct_url = ""
         resource = context.resolve_resource_id(resource_id) if resource_id else None
         effective_goal = str(params.get("goal") or tool_goal or "").strip()
         if resource_id and resource is None and not direct_url:
@@ -2197,6 +2242,9 @@ def _execute_tool_call(
             goal=effective_goal,
             assistant_output=assistant_text,
             resource=resource or context.resolve_url_resource(url),
+            raw_document_fetcher=(
+                tool_cache.fetch_document if tool_cache is not None else None
+            ),
         )
         if isinstance(output, dict) and output.get("ok") is False:
             _record_tool_failure(
@@ -2307,6 +2355,7 @@ def execute_tool_call(
     question_text: str = "",
     assistant_text: str = "",
     tool_goal: str = "",
+    tool_cache: Any | None = None,
 ) -> ToolExecutionResult:
     """Execute one tool and record failures before returning or re-raising."""
     try:
@@ -2319,6 +2368,7 @@ def execute_tool_call(
                 question_text=question_text,
                 assistant_text=assistant_text,
                 tool_goal=tool_goal,
+                tool_cache=tool_cache,
             ),
         )
     except Exception as exc:

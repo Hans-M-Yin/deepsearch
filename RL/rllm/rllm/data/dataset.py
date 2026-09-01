@@ -6,7 +6,13 @@ import tempfile
 from typing import Any
 
 import pandas as pd
-import polars as pl
+try:
+    import polars as pl
+except ModuleNotFoundError:  # pragma: no cover - depends on the runtime image
+    # Polars is declared as an rLLM dependency, but some existing training
+    # images only provide pandas/pyarrow.  DatasetRegistry only needs Polars
+    # for parquet reads, so keep a small pandas fallback for those images.
+    pl = None
 import torch
 
 logger = logging.getLogger(__name__)
@@ -304,7 +310,10 @@ class DatasetRegistry:
             logger.warning(f"Dataset file not found: {dataset_path}")
             return None
 
-        data = pl.read_parquet(dataset_path).to_dicts()
+        if pl is not None:
+            data = pl.read_parquet(dataset_path).to_dicts()
+        else:
+            data = pd.read_parquet(dataset_path).to_dict("records")
 
         logger.info(f"Loaded dataset '{name}' split '{split}' with {len(data)} examples.")
 

@@ -11,6 +11,12 @@ from tqdm import tqdm
 
 from rllm.agents.agent import Episode
 from rllm.engine.rollout import ModelOutput, RolloutEngine
+from rllm.utils.multimodal_debug import (
+    abort_on_missing_payload,
+    count_token,
+    event,
+    sequence_mode,
+)
 from rllm.utils import colorful_print
 from rllm.workflows.workflow import TerminationReason, Workflow
 
@@ -46,6 +52,74 @@ def _apply_fatal_step_mask(
             step += 1
         prev_val = val
     return mask
+
+
+def _expected_image_token_count(
+    multimodal_inputs: dict, merge_size: int = 1
+) -> int | None:
+    """Return image-pad count represented by grid metadata.
+
+    Qwen-VL's ``image_grid_thw`` is expressed before spatial merge on some
+    processor versions and after merge on others.  The processor's own
+    ``merge_size`` is therefore applied here, matching the feature-token
+    calculation used by the Qwen processor smoke test.
+    """
+    if not isinstance(multimodal_inputs, dict):
+        return None
+    image_grid_thw = multimodal_inputs.get("image_grid_thw")
+    if image_grid_thw is None:
+        return 0
+    try:
+        grid = torch.as_tensor(image_grid_thw)
+        if grid.numel() == 0:
+            return 0
+        if grid.ndim == 1:
+            grid = grid.reshape(1, -1)
+        if grid.shape[-1] < 3:
+            return None
+        merge_size = max(int(merge_size), 1)
+        spatial = (grid[..., 1] // merge_size) * (grid[..., 2] // merge_size)
+        return int((grid[..., 0] * spatial).sum().item())
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _validate_multimodal_alignment(
+    *,
+    input_ids: torch.Tensor,
+    multimodal_inputs: dict,
+    image_token_id: int | None,
+    merge_size: int,
+    row_idx: int,
+) -> None:
+    """Fail fast if expanded image ids and visual features disagree.
+
+    The legacy path intentionally does not call this check.  In either new
+    mode, silently replacing visual embeddings with text embeddings is worse
+    than stopping with an actionable error.
+    """
+    if image_token_id is None:
+        return
+    observed = count_token(input_ids, image_token_id)
+    expected = _expected_image_token_count(multimodal_inputs, merge_size)
+    if observed is None or expected is None:
+        return
+    has_pixel_values = (
+        isinstance(multimodal_inputs, dict)
+        and multimodal_inputs.get("pixel_values") is not None
+    )
+    if expected > 0 and not has_pixel_values:
+        raise RuntimeError(
+            "[RLLM_MM_SEQUENCE] visual features are missing after sequence "
+            f"construction at row={row_idx}: observed_image_tokens={observed}, "
+            f"expected_image_tokens={expected}, keys={sorted(multimodal_inputs)}"
+        )
+    if observed != expected:
+        raise RuntimeError(
+            "[RLLM_MM_SEQUENCE] image token/payload mismatch after sequence "
+            f"construction at row={row_idx}: observed_image_tokens={observed}, "
+            f"expected_image_tokens={expected}, keys={sorted(multimodal_inputs)}"
+        )
 
 
 class AgentWorkflowEngine:
@@ -217,6 +291,11 @@ class AgentWorkflowEngine:
         if task_ids is None:
             task_ids = [str(uuid.uuid4()) for _ in tasks]
 
+        # ``tool_cache`` is an optional RL-only epoch cache.  Resolve one
+        # sample-scoped cache for each task before launching its sibling
+        # rollouts; inference callers simply do not pass this argument.
+        tool_cache = kwargs.pop("tool_cache", None)
+
         task_states = defaultdict(
             lambda: {
                 "idx": None,
@@ -237,8 +316,18 @@ class AgentWorkflowEngine:
                 state["task"] = task
                 idx_counter += 1
             rollout_idx = state["total_rollouts"]
+            rollout_kwargs = dict(kwargs)
+            if tool_cache is not None:
+                if hasattr(tool_cache, "for_sample"):
+                    rollout_kwargs["tool_cache"] = tool_cache.for_sample(
+                        task, task_id
+                    )
+                else:
+                    rollout_kwargs["tool_cache"] = tool_cache
             futures.append(
-                self.process_task_with_retry(task, task_id, rollout_idx, **kwargs)
+                self.process_task_with_retry(
+                    task, task_id, rollout_idx, **rollout_kwargs
+                )
             )
             state["total_rollouts"] += 1
 
@@ -342,6 +431,23 @@ class AgentWorkflowEngine:
         is_fatal_flags = []
         fatal_step_indices = []
 
+        multimodal_mode = sequence_mode()
+        configured_stepwise = bool(self.config.rllm.stepwise_advantage.enable)
+        if multimodal_mode == "stepwise":
+            stepwise_enabled = True
+        elif multimodal_mode == "cumulative":
+            stepwise_enabled = False
+        else:
+            stepwise_enabled = configured_stepwise
+
+        if multimodal_mode != "legacy":
+            logger.info(
+                "RLLM multimodal sequence mode=%s (configured stepwise=%s, effective stepwise=%s)",
+                multimodal_mode,
+                configured_stepwise,
+                stepwise_enabled,
+            )
+
         for i, episode in enumerate(episodes):
             total_steps = 0
 
@@ -372,7 +478,7 @@ class AgentWorkflowEngine:
                     logger.info(f"Trajectory {trajectory_id} has no steps, skipping")
                     continue
 
-                if not self.config.rllm.stepwise_advantage.enable:
+                if not stepwise_enabled:
                     if len(trajectory.steps) > 1:
                         if not trajectory.is_cumulative():
                             logger.warning(
@@ -380,17 +486,46 @@ class AgentWorkflowEngine:
                             )
 
                         chat_completions = trajectory.steps[-1].chat_completions
-                        prompt, response, mask = (
-                            self.rollout_engine.chat_parser.tokenize_and_mask_cumulative(
-                                chat_completions
+                        if multimodal_mode == "cumulative":
+                            (
+                                prompt,
+                                response,
+                                mask,
+                                multimodal_inputs,
+                            ) = self.rollout_engine.chat_parser.tokenize_and_mask_cumulative_multimodal(
+                                chat_completions,
+                                model_output=trajectory.steps[-1].model_output,
                             )
-                        )
+                        else:
+                            prompt, response, mask = (
+                                self.rollout_engine.chat_parser.tokenize_and_mask_cumulative(
+                                    chat_completions
+                                )
+                            )
+                            multimodal_inputs = {}
                         if ep_is_fatal and ep_fatal_step_idx is not None:
                             mask = _apply_fatal_step_mask(mask, ep_fatal_step_idx)
                         prompts.append(prompt)
                         responses.append(response)
                         traj_mask.append(mask)
-                        multi_modal_inputs_list.append({})  # empty dict
+                        multi_modal_inputs_list.append(multimodal_inputs)
+
+                    elif multimodal_mode == "cumulative":
+                        (
+                            prompt,
+                            response,
+                            mask,
+                            multimodal_inputs,
+                        ) = self.rollout_engine.chat_parser.tokenize_and_mask_cumulative_multimodal(
+                            trajectory.steps[0].chat_completions,
+                            model_output=trajectory.steps[0].model_output,
+                        )
+                        if ep_is_fatal and ep_fatal_step_idx == 0:
+                            mask = torch.zeros_like(mask)
+                        prompts.append(prompt)
+                        responses.append(response)
+                        traj_mask.append(mask)
+                        multi_modal_inputs_list.append(multimodal_inputs)
 
                     elif isinstance(trajectory.steps[0].model_output, ModelOutput):
                         step = trajectory.steps[0]
@@ -538,6 +673,68 @@ class AgentWorkflowEngine:
 
         input_ids = torch.concat([prompts_batch, response_batch], dim=1)
 
+        # This is the boundary between workflow rollout and policy/ref-policy
+        # computation.  Log only metadata: never serialize image tensors.
+        image_token_id = getattr(self.rollout_engine.processor, "image_token_id", None)
+        if image_token_id is None and self.rollout_engine.processor is not None:
+            image_token_id = self.rollout_engine.tokenizer.convert_tokens_to_ids("<|image_pad|>")
+        merge_size = int(
+            getattr(
+                getattr(self.rollout_engine.processor, "image_processor", None),
+                "merge_size",
+                1,
+            )
+        )
+        for row_idx, mm_inputs in enumerate(multi_modal_inputs_list):
+            mm_keys = sorted(mm_inputs.keys()) if isinstance(mm_inputs, dict) else []
+            has_visual_payload = isinstance(mm_inputs, dict) and (
+                mm_inputs.get("pixel_values") is not None
+                or mm_inputs.get("image_grid_thw") is not None
+            )
+            event(
+                "trajectory_to_batch",
+                row_idx=row_idx,
+                input_ids_shape=getattr(input_ids, "shape", None),
+                image_token_count=count_token(input_ids[row_idx], image_token_id),
+                multimodal_keys=mm_keys,
+                has_visual_payload=has_visual_payload,
+                pixel_values_shape=getattr(
+                    mm_inputs.get("pixel_values") if isinstance(mm_inputs, dict) else None,
+                    "shape",
+                    None,
+                ),
+                image_grid_thw_shape=getattr(
+                    mm_inputs.get("image_grid_thw") if isinstance(mm_inputs, dict) else None,
+                    "shape",
+                    None,
+                ),
+                expected_image_token_count=_expected_image_token_count(
+                    mm_inputs, merge_size
+                ),
+                sequence_mode=multimodal_mode,
+                stepwise_enabled=stepwise_enabled,
+            )
+            image_token_count = count_token(input_ids[row_idx], image_token_id)
+            if (
+                abort_on_missing_payload()
+                and image_token_count
+                and not has_visual_payload
+            ):
+                raise RuntimeError(
+                    "[RLLM_MM_DEBUG] multimodal payload is missing at "
+                    f"trajectory_to_batch row={row_idx}: "
+                    f"image_token_count={image_token_count}, keys={mm_keys}"
+                )
+
+            if multimodal_mode in {"stepwise", "cumulative"}:
+                _validate_multimodal_alignment(
+                    input_ids=input_ids[row_idx],
+                    multimodal_inputs=mm_inputs,
+                    image_token_id=image_token_id,
+                    merge_size=merge_size,
+                    row_idx=row_idx,
+                )
+
         prompt_lengths = torch.as_tensor([len(t) for t in prompts]).clamp_(
             min=0, max=max_prompt_length
         )
@@ -661,6 +858,17 @@ class AgentWorkflowEngine:
             non_tensors["multi_modal_inputs"] = np.array(
                 multi_modal_inputs_list, dtype=object
             )
+
+        # The DataProto now owns the processor payload.  Do not keep another
+        # reference to large prompt/image tensors through _last_episodes or
+        # trajectory dumps after conversion.
+        if multimodal_mode in {"stepwise", "cumulative"}:
+            for episode in episodes:
+                if episode is None:
+                    continue
+                for trajectory in episode.trajectories:
+                    for step in trajectory.steps:
+                        step.model_output = None
 
         return DataProto.from_dict(
             tensors={

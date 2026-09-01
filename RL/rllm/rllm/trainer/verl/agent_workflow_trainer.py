@@ -35,6 +35,7 @@ from verl.utils.debug import marked_timer
 
 from rllm.engine.agent_workflow_engine import AgentWorkflowEngine
 from rllm.engine.rollout.verl_engine import VerlEngine
+from rllm.engine.tool_cache import EpochToolCache
 from rllm.utils.episode_logger import EpisodeLogger
 from rllm.workflows.workflow import TerminationReason
 
@@ -181,6 +182,7 @@ class AgentWorkflowPPOTrainer(RayPPOTrainer):
 
         for epoch in range(self.config.trainer.total_epochs):
             pprint(f"epoch {epoch}, step {self.global_steps} started")
+            epoch_tool_cache = EpochToolCache()
             for batch_dict in self.train_dataloader:
                 do_profile = (
                     self.global_steps in self.config.trainer.profile_steps
@@ -215,7 +217,9 @@ class AgentWorkflowPPOTrainer(RayPPOTrainer):
                 with marked_timer("step", timing_raw):
                     # generate trajectories
                     final_gen_batch_output = self.generate_trajectories(
-                        batch=new_batch, timing_raw=timing_raw
+                        batch=new_batch,
+                        timing_raw=timing_raw,
+                        tool_cache=epoch_tool_cache,
                     )
 
                     # dump the first trajectory for inspection
@@ -653,8 +657,15 @@ class AgentWorkflowPPOTrainer(RayPPOTrainer):
                 self.global_steps += 1
 
                 if self.global_steps >= self.total_training_steps:
-                    # perform validation after training
-                    if self.val_reward_fn is not None:
+                    epoch_tool_cache.clear()
+                    # Perform validation after training unless explicitly
+                    # disabled.  A one-step pipeline smoke test should be
+                    # able to exercise rollout -> reward -> update without
+                    # immediately rolling out the entire validation split.
+                    if (
+                        self.val_reward_fn is not None
+                        and self.config.trainer.get("run_final_validation", True)
+                    ):
                         self.agent_execution_engine.set_training_step(
                             self.global_steps, mode="val", epoch=epoch
                         )
@@ -662,6 +673,8 @@ class AgentWorkflowPPOTrainer(RayPPOTrainer):
                         pprint(f"Final validation metrics: {val_metrics}")
                         logger.log(data=val_metrics, step=self.global_steps)
                     return
+
+            epoch_tool_cache.clear()
 
     def _validate_agent(self):
         is_correct_lst = []
