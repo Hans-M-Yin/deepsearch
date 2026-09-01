@@ -179,6 +179,8 @@ class AgentWorkflowPPOTrainer(RayPPOTrainer):
         workflow_metrics = defaultdict(list)
         metrics = {}
         timing_raw = {}
+        rollout_latency_metrics = {}
+        last_checkpoint_step = None
 
         for epoch in range(self.config.trainer.total_epochs):
             pprint(f"epoch {epoch}, step {self.global_steps} started")
@@ -194,6 +196,14 @@ class AgentWorkflowPPOTrainer(RayPPOTrainer):
 
                 new_batch: DataProto = DataProto.from_single_dict(batch_dict)
                 num_tasks += len(new_batch.batch)
+
+                # The workflow reconstructs the multimodal payload from each
+                # task's ``extra_info`` and returns the exact payload used by
+                # rollout.  Some dataset/worker paths may already attach a
+                # stale ``multi_modal_inputs`` field to the input batch.  Keep
+                # the rollout-owned value so DataProto.union() does not try to
+                # compare two independently constructed payload objects.
+                new_batch.non_tensor_batch.pop("multi_modal_inputs", None)
 
                 new_batch.non_tensor_batch["task_ids"] = np.array(
                     [str(uuid.uuid4()) for _ in range(len(new_batch.batch))],
@@ -224,6 +234,10 @@ class AgentWorkflowPPOTrainer(RayPPOTrainer):
 
                     # dump the first trajectory for inspection
                     self._dump_first_trajectory(step=self.global_steps, mode="train")
+
+                    rollout_latency_metrics = final_gen_batch_output.meta_info.pop(
+                        "rollout_latency", {}
+                    )
 
                     # need to repeat to make shape match
                     repeat_counts = final_gen_batch_output.meta_info["repeat_counts"]
@@ -582,6 +596,7 @@ class AgentWorkflowPPOTrainer(RayPPOTrainer):
                         ):
                             with marked_timer("save_checkpoint", timing_raw, color="green"):
                                 self._save_checkpoint()
+                            last_checkpoint_step = self.global_steps
 
                         # Visualize some sample trajectories
                         if len(batch) > 0:
@@ -641,6 +656,13 @@ class AgentWorkflowPPOTrainer(RayPPOTrainer):
 
                 metrics["batch/num_tasks"] = num_tasks
 
+                metrics.update(
+                    {
+                        f"batch/{key}": value
+                        for key, value in rollout_latency_metrics.items()
+                    }
+                )
+
                 # TODO: make a canonical logger that supports various backend
                 logger.log(data=metrics, step=self.global_steps)
 
@@ -653,11 +675,21 @@ class AgentWorkflowPPOTrainer(RayPPOTrainer):
                 workflow_metrics = defaultdict(list)
                 metrics = {}
                 timing_raw = {}
+                rollout_latency_metrics = {}
 
                 self.global_steps += 1
 
                 if self.global_steps >= self.total_training_steps:
                     epoch_tool_cache.clear()
+                    # Save the final actor/dataloader state even when the
+                    # last training step is not aligned with save_freq.  The
+                    # counter has already advanced here, so the final
+                    # checkpoint directory records the completed run step.
+                    if last_checkpoint_step != self.global_steps:
+                        with marked_timer(
+                            "save_checkpoint_final", timing_raw, color="green"
+                        ):
+                            self._save_checkpoint()
                     # Perform validation after training unless explicitly
                     # disabled.  A one-step pipeline smoke test should be
                     # able to exercise rollout -> reward -> update without

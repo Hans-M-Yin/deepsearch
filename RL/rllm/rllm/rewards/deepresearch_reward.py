@@ -29,7 +29,38 @@ def _shorten_for_log(text: Any, limit: int = 200) -> str:
 
 
 def _print_debug(tag: str, **fields: Any) -> None:
-    """Standardized stdout debugging for reward function."""
+    """Print compact reward status by default.
+
+    Reward judging can be called once per rollout and the full question,
+    report, payload, and judge reasoning quickly overwhelm training logs.  The
+    reward computation still runs unchanged; by default only one outcome line
+    is emitted per sample.  Set ``RLLM_REWARD_DEBUG_VERBOSE=1`` to restore the
+    detailed request/response diagnostics when troubleshooting.
+    """
+
+    verbose = os.getenv("RLLM_REWARD_DEBUG_VERBOSE", "0").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    if not verbose:
+        if tag == "RewardResult":
+            fields = {
+                key: fields.get(key)
+                for key in (
+                    "reward",
+                    "is_correct",
+                    "judge_decided",
+                    "judge_attempts",
+                    "exact_match",
+                    "fallback",
+                )
+            }
+        elif tag == "InputError":
+            fields = {"reason": fields.get("reason", "unknown")}
+        else:
+            return
 
     parts = [f"[Reward][DeepResearch][{tag}]"]
     for key, value in fields.items():

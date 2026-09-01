@@ -2230,13 +2230,13 @@ def _execute_tool_call(
                 goal=effective_goal,
             )
             return ToolExecutionResult(name=name, arguments=params, output=output, output_text=_json_text(output))
-        print(
-            "[read_url debug] "
-            f"resource_id={resource_id or '-'} "
-            f"url={url}",
-            file=sys.stderr,
-            flush=True,
-        )
+        # print(
+        #     "[read_url debug] "
+        #     f"resource_id={resource_id or '-'} "
+        #     f"url={url}",
+        #     file=sys.stderr,
+        #     flush=True,
+        # )
         output = tools.read_url(
             url=url,
             goal=effective_goal,

@@ -17,6 +17,7 @@ from synthesis.firecrawl_client import (
     FirecrawlBrowserHttpError,
     FirecrawlBrowserImageDownloader,
     FirecrawlBrowserNonImageError,
+    FirecrawlBrowserTargetRequestError,
     FirecrawlBrowserSessionManager,
     FirecrawlClient,
 )
@@ -46,6 +47,7 @@ class _FakeBrowserFirecrawl:
     browser_calls: list[tuple[str, dict]] = []
     execute_calls: list[tuple[str, str, str, dict]] = []
     delete_calls: list[tuple[str, str]] = []
+    execute_responses: list[dict] = []
     response_payload: dict = {}
     next_session_id = 0
 
@@ -57,6 +59,7 @@ class _FakeBrowserFirecrawl:
         cls.browser_calls = []
         cls.execute_calls = []
         cls.delete_calls = []
+        cls.execute_responses = []
         cls.response_payload = payload
         cls.next_session_id = 0
 
@@ -68,6 +71,8 @@ class _FakeBrowserFirecrawl:
 
     def browser_execute(self, session_id: str, code: str, **kwargs: object) -> dict:
         type(self).execute_calls.append((self.api_key, session_id, code, dict(kwargs)))
+        if type(self).execute_responses:
+            return type(self).execute_responses.pop(0)
         return {"success": True, "result": json.dumps(type(self).response_payload)}
 
     def delete_browser(self, session_id: str) -> dict:
@@ -413,6 +418,7 @@ class FirecrawlClientTest(unittest.TestCase):
                 _FakeBrowserFirecrawl.execute_calls[1][1],
             )
             self.assertIn("page.request.get", _FakeBrowserFirecrawl.execute_calls[0][2])
+            self.assertIn('"timeoutMs": 115000', _FakeBrowserFirecrawl.execute_calls[0][2])
             self.assertIn("body.toString(\"base64\")", _FakeBrowserFirecrawl.execute_calls[0][2])
             self.assertIn("await (async () => {", _FakeBrowserFirecrawl.execute_calls[0][2])
             self.assertIn("return JSON.stringify(output);", _FakeBrowserFirecrawl.execute_calls[0][2])
@@ -542,6 +548,75 @@ class FirecrawlClientTest(unittest.TestCase):
             downloader = FirecrawlBrowserImageDownloader(session_manager=manager, retries=0)
             with self.assertRaises(FirecrawlBrowserNonImageError):
                 downloader.download("https://example.com/not-an-image")
+
+    def test_browser_image_download_reports_target_request_timeout(self) -> None:
+        _FakeBrowserFirecrawl.reset(
+            payload={
+                "status": None,
+                "resolved_url": "https://upload.wikimedia.org/example.jpg",
+                "content_type": "",
+                "body_base64": None,
+                "byte_count": 0,
+                "error": "target_request_timeout",
+                "target_error_type": "target_request_timeout",
+                "target_error_message": "Timeout 120000ms exceeded",
+                "target_phase": "request",
+            }
+        )
+        with TemporaryDirectory() as directory:
+            pool = FirecrawlApiKeyPool(keys=["one-key"], state_path=Path(directory) / "pool.json")
+            manager = FirecrawlBrowserSessionManager(
+                key_pool=pool,
+                app_factory=_FakeBrowserFirecrawl,
+                state_path=Path(directory) / "sessions.json",
+            )
+            downloader = FirecrawlBrowserImageDownloader(session_manager=manager, retries=0)
+            with self.assertRaisesRegex(FirecrawlBrowserTargetRequestError, "during request"):
+                downloader.download("https://upload.wikimedia.org/example.jpg")
+            state = json.loads((Path(directory) / "sessions.json").read_text(encoding="utf-8"))
+            self.assertEqual(state["sessions"][0]["state"], "idle")
+            self.assertEqual(_FakeBrowserFirecrawl.delete_calls, [])
+
+    def test_browser_timeout_retries_same_session_before_new_session(self) -> None:
+        jpeg = b"\xff\xd8\xff" + b"retry-image"
+        _FakeBrowserFirecrawl.reset(
+            payload={
+                "status": 200,
+                "resolved_url": "https://upload.wikimedia.org/retry.jpg",
+                "content_type": "image/jpeg",
+                "body_base64": base64.b64encode(jpeg).decode("ascii"),
+                "byte_count": len(jpeg),
+                "error": None,
+            }
+        )
+        _FakeBrowserFirecrawl.execute_responses = [
+            {"success": False, "error": "Execution timed out"},
+            {"success": False, "error": "Execution timed out"},
+            {"success": True, "result": json.dumps(_FakeBrowserFirecrawl.response_payload)},
+        ]
+        with TemporaryDirectory() as directory:
+            pool = FirecrawlApiKeyPool(keys=["one-key"], state_path=Path(directory) / "pool.json")
+            manager = FirecrawlBrowserSessionManager(
+                key_pool=pool,
+                app_factory=_FakeBrowserFirecrawl,
+                state_path=Path(directory) / "sessions.json",
+            )
+            downloader = FirecrawlBrowserImageDownloader(
+                session_manager=manager,
+                retries=1,
+                retry_sleep_s=0,
+                same_session_timeout_retries=1,
+                same_session_retry_sleep_s=0,
+            )
+            result = downloader.download("https://upload.wikimedia.org/retry.jpg")
+
+        self.assertEqual(result.payload, jpeg)
+        self.assertEqual(len(_FakeBrowserFirecrawl.browser_calls), 2)
+        self.assertEqual(
+            [session_id for _, session_id, _, _ in _FakeBrowserFirecrawl.execute_calls],
+            ["browser-1", "browser-1", "browser-2"],
+        )
+        self.assertEqual(_FakeBrowserFirecrawl.delete_calls, [("one-key", "browser-1")])
 
     def test_browser_pool_rotates_keys_only_when_new_sessions_are_created(self) -> None:
         _FakeBrowserFirecrawl.reset(payload={})

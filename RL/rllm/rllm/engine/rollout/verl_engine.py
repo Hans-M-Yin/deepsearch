@@ -6,6 +6,7 @@ from verl.workers.rollout.replica import TokenOutput
 
 from rllm.engine.rollout.rollout_engine import ModelOutput, RolloutEngine
 from rllm.parser import ChatTemplateParser
+from rllm.utils.multimodal_debug import count_token, event
 from rllm.workflows import TerminationEvent, TerminationReason
 
 
@@ -62,7 +63,30 @@ class VerlEngine(RolloutEngine):
 
         if any(msg.get("images", None) is not None and msg["role"] == "user" for msg in messages) and self.processor is not None:
             image_data = self.chat_parser.process_image_data(messages)  # list[PIL.Image.Image]
-            model_inputs = self.processor(text=[prompt], images=image_data)
+            # Request tensor outputs explicitly.  Without this argument the
+            # Qwen3-VL processor may return ``input_ids`` as a Python list,
+            # while the multimodal alignment/debug path below expects tensor
+            # semantics (``.shape`` and tensor slicing).
+            model_inputs = self.processor(
+                text=[prompt],
+                images=image_data,
+                return_tensors="pt",
+            )
+            image_token_id = getattr(self.processor, "image_token_id", None)
+            if image_token_id is None:
+                image_token_id = self.tokenizer.convert_tokens_to_ids("<|image_pad|>")
+            event(
+                "rollout_processor",
+                request_id=application_id,
+                image_count=len(image_data),
+                raw_prompt_length=len(request_prompt_ids),
+                expanded_prompt_length=int(model_inputs["input_ids"].shape[-1]),
+                raw_image_token_count=count_token(request_prompt_ids, image_token_id),
+                expanded_image_token_count=count_token(model_inputs["input_ids"][0], image_token_id),
+                image_grid_thw_shape=getattr(model_inputs.get("image_grid_thw"), "shape", None),
+                pixel_values_shape=getattr(model_inputs.get("pixel_values"), "shape", None),
+                processor_keys=sorted(model_inputs.keys()),
+            )
             prompt_ids = model_inputs.pop("input_ids")[0]  # list[int]
             model_inputs.pop("attention_mask")
             multi_modal_inputs = dict(model_inputs)
@@ -84,6 +108,14 @@ class VerlEngine(RolloutEngine):
             completion_ids = completion_ids[:max_tokens]
 
         completion_text = self.tokenizer.decode(completion_ids, skip_special_tokens=True)
+        event(
+            "rollout_complete",
+            request_id=application_id,
+            prompt_length=prompt_length,
+            completion_length=len(completion_ids),
+            finish_reason=finish_reason,
+            image_count=len(image_data or []),
+        )
         # TODO: implement parse_completion for the standard parser
         parsed_output = self.chat_parser.parse_completion(completion_ids)
 

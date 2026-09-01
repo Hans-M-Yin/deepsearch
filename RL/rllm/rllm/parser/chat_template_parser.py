@@ -165,6 +165,300 @@ class ChatTemplateParser:
 
         return prompt_ids, response_ids, response_mask
 
+    def _tokenize_cumulative_multimodal_from_model_output(
+        self, messages, model_output
+    ):
+        """Build the cumulative sequence from the final rollout payload.
+
+        The rollout engine has already fetched and processed every image in
+        the final context.  Reusing its ``prompt_ids``/``multi_modal_inputs``
+        avoids downloading the same URL again while converting the trajectory
+        for update.  Only the response mask is reconstructed from messages.
+        """
+        multimodal_inputs = dict(model_output.multi_modal_inputs or {})
+        image_token_id = getattr(self.processor, "image_token_id", None)
+        if image_token_id is None:
+            image_token_id = self.tokenizer.convert_tokens_to_ids("<|image_pad|>")
+
+        image_grid_thw = multimodal_inputs.get("image_grid_thw")
+        feature_counts = []
+        if image_grid_thw is not None:
+            grid = torch.as_tensor(image_grid_thw)
+            if grid.numel():
+                if grid.ndim == 1:
+                    grid = grid.reshape(1, -1)
+                merge_size = int(
+                    getattr(
+                        getattr(self.processor, "image_processor", None),
+                        "merge_size",
+                        1,
+                    )
+                )
+                merge_size = max(merge_size, 1)
+                feature_counts = [
+                    int(t) * (int(h) // merge_size) * (int(w) // merge_size)
+                    for t, h, w in grid[..., :3].tolist()
+                ]
+
+        feature_index = 0
+
+        def declared_image_count(chunk_messages):
+            return sum(
+                len(message.get("images") or [])
+                for message in chunk_messages
+                if isinstance(message, dict)
+            )
+
+        def expand_ids(rendered_text, chunk_messages):
+            raw_ids = self.tokenizer.encode(rendered_text, add_special_tokens=False)
+            logical_count = declared_image_count(chunk_messages)
+            raw_image_count = sum(int(token) == image_token_id for token in raw_ids)
+            if raw_image_count != logical_count:
+                raise ValueError(
+                    "Cumulative multimodal rendering found "
+                    f"{raw_image_count} image tokens for {logical_count} images"
+                )
+
+            nonlocal feature_index
+            expanded = []
+            for token in raw_ids:
+                if int(token) != image_token_id:
+                    expanded.append(int(token))
+                    continue
+                if feature_index >= len(feature_counts):
+                    raise ValueError(
+                        "Cumulative multimodal rendering has more image "
+                        "placeholders than final rollout grid metadata"
+                    )
+                expanded.extend([int(token)] * feature_counts[feature_index])
+                feature_index += 1
+            return torch.tensor(expanded, dtype=torch.long)
+
+        try:
+            first_assistant_idx = next(
+                i for i, msg in enumerate(messages) if msg["role"] == "assistant"
+            )
+            last_assistant_idx = max(
+                i for i, msg in enumerate(messages) if msg["role"] == "assistant"
+            )
+        except (StopIteration, ValueError):
+            raise ValueError("No assistant message found in chat_completions") from None
+
+        prompt_text = self.parse(
+            messages[:first_assistant_idx],
+            is_first_msg=True,
+            add_generation_prompt=True,
+            accumulate_reasoning=False,
+        )
+        prompt_ids = expand_ids(prompt_text, messages[:first_assistant_idx])
+        response_chunks = []
+        response_masks = []
+        reconstructed_final_prompt = [*prompt_ids.tolist()]
+
+        for i in range(first_assistant_idx, len(messages)):
+            is_assistant = messages[i]["role"] == "assistant"
+            if is_assistant:
+                rendered = self.parse(
+                    [messages[i]],
+                    is_first_msg=False,
+                    add_generation_prompt=False,
+                    accumulate_reasoning=True,
+                )
+                rendered = rendered[len(self.generation_prompt) :]
+                if (
+                    i == last_assistant_idx
+                    and getattr(model_output, "completion_ids", None) is not None
+                ):
+                    chunk_ids = torch.as_tensor(
+                        model_output.completion_ids, dtype=torch.long
+                    ).reshape(-1)
+                else:
+                    chunk_ids = expand_ids(rendered, [messages[i]])
+                mask_value = 1
+            else:
+                rendered = self.parse(
+                    [messages[i]],
+                    is_first_msg=False,
+                    add_generation_prompt=True,
+                    accumulate_reasoning=False,
+                )
+                chunk_ids = expand_ids(rendered, [messages[i]])
+                mask_value = 0
+
+            response_chunks.append(chunk_ids)
+            response_masks.append(
+                torch.full((len(chunk_ids),), mask_value, dtype=torch.long)
+            )
+            if not (is_assistant and i == last_assistant_idx):
+                reconstructed_final_prompt.extend(chunk_ids.tolist())
+
+        final_prompt_ids = torch.as_tensor(
+            model_output.prompt_ids, dtype=torch.long
+        ).reshape(-1)
+        reconstructed_final_prompt = torch.tensor(
+            reconstructed_final_prompt, dtype=torch.long
+        )
+        if not torch.equal(reconstructed_final_prompt, final_prompt_ids):
+            raise ValueError(
+                "Cumulative multimodal sequence differs from the final rollout "
+                f"prompt (reconstructed={len(reconstructed_final_prompt)}, "
+                f"rollout={len(final_prompt_ids)})"
+            )
+        if feature_index != len(feature_counts):
+            raise ValueError(
+                "Cumulative multimodal rendering consumed "
+                f"{feature_index} image payloads but final rollout contains "
+                f"{len(feature_counts)}"
+            )
+
+        response_ids = (
+            torch.cat(response_chunks, dim=0)
+            if response_chunks
+            else torch.empty(0, dtype=torch.long)
+        )
+        response_mask = (
+            torch.cat(response_masks, dim=0)
+            if response_masks
+            else torch.empty(0, dtype=torch.long)
+        )
+        return prompt_ids, response_ids, response_mask, multimodal_inputs
+
+    def tokenize_and_mask_cumulative_multimodal(self, messages, model_output=None):
+        """Tokenize a cumulative trajectory with processor-expanded images.
+
+        ``tokenize_and_mask_cumulative`` intentionally predates VLM support:
+        it tokenizes rendered text with the tokenizer and therefore leaves a
+        single logical ``<|image_pad|>`` per image.  This companion method
+        keeps the same prompt/response/mask semantics.  When the final
+        ``ModelOutput`` is supplied, it reuses the already processor-expanded
+        rollout payload and avoids downloading images again.  Without it, the
+        fallback runs every rendered image-containing chunk through the
+        multimodal processor.  The returned payload is ordered exactly like
+        the image placeholders in the returned token sequence.
+
+        Returns:
+            ``(prompt_ids, response_ids, response_mask, multi_modal_inputs)``.
+        """
+        if model_output is not None and getattr(model_output, "prompt_ids", None) is not None:
+            return self._tokenize_cumulative_multimodal_from_model_output(
+                messages, model_output
+            )
+
+        if self.processor is None:
+            prompt_ids, response_ids, response_mask = self.tokenize_and_mask_cumulative(messages)
+            return prompt_ids, response_ids, response_mask, {}
+
+        try:
+            first_assistant_idx = next(
+                i for i, msg in enumerate(messages) if msg["role"] == "assistant"
+            )
+        except StopIteration:
+            raise ValueError("No assistant message found in chat_completions") from None
+
+        def encode_chunk(rendered_text, chunk_messages):
+            images = self.process_image_data(chunk_messages)
+            if not images:
+                ids = self.tokenizer.encode(rendered_text, add_special_tokens=False)
+                return torch.tensor(ids, dtype=torch.long), {}
+
+            model_inputs = self.processor(
+                text=[rendered_text],
+                images=images,
+                return_tensors="pt",
+            )
+            ids = model_inputs["input_ids"][0]
+            multimodal = {
+                key: value
+                for key, value in model_inputs.items()
+                if key not in {"input_ids", "attention_mask"}
+            }
+            return ids.to(dtype=torch.long), multimodal
+
+        def merge_multimodal(target, source):
+            """Merge processor outputs while preserving image order."""
+            for key, value in source.items():
+                if key not in target:
+                    target[key] = value
+                    continue
+
+                previous = target[key]
+                # Qwen-VL image/video payloads are flattened along dimension 0
+                # and their grid metadata has one row per logical image/video.
+                if key in {
+                    "pixel_values",
+                    "image_grid_thw",
+                    "video_grid_thw",
+                    "second_per_grid_ts",
+                } and hasattr(previous, "shape") and hasattr(value, "shape"):
+                    target[key] = torch.cat([previous, value], dim=0)
+                elif hasattr(previous, "shape") and hasattr(value, "shape"):
+                    # Preserve a future processor field if it is identical;
+                    # otherwise fail instead of silently misaligning it.
+                    if previous.shape != value.shape or not torch.equal(previous, value):
+                        raise ValueError(
+                            f"Cannot merge multimodal processor field {key!r}: "
+                            f"shapes {tuple(previous.shape)} and {tuple(value.shape)} differ"
+                        )
+                elif previous != value:
+                    raise ValueError(
+                        f"Cannot merge multimodal processor field {key!r}: values differ"
+                    )
+
+        prompt_text = self.parse(
+            messages[:first_assistant_idx],
+            is_first_msg=True,
+            add_generation_prompt=True,
+            accumulate_reasoning=False,
+        )
+        prompt_ids, prompt_mm = encode_chunk(
+            prompt_text, messages[:first_assistant_idx]
+        )
+        merged_mm = {}
+        merge_multimodal(merged_mm, prompt_mm)
+
+        response_chunks = []
+        response_masks = []
+        for i in range(first_assistant_idx, len(messages)):
+            is_assistant = messages[i]["role"] == "assistant"
+            if is_assistant:
+                rendered = self.parse(
+                    [messages[i]],
+                    is_first_msg=False,
+                    add_generation_prompt=False,
+                    accumulate_reasoning=True,
+                )
+                rendered = rendered[len(self.generation_prompt) :]
+                chunk_mask_value = 1
+            else:
+                rendered = self.parse(
+                    [messages[i]],
+                    is_first_msg=False,
+                    add_generation_prompt=True,
+                    accumulate_reasoning=False,
+                )
+                chunk_mask_value = 0
+
+            chunk_ids, chunk_mm = encode_chunk(rendered, [messages[i]])
+            response_chunks.append(chunk_ids)
+            response_masks.append(
+                torch.full(
+                    (len(chunk_ids),), chunk_mask_value, dtype=torch.long
+                )
+            )
+            merge_multimodal(merged_mm, chunk_mm)
+
+        response_ids = (
+            torch.cat(response_chunks, dim=0)
+            if response_chunks
+            else torch.empty(0, dtype=torch.long)
+        )
+        response_mask = (
+            torch.cat(response_masks, dim=0)
+            if response_masks
+            else torch.empty(0, dtype=torch.long)
+        )
+        return prompt_ids, response_ids, response_mask, merged_mm
+
 
 class DeepseekQwenChatTemplateParser(ChatTemplateParser):
     def __init__(self, tokenizer):

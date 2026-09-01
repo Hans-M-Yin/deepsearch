@@ -143,12 +143,29 @@ def _get_input_embeds(
     video_grid_thw: Optional[torch.LongTensor] = None,
 ):
     inputs_embeds = model.get_input_embeddings()(input_ids)
+    from rllm.utils.multimodal_debug import count_token, event
+
+    event(
+        "qwen3_forward_inputs",
+        input_ids_shape=getattr(input_ids, "shape", None),
+        image_token_count=count_token(input_ids, getattr(model.config, "image_token_id", None)),
+        pixel_values_shape=getattr(pixel_values, "shape", None),
+        image_grid_thw_shape=getattr(image_grid_thw, "shape", None),
+        visual_payload_present=pixel_values is not None,
+    )
     image_mask, video_mask = None, None
     if pixel_values is not None:
         pixel_values = pixel_values.type(model.visual.dtype)
         image_embeds, deepstack_image_embeds = model.visual(pixel_values, grid_thw=image_grid_thw)
         n_image_tokens = (input_ids == model.config.image_token_id).sum().item()
         n_image_features = image_embeds.shape[0]
+        event(
+            "qwen3_visual_features",
+            image_token_count=n_image_tokens,
+            image_feature_count=n_image_features,
+            image_grid_thw_shape=getattr(image_grid_thw, "shape", None),
+            token_feature_match=n_image_tokens == n_image_features,
+        )
         if n_image_tokens != n_image_features:
             raise ValueError(
                 f"Image features and image tokens do not match: tokens: {n_image_tokens}, features {n_image_features}"
@@ -205,6 +222,11 @@ def _get_input_embeds(
         deepstack_visual_embeds = deepstack_video_embeds
 
     if pixel_values is None and pixel_values_videos is None:
+        event(
+            "qwen3_visual_fallback",
+            reason="pixel_values_missing",
+            image_token_count=count_token(input_ids, getattr(model.config, "image_token_id", None)),
+        )
         config = model.config.vision_config
         patch_dim = config.in_channels * config.temporal_patch_size * config.patch_size**2
         pixel_values = torch.zeros((16, patch_dim), dtype=inputs_embeds.dtype, device=inputs_embeds.device)

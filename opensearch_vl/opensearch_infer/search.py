@@ -31,6 +31,7 @@ import requests
 
 from . import config
 from . import image_io
+from synthesis.retry_monitor import retry_reason_from_exception, tracked_sleep
 from synthesis.search_client import acquire_serper_api_key
 
 
@@ -608,7 +609,15 @@ def i2i_search(
         except Exception as exc:
             last_error = exc
             if attempt < max_retries:
-                time.sleep(base_delay * (2 ** (attempt - 1)))
+                tracked_sleep(
+                    base_delay * (2 ** (attempt - 1)),
+                    reason=retry_reason_from_exception(exc, default="image_search_error"),
+                    tool="image_search",
+                    error=exc,
+                    url=image_url,
+                    error_type=type(exc).__name__,
+                    fallback_sleep=time.sleep,
+                )
     return f"Tool execution error:\ni2i_search failed after {max_retries} retries: {last_error}"
 
 

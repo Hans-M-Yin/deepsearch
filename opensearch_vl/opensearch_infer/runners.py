@@ -35,6 +35,7 @@ import requests
 
 from . import auth, config, messages
 from .config import ModelSpec
+from synthesis.retry_monitor import retry_reason_from_exception, tracked_sleep
 
 
 logger = logging.getLogger(__name__)
@@ -419,7 +420,15 @@ class OpenAICompatibleRunner(BaseRunner):
                     "request_summary": request_summary,
                 }
                 if attempt < self.max_retries:
-                    time.sleep(min(2 ** (attempt - 1), 8))
+                    tracked_sleep(
+                        min(2 ** (attempt - 1), 8),
+                        reason=retry_reason_from_exception(exc, default="llm_error"),
+                        tool="llm",
+                        error=exc,
+                        url=url,
+                        error_type=type(exc).__name__,
+                        fallback_sleep=time.sleep,
+                    )
 
         assert last_error is not None
         details = last_error_details or {

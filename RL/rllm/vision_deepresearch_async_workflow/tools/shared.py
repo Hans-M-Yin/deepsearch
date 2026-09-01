@@ -300,8 +300,9 @@ CACHE_TABLES = {
 
 
 def get_cache_key(text: str) -> str:
-    """Generate a cache key from text using SHA256."""
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+    """Generate a case-insensitive, trim-insensitive SHA256 cache key."""
+    normalized_text = text.strip().lower()
+    return hashlib.sha256(normalized_text.encode("utf-8")).hexdigest()
 
 
 # ============================================================================

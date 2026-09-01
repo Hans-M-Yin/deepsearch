@@ -18,23 +18,26 @@ from rllm.trainer.agent_trainer import AgentTrainer
     version_base=None,
 )
 def main(config):
-    dataset_name = config.data.dataset_name
+    train_dataset_name = config.data.dataset_name
+    # Allow evaluation to come from an independent registered dataset while
+    # keeping the optimization dataset unchanged.
+    val_dataset_name = config.data.get("val_dataset_name", train_dataset_name)
     train_dataset = DatasetRegistry.load_dataset(
-        dataset_name, config.data.train_split
+        train_dataset_name, config.data.train_split
     )
     val_dataset = DatasetRegistry.load_dataset(
-        dataset_name, config.data.val_split
+        val_dataset_name, config.data.val_split
     )
 
     if train_dataset is None:
         raise FileNotFoundError(
             f"Training split '{config.data.train_split}' for dataset "
-            f"'{dataset_name}' was not found in DatasetRegistry."
+            f"'{train_dataset_name}' was not found in DatasetRegistry."
         )
     if val_dataset is None:
         raise FileNotFoundError(
             f"Validation split '{config.data.val_split}' for dataset "
-            f"'{dataset_name}' was not found in DatasetRegistry."
+            f"'{val_dataset_name}' was not found in DatasetRegistry."
         )
 
     trainer = AgentTrainer(

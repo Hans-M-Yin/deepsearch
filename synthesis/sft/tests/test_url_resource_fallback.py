@@ -5,7 +5,10 @@ from __future__ import annotations
 import os
 import tempfile
 import unittest
+from io import BytesIO
 from unittest import mock
+
+from PIL import Image
 
 from synthesis.firecrawl_client import FirecrawlBrowserImageDownload
 from synthesis.sft import tools
@@ -13,6 +16,29 @@ from synthesis.sft.api_tools import ToolRuntimeContext
 
 
 class UrlResourceFallbackTests(unittest.TestCase):
+    def test_svg_is_rasterized_and_validated_before_return(self) -> None:
+        svg = b'<?xml version="1.0"?><svg xmlns="http://www.w3.org/2000/svg" width="2" height="3"><rect width="2" height="3" fill="red"/></svg>'
+        png_output = BytesIO()
+        Image.new("RGBA", (2, 3), (255, 0, 0, 255)).save(png_output, format="PNG")
+
+        class FakeCairoSVG:
+            @staticmethod
+            def svg2png(*, bytestring: bytes, unsafe: bool) -> bytes:
+                self.assertEqual(bytestring, svg)
+                self.assertFalse(unsafe)
+                return png_output.getvalue()
+
+        with mock.patch.object(tools, "cairosvg", FakeCairoSVG):
+            converted, content_type = tools._maybe_resize_downloaded_image(
+                svg,
+                content_type="image/jpeg",
+            )
+
+        self.assertEqual(content_type, "image/png")
+        with Image.open(BytesIO(converted)) as image:
+            image.load()
+            self.assertEqual(image.size, (2, 3))
+
     def test_search_result_registers_all_resource_urls(self) -> None:
         context = ToolRuntimeContext(working_dir=tempfile.mkdtemp())
         with mock.patch("synthesis.sft.tools.extract_url_semantic_keywords", return_value=""):

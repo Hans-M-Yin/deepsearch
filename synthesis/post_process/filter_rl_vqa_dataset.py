@@ -1340,6 +1340,7 @@ def _quality_judge_one(
                 ModelMessage(role="system", content=QUALITY_SYSTEM_PROMPT),
                 ModelMessage(role="user", content=prompt),
             ],
+            max_tokens=max_tokens,
             metadata={"trace_label": "rl_vqa_quality_judge"},
         )
     )

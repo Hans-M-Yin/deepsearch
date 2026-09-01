@@ -54,6 +54,118 @@ def _apply_fatal_step_mask(
     return mask
 
 
+def _aggregate_rollout_latency(episodes: list[Episode]) -> dict[str, float]:
+    """Aggregate per-trajectory latency samples for trainer/WandB logging.
+
+    The agent records individual LLM/tool call samples in ``Episode.info``.
+    Aggregate them here, before the large multimodal payload is converted to
+    a DataProto, so latency telemetry does not travel through the training
+    tensors or get mixed with reward metrics.
+    """
+
+    trajectory_times: list[float] = []
+    llm_call_samples: list[float] = []
+    tool_call_samples: list[float] = []
+    llm_total_times: list[float] = []
+    tool_total_times: list[float] = []
+    llm_call_counts: list[float] = []
+    tool_call_counts: list[float] = []
+    tool_samples_by_name: dict[str, list[float]] = defaultdict(list)
+    tool_call_counts_by_name: dict[str, list[float]] = defaultdict(list)
+    tool_failures_by_name: dict[str, int] = defaultdict(int)
+    llm_failures = 0
+    tool_failures = 0
+    valid_episodes = 0
+
+    for episode in episodes:
+        if episode is None or not isinstance(episode.info, dict):
+            continue
+        latency = episode.info.get("latency")
+        if not isinstance(latency, dict):
+            continue
+
+        valid_episodes += 1
+        trajectory_time = latency.get("trajectory_time_s")
+        if trajectory_time is not None:
+            trajectory_times.append(max(0.0, float(trajectory_time)))
+
+        llm = latency.get("llm")
+        if isinstance(llm, dict):
+            samples = [
+                max(0.0, float(value))
+                for value in (llm.get("samples_s") or [])
+            ]
+            llm_call_samples.extend(samples)
+            llm_total_times.append(max(0.0, float(llm.get("total_s") or 0.0)))
+            llm_call_counts.append(float(llm.get("calls") or 0))
+            llm_failures += int(llm.get("failures") or 0)
+
+        tool = latency.get("tool")
+        if isinstance(tool, dict):
+            tool_total_times.append(max(0.0, float(tool.get("total_s") or 0.0)))
+            tool_call_counts.append(float(tool.get("calls") or 0))
+            tool_failures += int(tool.get("failures") or 0)
+
+        tools = latency.get("tools")
+        if not isinstance(tools, dict):
+            continue
+        for tool_name, tool_summary in tools.items():
+            if not isinstance(tool_summary, dict):
+                continue
+            name = str(tool_name)
+            samples = [
+                max(0.0, float(value))
+                for value in (tool_summary.get("samples_s") or [])
+            ]
+            tool_samples_by_name[name].extend(samples)
+            tool_call_samples.extend(samples)
+            tool_call_counts_by_name[name].append(
+                float(tool_summary.get("calls") or 0)
+            )
+            failures = int(tool_summary.get("failures") or 0)
+            tool_failures_by_name[name] += failures
+
+    metrics: dict[str, float] = {
+        "rollout/latency_episodes": float(valid_episodes),
+        "rollout/llm_calls_total": float(len(llm_call_samples)),
+        "rollout/llm_failures_total": float(llm_failures),
+        "rollout/tool_calls_total": float(len(tool_call_samples)),
+        "rollout/tool_failures_total": float(tool_failures),
+    }
+
+    def add_distribution(prefix: str, values: list[float]) -> None:
+        if not values:
+            return
+        array = np.asarray(values, dtype=np.float64)
+        metrics[f"rollout/{prefix}_mean_s"] = float(np.mean(array))
+        metrics[f"rollout/{prefix}_p95_s"] = float(np.percentile(array, 95))
+        metrics[f"rollout/{prefix}_max_s"] = float(np.max(array))
+
+    add_distribution("trajectory_time", trajectory_times)
+    add_distribution("llm_call_time", llm_call_samples)
+    add_distribution("tool_call_time", tool_call_samples)
+    add_distribution("llm_total_time", llm_total_times)
+    add_distribution("tool_total_time", tool_total_times)
+
+    if llm_call_counts:
+        metrics["rollout/llm_calls_mean"] = float(np.mean(llm_call_counts))
+    if tool_call_counts:
+        metrics["rollout/tool_calls_mean"] = float(np.mean(tool_call_counts))
+
+    for tool_name, samples in sorted(tool_samples_by_name.items()):
+        prefix = f"tool/{tool_name}/call_time"
+        add_distribution(prefix, samples)
+        counts = tool_call_counts_by_name[tool_name]
+        if counts:
+            metrics[f"rollout/tool/{tool_name}/calls_mean"] = float(np.mean(counts))
+        metrics[f"rollout/tool/{tool_name}/calls_total"] = float(sum(counts))
+        metrics[f"rollout/tool/{tool_name}/failures_total"] = float(
+            tool_failures_by_name[tool_name]
+        )
+
+    return metrics
+
+
 def _expected_image_token_count(
     multimodal_inputs: dict, merge_size: int = 1
 ) -> int | None:
@@ -395,7 +507,9 @@ class AgentWorkflowEngine:
         await self.rollout_engine.sleep()
 
         self.current_mode = "train"
-        return self.transform_results_for_verl(results, task_ids)
+        transformed = self.transform_results_for_verl(results, task_ids)
+        transformed.meta_info["rollout_latency"] = _aggregate_rollout_latency(results)
+        return transformed
 
     def transform_results_for_verl(
         self, episodes: list[Episode], task_ids: np.ndarray

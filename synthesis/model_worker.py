@@ -19,13 +19,16 @@ import threading
 import time
 from typing import Any, Protocol
 
+from synthesis.retry_monitor import retry_reason_from_exception, tracked_sleep
+
 
 # #### START Response 0720 ####
 VALID_REASONING_EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh", "max"}
 # #### END Response 0720 ####
 FIXED_TT_LOGID = "3200636808"
 # A request is attempted once initially, then retried at most this many times.
-LLM_RETRY_COUNT = 50
+LLM_RETRY_COUNT = 5
+LLM_RETRY_SLEEP_S = 5
 _ADAPTIVE_QPM_ENV = "SYNTHESIS_ADAPTIVE_QPM_ENABLED"
 _ADAPTIVE_QPM_ERROR_WINDOW_S = 60.0
 _ADAPTIVE_QPM_RECOVERY_INTERVAL_S = 60.0
@@ -33,6 +36,7 @@ _ADAPTIVE_QPM_RECOVERY_UTILIZATION = 0.8
 _ADAPTIVE_QPM_COOLDOWN_S = 30.0
 _RAW_INPUT_ENV = "LLM_WORKER_PRINT_RAW_INPUT"
 _RAW_OUTPUT_ENV = "LLM_WORKER_PRINT_RAW_OUTPUT"
+_USAGE_LOG_ENV = "LLM_WORKER_PRINT_USAGE"
 
 
 def _adaptive_qpm_enabled() -> bool:
@@ -1050,11 +1054,19 @@ class ModelRouterWorkerClient:
                     f" attempt={attempt_index + 1}"
                     f" error_type={exc.__class__.__name__}"
                     f" error={str(exc)!r}"
-                    " sleep_seconds=30",
+                    f" sleep_seconds={LLM_RETRY_SLEEP_S}",
                     file=sys.stderr,
                     flush=True,
                 )
-                time.sleep(30)
+                tracked_sleep(
+                    LLM_RETRY_SLEEP_S,
+                    reason=retry_reason_from_exception(exc, default="llm_worker_error"),
+                    tool="llm_worker",
+                    error=exc,
+                    url=str(config.get("base_url") or config.get("azure_endpoint") or ""),
+                    error_type=type(exc).__name__,
+                    fallback_sleep=time.sleep,
+                )
         if last_error is None:
             raise RuntimeError(f"Model request failed without a captured exception for alias={alias!r}")
         raise last_error
@@ -1105,11 +1117,19 @@ class ModelRouterWorkerClient:
                     f" attempt={attempt_index + 1}"
                     f" error_type={exc.__class__.__name__}"
                     f" error={str(exc)!r}"
-                    " sleep_seconds=30",
+                    f" sleep_seconds={LLM_RETRY_SLEEP_S}",
                     file=sys.stderr,
                     flush=True,
                 )
-                time.sleep(30)
+                tracked_sleep(
+                    LLM_RETRY_SLEEP_S,
+                    reason=retry_reason_from_exception(exc, default="llm_worker_error"),
+                    tool="llm_worker",
+                    error=exc,
+                    url=str(config.get("base_url") or config.get("azure_endpoint") or ""),
+                    error_type=type(exc).__name__,
+                    fallback_sleep=time.sleep,
+                )
         if last_error is None:
             raise RuntimeError(f"Responses request failed without a captured exception for alias={alias!r}")
         raise last_error
@@ -1141,7 +1161,15 @@ class ModelRouterWorkerClient:
                 file=sys.stderr,
                 flush=True,
             )
-            time.sleep(30)
+            tracked_sleep(
+                30,
+                reason="llm_qpm_wait",
+                tool="llm_worker",
+                url=str(config.get("base_url") or config.get("azure_endpoint") or ""),
+                error_type="QPMResourceWait",
+                kind="resource_wait",
+                fallback_sleep=time.sleep,
+            )
 
     def _effective_qpm_limit(self, *, alias: str, config: dict[str, Any]) -> int | None:
         """Return the currently active QPM cap, never exceeding configured qpm."""
@@ -1378,29 +1406,30 @@ class ModelRouterWorkerClient:
             totals["cached_tokens"] += cached_tokens
             totals["elapsed_s"] += worker_elapsed_s
             snapshot = dict(totals)
-        print(
-            "[llm-usage]"
-            f" alias={alias}"
-            f" served_model={response.metadata.get('served_model') or response.model}"
-            f" current_qpm={response.metadata.get('dispatch_qpm', self._current_qpm(alias=alias))}"
-            f" qpm_limit={response.metadata.get('qpm')}"
-            f" adaptive_qpm_limit={response.metadata.get('adaptive_qpm_limit', self._effective_qpm_limit(alias=alias, config=self._configs.get(alias) or {}))}"
-            f" call_prompt_tokens={prompt_tokens}"
-            f" call_completion_tokens={completion_tokens}"
-            f" call_total_tokens={total_tokens}"
-            f" call_reasoning_tokens={reasoning_tokens}"
-            f" call_cached_tokens={cached_tokens}"
-            f" cumulative_calls={snapshot['calls']}"
-            f" cumulative_prompt_tokens={snapshot['prompt_tokens']}"
-            f" cumulative_completion_tokens={snapshot['completion_tokens']}"
-            f" cumulative_total_tokens={snapshot['total_tokens']}"
-            f" cumulative_reasoning_tokens={snapshot['reasoning_tokens']}"
-            f" cumulative_cached_tokens={snapshot['cached_tokens']}"
-            f" call_elapsed_s={worker_elapsed_s:.3f}"
-            f" cumulative_elapsed_s={float(snapshot.get('elapsed_s', 0.0)):.3f}",
-            file=sys.stderr,
-            flush=True,
-        )
+        if _debug_env_enabled(_USAGE_LOG_ENV):
+            print(
+                "[llm-usage]"
+                f" alias={alias}"
+                f" served_model={response.metadata.get('served_model') or response.model}"
+                f" current_qpm={response.metadata.get('dispatch_qpm', self._current_qpm(alias=alias))}"
+                f" qpm_limit={response.metadata.get('qpm')}"
+                f" adaptive_qpm_limit={response.metadata.get('adaptive_qpm_limit', self._effective_qpm_limit(alias=alias, config=self._configs.get(alias) or {}))}"
+                f" call_prompt_tokens={prompt_tokens}"
+                f" call_completion_tokens={completion_tokens}"
+                f" call_total_tokens={total_tokens}"
+                f" call_reasoning_tokens={reasoning_tokens}"
+                f" call_cached_tokens={cached_tokens}"
+                f" cumulative_calls={snapshot['calls']}"
+                f" cumulative_prompt_tokens={snapshot['prompt_tokens']}"
+                f" cumulative_completion_tokens={snapshot['completion_tokens']}"
+                f" cumulative_total_tokens={snapshot['total_tokens']}"
+                f" cumulative_reasoning_tokens={snapshot['reasoning_tokens']}"
+                f" cumulative_cached_tokens={snapshot['cached_tokens']}"
+                f" call_elapsed_s={worker_elapsed_s:.3f}"
+                f" cumulative_elapsed_s={float(snapshot.get('elapsed_s', 0.0)):.3f}",
+                file=sys.stderr,
+                flush=True,
+            )
         if _debug_env_enabled(_RAW_OUTPUT_ENV):
             print(
                 f"[llm-raw-output] alias={alias} model={response.model or ''}\n"

@@ -143,28 +143,53 @@ def _browser_execute_path(path: str) -> bool:
     )
 
 
-def _browser_image_status_code(response_body: bytes) -> int | None:
-    """Extract the target-image status from our Browser result envelope."""
+def _browser_image_diagnostics(response_body: bytes) -> dict[str, object]:
+    """Extract target-image diagnostics from our Browser result envelope."""
 
     try:
         outer = json.loads(response_body.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError):
-        return None
+        return {}
     if not isinstance(outer, dict):
-        return None
+        return {}
     result = outer.get("result") or outer.get("stdout") or outer.get("output")
     if isinstance(result, str):
         try:
             result = json.loads(result)
         except (UnicodeDecodeError, json.JSONDecodeError):
-            return None
+            return {}
     if not isinstance(result, dict):
-        return None
+        return {}
+    diagnostics: dict[str, object] = {}
     try:
         status_code = int(result.get("status") or 0)
     except (TypeError, ValueError):
-        return None
-    return status_code if 100 <= status_code <= 599 else None
+        status_code = 0
+    if 100 <= status_code <= 599:
+        diagnostics["status_code"] = status_code
+    for source_key, log_key in (
+        ("target_error_type", "target_error_type"),
+        ("target_error_message", "target_error"),
+        ("target_phase", "target_phase"),
+        ("error", "target_error"),
+    ):
+        value = result.get(source_key)
+        if value and log_key not in diagnostics:
+            diagnostics[log_key] = str(value)[:500]
+    try:
+        byte_count = int(result.get("byte_count") or 0)
+    except (TypeError, ValueError):
+        byte_count = 0
+    if byte_count >= 0:
+        diagnostics["target_byte_count"] = byte_count
+    return diagnostics
+
+
+def _browser_image_status_code(response_body: bytes) -> int | None:
+    """Extract the target-image status from our Browser result envelope."""
+
+    status_code = _browser_image_diagnostics(response_body).get("status_code")
+    return int(status_code) if isinstance(status_code, int) else None
 
 
 def _log_upstream(
@@ -175,6 +200,11 @@ def _log_upstream(
     elapsed_s: float,
     response_bytes: int | None = None,
     attempt: int | None = None,
+    target_status_code: int | None = None,
+    target_error_type: str | None = None,
+    target_phase: str | None = None,
+    target_error: str | None = None,
+    target_byte_count: int | None = None,
     error: BaseException | None = None,
 ) -> None:
     fields = [f"path={path!r}"]
@@ -187,6 +217,16 @@ def _log_upstream(
         fields.append(f"status_code={status_code}")
     if response_bytes is not None:
         fields.append(f"response_bytes={response_bytes}")
+    if target_status_code is not None:
+        fields.append(f"target_http_status={target_status_code}")
+    if target_error_type is not None:
+        fields.append(f"target_error_type={target_error_type!r}")
+    if target_phase is not None:
+        fields.append(f"target_phase={target_phase!r}")
+    if target_error is not None:
+        fields.append(f"target_error={target_error!r}")
+    if target_byte_count is not None:
+        fields.append(f"target_byte_count={target_byte_count}")
     if error is not None:
         fields.append(f"error_type={error.__class__.__name__}")
         fields.append(f"error={str(getattr(error, 'reason', error))!r}")
@@ -383,11 +423,12 @@ class FirecrawlRelayHandler(BaseHTTPRequestHandler):
                     )
                     status_code = int(response.getcode() or 200)
                     content_type = response.headers.get("Content-Type", "application/json")
-                target_status_code = (
-                    _browser_image_status_code(response_body)
+                target_diagnostics = (
+                    _browser_image_diagnostics(response_body)
                     if request_type == "browser_image"
-                    else None
+                    else {}
                 )
+                target_status_code = target_diagnostics.get("status_code")
                 if (
                     target_status_code in _TRANSIENT_HTTP_STATUS_CODES
                     and attempt < attempts
@@ -399,6 +440,11 @@ class FirecrawlRelayHandler(BaseHTTPRequestHandler):
                         elapsed_s=time.perf_counter() - started_at,
                         response_bytes=len(response_body),
                         attempt=attempt,
+                        target_status_code=target_status_code,
+                        target_error_type=target_diagnostics.get("target_error_type"),
+                        target_phase=target_diagnostics.get("target_phase"),
+                        target_error=target_diagnostics.get("target_error"),
+                        target_byte_count=target_diagnostics.get("target_byte_count"),
                         error=RuntimeError("transient target-image status inside Browser result"),
                     )
                     time.sleep(
@@ -415,6 +461,11 @@ class FirecrawlRelayHandler(BaseHTTPRequestHandler):
                     elapsed_s=time.perf_counter() - started_at,
                     response_bytes=len(response_body),
                     attempt=attempt,
+                    target_status_code=target_status_code,
+                    target_error_type=target_diagnostics.get("target_error_type"),
+                    target_phase=target_diagnostics.get("target_phase"),
+                    target_error=target_diagnostics.get("target_error"),
+                    target_byte_count=target_diagnostics.get("target_byte_count"),
                 )
                 self._write_bytes(status_code, response_body, content_type)
                 return

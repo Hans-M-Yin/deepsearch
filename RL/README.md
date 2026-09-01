@@ -140,6 +140,28 @@ Key knobs inside each script:
 
 Checkpoints go to `checkpoints/${project_name}/${exp_name}/`.
 
+### Multimodal sequence compatibility modes
+
+The multimodal RL sequence path is controlled by `RLLM_MM_SEQUENCE_MODE` and
+defaults to `legacy`, which preserves the historical behavior.  For a staged
+verification/fix, export one of the following before launching training:
+
+```bash
+# Stage 1: one DataProto row per assistant generation; preserves the exact
+# processor output (including pixel_values and image_grid_thw).
+export RLLM_MM_SEQUENCE_MODE=stepwise
+
+# Stage 2: one cumulative DataProto row per trajectory, with processor-expanded
+# image tokens and the original assistant/tool response mask.
+export RLLM_MM_SEQUENCE_MODE=cumulative
+```
+
+The new modes fail fast if the number of image-pad tokens in `input_ids` does
+not match `image_grid_thw`; `legacy` intentionally retains the previous
+behavior for regression comparison.  `stepwise` supersedes the configured
+`rllm.stepwise_advantage.enable` value for that run, while `cumulative` forces
+the cumulative packing path.
+
 ## 5. Reproducing the paper
 
 The reported numbers use:

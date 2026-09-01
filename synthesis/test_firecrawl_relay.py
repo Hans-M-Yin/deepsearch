@@ -63,6 +63,33 @@ class FirecrawlRelayTest(unittest.TestCase):
         host, port = self.server.server_address[:2]
         return f"http://{host}:{port}{path}"
 
+    def test_browser_image_diagnostics_extract_target_request_timeout(self) -> None:
+        body = json.dumps(
+            {
+                "success": True,
+                "result": json.dumps(
+                    {
+                        "status": None,
+                        "error": "target_request_timeout",
+                        "target_error_type": "target_request_timeout",
+                        "target_error_message": "Timeout 120000ms exceeded",
+                        "target_phase": "request",
+                        "byte_count": 0,
+                    }
+                ),
+            }
+        ).encode("utf-8")
+
+        self.assertEqual(
+            firecrawl_relay._browser_image_diagnostics(body),
+            {
+                "target_error_type": "target_request_timeout",
+                "target_error": "Timeout 120000ms exceeded",
+                "target_phase": "request",
+                "target_byte_count": 0,
+            },
+        )
+
     def test_browser_execute_image_retries_transient_upstream_error(self) -> None:
         calls: list[tuple[str, str, float]] = []
 

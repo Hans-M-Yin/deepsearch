@@ -651,6 +651,7 @@ class DeepResearchWorkflow(Workflow):
         termination = result.get("termination", "unknown")
         rounds = result.get("rounds", 0)
         time_taken = result.get("time_taken", 0.0)
+        latency = result.get("latency", {})
 
         trajectories: list[Trajectory] = []
         steps: list[Step] = []
@@ -729,6 +730,7 @@ class DeepResearchWorkflow(Workflow):
         episode.info = {
             "rounds": rounds,
             "time_taken": time_taken,
+            "latency": latency,
             "prediction": prediction,
             "answer": answer_text,
             "token_usage": result.get("token_usage", {}),

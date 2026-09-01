@@ -28,6 +28,10 @@ data:
   # DatasetRegistry split used for validation.
   val_split: test
 
+  # Optional independent DatasetRegistry name for evaluation.  When null,
+  # validation falls back to data.dataset_name.
+  val_dataset_name: null
+
   gen_batch_size: ${mul:${data.train_batch_size},${rllm.rejection_sample.multiplier}}
 
 rllm:

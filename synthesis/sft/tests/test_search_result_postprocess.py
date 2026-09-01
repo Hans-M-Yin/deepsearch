@@ -85,6 +85,26 @@ class SearchResultPostprocessTests(unittest.TestCase):
         self.assertIn(f"resource_id={resource_id}", stderr.getvalue())
         self.assertIn("url=https://page.example/story", stderr.getvalue())
 
+    def test_url_field_compact_resource_id_uses_registered_primary_url(self) -> None:
+        context = ToolRuntimeContext(working_dir="/tmp/sft_resource_test")
+        raw = {
+            "ok": True,
+            "query": "example query",
+            "results": [{"title": "Example", "url": "https://page.example/story", "rank": 1}],
+        }
+        with patch("synthesis.sft.tools.extract_url_semantic_keywords", self._fake_keywords):
+            compact = context.postprocess_search_output("t2t_search", raw)
+        resource_id = compact["results"][0]["source_page_id"]
+
+        with patch(
+            "synthesis.sft.api_tools.tools.read_url",
+            return_value={"ok": True, "kind": "text", "title": "Example", "content": "Evidence"},
+        ) as read:
+            result = execute_tool_call("read_url", {"url": resource_id}, context)
+
+        self.assertEqual(result.output["title"], "Example")
+        self.assertEqual(read.call_args.kwargs["url"], "https://page.example/story")
+
     def test_i2i_compact_output_omits_query_fields(self) -> None:
         raw = {
             "ok": True,
@@ -145,6 +165,39 @@ class SearchResultPostprocessTests(unittest.TestCase):
         self.assertTrue(result.output["page_id"].startswith("page_"))
         self.assertNotIn("unknown.example", result.output_text)
         self.assertEqual(read.call_args.kwargs["url"], "https://unknown.example/page")
+
+    def test_optional_tool_cache_is_used_only_when_injected(self) -> None:
+        class FakeCache:
+            def __init__(self):
+                self.values = {}
+
+            def get_or_compute(self, tool_name, arguments, compute):
+                key = (tool_name, tuple(sorted(arguments.items())))
+                if key not in self.values:
+                    self.values[key] = compute()
+                return self.values[key]
+
+        context = ToolRuntimeContext(working_dir="/tmp/sft_resource_test")
+        cache = FakeCache()
+        raw = {"ok": True, "query": "example", "results": []}
+        with (
+            patch("synthesis.sft.api_tools.tools.t2t_search", return_value=raw) as search,
+            patch.object(ToolRuntimeContext, "postprocess_search_output", return_value=raw),
+        ):
+            execute_tool_call(
+                "t2t_search",
+                {"query": "example"},
+                context,
+                tool_cache=cache,
+            )
+            execute_tool_call(
+                "t2t_search",
+                {"query": "example"},
+                context,
+                tool_cache=cache,
+            )
+
+        search.assert_called_once()
 
 
 if __name__ == "__main__":

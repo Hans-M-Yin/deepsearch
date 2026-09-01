@@ -20,7 +20,7 @@ from hashlib import sha256
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Callable
-from urllib.parse import unquote, urlparse, urlsplit
+from urllib.parse import quote, unquote, urlparse, urlsplit
 
 import requests
 from PIL import Image, ImageOps
@@ -111,6 +111,7 @@ _URL_KEYWORD_CACHE_LOCK = threading.Lock()
 _WIKIMEDIA_UPLOAD_HOST = "upload.wikimedia.org"
 _WIKIMEDIA_MAX_CONCURRENCY_ENV = "SFT_WIKIMEDIA_MAX_CONCURRENCY"
 _WIKIMEDIA_DEFAULT_MAX_CONCURRENCY = 3
+_HTTP_RELAY_URL_ENV = "HTTP_RELAY_URL"
 
 
 def _configured_wikimedia_max_concurrency() -> int:
@@ -488,6 +489,11 @@ _TOOL_STATS: dict[str, Any] = {
             "image_http_errors": 0,
             "image_http_statuses": {},
         },
+        "firecrawl_browser": {
+            "success": 0,
+            "failure": 0,
+            "failure_reasons": {},
+        },
     },
 }
 
@@ -517,6 +523,14 @@ def _tool_stats_snapshot_text() -> str:
         f"image_calls={read_stats['image_calls']} image_http_errors={read_stats['image_http_errors']} "
         f"image_http_statuses={json.dumps(read_stats['image_http_statuses'], ensure_ascii=False, sort_keys=True)}"
     )
+    browser_stats = stats["tools"]["firecrawl_browser"]
+    browser_calls = browser_stats["success"] + browser_stats["failure"]
+    if browser_calls:
+        lines.append(
+            f"[tool-stats] firecrawl_browser success={browser_stats['success']} "
+            f"failure={browser_stats['failure']} "
+            f"failure_reasons={json.dumps(browser_stats['failure_reasons'], ensure_ascii=False, sort_keys=True)}"
+        )
     return "\n".join(lines)
 
 
@@ -547,6 +561,56 @@ def _extract_http_status_code(exc: Exception) -> int | None:
     if isinstance(exc, requests.HTTPError) and exc.response is not None:
         return exc.response.status_code
     return None
+
+
+def _firecrawl_browser_failure_reason(exc: BaseException) -> str:
+    """Map one final Browser download error to a stable tool-stat label."""
+
+    message = str(exc or "").lower()
+    class_name = exc.__class__.__name__
+    raw_status_code = getattr(exc, "status_code", None)
+    try:
+        status_code = int(raw_status_code) if raw_status_code is not None else None
+    except (TypeError, ValueError):
+        status_code = None
+
+    if "idle firecrawl browser session" in message or "waiting for an idle" in message:
+        return "session_queue_timeout"
+    if "session creation" in message:
+        return "session_create_timeout" if "timeout" in message or "timed out" in message else "session_create_error"
+    if class_name == "FirecrawlBrowserHttpError" or status_code is not None and 400 <= status_code <= 599:
+        return f"target_image_http_{status_code}" if status_code is not None else "target_image_http_error"
+    if "no image payload" in message or "empty image payload" in message:
+        return "empty_image_payload"
+    if "non_image_content_type" in message or "did not return an image" in message:
+        return "non_image_content_type"
+    if "invalid base64" in message or "unparseable image response" in message:
+        return "invalid_browser_response"
+    if "target request" in message and ("timeout" in message or "timed out" in message):
+        return "target_request_timeout"
+    if "target request" in message:
+        return "target_request_error"
+    if "timeout" in message or "timed out" in message:
+        return "image_download_timeout"
+    if "execute" in message or "transport" in class_name.lower():
+        return "browser_execute_error"
+    if "session" in message or "session" in class_name.lower():
+        return "browser_session_error"
+    return "browser_error"
+
+
+def _record_firecrawl_browser_event(*, success: bool, error: BaseException | None = None) -> None:
+    """Record one final Firecrawl Browser image-download outcome."""
+
+    with _TOOL_STATS_LOCK:
+        browser_stats = _TOOL_STATS["tools"]["firecrawl_browser"]
+        if success:
+            browser_stats["success"] += 1
+            return
+        browser_stats["failure"] += 1
+        reason = _firecrawl_browser_failure_reason(error or RuntimeError("unknown Browser error"))
+        reasons = browser_stats["failure_reasons"]
+        reasons[reason] = int(reasons.get(reason) or 0) + 1
 
 
 def _record_read_url_call(
@@ -1783,6 +1847,7 @@ def _download_binary(
     retry_429_sleep_s: float | None = None,
     timings: dict[str, float] | None = None,
     timing_prefix: str = "binary_http",
+    use_http_relay: bool = False,
 ) -> tuple[bytes, str]:
     effective_max_retries = TOOL_TIMEOUT_RETRIES if max_retries is None else max(0, int(max_retries))
     effective_retry_sleep_s = TOOL_RETRY_SLEEP_S if retry_sleep_s is None else max(0, int(retry_sleep_s))
@@ -1790,11 +1855,13 @@ def _download_binary(
     effective_retry_429_sleep_s = (
         TOOL_429_RETRY_SLEEP_S if retry_429_sleep_s is None else max(0.0, float(retry_429_sleep_s))
     )
+    request_url = _http_relay_request_url(url) if use_http_relay else url
+    request_headers = _web_request_headers(referer_url=referer_url or url)
     response = _request_with_retry(
         "GET",
-        url,
+        request_url,
         timeout=timeout,
-        headers=_web_request_headers(referer_url=referer_url or url),
+        headers=request_headers,
         max_retries=effective_max_retries,
         retry_sleep_s=effective_retry_sleep_s,
         retry_on_429=retry_on_429,
@@ -1810,6 +1877,37 @@ def _download_binary(
     return payload, normalized
 
 
+def _http_relay_request_url(url: str) -> str:
+    """Wrap one non-Wikimedia image URL with the optional HTTP Relay.
+
+    The relay is applied below ``read_url`` so candidate selection, SVG
+    conversion, retries, and the agent-facing tool contract remain unchanged.
+    ``HTTP_RELAY_URL`` is deliberately a URL prefix, for example
+    ``http://relay:18083/``.  The default is an empty string, which makes
+    this function return the original URL unchanged.  The target is
+    percent-encoded before it is appended so its own query string cannot
+    change the Relay request's path or query parameters.
+    """
+
+    if _is_wikimedia_upload_url(url):
+        return url
+    relay_prefix = str(os.environ.get(_HTTP_RELAY_URL_ENV) or "").strip()
+    if not relay_prefix:
+        return url
+    target_parts = urlsplit(str(url).strip())
+    if target_parts.scheme.lower() not in {"http", "https"} or not target_parts.netloc:
+        return url
+    encoded_target = quote(str(url).strip(), safe="")
+    # Keep compatibility with the first implementation, which used the
+    # explicit /fetch?url= endpoint.  The normal and documented form is just
+    # the Relay base URL followed by the encoded target URL.
+    if "{url}" in relay_prefix:
+        return relay_prefix.replace("{url}", encoded_target, 1)
+    if "?url=" in relay_prefix:
+        return f"{relay_prefix}{encoded_target}"
+    return f"{relay_prefix.rstrip('/')}/{encoded_target}"
+
+
 def _configured_image_download_backend(url: str) -> str:
     """Choose the image transport without exposing backend state to the agent.
 
@@ -1819,7 +1917,8 @@ def _configured_image_download_backend(url: str) -> str:
     - ``firecrawl_browser``: Browser only;
     - ``firecrawl_browser_then_http``: Browser first, direct HTTP only if it
       fails;
-    - ``http``: direct HTTP only.
+    - ``http``: direct HTTP, optionally through the ``HTTP_RELAY_URL`` prefix
+      for non-Wikimedia image URLs.
 
     Wikimedia can be configured independently with
     ``SFT_WIKIMEDIA_IMAGE_DOWNLOAD_BACKEND``.  This lets RL runs move the
@@ -1878,8 +1977,10 @@ def _download_image_with_configured_backend(
                 referer_url=referer_url,
                 timeout_s=timeout,
             )
+            _record_firecrawl_browser_event(success=True)
             return downloaded.payload, downloaded.content_type, "firecrawl_browser"
-        except Exception:
+        except Exception as exc:
+            _record_firecrawl_browser_event(success=False, error=exc)
             if backend == "firecrawl_browser":
                 raise
         finally:
@@ -1900,6 +2001,7 @@ def _download_image_with_configured_backend(
         retry_429_sleep_s=retry_429_sleep_s,
         timings=timings,
         timing_prefix=timing_prefix,
+        use_http_relay=True,
     )
     return payload, content_type, "http_fallback" if backend == "firecrawl_browser_then_http" else "http"
 

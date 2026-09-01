@@ -97,13 +97,12 @@ class RunInferUrlResourceTests(unittest.TestCase):
                 {
                     "title": "Example",
                     "url": "https://example.com/page",
-                    "source_page_id": "page_example",
                     "rank": 1,
                 }
             ],
         }
         with mock.patch.object(sft_tools, "t2t_search", return_value=search_output):
-            tools.execute_tool(
+            message, _ = tools.execute_tool(
                 {"name": "t2t_search", "parameters": {"query": "example"}},
                 {},
                 "case",
@@ -113,6 +112,7 @@ class RunInferUrlResourceTests(unittest.TestCase):
                 url_registry=registry,
             )
 
+        resource_id = json.loads(message)["results"][0]["source_page_id"]
         captured: dict[str, object] = {}
 
         def fake_read_url(*, url: str, goal: str = "", resource=None, **kwargs):
@@ -124,7 +124,7 @@ class RunInferUrlResourceTests(unittest.TestCase):
             tools.execute_tool(
                 {
                     "name": "read_url",
-                    "parameters": {"resource_id": "page_example"},
+                    "parameters": {"resource_id": resource_id},
                 },
                 {},
                 "case",
@@ -133,6 +133,46 @@ class RunInferUrlResourceTests(unittest.TestCase):
                 tempfile.mkdtemp(),
                 url_registry=registry,
             )
+        self.assertEqual(captured["url"], "https://example.com/page")
+        self.assertIsInstance(captured["resource"], sft_tools.UrlResource)
+
+    def test_read_url_resolves_compact_resource_id_passed_as_url(self) -> None:
+        registry: dict[str, sft_tools.UrlResource] = {}
+        search_output = {
+            "ok": True,
+            "query": "example",
+            "results": [{"title": "Example", "url": "https://example.com/page", "rank": 1}],
+        }
+        with mock.patch.object(sft_tools, "t2t_search", return_value=search_output):
+            message, _ = tools.execute_tool(
+                {"name": "t2t_search", "parameters": {"query": "example"}},
+                {},
+                "case",
+                0,
+                0,
+                tempfile.mkdtemp(),
+                url_registry=registry,
+            )
+        resource_id = json.loads(message)["results"][0]["source_page_id"]
+
+        captured: dict[str, object] = {}
+
+        def fake_read_url(*, url: str, goal: str = "", resource=None, **kwargs):
+            captured["url"] = url
+            captured["resource"] = resource
+            return {"ok": True, "kind": "text", "url": url, "title": "x", "content": "x"}
+
+        with mock.patch.object(sft_tools, "read_url", side_effect=fake_read_url):
+            tools.execute_tool(
+                {"name": "read_url", "parameters": {"url": resource_id}},
+                {},
+                "case",
+                0,
+                1,
+                tempfile.mkdtemp(),
+                url_registry=registry,
+            )
+
         self.assertEqual(captured["url"], "https://example.com/page")
         self.assertIsInstance(captured["resource"], sft_tools.UrlResource)
 

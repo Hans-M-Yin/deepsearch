@@ -38,7 +38,7 @@ opensearch_vl/
 
    ```bash
    pip install torch transformers qwen-vl-utils accelerate \
-               pandas pyarrow Pillow opencv-python tqdm requests httpx
+               pandas pyarrow Pillow opencv-python tqdm requests httpx cairosvg
    ```
 
    `opencv-python` is only required if you plan to use

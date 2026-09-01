@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 
 
 class InferenceTiming:
-    """Collect per-sample wall-clock timings for debug diagnostics."""
+    """Collect per-sample wall-clock timings for INFO-level diagnostics."""
 
     def __init__(self) -> None:
         self.started_at = time.perf_counter()
@@ -35,13 +35,13 @@ class InferenceTiming:
         stats["total_s"] = float(stats["total_s"]) + elapsed_s
 
     def emit(self, *, case_id: str, case_idx: int, status: str) -> None:
-        """Write one summary plus one line per module at DEBUG level only."""
+        """Write one summary plus one line per module at INFO level."""
 
-        if not logger.isEnabledFor(logging.DEBUG):
+        if not logger.isEnabledFor(logging.INFO):
             return
 
         elapsed_s = time.perf_counter() - self.started_at
-        logger.debug(
+        logger.info(
             "[inference-timing] case_id=%s case_idx=%s status=%s "
             "total_elapsed_s=%.3f modules=%d",
             case_id,
@@ -54,7 +54,7 @@ class InferenceTiming:
             calls = int(stats["calls"])
             total_s = float(stats["total_s"])
             average_s = total_s / calls if calls else 0.0
-            logger.debug(
+            logger.info(
                 "[inference-timing] case_id=%s module=%s calls=%d "
                 "total_s=%.3f average_s=%.3f",
                 case_id,
@@ -117,10 +117,63 @@ def _strip_base64_payloads(obj: Any, image_urls: Dict[str, str]) -> Any:
     return obj
 
 
+def _serialise_url_resources(url_registry: Dict[str, Any]) -> Dict[str, Any]:
+    """Convert the per-case URL registry into JSON-safe provenance data.
+
+    ``url_registry`` intentionally contains aliases as well as resource IDs:
+    ``read_url`` may be called with either form.  Keep both pieces of
+    information so a saved trajectory can be used to reconstruct exactly
+    which URL a resource ID resolved to.
+    """
+
+    resources: Dict[str, Dict[str, Any]] = {}
+    aliases: Dict[str, str] = {}
+    collisions: List[Dict[str, Any]] = []
+
+    for registry_key, resource in url_registry.items():
+        if hasattr(resource, "to_dict"):
+            payload = resource.to_dict()
+        elif isinstance(resource, dict):
+            payload = dict(resource)
+        else:
+            payload = {"value": str(resource)}
+
+        resource_id = str(payload.get("resource_id") or registry_key)
+        payload["resource_id"] = resource_id
+        registry_key = str(registry_key)
+
+        existing = resources.get(resource_id)
+        if existing is not None:
+            existing_url = existing.get("primary_url")
+            current_url = payload.get("primary_url")
+            if existing_url != current_url:
+                collisions.append(
+                    {
+                        "resource_id": resource_id,
+                        "existing_primary_url": existing_url,
+                        "new_primary_url": current_url,
+                        "registry_key": registry_key,
+                    }
+                )
+        else:
+            resources[resource_id] = payload
+
+        aliases[registry_key] = resource_id
+
+    return {
+        "schema_version": 1,
+        "resource_count": len(resources),
+        "resources": resources,
+        "aliases": aliases,
+        "collisions": collisions,
+    }
+
+
 def _save_failure_trajectory(
     trajectory: Dict[str, Any],
     output_dir: str,
     image_paths_dict: Dict[str, Any],
+    url_registry: Dict[str, Any],
     *,
     failure_kind: str,
     failure_reason: str,
@@ -146,6 +199,7 @@ def _save_failure_trajectory(
         for turn in trajectory.get("turns", [])
         if turn.get("response_text")
     )
+    trajectory["url_resources"] = _serialise_url_resources(url_registry)
 
     image_urls = {
         img_id: data
@@ -432,6 +486,7 @@ def process_single_case(
                 trajectory,
                 output_dir,
                 image_paths_dict,
+                url_registry,
                 failure_kind=kind,
                 failure_reason=reason,
                 failed_turn=failed_turn,
@@ -631,6 +686,7 @@ def process_single_case(
         for turn in trajectory["turns"]
         if turn.get("response_text")
     )
+    trajectory["url_resources"] = _serialise_url_resources(url_registry)
 
     image_urls = {
         img_id: data

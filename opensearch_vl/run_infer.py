@@ -41,6 +41,7 @@ from typing import Any, Optional
 from tqdm.auto import tqdm
 
 from opensearch_infer import config
+from synthesis.retry_monitor import RetryMonitor, case_context, install_monitor
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
@@ -198,6 +199,24 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         help="Root logger level.",
     )
+    parser.add_argument(
+        "--retry-monitor-interval",
+        type=float,
+        default=10.0,
+        help=(
+            "Seconds between retry-status reports. Set to 0 to disable the "
+            "process-local retry monitor."
+        ),
+    )
+    parser.add_argument(
+        "--retry-error-log",
+        type=str,
+        default=None,
+        help=(
+            "Path for the detailed per-retry error log. Defaults to "
+            "<output-dir>/retry_errors.txt."
+        ),
+    )
     return parser
 
 
@@ -312,27 +331,28 @@ def main(argv: Optional[list[str]] = None) -> int:
     def _run_one(idx: int) -> tuple[int, bool, Optional[str]]:
         row = df.iloc[idx]
         case_id = _row_to_case_id(row, idx)
-        timing = pipeline.InferenceTiming() if logger.isEnabledFor(logging.DEBUG) else None
+        timing = pipeline.InferenceTiming() if logger.isEnabledFor(logging.INFO) else None
         status = "failed"
-        try:
-            pipeline.process_single_case(
-                row=row,
-                runner=runner,
-                output_dir=args.output_dir,
-                case_idx=idx,
-                dataset_type=args.dataset,
-                inference_cfg=inference_cfg,
-                timing=timing,
-            )
-            status = "completed"
-            return idx, True, None
-        except Exception as exc:
-            logger.error("Case %d failed: %s", idx, exc)
-            traceback.print_exc()
-            return idx, False, str(exc)
-        finally:
-            if timing is not None:
-                timing.emit(case_id=case_id, case_idx=idx, status=status)
+        with case_context(case_id, idx):
+            try:
+                pipeline.process_single_case(
+                    row=row,
+                    runner=runner,
+                    output_dir=args.output_dir,
+                    case_idx=idx,
+                    dataset_type=args.dataset,
+                    inference_cfg=inference_cfg,
+                    timing=timing,
+                )
+                status = "completed"
+                return idx, True, None
+            except Exception as exc:
+                logger.error("Case %d failed: %s", idx, exc)
+                traceback.print_exc()
+                return idx, False, str(exc)
+            finally:
+                if timing is not None:
+                    timing.emit(case_id=case_id, case_idx=idx, status=status)
 
     success, failure, skipped = 0, 0, 0
     completed_case_ids = _completed_case_ids(args.output_dir)
@@ -352,44 +372,61 @@ def main(argv: Optional[list[str]] = None) -> int:
             args.output_dir,
         )
 
-    if workers == 1:
-        for idx in tqdm(indices, desc="Inference", unit="case"):
-            _, ok, _ = _run_one(idx)
-            success += int(ok)
-            failure += int(not ok)
-    else:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
-            futures = {executor.submit(_run_one, idx): idx for idx in indices}
-            with tqdm(total=len(futures), desc="Inference", unit="case") as progress:
-                for future in concurrent.futures.as_completed(futures):
-                    idx, ok, error = future.result()
-                    success += int(ok)
-                    failure += int(not ok)
-                    progress.update(1)
-                    if ok:
-                        logger.info(
-                            "Case %d completed (%d/%d)",
-                            idx,
-                            success + failure,
-                            len(indices),
-                        )
-                    else:
-                        logger.error(
-                            "Case %d failed (%d/%d): %s",
-                            idx,
-                            success + failure,
-                            len(indices),
-                            error,
-                        )
+    retry_monitor = None
+    if args.retry_monitor_interval > 0:
+        retry_error_log = args.retry_error_log or os.path.join(
+            args.output_dir,
+            "retry_errors.txt",
+        )
+        retry_monitor = RetryMonitor(
+            interval_s=args.retry_monitor_interval,
+            error_log_path=retry_error_log,
+        )
+        install_monitor(retry_monitor)
+        retry_monitor.start()
+    try:
+        if workers == 1:
+            for idx in tqdm(indices, desc="Inference", unit="case"):
+                _, ok, _ = _run_one(idx)
+                success += int(ok)
+                failure += int(not ok)
+        else:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+                futures = {executor.submit(_run_one, idx): idx for idx in indices}
+                with tqdm(total=len(futures), desc="Inference", unit="case") as progress:
+                    for future in concurrent.futures.as_completed(futures):
+                        idx, ok, error = future.result()
+                        success += int(ok)
+                        failure += int(not ok)
+                        progress.update(1)
+                        if ok:
+                            logger.info(
+                                "Case %d completed (%d/%d)",
+                                idx,
+                                success + failure,
+                                len(indices),
+                            )
+                        else:
+                            logger.error(
+                                "Case %d failed (%d/%d): %s",
+                                idx,
+                                success + failure,
+                                len(indices),
+                                error,
+                            )
 
-    logger.info(
-        "Done. success=%d failure=%d skipped=%d output=%s",
-        success,
-        failure,
-        skipped,
-        args.output_dir,
-    )
-    return 0
+        logger.info(
+            "Done. success=%d failure=%d skipped=%d output=%s",
+            success,
+            failure,
+            skipped,
+            args.output_dir,
+        )
+        return 0
+    finally:
+        if retry_monitor is not None:
+            retry_monitor.stop()
+            install_monitor(None)
 
 
 if __name__ == "__main__":

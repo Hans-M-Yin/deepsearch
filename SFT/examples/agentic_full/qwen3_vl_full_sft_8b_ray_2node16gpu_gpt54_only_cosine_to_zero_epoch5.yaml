@@ -1,0 +1,89 @@
+# Based on qwen3_vl_full_sft_8b_ray_2node16gpu_final_nothink_v2_cosine_to_zero.yaml.
+# USE_RAY=1 python -m llamafactory.cli train examples/agentic_full/qwen3_vl_full_sft_8b_ray_2node16gpu_gpt54_only_cosine_to_zero_epoch5.yaml
+### model
+model_name_or_path: /mnt/hdfs/byte_ai_sales/user/user/yinzhihan/models/qwen3-vl-8b
+image_max_pixels: 262144
+video_max_pixels: 16384
+trust_remote_code: true
+flash_attn: fa2
+
+### method
+stage: sft
+do_train: true
+finetuning_type: full
+freeze_vision_tower: false
+freeze_multi_modal_projector: false
+deepspeed: /mnt/hdfs/byte_ai_sales/user/user/yinzhihan/agent/OpenSearch-VL/SFT/examples/deepspeed/ds_z3_config.json
+
+### dataset
+dataset: opensearch_vl_sft
+dataset_dir: /mnt/hdfs/byte_ai_sales/user/user/yinzhihan/agent/OpenSearch-VL/data/sharegpt_dataset_part3_part4
+template: qwen3_vl_nothink
+cutoff_len: 32768
+overwrite_cache: true
+preprocessing_num_workers: 16
+dataloader_num_workers: 4
+tokenized_path: /mnt/hdfs/byte_ai_sales/user/user/yinzhihan/cache/opensearch_sft_tokenized_redundancy_compressed_gpt54_640_cutoff_clean_tagclean_nothink_32768
+data_shared_file_system: true
+
+### output
+output_dir: saves/qwen3_vl_8b/full/data_redundancy_compressed_gpt54_640_tagclean_2node16gpu_lr_2e_5_cosine_to_zero_epoch5
+logging_steps: 1
+save_steps: 400
+plot_loss: true
+overwrite_output_dir: true
+save_only_model: true
+report_to: wandb
+project: mmdeepsearch
+run_name: 0831_8b_2node_16gpus_redundancy_compressed_gpt54_640_tagclean_lr_2e_5_cosine_to_zero_epoch5
+
+### ray
+ray_num_workers: 16
+ray_init_kwargs:
+  runtime_env:
+    env_vars:
+      NCCL_IB_DISABLE: "0"
+      NCCL_IB_GID_INDEX: "3"
+      NCCL_IB_SL: "3"
+      NCCL_DEBUG: "INFO"
+      NCCL_SOCKET_IFNAME: "bond1"
+      GLOO_SOCKET_IFNAME: "bond1"
+      TP_SOCKET_IFNAME: "bond1"
+      UCX_NET_DEVICES: "bond1"
+      NCCL_IB_HCA: "mlx5_bond*"
+      NCCL_NET_GDR_LEVEL: "1"
+      NCCL_IB_TC: "106"
+      NCCL_IB_QPS_PER_CONNECTION: "4"
+      NCCL_LL_THRESHOLD: "32768"
+      NCCL_P2P_DISABLE: "0"
+      NCCL_CHECK_DISABLE: "1"
+      NCCL_PXN_DISABLE: "0"
+      NCCL_COLLNET_ENABLE: "0"
+      SHARP_COLL_ENABLE_SAT: "0"
+      TOKENIZERS_PARALLELISM: "false"
+      HF_DATASETS_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+      PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION: "python"
+      WANDB_PROJECT: "mmdeepsearch"
+      PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+
+### train
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 16
+gradient_checkpointing: true
+learning_rate: 2.0e-5
+num_train_epochs: 5.0
+lr_scheduler_type: cosine
+# HF cosine scheduler reaches zero at the end when num_cycles=0.5.
+lr_scheduler_kwargs:
+  num_cycles: 0.5
+warmup_ratio: 0.1
+bf16: true
+ddp_timeout: 1800
+resume_from_checkpoint: false
+
+### eval
+# val_size: 0.1
+# per_device_eval_batch_size: 1
+# eval_strategy: steps
+# eval_steps: 500

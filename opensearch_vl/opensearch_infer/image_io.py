@@ -14,6 +14,7 @@ import requests
 from PIL import Image
 
 from . import config
+from synthesis.retry_monitor import tracked_sleep
 
 
 logger = logging.getLogger(__name__)
@@ -126,7 +127,15 @@ def download_image_bytes(
                 exc,
             )
             if attempt < max_retries:
-                time.sleep(wait)
+                tracked_sleep(
+                    wait,
+                    reason="image_download_error",
+                    tool="image_download",
+                    error=exc,
+                    url=url,
+                    error_type=type(exc).__name__,
+                    fallback_sleep=time.sleep,
+                )
         except Exception as exc:
             logger.warning(
                 "Download attempt %d/%d errored for %s: %s",
@@ -136,7 +145,15 @@ def download_image_bytes(
                 exc,
             )
             if attempt < max_retries:
-                time.sleep(attempt * 2)
+                tracked_sleep(
+                    attempt * 2,
+                    reason="image_download_error",
+                    tool="image_download",
+                    error=exc,
+                    url=url,
+                    error_type=type(exc).__name__,
+                    fallback_sleep=time.sleep,
+                )
     return None
 
 

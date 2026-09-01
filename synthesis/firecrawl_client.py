@@ -26,6 +26,7 @@ from typing import Any, Callable
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
+from synthesis.retry_monitor import tracked_sleep
 from synthesis.url_utils import normalize_http_referer, normalize_http_url
 
 try:
@@ -739,6 +740,10 @@ class FirecrawlBrowserTransportError(FirecrawlBrowserError):
     """A Browser API/relay request failed without proving the session is broken."""
 
 
+class FirecrawlBrowserTargetRequestError(FirecrawlBrowserError):
+    """The remote Browser could not complete the request to the target URL."""
+
+
 class FirecrawlBrowserSessionError(FirecrawlBrowserError):
     """A Browser session could not be created or is no longer usable."""
 
@@ -1060,7 +1065,15 @@ class FirecrawlBrowserSessionManager:
                     raise FirecrawlBrowserSessionError(
                         f"Timed out waiting for an idle Firecrawl Browser session{suffix}"
                     )
-                time.sleep(0.1)
+                tracked_sleep(
+                    0.1,
+                    reason="firecrawl_pool_wait",
+                    tool="firecrawl_browser",
+                    url=request_url,
+                    error_type="FirecrawlBrowserPoolWait",
+                    kind="resource_wait",
+                    fallback_sleep=time.sleep,
+                )
         finally:
             self._remove_waiter(waiter_id)
 
@@ -1650,12 +1663,22 @@ class FirecrawlBrowserImageDownloader:
         acquire_timeout_s: float = 120.0,
         retries: int = 1,
         retry_sleep_s: float = 0.5,
+        timeout_cap_s: float | None = None,
+        same_session_timeout_retries: int = 0,
+        same_session_retry_sleep_s: float = 1.0,
     ) -> None:
         self.session_manager = session_manager
         self.max_image_bytes = max(1024, int(max_image_bytes))
         self.acquire_timeout_s = max(1.0, float(acquire_timeout_s))
         self.retries = max(0, int(retries))
         self.retry_sleep_s = max(0.0, float(retry_sleep_s))
+        self.timeout_cap_s = (
+            max(1.0, min(float(timeout_cap_s), 300.0))
+            if timeout_cap_s is not None and float(timeout_cap_s) > 0
+            else None
+        )
+        self.same_session_timeout_retries = max(0, int(same_session_timeout_retries))
+        self.same_session_retry_sleep_s = max(0.0, float(same_session_retry_sleep_s))
 
     @classmethod
     def from_environment(
@@ -1675,12 +1698,21 @@ class FirecrawlBrowserImageDownloader:
             ),
             max_image_bytes=_env_int("FIRECRAWL_BROWSER_IMAGE_MAX_BYTES", 20 * 1024 * 1024),
             acquire_timeout_s=_env_float("FIRECRAWL_BROWSER_POOL_ACQUIRE_TIMEOUT_S", 120.0),
-            # The Relay retries the idempotent image execution upstream.  A
-            # single worker-side retry is enough to acquire a fresh session
-            # after a confirmed remote-session failure, without multiplying
-            # every transient error into many upstream requests.
+            # The Relay retries the idempotent image execution upstream.  The
+            # worker first retries a timeout on the same session, then uses a
+            # single worker-side retry for a fresh session.
             retries=_env_int("FIRECRAWL_BROWSER_IMAGE_RETRIES", 1),
             retry_sleep_s=_env_float("FIRECRAWL_BROWSER_IMAGE_RETRY_SLEEP_S", 2.0),
+            timeout_cap_s=(
+                _env_float("FIRECRAWL_BROWSER_IMAGE_TIMEOUT_S", 0.0)
+                or None
+            ),
+            same_session_timeout_retries=_env_int(
+                "FIRECRAWL_BROWSER_SAME_SESSION_TIMEOUT_RETRIES", 0
+            ),
+            same_session_retry_sleep_s=_env_float(
+                "FIRECRAWL_BROWSER_SAME_SESSION_RETRY_SLEEP_S", 1.0
+            ),
         )
 
     def download(
@@ -1698,80 +1730,130 @@ class FirecrawlBrowserImageDownloader:
         except (TypeError, ValueError, UnicodeError) as exc:
             raise FirecrawlBrowserError("Image URL is invalid.") from exc
         timeout_s = max(1.0, min(float(timeout_s), 300.0))
+        if self.timeout_cap_s is not None:
+            timeout_s = min(timeout_s, self.timeout_cap_s)
+        # Let the target request fail inside our JS catch block before the
+        # outer Browser Execute timeout kills the whole script.
+        request_timeout_s = max(1.0, timeout_s - min(5.0, timeout_s * 0.1))
         last_error: Exception | None = None
         for attempt in range(self.retries + 1):
             lease: _BrowserSessionLease | None = None
-            try:
-                lease = self.session_manager.acquire(
-                    acquire_timeout_s=self.acquire_timeout_s,
-                    lease_timeout_s=max(
-                        timeout_s + 30.0,
-                        self.session_manager.relay_timeout_s + 30.0,
-                    ),
-                    request_url=target_url,
-                )
-                response = self.session_manager.execute(
-                    lease,
-                    code=self._download_code(
-                        target_url,
-                        referer_url=referer_url,
-                        request_timeout_ms=int(timeout_s * 1000),
-                    ),
-                    timeout_s=timeout_s,
-                    request_type="browser_image",
-                )
-                result = self._decode_download_response(
-                    response,
-                    requested_url=target_url,
-                    session_id=lease.session_id,
-                    key_id=lease.key_id,
-                )
-                self.session_manager._debug_pool_status(
-                    "download_succeeded",
-                    session_id=lease.session_id,
-                    key_id=lease.key_id,
-                    url=target_url,
-                    attempt=attempt + 1,
-                    http_status=result.status_code,
-                    content_type=result.content_type,
-                    byte_count=len(result.payload),
-                    resolved_url=result.resolved_url,
-                )
-                lease.release()
-                return result
-            except Exception as exc:
-                last_error = exc
-                status_code = getattr(exc, "status_code", None)
-                will_retry = attempt < self.retries and self._is_retryable(exc)
-                self.session_manager._debug_pool_status(
-                    "download_failed",
-                    session_id=lease.session_id if lease is not None else "",
-                    key_id=lease.key_id if lease is not None else "",
-                    url=target_url,
-                    attempt=attempt + 1,
-                    http_status=status_code,
-                    error_type=type(exc).__name__,
-                    error=str(exc)[:500],
-                    will_retry=will_retry,
-                )
-                if lease is not None:
-                    # FirecrawlBrowserHttpError represents the target image's
-                    # HTTP status. A target 404/502 must not destroy an
-                    # otherwise reusable Browser session. Only an error that
-                    # identifies the Browser session itself warrants
-                    # invalidation. A relay/client timeout is also
-                    # invalidated because the remote execution may still be
-                    # in flight after the worker stopped waiting.
-                    if isinstance(exc, FirecrawlBrowserSessionError) or (
-                        isinstance(exc, FirecrawlBrowserTransportError)
+            same_session_retry = 0
+            while True:
+                try:
+                    if lease is None:
+                        lease = self.session_manager.acquire(
+                            acquire_timeout_s=self.acquire_timeout_s,
+                            lease_timeout_s=max(
+                                timeout_s + 30.0,
+                                self.session_manager.relay_timeout_s + 30.0,
+                            ),
+                            request_url=target_url,
+                        )
+                    response = self.session_manager.execute(
+                        lease,
+                        code=self._download_code(
+                            target_url,
+                            referer_url=referer_url,
+                            request_timeout_ms=int(request_timeout_s * 1000),
+                        ),
+                        timeout_s=timeout_s,
+                        request_type="browser_image",
+                    )
+                    result = self._decode_download_response(
+                        response,
+                        requested_url=target_url,
+                        session_id=lease.session_id,
+                        key_id=lease.key_id,
+                    )
+                    self.session_manager._debug_pool_status(
+                        "download_succeeded",
+                        session_id=lease.session_id,
+                        key_id=lease.key_id,
+                        url=target_url,
+                        attempt=attempt + 1,
+                        session_retry=same_session_retry,
+                        http_status=result.status_code,
+                        content_type=result.content_type,
+                        byte_count=len(result.payload),
+                        resolved_url=result.resolved_url,
+                    )
+                    lease.release()
+                    return result
+                except Exception as exc:
+                    last_error = exc
+                    status_code = getattr(exc, "status_code", None)
+                    timeout_error = (
+                        isinstance(exc, (FirecrawlBrowserTransportError, FirecrawlBrowserTargetRequestError))
                         and _is_timeout_message(str(exc))
-                    ):
-                        lease.invalidate(reason=str(exc))
-                    else:
-                        lease.release()
-                if not will_retry:
-                    raise
-                time.sleep(self.retry_sleep_s * (attempt + 1))
+                    )
+                    retry_same_session = timeout_error and same_session_retry < self.same_session_timeout_retries
+                    retry_new_session = (
+                        not retry_same_session
+                        and attempt < self.retries
+                        and self._is_retryable(exc)
+                    )
+                    self.session_manager._debug_pool_status(
+                        "download_failed",
+                        session_id=lease.session_id if lease is not None else "",
+                        key_id=lease.key_id if lease is not None else "",
+                        url=target_url,
+                        attempt=attempt + 1,
+                        session_retry=same_session_retry,
+                        http_status=status_code,
+                        error_type=type(exc).__name__,
+                        error=str(exc)[:500],
+                        retry_scope=(
+                            "same_session"
+                            if retry_same_session
+                            else "new_session"
+                            if retry_new_session
+                            else None
+                        ),
+                        will_retry=retry_same_session or retry_new_session,
+                    )
+                    if retry_same_session:
+                        same_session_retry += 1
+                        tracked_sleep(
+                            self.same_session_retry_sleep_s,
+                            reason="firecrawl_browser_same_session_retry",
+                            tool="firecrawl_browser",
+                            error=exc,
+                            url=target_url,
+                            error_type=type(exc).__name__,
+                            fallback_sleep=time.sleep,
+                        )
+                        continue
+
+                    if lease is not None:
+                        # An outer transport timeout is unsafe to reuse. A
+                        # structured target-request timeout is reusable unless
+                        # its configured same-session retry has already failed.
+                        destroy_after_same_session_retry = (
+                            isinstance(exc, FirecrawlBrowserTargetRequestError)
+                            and same_session_retry > 0
+                        )
+                        if (
+                            isinstance(exc, FirecrawlBrowserSessionError)
+                            or isinstance(exc, FirecrawlBrowserTransportError)
+                            and timeout_error
+                            or destroy_after_same_session_retry
+                        ):
+                            lease.invalidate(reason=str(exc))
+                        else:
+                            lease.release()
+                    if not retry_new_session:
+                        raise
+                    tracked_sleep(
+                        self.retry_sleep_s * (attempt + 1),
+                        reason="firecrawl_browser_retry",
+                        tool="firecrawl_browser",
+                        error=exc,
+                        url=target_url,
+                        error_type=type(exc).__name__,
+                        fallback_sleep=time.sleep,
+                    )
+                    break
         assert last_error is not None
         raise last_error
 
@@ -1803,27 +1885,37 @@ const headers = {{
   "Accept-Language": "en-US,en;q=0.9",
 }};
 if (input.referer) headers["Referer"] = input.referer;
-const response = await page.request.get(input.url, {{
-  failOnStatusCode: false,
-  headers,
-  timeout: input.timeoutMs,
-}});
-const responseHeaders = response.headers();
-const contentType = String(responseHeaders["content-type"] || "").split(";", 1)[0].trim().toLowerCase();
-const status = response.status();
-const resolvedUrl = response.url();
-const declaredLength = Number(responseHeaders["content-length"] || 0);
 const maxBytes = {self.max_image_bytes};
-const likelyImage = contentType.startsWith("image/") || !contentType || contentType === "application/octet-stream" || contentType === "binary/octet-stream";
+let response = null;
+let phase = "request";
 const output = {{
-  status,
-  resolved_url: resolvedUrl,
-  content_type: contentType,
+  status: null,
+  resolved_url: input.url,
+  content_type: "",
   body_base64: null,
   byte_count: 0,
   error: null,
+  target_error_type: null,
+  target_error_message: null,
+  target_phase: phase,
 }};
 try {{
+  response = await page.request.get(input.url, {{
+    failOnStatusCode: false,
+    headers,
+    timeout: input.timeoutMs,
+  }});
+  phase = "response";
+  const responseHeaders = response.headers();
+  const contentType = String(responseHeaders["content-type"] || "").split(";", 1)[0].trim().toLowerCase();
+  const status = response.status();
+  const resolvedUrl = response.url();
+  const declaredLength = Number(responseHeaders["content-length"] || 0);
+  const likelyImage = contentType.startsWith("image/") || !contentType || contentType === "application/octet-stream" || contentType === "binary/octet-stream";
+  output.status = status;
+  output.resolved_url = resolvedUrl;
+  output.content_type = contentType;
+  output.target_phase = phase;
   if (status < 200 || status >= 300) {{
     output.error = `http_status_${{status}}`;
   }} else if (!likelyImage) {{
@@ -1831,6 +1923,8 @@ try {{
   }} else if (Number.isFinite(declaredLength) && declaredLength > maxBytes) {{
     output.error = "image_too_large";
   }} else {{
+    phase = "body";
+    output.target_phase = phase;
     const body = await response.body();
     output.byte_count = body.length;
     if (body.length > maxBytes) {{
@@ -1839,8 +1933,19 @@ try {{
       output.body_base64 = body.toString("base64");
     }}
   }}
+}} catch (error) {{
+  const message = String(error && error.message ? error.message : error || "target request failed");
+  const normalized = message.toLowerCase();
+  output.target_phase = phase;
+  output.target_error_type = normalized.includes("timeout") || normalized.includes("timed out")
+    ? "target_request_timeout"
+    : "target_request_error";
+  output.target_error_message = message.slice(0, 500);
+  output.error = output.target_error_type;
 }} finally {{
-  await response.dispose();
+  if (response) {{
+    try {{ await response.dispose(); }} catch (_) {{}}
+  }}
 }}
 return JSON.stringify(output);
 }})();
@@ -1873,6 +1978,16 @@ return JSON.stringify(output);
         resolved_url = str(payload.get("resolved_url") or requested_url)
         content_type = _normalized_content_type(payload.get("content_type"))
         error = str(payload.get("error") or "")
+        target_error_type = str(payload.get("target_error_type") or "")
+        target_error_message = str(payload.get("target_error_message") or "")
+        target_phase = str(payload.get("target_phase") or "request")
+        if error in {"target_request_timeout", "target_request_error"} or target_error_type:
+            detail = target_error_message or error or target_error_type
+            raise FirecrawlBrowserTargetRequestError(
+                f"Firecrawl Browser target request failed during {target_phase} "
+                f"for {requested_url}: {detail}",
+                status_code=status_code or None,
+            )
         if status_code < 200 or status_code >= 300:
             raise FirecrawlBrowserHttpError(
                 f"Firecrawl Browser image request returned HTTP {status_code} for {requested_url}",

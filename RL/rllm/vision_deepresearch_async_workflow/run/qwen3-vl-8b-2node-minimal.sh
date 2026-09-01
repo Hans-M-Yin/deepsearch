@@ -1,9 +1,16 @@
 #!/usr/bin/env bash
 set -xeuo pipefail
 
-# Qwen3-VL-8B DeepResearch RL configuration for 2 nodes x 8 GPUs.
-# This is the 8B multi-node configuration adapted to a 16-GPU world:
-# train_tp x train_pp x train_cp = 4 x 2 x 2 = 16.
+# Minimal end-to-end RL pipeline test for 2 nodes x 8 GPUs.
+#
+# This keeps the real SGLang rollout, SFT tool adapter, reward computation and
+# Megatron actor update, but executes only one training update:
+#   - one prompt per training batch
+#   - two rollouts per prompt (RLOO)
+#   - two concurrent workflow/tool slots
+#   - no periodic or final validation
+#
+# Override MODEL_PATH or DATASET_NAME from the shell when needed.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RLLM_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
@@ -11,8 +18,8 @@ PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../../../.." && pwd)"
 export PYTHONPATH="${PROJECT_ROOT}:${RLLM_ROOT}:${RLLM_ROOT}/verl${PYTHONPATH:+:${PYTHONPATH}}"
 cd "${RLLM_ROOT}"
 
-# Load RL credentials when present.  Serper/Reader variables can also be
-# exported before launching, or loaded from synthesis/.env by the caller.
+# The caller should source RL/.env_remote before invoking this script.  Keep
+# support for an optional RL/rllm/.env for compatibility with older launches.
 if [ -f .env ]; then
   set -a
   source .env
@@ -21,30 +28,23 @@ fi
 
 export WANDB_BASE_URL=${WANDB_BASE_URL:-https://api.wandb.ai}
 export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
-export VLLM_ENGINE_ITERATION_TIMEOUT_S=${VLLM_ENGINE_ITERATION_TIMEOUT_S:-100000000000}
+export VLLM_ENGINE_ITERATION_TIMEOUT_S=${VLLM_ENGINE_ITERATION_TIMEOUT_S:-3600}
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export VLLM_ALLREDUCE_USE_SYMM_MEM=0
 export HYDRA_FULL_ERROR=1
-
-# Use the validated multimodal sequence path for production training.  Debug
-# events are disabled here so Ray workers do not concurrently append to a
-# shared HDFS/FUSE log file.
-export RLLM_MM_SEQUENCE_MODE=cumulative
-export RLLM_MM_DEBUG=0
 
 PYTHON_BIN="${PYTHON_BIN:-$(command -v python3)}"
 echo "Using Python: ${PYTHON_BIN}"
 "${PYTHON_BIN}" -c "import torch; print('torch:', torch.__version__, 'cuda:', torch.version.cuda)"
 "${PYTHON_BIN}" -c "import transformer_engine.pytorch as te; print('transformer_engine: ok')"
 
-# ========= user-overridable paths / data =========
-MODEL_PATH=${MODEL_PATH:-/mnt/hdfs/byte_ai_sales/user/user/yinzhihan/agent/OpenSearch-VL/SFT/saves/qwen3_vl_8b/full/data_redundancy_compressed_gpt54_640_tagclean_2node16gpu_lr_2e_5_cosine_to_zero_epoch5}
-DATASET_NAME=${DATASET_NAME:-Vision-DeepResearch-QA-rl-combined-5871}
-EVAL_DATASET_NAME=${EVAL_DATASET_NAME:-Vision-DeepResearch-QA-benchmark-eval-200}
+# ========= paths / data =========
+MODEL_PATH=${MODEL_PATH:-/mnt/hdfs/byte_ai_sales/user/user/yinzhihan/agent/OpenSearch-VL/SFT/saves/qwen3_vl_8b/full/data_final_nothink_v2_2node16gpu_lr_2e_5_cosine_to_zero_epoch3}
+DATASET_NAME=${DATASET_NAME:-Vision-DeepResearch-QA-smoke-128}
 TRAIN_SPLIT=${TRAIN_SPLIT:-train}
 VAL_SPLIT=${VAL_SPLIT:-test}
-PROJECT_NAME=${PROJECT_NAME:-vision-deepresearch}
-EXPERIMENT_NAME=${EXPERIMENT_NAME:-open_mm_searcher_8b_2node}
+PROJECT_NAME=${PROJECT_NAME:-vision-deepresearch-smoke}
+EXPERIMENT_NAME=${EXPERIMENT_NAME:-qwen3-vl-8b-2node-minimal}
 CKPTS_DIR=${CKPTS_DIR:-checkpoints/${PROJECT_NAME}/${EXPERIMENT_NAME}}
 
 # ========= rollout / algorithm =========
@@ -59,26 +59,30 @@ use_kl_loss=False
 kl_loss_coef=0.001
 clip_ratio_high=0.28
 
-# ========= batch / workflow =========
-train_prompt_bsz=192
-n_resp_per_prompt=7
-train_prompt_mini_bsz=64
-n_parallel_tasks=160
-n_parallel_tools=160
+# One prompt and two sampled responses are the smallest useful RLOO group.
+train_prompt_bsz=1
+n_resp_per_prompt=2
+train_prompt_mini_bsz=1
+n_parallel_tasks=2
+n_parallel_tools=2
 
-# ========= length =========
+# Keep enough room for the actual multimodal prompt and one short ReAct turn.
 max_prompt_length=4096
-max_response_length=56000
+max_response_length=70000
 use_dynamic_bsz=True
-actor_ppo_max_token_len_per_gpu=74576
-infer_ppo_max_token_len_per_gpu=74576
+# context_parallel_size=2, so the effective dynamic token budget is 81920.
+# This must cover max_prompt_length + max_response_length = 74096.
+actor_ppo_max_token_len_per_gpu=40960
+infer_ppo_max_token_len_per_gpu=40960
 
-# ========= offload / parallelism =========
+# ========= 2-node x 8-GPU parallelism =========
 offload=True
 gen_tp=4
 train_tp=4
 train_pp=2
 train_cp=2
+NNODES=2
+N_GPUS_PER_NODE=8
 
 # ========= sampling =========
 temperature=0.7
@@ -87,21 +91,16 @@ top_k=-1
 val_top_p=0.95
 loss_agg_mode="seq-mean-token-sum"
 
-# ========= cluster =========
-NNODES=2
-N_GPUS_PER_NODE=8
-
 "${PYTHON_BIN}" -m vision_deepresearch_async_workflow.train_deepresearch_workflow_megatron \
     algorithm.adv_estimator=${adv_estimator} \
     algorithm.kl_ctrl.kl_coef=${kl_coef} \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
     \
     data.dataset_name="${DATASET_NAME}" \
-    data.val_dataset_name="${EVAL_DATASET_NAME}" \
     data.train_split="${TRAIN_SPLIT}" \
     data.val_split="${VAL_SPLIT}" \
     data.train_batch_size=${train_prompt_bsz} \
-    data.val_batch_size=64 \
+    data.val_batch_size=1 \
     data.max_prompt_length=${max_prompt_length} \
     data.max_response_length=${max_response_length} \
     data.return_raw_chat=${return_raw_chat} \
@@ -115,7 +114,7 @@ N_GPUS_PER_NODE=8
     actor_rollout_ref.rollout.mode=${rollout_mode} \
     actor_rollout_ref.rollout.dtype=${dtype} \
     actor_rollout_ref.rollout.tensor_model_parallel_size=${gen_tp} \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.85 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.75 \
     actor_rollout_ref.rollout.enforce_eager=True \
     actor_rollout_ref.rollout.temperature=${temperature} \
     actor_rollout_ref.rollout.top_p=${top_p} \
@@ -175,26 +174,26 @@ N_GPUS_PER_NODE=8
     actor_rollout_ref.actor.loss_agg_mode=${loss_agg_mode} \
     \
     rllm.workflow.use_workflow=True \
-    rllm.workflow.workflow_args.timeout=1800 \
     rllm.workflow.n_parallel_tasks=${n_parallel_tasks} \
     rllm.workflow.n_parallel_tools=${n_parallel_tools} \
-    rllm.compact_filtering.enable=True \
-    rllm.compact_filtering.mask_unknown=True \
-    rllm.compact_filtering.mask_error=True \
+    rllm.workflow.retry_limit=1 \
+    rllm.compact_filtering.enable=False \
     rllm.rejection_sample.enable=False \
     rllm.rejection_sample.multiplier=1.0 \
     rllm.stepwise_advantage.enable=False \
     +ray_init.include_dashboard=False \
     \
     trainer.critic_warmup=0 \
-    trainer.logger='["console","wandb"]' \
+    trainer.logger='["console"]' \
     trainer.project_name="${PROJECT_NAME}" \
     trainer.experiment_name="${EXPERIMENT_NAME}" \
     trainer.val_before_train=False \
+    +trainer.run_final_validation=False \
     trainer.n_gpus_per_node=${N_GPUS_PER_NODE} \
     trainer.nnodes=${NNODES} \
-    trainer.save_freq=30 \
-    trainer.test_freq=10 \
+    trainer.save_freq=1 \
+    trainer.test_freq=-1 \
     trainer.resume_mode=disable \
-    trainer.total_epochs=2 \
+    trainer.total_epochs=1 \
+    trainer.total_training_steps=1 \
     trainer.default_local_dir="${CKPTS_DIR}"

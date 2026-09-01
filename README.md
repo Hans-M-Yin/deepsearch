@@ -227,7 +227,7 @@ Cold-starts the base VLM on **7 tool-use datasets** (FVQA, Palace, WebQA, LiveVQ
 ```bash
 cd code/SFT
 pip install -e ".[torch,metrics,deepspeed,ray]"
-pip install qwen-vl-utils pillow av decord torchvision flash-attn
+pip install qwen-vl-utils pillow av decord torchvision flash-attn cairosvg
 ```
 
 ### Data layout
@@ -487,4 +487,3 @@ This repository bundles and builds on several outstanding open-source projects; 
 Project-specific additions are released under the root [`LICENSE`](LICENSE) (Apache 2.0).
 
 ---
-

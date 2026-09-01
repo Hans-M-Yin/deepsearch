@@ -619,6 +619,12 @@ def execute_tool(
             or params.get("image_id")
             or ""
         )
+        # Be tolerant of model calls that put a compact search-result ID in
+        # the legacy ``url`` field. Otherwise normalize_http_url() would
+        # reinterpret it as a hostname such as https://image_.../.
+        if not resource_id and sft_tools.is_compact_resource_id(url):
+            resource_id = url
+            url = ""
         resource = None
         if resource_id:
             resource = _resolve_registered_resource(resource_registry, resource_id)

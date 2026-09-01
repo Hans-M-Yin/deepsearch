@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import os
 import time
 from datetime import datetime
@@ -317,6 +318,13 @@ class MultiTurnReactAgent:
         self.prompt_tokens_by_call: list[int] = []
         self.completion_tokens_by_call: list[int] = []
         self.model_call_count = 0
+        # Per-trajectory latency samples.  Keep the raw samples small and
+        # local to the trajectory; the workflow aggregates them into batch
+        # metrics before the DataProto is returned to the trainer.
+        self._llm_latency_samples_s: list[float] = []
+        self._llm_latency_failures = 0
+        self._tool_latency_samples_s: dict[str, list[float]] = {}
+        self._tool_latency_failures: dict[str, int] = {}
         # Stage 1 keeps the processor output of every model call so the
         # stepwise DataProto path can carry visual payloads into update.  Do
         # not retain these large tensors in the default/legacy path.
@@ -381,6 +389,91 @@ class MultiTurnReactAgent:
         self.prompt_tokens_by_call.append(self.last_prompt_tokens)
         self.completion_tokens_by_call.append(self.last_completion_tokens)
         self.model_call_count += 1
+
+    @staticmethod
+    def _percentile(samples: list[float], percentile: float) -> float:
+        """Return a dependency-free percentile for a small sample list."""
+
+        if not samples:
+            return 0.0
+        ordered = sorted(float(sample) for sample in samples)
+        index = max(
+            0,
+            min(
+                len(ordered) - 1,
+                math.ceil((float(percentile) / 100.0) * len(ordered)) - 1,
+            ),
+        )
+        return ordered[index]
+
+    @classmethod
+    def _summarize_latency_samples(
+        cls,
+        samples: list[float],
+        *,
+        failures: int = 0,
+        include_samples: bool = True,
+    ) -> dict[str, Any]:
+        values = [max(0.0, float(sample)) for sample in samples]
+        calls = len(values)
+        summary: dict[str, Any] = {
+            "calls": calls,
+            "failures": int(failures),
+            "total_s": round(sum(values), 6),
+            "mean_s": round(sum(values) / calls, 6) if calls else 0.0,
+            "p95_s": round(cls._percentile(values, 95), 6) if values else 0.0,
+            "max_s": round(max(values), 6) if values else 0.0,
+        }
+        if include_samples:
+            # These are scalar telemetry values, not prompts/tool payloads.
+            # Retaining them enables exact batch-level p95 aggregation.
+            summary["samples_s"] = [round(value, 6) for value in values]
+        return summary
+
+    def _record_llm_latency(self, elapsed_s: float, *, success: bool) -> None:
+        self._llm_latency_samples_s.append(max(0.0, float(elapsed_s)))
+        if not success:
+            self._llm_latency_failures += 1
+
+    def _record_tool_latency(
+        self,
+        tool_name: str,
+        elapsed_s: float,
+        *,
+        success: bool,
+    ) -> None:
+        name = str(tool_name or "unknown")
+        self._tool_latency_samples_s.setdefault(name, []).append(
+            max(0.0, float(elapsed_s))
+        )
+        if not success:
+            self._tool_latency_failures[name] = (
+                self._tool_latency_failures.get(name, 0) + 1
+            )
+
+    def _build_latency_stats(self, trajectory_time_s: float) -> dict[str, Any]:
+        tool_summaries: dict[str, dict[str, Any]] = {}
+        all_tool_samples: list[float] = []
+        for tool_name, samples in sorted(self._tool_latency_samples_s.items()):
+            all_tool_samples.extend(samples)
+            tool_summaries[tool_name] = self._summarize_latency_samples(
+                samples,
+                failures=self._tool_latency_failures.get(tool_name, 0),
+            )
+
+        return {
+            "trajectory_time_s": round(max(0.0, float(trajectory_time_s)), 6),
+            "llm": self._summarize_latency_samples(
+                self._llm_latency_samples_s,
+                failures=self._llm_latency_failures,
+            ),
+            "tool": self._summarize_latency_samples(
+                all_tool_samples,
+                failures=sum(self._tool_latency_failures.values()),
+                include_samples=False,
+            ),
+            "tools": tool_summaries,
+        }
 
     def get_total_tokens_used(self) -> int:
         """Return cumulative prompt + completion tokens for this trajectory."""
@@ -453,9 +546,10 @@ class MultiTurnReactAgent:
             "prediction": prediction,
             "termination": termination,
             "rounds": rounds,
-            "time_taken": time.time() - start_time,
+            "time_taken": time.perf_counter() - start_time,
             "token_usage": token_usage,
         }
+        result["latency"] = self._build_latency_stats(result["time_taken"])
         if self._sequence_mode == "stepwise":
             # ModelOutput contains the processor-expanded prompt ids and the
             # corresponding pixel_values/image_grid_thw.  It is consumed by
@@ -482,7 +576,7 @@ class MultiTurnReactAgent:
         Supports image-processing tools via an internal ``image_paths``
         dictionary that maps ``img_1``, ``img_2``, … to local paths / URLs.
         """
-        start_time = time.time()
+        start_time = time.perf_counter()
         # RL may inject a sample-scoped cache.  Remove it before forwarding
         # kwargs to the model client; it is only for tool execution.
         tool_cache = kwargs.pop("tool_cache", None)
@@ -496,6 +590,10 @@ class MultiTurnReactAgent:
         self.prompt_tokens_by_call = []
         self.completion_tokens_by_call = []
         self.model_call_count = 0
+        self._llm_latency_samples_s = []
+        self._llm_latency_failures = 0
+        self._tool_latency_samples_s = {}
+        self._tool_latency_failures = {}
         self.model_outputs_by_round = []
         self.last_model_output = None
         # Read this at run time as well as construction time so a workflow
@@ -558,8 +656,11 @@ class MultiTurnReactAgent:
             num_llm_calls_available -= 1
 
             # Get model response from rollout engine
+            llm_started_at = time.perf_counter()
+            llm_succeeded = False
             try:
                 response = await self.call_server(messages, **kwargs)
+                llm_succeeded = True
             except Exception as exc:  # noqa: BLE001
                 prediction = "call_server failed"
                 termination = "error"
@@ -571,6 +672,11 @@ class MultiTurnReactAgent:
                     termination=termination,
                     rounds=round,
                     start_time=start_time,
+                )
+            finally:
+                self._record_llm_latency(
+                    time.perf_counter() - llm_started_at,
+                    success=llm_succeeded,
                 )
 
             self.record_token_usage(response)
@@ -621,6 +727,7 @@ class MultiTurnReactAgent:
                         # only by the parsed tool name.  Checking whether the
                         # raw JSON contains the word "python" would wrongly
                         # intercept valid search queries such as "Python history".
+                        tool_started_at = time.perf_counter()
                         try:
                             code_raw = str(tool_args.get("code") or "").strip()
                             if not code_raw:
@@ -639,7 +746,14 @@ class MultiTurnReactAgent:
                         except Exception:
                             result = "[Python Interpreter Error]: Python code formatting error."
                             tool_error = True
+                        finally:
+                            self._record_tool_latency(
+                                tool_name,
+                                time.perf_counter() - tool_started_at,
+                                success=not tool_error,
+                            )
                     else:
+                        tool_started_at = time.perf_counter()
                         try:
                             result = await self.custom_call_tool(
                                 tool_name,
@@ -652,6 +766,12 @@ class MultiTurnReactAgent:
                         except Exception as exc:  # noqa: BLE001
                             result = f"Tool execution error: {type(exc).__name__}: {exc}"
                             tool_error = True
+                        finally:
+                            self._record_tool_latency(
+                                tool_name,
+                                time.perf_counter() - tool_started_at,
+                                success=not tool_error,
+                            )
 
                 if tool_error:
                     assistant_message["step_error"] = True
