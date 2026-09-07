@@ -1,5 +1,7 @@
 import asyncio
 import logging
+import sys
+import time
 import uuid
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
@@ -25,6 +27,11 @@ if TYPE_CHECKING:
     from verl import DataProto
 
 logger = logging.getLogger(__name__)
+
+# Print a lightweight terminal progress summary after every N completed
+# rollouts.  This is intentionally local to rollout collection and does not
+# affect scheduling, retry, or training behavior.
+ROLLOUT_PROGRESS_INTERVAL = 50
 
 
 def _apply_fatal_step_mask(
@@ -73,6 +80,11 @@ def _aggregate_rollout_latency(episodes: list[Episode]) -> dict[str, float]:
     tool_samples_by_name: dict[str, list[float]] = defaultdict(list)
     tool_call_counts_by_name: dict[str, list[float]] = defaultdict(list)
     tool_failures_by_name: dict[str, int] = defaultdict(int)
+    wikimedia_download_calls = 0
+    wikimedia_download_success = 0
+    wikimedia_download_cache_success = 0
+    wikimedia_download_failure = 0
+    wikimedia_download_times: list[float] = []
     llm_failures = 0
     tool_failures = 0
     valid_episodes = 0
@@ -105,6 +117,21 @@ def _aggregate_rollout_latency(episodes: list[Episode]) -> dict[str, float]:
             tool_total_times.append(max(0.0, float(tool.get("total_s") or 0.0)))
             tool_call_counts.append(float(tool.get("calls") or 0))
             tool_failures += int(tool.get("failures") or 0)
+
+        wikimedia_download = latency.get("wikimedia_download")
+        if isinstance(wikimedia_download, dict):
+            wikimedia_download_calls += int(wikimedia_download.get("calls") or 0)
+            wikimedia_download_success += int(
+                wikimedia_download.get("download_success") or 0
+            )
+            wikimedia_download_cache_success += int(
+                wikimedia_download.get("cache_success") or 0
+            )
+            wikimedia_download_failure += int(wikimedia_download.get("failure") or 0)
+            calls = int(wikimedia_download.get("calls") or 0)
+            total_s = max(0.0, float(wikimedia_download.get("total_s") or 0.0))
+            if calls > 0:
+                wikimedia_download_times.extend([total_s / calls] * calls)
 
         tools = latency.get("tools")
         if not isinstance(tools, dict):
@@ -146,11 +173,24 @@ def _aggregate_rollout_latency(episodes: list[Episode]) -> dict[str, float]:
     add_distribution("tool_call_time", tool_call_samples)
     add_distribution("llm_total_time", llm_total_times)
     add_distribution("tool_total_time", tool_total_times)
+    add_distribution("wikimedia_download_time", wikimedia_download_times)
 
     if llm_call_counts:
         metrics["rollout/llm_calls_mean"] = float(np.mean(llm_call_counts))
     if tool_call_counts:
         metrics["rollout/tool_calls_mean"] = float(np.mean(tool_call_counts))
+    metrics["rollout/wikimedia_download_calls_total"] = float(
+        wikimedia_download_calls
+    )
+    metrics["rollout/wikimedia_download_success_total"] = float(
+        wikimedia_download_success
+    )
+    metrics["rollout/wikimedia_download_cache_success_total"] = float(
+        wikimedia_download_cache_success
+    )
+    metrics["rollout/wikimedia_download_failure_total"] = float(
+        wikimedia_download_failure
+    )
 
     for tool_name, samples in sorted(tool_samples_by_name.items()):
         prefix = f"tool/{tool_name}/call_time"
@@ -348,14 +388,10 @@ class AgentWorkflowEngine:
                     task=task, uid=uid, **kwargs
                 )
 
-                # Display rewards for all trajectories
-                rewards_str = ", ".join(
-                    [f"{traj.name}: {traj.reward:.1f}" for traj in episode.trajectories]
-                )
-                colorful_print(
-                    f"[{uid}] Rollout completed. Rewards: {rewards_str}, Termination: {episode.termination_reason}",
-                    fg="green" if episode.is_correct else "yellow",
-                )
+                # Temporarily suppress one terminal line per rollout.  The
+                # every-50-rollout progress summary retains aggregate reward,
+                # termination, and timing information without producing
+                # high-frequency stdout traffic.
 
                 if episode.termination_reason != TerminationReason.ERROR:
                     return task_id, rollout_idx, episode
@@ -403,6 +439,12 @@ class AgentWorkflowEngine:
         if task_ids is None:
             task_ids = [str(uuid.uuid4()) for _ in tasks]
 
+        # Optional local callback used by the RL trainer to emit a compact
+        # live W&B record while one long logical training step is still
+        # collecting rollouts.  It is deliberately removed here so it is not
+        # passed into individual workflow/tool calls.
+        progress_callback = kwargs.pop("progress_callback", None)
+
         # ``tool_cache`` is an optional RL-only epoch cache.  Resolve one
         # sample-scoped cache for each task before launching its sibling
         # rollouts; inference callers simply do not pass this argument.
@@ -443,6 +485,96 @@ class AgentWorkflowEngine:
             )
             state["total_rollouts"] += 1
 
+        completed_count = 0
+        correct_count = 0
+        trajectory_time_sum = 0.0
+        trajectory_time_count = 0
+        termination_counts: dict[str, int] = defaultdict(int)
+        raw_termination_counts: dict[str, int] = defaultdict(int)
+        marker_counts: dict[str, int] = defaultdict(int)
+        llm_total_s = 0.0
+        llm_call_count = 0
+        tool_total_s = 0.0
+        tool_call_count = 0
+        tool_timing: dict[str, dict[str, float]] = defaultdict(
+            lambda: {"total_s": 0.0, "calls": 0.0}
+        )
+        tool_dispatch_timing: dict[str, dict[str, float]] = defaultdict(
+            lambda: {"total_s": 0.0, "calls": 0.0}
+        )
+        read_url_stage_timing: dict[str, dict[str, float]] = defaultdict(
+            lambda: {"total_s": 0.0, "calls": 0.0}
+        )
+        wikimedia_download_stats: dict[str, float] = defaultdict(float)
+
+        # Windowed counters are reset after every progress report. The window
+        # is over completed rollouts (not individual LLM/tool calls), which
+        # makes it useful for spotting latency drift and long-tail batches.
+        recent_trajectory_time_sum = 0.0
+        recent_trajectory_time_count = 0
+        recent_llm_total_s = 0.0
+        recent_llm_call_count = 0
+        recent_tool_total_s = 0.0
+        recent_tool_call_count = 0
+        recent_tool_timing: dict[str, dict[str, float]] = defaultdict(
+            lambda: {"total_s": 0.0, "calls": 0.0}
+        )
+        recent_tool_dispatch_timing: dict[str, dict[str, float]] = defaultdict(
+            lambda: {"total_s": 0.0, "calls": 0.0}
+        )
+        recent_read_url_stage_timing: dict[str, dict[str, float]] = defaultdict(
+            lambda: {"total_s": 0.0, "calls": 0.0}
+        )
+        recent_wikimedia_download_stats: dict[str, float] = defaultdict(float)
+
+        def add_timing(
+            target: dict[str, dict[str, float]],
+            name: str,
+            total_s: float,
+            calls: int,
+        ) -> None:
+            if calls <= 0:
+                return
+            target[str(name)]["total_s"] += max(0.0, float(total_s))
+            target[str(name)]["calls"] += int(calls)
+
+        def format_named_timing(
+            timing: dict[str, dict[str, float]],
+        ) -> str:
+            return ";".join(
+                f"{name}(avg_s={values['total_s'] / values['calls']:.2f},"
+                f"total_s={values['total_s']:.1f},calls={int(values['calls'])})"
+                for name, values in sorted(timing.items())
+                if values["calls"] > 0
+            ) or "-"
+
+        def format_read_url_stage_timing(
+            timing: dict[str, dict[str, float]],
+        ) -> str:
+            stage_names = (
+                "enhanced_reader",
+                "http_download",
+                "firecrawl_scrape",
+                "wikimedia_download",
+            )
+            return ";".join(
+                f"{name}(avg_s={(timing[name]['total_s'] / timing[name]['calls']) if timing[name]['calls'] else 0.0:.2f},"
+                f"total_s={timing[name]['total_s']:.1f},calls={int(timing[name]['calls'])})"
+                for name in stage_names
+            )
+
+        def format_wikimedia_download_stats(stats: dict[str, float]) -> str:
+            calls = int(stats.get("calls", 0.0))
+            total_s = float(stats.get("total_s", 0.0))
+            avg_s = total_s / calls if calls else 0.0
+            return (
+                f"download_success={int(stats.get('download_success', 0.0))},"
+                f"cache_success={int(stats.get('cache_success', 0.0))},"
+                f"failure={int(stats.get('failure', 0.0))},"
+                f"avg_s={avg_s:.2f},total_s={total_s:.1f},calls={calls}"
+            )
+        progress_started_at = time.monotonic()
+
         with tqdm(total=len(tasks), desc="Generating trajectories") as pbar:
             for future in asyncio.as_completed(futures):
                 task_id, rollout_idx, episode = await future
@@ -450,7 +582,313 @@ class AgentWorkflowEngine:
                 state = task_states[task_id]
                 state["episodes"].append(episode)
                 state["completed"] += 1
+                completed_count += 1
+                correct_count += int(bool(getattr(episode, "is_correct", False)))
+
+                termination = getattr(episode, "termination_reason", None)
+                termination_name = getattr(termination, "value", None) or str(
+                    termination or "unknown"
+                )
+                termination_counts[termination_name] += 1
+
+                episode_info = getattr(episode, "info", None)
+                if not isinstance(episode_info, dict):
+                    episode_info = {}
+
+                raw_termination = episode_info.get("raw_termination")
+                if raw_termination:
+                    raw_termination_counts[str(raw_termination)] += 1
+
+                markers = episode_info.get("rollout_markers", [])
+                if isinstance(markers, (list, tuple, set)):
+                    for marker in markers:
+                        marker_counts[str(marker)] += 1
+
+                latency = episode_info.get("latency")
+                if isinstance(latency, dict):
+                    llm_summary = latency.get("llm")
+                    if isinstance(llm_summary, dict):
+                        llm_samples = [
+                            max(0.0, float(value))
+                            for value in (llm_summary.get("samples_s") or [])
+                        ]
+                        llm_total_s += float(
+                            llm_summary.get("total_s") or sum(llm_samples)
+                        )
+                        llm_calls = int(
+                            llm_summary.get("calls") or len(llm_samples)
+                        )
+                        llm_call_count += llm_calls
+                        recent_llm_total_s += float(
+                            llm_summary.get("total_s") or sum(llm_samples)
+                        )
+                        recent_llm_call_count += llm_calls
+
+                    tool_summary = latency.get("tool")
+                    if isinstance(tool_summary, dict):
+                        tool_samples = [
+                            max(0.0, float(value))
+                            for value in (tool_summary.get("samples_s") or [])
+                        ]
+                        tool_total = float(
+                            tool_summary.get("total_s") or sum(tool_samples)
+                        )
+                        tool_calls = int(
+                            tool_summary.get("calls") or len(tool_samples)
+                        )
+                        tool_total_s += tool_total
+                        tool_call_count += tool_calls
+                        recent_tool_total_s += tool_total
+                        recent_tool_call_count += tool_calls
+
+                    tool_summaries = latency.get("tools")
+                    if isinstance(tool_summaries, dict):
+                        for tool_name, summary in tool_summaries.items():
+                            if not isinstance(summary, dict):
+                                continue
+                            samples = [
+                                max(0.0, float(value))
+                                for value in (summary.get("samples_s") or [])
+                            ]
+                            tool_total = float(
+                                summary.get("total_s") or sum(samples)
+                            )
+                            tool_calls = int(
+                                summary.get("calls") or len(samples)
+                            )
+                            add_timing(tool_timing, str(tool_name), tool_total, tool_calls)
+                            add_timing(
+                                recent_tool_timing,
+                                str(tool_name),
+                                tool_total,
+                                tool_calls,
+                            )
+
+                    tool_dispatch_summaries = latency.get("tool_dispatch")
+                    if isinstance(tool_dispatch_summaries, dict):
+                        for metric_name, summary in tool_dispatch_summaries.items():
+                            if not isinstance(summary, dict):
+                                continue
+                            dispatch_total = float(summary.get("total_s") or 0.0)
+                            dispatch_calls = int(summary.get("calls") or 0)
+                            add_timing(
+                                tool_dispatch_timing,
+                                str(metric_name),
+                                dispatch_total,
+                                dispatch_calls,
+                            )
+                            add_timing(
+                                recent_tool_dispatch_timing,
+                                str(metric_name),
+                                dispatch_total,
+                                dispatch_calls,
+                            )
+
+                    wikimedia_download = latency.get("wikimedia_download")
+                    if isinstance(wikimedia_download, dict):
+                        for key in (
+                            "calls",
+                            "download_success",
+                            "cache_success",
+                            "failure",
+                            "total_s",
+                        ):
+                            try:
+                                value = max(
+                                    0.0,
+                                    float(wikimedia_download.get(key) or 0.0),
+                                )
+                            except (TypeError, ValueError):
+                                continue
+                            wikimedia_download_stats[key] += value
+                            recent_wikimedia_download_stats[key] += value
+
+                    read_url_stages = latency.get("read_url_stages")
+                    if isinstance(read_url_stages, dict):
+                        for stage_name, summary in read_url_stages.items():
+                            if not isinstance(summary, dict):
+                                continue
+                            stage_total = float(summary.get("total_s") or 0.0)
+                            stage_calls = int(summary.get("calls") or 0)
+                            add_timing(
+                                read_url_stage_timing,
+                                str(stage_name),
+                                stage_total,
+                                stage_calls,
+                            )
+                            add_timing(
+                                recent_read_url_stage_timing,
+                                str(stage_name),
+                                stage_total,
+                                stage_calls,
+                            )
+
+                trajectory_time = (
+                    latency.get("trajectory_time_s")
+                    if isinstance(latency, dict)
+                    else None
+                )
+                if trajectory_time is not None:
+                    try:
+                        trajectory_time_sum += max(0.0, float(trajectory_time))
+                        trajectory_time_count += 1
+                        recent_trajectory_time_sum += max(0.0, float(trajectory_time))
+                        recent_trajectory_time_count += 1
+                    except (TypeError, ValueError):
+                        pass
+
                 pbar.update(1)
+
+                if completed_count % ROLLOUT_PROGRESS_INTERVAL == 0:
+                    elapsed = max(time.monotonic() - progress_started_at, 1e-6)
+                    rate = completed_count / elapsed
+                    termination_summary = ",".join(
+                        f"{name}:{count}"
+                        for name, count in sorted(termination_counts.items())
+                    )
+                    raw_termination_summary = ",".join(
+                        f"{name}:{count}"
+                        for name, count in sorted(raw_termination_counts.items())
+                    ) or "-"
+                    marker_summary = ",".join(
+                        f"{name}:{count}"
+                        for name, count in sorted(marker_counts.items())
+                    ) or "-"
+                    tool_timing_summary = format_named_timing(tool_timing)
+                    recent_tool_timing_summary = format_named_timing(recent_tool_timing)
+                    tool_dispatch_summary = format_named_timing(tool_dispatch_timing)
+                    recent_tool_dispatch_summary = format_named_timing(
+                        recent_tool_dispatch_timing
+                    )
+                    avg_trajectory_time = (
+                        trajectory_time_sum / trajectory_time_count
+                        if trajectory_time_count
+                        else 0.0
+                    )
+                    recent_avg_trajectory_time = (
+                        recent_trajectory_time_sum / recent_trajectory_time_count
+                        if recent_trajectory_time_count
+                        else 0.0
+                    )
+                    llm_avg_s = llm_total_s / llm_call_count if llm_call_count else 0.0
+                    tool_avg_s = tool_total_s / tool_call_count if tool_call_count else 0.0
+                    recent_llm_avg_s = (
+                        recent_llm_total_s / recent_llm_call_count
+                        if recent_llm_call_count
+                        else 0.0
+                    )
+                    recent_tool_avg_s = (
+                        recent_tool_total_s / recent_tool_call_count
+                        if recent_tool_call_count
+                        else 0.0
+                    )
+                    tqdm.write(
+                        "[RL_ROLLOUT_PROGRESS] "
+                        f"completed={completed_count}/{len(tasks)} "
+                        f"correct={correct_count} "
+                        f"elapsed_s={elapsed:.1f} "
+                        f"rate={rate:.2f}/s "
+                        f"avg_trajectory_s={avg_trajectory_time:.1f} "
+                        f"recent50_avg_trajectory_s={recent_avg_trajectory_time:.1f} "
+                        f"termination={termination_summary} "
+                        f"raw_termination={raw_termination_summary} "
+                        f"markers={marker_summary} "
+                        f"llm_request(avg_s={llm_avg_s:.2f},recent50_avg_s={recent_llm_avg_s:.2f},"
+                        f"total_s={llm_total_s:.1f},calls={llm_call_count};"
+                        f"recent50_total_s={recent_llm_total_s:.1f},recent50_calls={recent_llm_call_count}) "
+                        f"tools(avg_s={tool_avg_s:.2f},recent50_avg_s={recent_tool_avg_s:.2f},"
+                        f"total_s={tool_total_s:.1f},calls={tool_call_count};"
+                        f"by_name={tool_timing_summary};recent50_by_name={recent_tool_timing_summary}) "
+                        f"tool_dispatch(overall={tool_dispatch_summary};"
+                        f"recent50={recent_tool_dispatch_summary}) "
+                        f"read_url_stages(overall={format_read_url_stage_timing(read_url_stage_timing)};"
+                        f"recent50={format_read_url_stage_timing(recent_read_url_stage_timing)}) "
+                        f"wikimedia_download(overall={format_wikimedia_download_stats(wikimedia_download_stats)};"
+                        f"recent50={format_wikimedia_download_stats(recent_wikimedia_download_stats)})"
+                    )
+                    sys.stdout.flush()
+
+                    if progress_callback is not None:
+                        live_metrics = {
+                            "live/rollouts_completed": completed_count,
+                            "live/rollouts_total": len(tasks),
+                            "live/rollouts_correct": correct_count,
+                            "live/elapsed_s": elapsed,
+                            "live/rate_per_s": rate,
+                            "live/trajectory_avg_s": avg_trajectory_time,
+                            "live/trajectory_recent50_avg_s": recent_avg_trajectory_time,
+                            "live/llm_avg_s": llm_avg_s,
+                            "live/llm_recent50_avg_s": recent_llm_avg_s,
+                            "live/llm_total_s": llm_total_s,
+                            "live/llm_calls": llm_call_count,
+                            "live/tool_avg_s": tool_avg_s,
+                            "live/tool_recent50_avg_s": recent_tool_avg_s,
+                            "live/tool_total_s": tool_total_s,
+                            "live/tool_calls": tool_call_count,
+                            "live/wikimedia_download/download_success": wikimedia_download_stats.get(
+                                "download_success", 0.0
+                            ),
+                            "live/wikimedia_download/cache_success": wikimedia_download_stats.get(
+                                "cache_success", 0.0
+                            ),
+                            "live/wikimedia_download/failure": wikimedia_download_stats.get(
+                                "failure", 0.0
+                            ),
+                            "live/wikimedia_download/calls": wikimedia_download_stats.get(
+                                "calls", 0.0
+                            ),
+                            "live/wikimedia_download/total_s": wikimedia_download_stats.get(
+                                "total_s", 0.0
+                            ),
+                            "live/wikimedia_download/recent50_download_success": recent_wikimedia_download_stats.get(
+                                "download_success", 0.0
+                            ),
+                            "live/wikimedia_download/recent50_cache_success": recent_wikimedia_download_stats.get(
+                                "cache_success", 0.0
+                            ),
+                            "live/wikimedia_download/recent50_failure": recent_wikimedia_download_stats.get(
+                                "failure", 0.0
+                            ),
+                            "live/wikimedia_download/recent50_calls": recent_wikimedia_download_stats.get(
+                                "calls", 0.0
+                            ),
+                            "live/wikimedia_download/recent50_total_s": recent_wikimedia_download_stats.get(
+                                "total_s", 0.0
+                            ),
+                        }
+                        for stage_name, stage_values in read_url_stage_timing.items():
+                            stage_prefix = f"live/read_url/{stage_name}"
+                            stage_calls = int(stage_values["calls"])
+                            live_metrics[f"{stage_prefix}/total_s"] = stage_values[
+                                "total_s"
+                            ]
+                            live_metrics[f"{stage_prefix}/calls"] = stage_calls
+                            live_metrics[f"{stage_prefix}/avg_s"] = (
+                                stage_values["total_s"] / stage_calls
+                                if stage_calls
+                                else 0.0
+                            )
+                        try:
+                            progress_callback(live_metrics, self.current_step)
+                        except Exception as exc:
+                            # Monitoring must never turn into a rollout error.
+                            logger.warning(
+                                "Live rollout logging failed at completed=%s: %s",
+                                completed_count,
+                                exc,
+                            )
+
+                    # Start the next completed-rollout window.
+                    recent_trajectory_time_sum = 0.0
+                    recent_trajectory_time_count = 0
+                    recent_llm_total_s = 0.0
+                    recent_llm_call_count = 0
+                    recent_tool_total_s = 0.0
+                    recent_tool_call_count = 0
+                    recent_tool_timing.clear()
+                    recent_tool_dispatch_timing.clear()
+                    recent_read_url_stage_timing.clear()
+                    recent_wikimedia_download_stats.clear()
 
         results = []
         sorted_tasks = sorted(
@@ -540,6 +978,7 @@ class AgentWorkflowEngine:
         is_correct = []
         traj_mask = []
         termination_reasons = []
+        rollout_markers = []
         metrics = []
         multi_modal_inputs_list = []
         is_fatal_flags = []
@@ -753,6 +1192,14 @@ class AgentWorkflowEngine:
                 * total_steps
             )
             metrics.extend([episode.metrics] * total_steps)
+            episode_markers = ep_info.get("rollout_markers", [])
+            if isinstance(episode_markers, (list, tuple, set)):
+                episode_markers = ",".join(
+                    sorted({str(marker) for marker in episode_markers})
+                )
+            else:
+                episode_markers = str(episode_markers or "")
+            rollout_markers.extend([episode_markers] * total_steps)
             repeat_counts.append(total_steps)
 
         prompts_batch = torch.nn.utils.rnn.pad_sequence(
@@ -961,6 +1408,7 @@ class AgentWorkflowEngine:
             "step_nums": np.array(step_nums),
             "is_correct": np.array(is_correct),
             "termination_reasons": np.array([x.value for x in termination_reasons]),
+            "rollout_markers": np.array(rollout_markers, dtype=object),
             "metrics": np.array(metrics),
             "is_valid": np.array(is_valid),
             "is_last_step": np.array(is_last_step),

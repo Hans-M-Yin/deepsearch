@@ -41,6 +41,7 @@ def gptmodel_forward_1f1b_overlap(
     logits_processor: Optional[Callable] = None,
     logits_processor_args: Optional[dict] = None,
     temperature: float = 1.0,
+    calculate_entropy: bool = True,
 ) -> TransformerModelChunkSchedulePlan:
     pre_process: bool = unwrap_model(model).pre_process
     post_process: bool = unwrap_model(model).post_process
@@ -196,6 +197,7 @@ def gptmodel_forward_1f1b_overlap(
                     temperature,
                     "none",
                     parallel_state.get_tensor_model_parallel_group(),
+                    calculate_entropy,
                 )
                 output.entropy = entropy
                 output.log_probs = logprobs

@@ -93,10 +93,10 @@ Tool rules:
 4. read_url reads a prior search resource or a directly available URL. Include a focused goal describing the evidence to extract.
 5. Use resource IDs returned by search tools instead of inventing or exposing backend URLs.
 
-When enough evidence has been collected, finish with:
-<answer>final answer</answer>
-
-Do not call tools not listed above. Do not emit more than one tool call in a turn.
+When enough evidence has been collected, you should follow the format:
+<thinking>...</thinking><answer>wrap your final answer here</answer>
+Before that, you should follow the format:
+<thinking></thinking><tool_call>tool use here</tool_call>.
 """ + "\n\n" + qwen_tool_prompt
 
 

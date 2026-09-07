@@ -17,8 +17,9 @@ from typing import Dict, Optional
 # Generic runtime knobs
 # ---------------------------------------------------------------------------
 
-# Maximum number of agent turns per case before forcing termination.
-MAX_TURNS: int = int(os.environ.get("AGENT_MAX_TURNS", "50"))
+# Maximum number of agent turns per case.  The final turn is reserved for a
+# forced answer when the preceding turn still requests another tool call.
+MAX_TURNS: int = int(os.environ.get("AGENT_MAX_TURNS", "46"))
 
 # Maximum number of tool calls allowed for one case.  Keep this below
 # MAX_TURNS so the agent still has room to produce a final answer.

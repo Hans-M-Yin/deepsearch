@@ -46,6 +46,7 @@ coverage.xml
 # --- Local data / model artifacts (do NOT ship into the repo) ---
 checkpoints/
 ckpts/
+RL/rollouts/
 runs/
 wandb/
 outputs/

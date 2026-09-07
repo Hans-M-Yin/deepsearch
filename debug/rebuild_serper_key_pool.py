@@ -125,14 +125,13 @@ def main() -> int:
         print("No Serper keys configured.", file=sys.stderr)
         return 2
 
-    # Use the normal client with the complete pool.  We only move its cursor
-    # before each request; this preserves the normal state format and rotation.
+    # Use the fixed-key client for the probe.  The Relay pool remains the
+    # source of rotation/state; this utility explicitly acquires the selected
+    # key so each configured key can still be validated one at a time.
     client = SerperSearchClient(
-        api_keys=keys,
+        api_key=keys[0],
         search_url=args.search_url,
         timeout_s=args.timeout_s,
-        pool_state_path=pool.state_path,
-        pool_min_remaining=pool.min_remaining,
         ipv6_only=args.ipv6_only,
     )
 
@@ -158,6 +157,12 @@ def main() -> int:
             continue
 
         tested += 1
+        selected_key, _ = pool.acquire_key()
+        if selected_key != key:
+            raise RuntimeError(
+                f"Serper pool selected an unexpected key during validation: expected {masked}"
+            )
+        client.api_key = key
         started = time.perf_counter()
         try:
             response = client.search_text(args.query, limit=max(1, args.limit), hl=args.hl)

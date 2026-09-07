@@ -3,12 +3,15 @@ set -xeuo pipefail
 
 # Minimal end-to-end RL pipeline test for 2 nodes x 8 GPUs.
 #
-# This keeps the real SGLang rollout, SFT tool adapter, reward computation and
-# Megatron actor update, but executes only one training update:
+# This keeps the formal 2-node configuration and executes on the smallest
+# registered dataset/batch:
 #   - one prompt per training batch
 #   - two rollouts per prompt (RLOO)
-#   - two concurrent workflow/tool slots
-#   - no periodic or final validation
+#   - one training update (hard-capped below by total_training_steps=1)
+#
+# The model, sequence, rollout, reward, parallelism and checkpoint settings are
+# intentionally aligned with qwen3-vl-8b-2node.sh. Only dataset/batch scale and
+# the experiment name remain smoke-test specific.
 #
 # Override MODEL_PATH or DATASET_NAME from the shell when needed.
 
@@ -28,10 +31,15 @@ fi
 
 export WANDB_BASE_URL=${WANDB_BASE_URL:-https://api.wandb.ai}
 export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
-export VLLM_ENGINE_ITERATION_TIMEOUT_S=${VLLM_ENGINE_ITERATION_TIMEOUT_S:-3600}
+export VLLM_ENGINE_ITERATION_TIMEOUT_S=${VLLM_ENGINE_ITERATION_TIMEOUT_S:-100000000000}
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export VLLM_ALLREDUCE_USE_SYMM_MEM=0
 export HYDRA_FULL_ERROR=1
+
+# Use the same validated multimodal path as the formal run. Debug output is
+# disabled because Ray workers must not append concurrently to an HDFS/FUSE log.
+export RLLM_MM_SEQUENCE_MODE=cumulative
+export RLLM_MM_DEBUG=0
 
 PYTHON_BIN="${PYTHON_BIN:-$(command -v python3)}"
 echo "Using Python: ${PYTHON_BIN}"
@@ -39,11 +47,12 @@ echo "Using Python: ${PYTHON_BIN}"
 "${PYTHON_BIN}" -c "import transformer_engine.pytorch as te; print('transformer_engine: ok')"
 
 # ========= paths / data =========
-MODEL_PATH=${MODEL_PATH:-/mnt/hdfs/byte_ai_sales/user/user/yinzhihan/agent/OpenSearch-VL/SFT/saves/qwen3_vl_8b/full/data_final_nothink_v2_2node16gpu_lr_2e_5_cosine_to_zero_epoch3}
+MODEL_PATH=${MODEL_PATH:-/mnt/hdfs/byte_ai_sales/user/user/yinzhihan/agent/OpenSearch-VL/SFT/saves/qwen3_vl_8b/full/data_redundancy_compressed_gpt54_640_tagclean_2node16gpu_lr_2e_5_cosine_to_zero_epoch5}
 DATASET_NAME=${DATASET_NAME:-Vision-DeepResearch-QA-smoke-128}
+EVAL_DATASET_NAME=${EVAL_DATASET_NAME:-Vision-DeepResearch-QA-benchmark-eval-200}
 TRAIN_SPLIT=${TRAIN_SPLIT:-train}
 VAL_SPLIT=${VAL_SPLIT:-test}
-PROJECT_NAME=${PROJECT_NAME:-vision-deepresearch-smoke}
+PROJECT_NAME=${PROJECT_NAME:-vision-deepresearch}
 EXPERIMENT_NAME=${EXPERIMENT_NAME:-qwen3-vl-8b-2node-minimal}
 CKPTS_DIR=${CKPTS_DIR:-checkpoints/${PROJECT_NAME}/${EXPERIMENT_NAME}}
 
@@ -63,21 +72,20 @@ clip_ratio_high=0.28
 train_prompt_bsz=1
 n_resp_per_prompt=2
 train_prompt_mini_bsz=1
-n_parallel_tasks=2
-n_parallel_tools=2
+n_parallel_tasks=160
+n_parallel_tools=160
+max_turns=45
 
-# Keep enough room for the actual multimodal prompt and one short ReAct turn.
+# Same length limits as the formal run.
 max_prompt_length=4096
-max_response_length=70000
+max_response_length=56000
 use_dynamic_bsz=True
-# context_parallel_size=2, so the effective dynamic token budget is 81920.
-# This must cover max_prompt_length + max_response_length = 74096.
-actor_ppo_max_token_len_per_gpu=40960
-infer_ppo_max_token_len_per_gpu=40960
+actor_ppo_max_token_len_per_gpu=74576
+infer_ppo_max_token_len_per_gpu=74576
 
 # ========= 2-node x 8-GPU parallelism =========
 offload=True
-gen_tp=4
+gen_tp=2
 train_tp=4
 train_pp=2
 train_cp=2
@@ -97,6 +105,7 @@ loss_agg_mode="seq-mean-token-sum"
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
     \
     data.dataset_name="${DATASET_NAME}" \
+    data.val_dataset_name="${EVAL_DATASET_NAME}" \
     data.train_split="${TRAIN_SPLIT}" \
     data.val_split="${VAL_SPLIT}" \
     data.train_batch_size=${train_prompt_bsz} \
@@ -114,8 +123,8 @@ loss_agg_mode="seq-mean-token-sum"
     actor_rollout_ref.rollout.mode=${rollout_mode} \
     actor_rollout_ref.rollout.dtype=${dtype} \
     actor_rollout_ref.rollout.tensor_model_parallel_size=${gen_tp} \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.75 \
-    actor_rollout_ref.rollout.enforce_eager=True \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.85 \
+    actor_rollout_ref.rollout.enforce_eager=False \
     actor_rollout_ref.rollout.temperature=${temperature} \
     actor_rollout_ref.rollout.top_p=${top_p} \
     actor_rollout_ref.rollout.top_k=${top_k} \
@@ -174,26 +183,33 @@ loss_agg_mode="seq-mean-token-sum"
     actor_rollout_ref.actor.loss_agg_mode=${loss_agg_mode} \
     \
     rllm.workflow.use_workflow=True \
+    rllm.workflow.workflow_args.timeout=36000 \
+    +rllm.workflow.workflow_args.max_llm_calls=${max_turns} \
     rllm.workflow.n_parallel_tasks=${n_parallel_tasks} \
     rllm.workflow.n_parallel_tools=${n_parallel_tools} \
-    rllm.workflow.retry_limit=1 \
-    rllm.compact_filtering.enable=False \
+    rllm.compact_filtering.enable=True \
+    rllm.compact_filtering.mask_unknown=True \
+    rllm.compact_filtering.mask_error=True \
     rllm.rejection_sample.enable=False \
     rllm.rejection_sample.multiplier=1.0 \
     rllm.stepwise_advantage.enable=False \
     +ray_init.include_dashboard=False \
     \
     trainer.critic_warmup=0 \
-    trainer.logger='["console"]' \
+    trainer.logger='["console","wandb"]' \
     trainer.project_name="${PROJECT_NAME}" \
     trainer.experiment_name="${EXPERIMENT_NAME}" \
+    trainer.log_episodes=True \
+    +trainer.episode_log_max_per_batch=50 \
+    trainer.episode_log_dir="${PROJECT_ROOT}/RL/rollouts/${EXPERIMENT_NAME}" \
     trainer.val_before_train=False \
     +trainer.run_final_validation=False \
     trainer.n_gpus_per_node=${N_GPUS_PER_NODE} \
     trainer.nnodes=${NNODES} \
-    trainer.save_freq=1 \
-    trainer.test_freq=-1 \
+    trainer.save_freq=10 \
+    trainer.max_actor_ckpt_to_keep=1 \
+    trainer.test_freq=10 \
     trainer.resume_mode=disable \
-    trainer.total_epochs=1 \
+    trainer.total_epochs=2 \
     trainer.total_training_steps=1 \
     trainer.default_local_dir="${CKPTS_DIR}"

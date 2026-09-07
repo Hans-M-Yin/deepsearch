@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import math
 import os
+import sys
 import time
-from datetime import datetime
 from typing import Any, List, Optional
 
 from PIL import Image
@@ -33,6 +34,104 @@ OBS_END = "\n</tool_response>"
 MAX_LLM_CALL_PER_RUN = 50
 MAX_PROMPT_LENGTH_PER_RUN = 64000
 MAX_RESPONSE_LENGTH_PER_RUN = 4096
+
+
+def _repair_unescaped_json_quotes(text: str) -> str:
+    """Repair common model-generated JSON with unescaped inner quotes.
+
+    Tool arguments are parsed with ``json5`` first. This fallback is
+    intentionally conservative: it only changes a double quote encountered
+    inside a double-quoted string when the following non-whitespace character
+    cannot terminate a JSON/JSON5 value. For example, the quotes around
+    ``ME!`` in ``"single "ME!" was released"`` are escaped, while normal
+    object/string delimiters are left untouched.
+
+    Single-quoted JSON5 strings are tracked separately, so embedded double
+    quotes in those strings are not modified.
+    """
+
+    def next_non_whitespace(index: int) -> str | None:
+        while index < len(text) and text[index].isspace():
+            index += 1
+        return text[index] if index < len(text) else None
+
+    repaired: list[str] = []
+    quote: str | None = None
+    escaped = False
+
+    for index, char in enumerate(text):
+        if quote is None:
+            repaired.append(char)
+            if char in {'"', "'"}:
+                quote = char
+            continue
+
+        if escaped:
+            repaired.append(char)
+            escaped = False
+            continue
+
+        if char == "\\":
+            repaired.append(char)
+            escaped = True
+            continue
+
+        if char != quote:
+            repaired.append(char)
+            continue
+
+        # A normal closing quote is followed by a JSON delimiter (or EOF).
+        # Otherwise it is most likely an unescaped quote inside the value.
+        following = next_non_whitespace(index + 1)
+        if quote == '"' and following not in {None, ",", ":", "}", "]"}:
+            repaired.append('\\"')
+        else:
+            repaired.append(char)
+            quote = None
+
+    return "".join(repaired)
+
+
+def _parse_tool_call_payload(tool_call_text: str) -> Any:
+    """Parse a model tool call, with a narrow malformed-quote fallback."""
+
+    try:
+        return json5.loads(tool_call_text)
+    except Exception as original_error:  # noqa: BLE001
+        repaired_text = _repair_unescaped_json_quotes(tool_call_text)
+        if repaired_text == tool_call_text:
+            raise
+
+        try:
+            parsed = json5.loads(repaired_text)
+        except Exception:
+            # Preserve the original parser failure and existing caller
+            # behaviour when the fallback cannot make the payload valid.
+            raise original_error
+
+        logger.warning(
+            "Repaired unescaped double quote(s) in a model tool call payload"
+        )
+        return parsed
+
+
+def _extract_answer_tool_fallback(tool_args: Any) -> str:
+    """Extract a final answer from a mistakenly emitted ``answer`` call."""
+    if isinstance(tool_args, dict):
+        for key in ("answer", "final_answer", "response", "content"):
+            value = tool_args.get(key)
+            if value is None:
+                continue
+            if isinstance(value, str):
+                return value.strip()
+            try:
+                return json.dumps(value, ensure_ascii=False)
+            except (TypeError, ValueError):
+                return str(value).strip()
+    elif isinstance(tool_args, str):
+        return tool_args.strip()
+    return ""
+
 
 DEEPRESEARCH_SYSTEM_PROMPT_TEXT = """You are an advanced **Visual Investigation Agent**. Your goal is to answer user questions with maximum precision by proactively using a suite of powerful image processing and retrieval tools. When you have gathered sufficient information and are ready to provide the definitive response, you must enclose the entire final answer within <answer></answer> tags.
 
@@ -200,11 +299,6 @@ Current date: """
 DEEPRESEARCH_SYSTEM_PROMPT = build_sft_react_system_prompt()
 
 
-def today_date():
-    """Get today's date in YYYY-MM-DD format."""
-    return datetime.now().date().strftime("%Y-%m-%d")
-
-
 def analyze_repetition_ngram(text: str, n: int = 30, threshold: float = 0.5):
     """
     Use N-grams to detect repetition in a string.
@@ -285,6 +379,7 @@ class MultiTurnReactAgent:
         tools: dict = None,
         system_prompt: str | None = None,
         default_max_tries: int = 3,
+        max_llm_calls: int | None = None,
         **kwargs,
     ):
         """
@@ -304,8 +399,14 @@ class MultiTurnReactAgent:
         self.executor = kwargs.get("executor")
         self._sft_context: ToolRuntimeContext | None = None
         self._pending_sft_images: list[Any] = []
-        # Configuration from original DeepResearch
-        self.max_llm_calls = MAX_LLM_CALL_PER_RUN
+        # Configuration from original DeepResearch.  Keep the historical
+        # default, but allow the workflow/configuration to override it for a
+        # particular experiment.
+        self.max_llm_calls = (
+            int(max_llm_calls)
+            if max_llm_calls is not None
+            else MAX_LLM_CALL_PER_RUN
+        )
         self.default_max_tries = default_max_tries
 
         # Token accounting is reset at the start of every trajectory.  The
@@ -325,12 +426,37 @@ class MultiTurnReactAgent:
         self._llm_latency_failures = 0
         self._tool_latency_samples_s: dict[str, list[float]] = {}
         self._tool_latency_failures: dict[str, int] = {}
+        self._tool_dispatch_latency_samples_s: dict[str, list[float]] = {
+            "executor_wait_s": [],
+            "worker_execute_s": [],
+            "executor_result_wait_s": [],
+        }
+        # Private timing for the most recent SFT-dispatched tool call.  It is
+        # emitted only by the opt-in per-call timing debug stream and never
+        # enters the model-visible observation.
+        self._last_tool_execution_timing: dict[str, Any] = {}
+        # ``read_url`` reports scalar backend timing buckets through the SFT
+        # dispatcher. Keep only totals/calls here; no tool payload is copied
+        # into the trajectory latency metadata.
+        self._read_url_stage_latency: dict[str, dict[str, float]] = {}
+        self._wikimedia_download_stats: dict[str, float] = {
+            "calls": 0.0,
+            "download_success": 0.0,
+            "cache_success": 0.0,
+            "failure": 0.0,
+            "total_s": 0.0,
+        }
+        # Count tool attempts at dispatch time, so timeout diagnostics also
+        # include a tool that is still running when the workflow is cancelled.
+        self._tool_call_counts: dict[str, int] = {}
         # Stage 1 keeps the processor output of every model call so the
         # stepwise DataProto path can carry visual payloads into update.  Do
         # not retain these large tensors in the default/legacy path.
         self._sequence_mode = sequence_mode()
         self.model_outputs_by_round: list[Any] = []
         self.last_model_output: Any | None = None
+        self._trajectory_id = ""
+        self._current_round = 0
 
         self.max_prompt_tokens = MAX_PROMPT_LENGTH_PER_RUN
         self.max_response_tokens = MAX_RESPONSE_LENGTH_PER_RUN
@@ -338,6 +464,104 @@ class MultiTurnReactAgent:
     def sanity_check_output(self, content: str) -> bool:
         """Check if the model output contains the expected thinking structure."""
         return "<thinking>" in content and "</thinking>" in content
+
+    @staticmethod
+    def _debug_text_without_images(content: Any) -> str:
+        """Return only textual content for the answer-tool debug message.
+
+        Debugging should show the prompt and model outputs without copying image
+        objects or image placeholders into the terminal log.  The normal
+        trajectory is not modified by this helper.
+        """
+        if isinstance(content, str):
+            return re.sub(
+                r"<image>|<\|vision_start\|>|<\|image_pad\|>|<\|vision_end\|>",
+                "",
+                content,
+            ).strip()
+        if isinstance(content, list):
+            text_parts: list[str] = []
+            for part in content:
+                if isinstance(part, str):
+                    text_parts.append(part)
+                elif isinstance(part, dict):
+                    part_type = str(part.get("type", ""))
+                    if part_type in {"image", "image_url", "input_image"}:
+                        continue
+                    if part_type in {"text", "input_text"}:
+                        text = part.get("text", "")
+                        if text:
+                            text_parts.append(str(text))
+            return MultiTurnReactAgent._debug_text_without_images("\n".join(text_parts))
+        return ""
+
+    def _build_answer_tool_debug_input(self, messages: list[dict]) -> list[dict[str, str]]:
+        """Keep system prompt, original user prompt, and assistant turns only."""
+        debug_messages: list[dict[str, str]] = []
+        initial_user_seen = False
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            role = str(message.get("role", ""))
+            if role == "system":
+                debug_messages.append(
+                    {
+                        "role": "system",
+                        "content": self._debug_text_without_images(message.get("content", "")),
+                    }
+                )
+            elif role == "user" and not initial_user_seen:
+                debug_messages.append(
+                    {
+                        "role": "user",
+                        "content": self._debug_text_without_images(message.get("content", "")),
+                    }
+                )
+                initial_user_seen = True
+            elif role == "assistant":
+                debug_messages.append(
+                    {
+                        "role": "assistant",
+                        "content": self._debug_text_without_images(message.get("content", "")),
+                    }
+                )
+        return debug_messages
+
+    def _log_step_error(
+        self,
+        *,
+        reason: str,
+        round_number: int,
+        consecutive_errors: int | None = None,
+        tool_name: str | None = None,
+        detail: str | None = None,
+    ) -> None:
+        """Print one bounded diagnostic line for an already-detected error.
+
+        This is intentionally diagnostic-only: it does not change the error
+        flag, retry counter, reward, or termination behavior.
+        """
+        if str(os.environ.get("RLLM_STEP_ERROR_DEBUG", "1")).strip().lower() in {
+            "0",
+            "false",
+            "no",
+            "off",
+        }:
+            return
+
+        fields = [
+            f"task={self._trajectory_id or 'unknown'}",
+            f"round={round_number}",
+            f"reason={reason}",
+        ]
+        if consecutive_errors is not None:
+            fields.append(f"consecutive={consecutive_errors}")
+        if tool_name:
+            fields.append(f"tool={tool_name}")
+        if detail:
+            compact_detail = " ".join(str(detail).split())[:240]
+            fields.append(f"detail={compact_detail}")
+        print("[RL_STEP_ERROR] " + " ".join(fields), flush=True)
 
     async def call_server(
         self, messages: list[dict], max_tries: Optional[int] = None, **kwargs
@@ -358,7 +582,17 @@ class MultiTurnReactAgent:
 
             return response
         except Exception as exc:  # noqa: BLE001
-            print(f"call_server failed: {exc}")
+            if str(os.environ.get("RLLM_STEP_ERROR_DEBUG", "1")).strip().lower() not in {
+                "0",
+                "false",
+                "no",
+                "off",
+            }:
+                self._log_step_error(
+                    reason="llm_request_failed",
+                    round_number=self._current_round,
+                    detail=f"{type(exc).__name__}: {exc}",
+                )
             raise
 
     def record_token_usage(self, response) -> None:
@@ -451,6 +685,59 @@ class MultiTurnReactAgent:
                 self._tool_latency_failures.get(name, 0) + 1
             )
 
+    def _print_tool_timing(
+        self,
+        tool_name: str,
+        elapsed_s: float,
+        *,
+        success: bool,
+    ) -> None:
+        """Suppress per-tool timing output while retaining timing collection.
+
+        The actual timing payload is stored by ``custom_call_tool`` and later
+        aggregated into the every-50-rollout progress line.  Emitting one
+        flushed JSON line for every tool call creates substantial Ray/stdout
+        backpressure at high rollout concurrency.
+        """
+        return
+
+    def _record_read_url_stage_latency(self, timing: Any) -> None:
+        """Accumulate scalar ``read_url`` backend timing for this trajectory."""
+
+        if not isinstance(timing, dict):
+            return
+        stages = timing.get("read_url_stages")
+        if not isinstance(stages, dict):
+            return
+        for stage_name, elapsed_s in stages.items():
+            try:
+                elapsed = max(0.0, float(elapsed_s))
+            except (TypeError, ValueError):
+                continue
+            if elapsed <= 0.0:
+                continue
+            summary = self._read_url_stage_latency.setdefault(
+                str(stage_name), {"total_s": 0.0, "calls": 0.0}
+            )
+            summary["total_s"] += elapsed
+            summary["calls"] += 1.0
+
+        wikimedia_download = timing.get("wikimedia_download")
+        if isinstance(wikimedia_download, dict):
+            for key in (
+                "calls",
+                "download_success",
+                "cache_success",
+                "failure",
+                "total_s",
+            ):
+                try:
+                    self._wikimedia_download_stats[key] += max(
+                        0.0, float(wikimedia_download.get(key) or 0.0)
+                    )
+                except (TypeError, ValueError):
+                    continue
+
     def _build_latency_stats(self, trajectory_time_s: float) -> dict[str, Any]:
         tool_summaries: dict[str, dict[str, Any]] = {}
         all_tool_samples: list[float] = []
@@ -460,6 +747,44 @@ class MultiTurnReactAgent:
                 samples,
                 failures=self._tool_latency_failures.get(tool_name, 0),
             )
+
+        tool_dispatch_summaries = {
+            metric_name: self._summarize_latency_samples(
+                samples,
+                include_samples=True,
+            )
+            for metric_name, samples in self._tool_dispatch_latency_samples_s.items()
+            if samples
+        }
+
+        read_url_stages: dict[str, dict[str, Any]] = {}
+        for stage_name, aggregate in sorted(self._read_url_stage_latency.items()):
+            total_s = max(0.0, float(aggregate.get("total_s") or 0.0))
+            calls = int(aggregate.get("calls") or 0)
+            read_url_stages[stage_name] = {
+                "calls": calls,
+                "total_s": round(total_s, 6),
+                "mean_s": round(total_s / calls, 6) if calls else 0.0,
+            }
+
+        wikimedia_download = dict(self._wikimedia_download_stats)
+        wikimedia_calls = int(wikimedia_download.get("calls") or 0)
+        wikimedia_download["calls"] = wikimedia_calls
+        wikimedia_download["download_success"] = int(
+            wikimedia_download.get("download_success") or 0
+        )
+        wikimedia_download["cache_success"] = int(
+            wikimedia_download.get("cache_success") or 0
+        )
+        wikimedia_download["failure"] = int(
+            wikimedia_download.get("failure") or 0
+        )
+        wikimedia_download["total_s"] = round(
+            max(0.0, float(wikimedia_download.get("total_s") or 0.0)), 6
+        )
+        wikimedia_download["mean_s"] = round(
+            wikimedia_download["total_s"] / wikimedia_calls, 6
+        ) if wikimedia_calls else 0.0
 
         return {
             "trajectory_time_s": round(max(0.0, float(trajectory_time_s)), 6),
@@ -473,6 +798,9 @@ class MultiTurnReactAgent:
                 include_samples=False,
             ),
             "tools": tool_summaries,
+            "tool_dispatch": tool_dispatch_summaries,
+            "read_url_stages": read_url_stages,
+            "wikimedia_download": wikimedia_download,
         }
 
     def get_total_tokens_used(self) -> int:
@@ -580,6 +908,7 @@ class MultiTurnReactAgent:
         # RL may inject a sample-scoped cache.  Remove it before forwarding
         # kwargs to the model client; it is only for tool execution.
         tool_cache = kwargs.pop("tool_cache", None)
+        self._trajectory_id = str(kwargs.pop("trajectory_id", "") or "")
 
         # A workflow object may be reused by the execution engine.  Keep
         # token statistics scoped to this individual trajectory.
@@ -594,15 +923,29 @@ class MultiTurnReactAgent:
         self._llm_latency_failures = 0
         self._tool_latency_samples_s = {}
         self._tool_latency_failures = {}
+        self._tool_dispatch_latency_samples_s = {
+            "executor_wait_s": [],
+            "worker_execute_s": [],
+            "executor_result_wait_s": [],
+        }
+        self._last_tool_execution_timing = {}
+        self._read_url_stage_latency = {}
+        self._wikimedia_download_stats = {
+            "calls": 0.0,
+            "download_success": 0.0,
+            "cache_success": 0.0,
+            "failure": 0.0,
+            "total_s": 0.0,
+        }
+        self._tool_call_counts = {}
         self.model_outputs_by_round = []
         self.last_model_output = None
+        self._current_round = 0
         # Read this at run time as well as construction time so a workflow
         # object reused by a test/worker observes the current exported mode.
         self._sequence_mode = sequence_mode()
 
-        effective_system_prompt = (
-            system_prompt or self.system_prompt or DEEPRESEARCH_SYSTEM_PROMPT
-        ) + today_date()
+        effective_system_prompt = system_prompt or self.system_prompt or DEEPRESEARCH_SYSTEM_PROMPT
 
         # ---- image_paths management for visual tools ----
         self._image_paths: dict[str, str] = {}
@@ -653,6 +996,7 @@ class MultiTurnReactAgent:
 
         while num_llm_calls_available > 0:
             round += 1
+            self._current_round = round
             num_llm_calls_available -= 1
 
             # Get model response from rollout engine
@@ -685,9 +1029,10 @@ class MultiTurnReactAgent:
             if self._sequence_mode == "stepwise":
                 self.model_outputs_by_round.append(response)
 
-            content = (
+            raw_content = (
                 response.text if hasattr(response, "text") and response.text else ""
             )
+            content = raw_content
 
             if "<tool_response>" in content:
                 pos = content.find("<tool_response>")
@@ -701,77 +1046,138 @@ class MultiTurnReactAgent:
                 }
                 messages.append(assistant_message)
                 tool_error = False
+                tool_error_reason = ""
+                tool_error_detail = ""
+                tool_name = ""
+                answer_tool_fallback = False
 
                 tool_call_text = content.split("<tool_call>")[1].split("</tool_call>")[
                     0
                 ]
 
                 try:
-                    tool_call = json5.loads(tool_call_text)
-                except Exception:
+                    tool_call = _parse_tool_call_payload(tool_call_text)
+                except Exception as exc:
                     tool_call = None
                     result = "[Json Parse Error]: Tool call is not a valid JSON."
                     tool_error = True
+                    tool_error_reason = "tool_call_json_parse"
+                    tool_error_detail = f"{type(exc).__name__}: {exc}"
                 if not isinstance(tool_call, dict):
                     if not tool_error:
                         result = "[Json Parse Error]: Tool call must be a JSON object."
+                        tool_error_reason = "tool_call_not_object"
                     tool_error = True
                 else:
                     tool_name = tool_call.get("name", "")
                     tool_args = tool_call.get("arguments", {})
+                    if False:  # Temporarily suppress high-volume raw-output logs.
+                        # Keep the entire model output on one physical log line
+                        # so it remains readable when many Ray workers print it.
+                        raw_output_one_line = repr(str(raw_content))
+                        debug_input_one_line = json.dumps(
+                            self._build_answer_tool_debug_input(messages),
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        )
+                        print(
+                            f"[RL_ANSWER_TOOL_DEBUG] task={self._trajectory_id or 'unknown'} "
+                            f"round={round} input_messages={debug_input_one_line} "
+                            f"raw_output={raw_output_one_line}",
+                            flush=True,
+                        )
                     if not isinstance(tool_name, str) or not isinstance(tool_args, dict):
                         result = "[Json Parse Error]: Tool call requires a name and an arguments object."
                         tool_error = True
-                    elif tool_name == "PythonInterpreter":
-                        # Keep the legacy compatibility path, but dispatch it
-                        # only by the parsed tool name.  Checking whether the
-                        # raw JSON contains the word "python" would wrongly
-                        # intercept valid search queries such as "Python history".
-                        tool_started_at = time.perf_counter()
-                        try:
-                            code_raw = str(tool_args.get("code") or "").strip()
-                            if not code_raw:
-                                result = "[Python Interpreter Error]: Python code is required."
-                                tool_error = True
-                            else:
-                                result = await self.execute_python(code_raw)
-                                if isinstance(result, str) and result.startswith(
-                                    (
-                                        "Python execution error:",
-                                        "PythonInterpreter tool not available",
-                                        "PythonInterpreter tool is not callable",
-                                    )
-                                ):
-                                    tool_error = True
-                        except Exception:
-                            result = "[Python Interpreter Error]: Python code formatting error."
-                            tool_error = True
-                        finally:
-                            self._record_tool_latency(
-                                tool_name,
-                                time.perf_counter() - tool_started_at,
-                                success=not tool_error,
-                            )
+                        tool_error_reason = "tool_call_schema"
                     else:
-                        tool_started_at = time.perf_counter()
-                        try:
-                            result = await self.custom_call_tool(
-                                tool_name,
-                                tool_args,
-                                question_text=question,
-                                assistant_text=content,
-                                tool_goal=str(tool_args.get("goal") or ""),
-                                tool_cache=tool_cache,
-                            )
-                        except Exception as exc:  # noqa: BLE001
-                            result = f"Tool execution error: {type(exc).__name__}: {exc}"
+                        counted_tool_name = tool_name or "<empty>"
+                        self._tool_call_counts[counted_tool_name] = (
+                            self._tool_call_counts.get(counted_tool_name, 0) + 1
+                        )
+                        if tool_name == "answer":
+                            # ``answer`` is not a registered backend tool, but
+                            # some checkpoints still emit it instead of using
+                            # the <answer>...</answer> protocol.  Preserve the
+                            # malformed step for format accounting, while
+                            # salvaging its answer and terminating immediately.
+                            prediction = _extract_answer_tool_fallback(tool_args)
+                            answer_tool_fallback = True
                             tool_error = True
-                        finally:
-                            self._record_tool_latency(
-                                tool_name,
-                                time.perf_counter() - tool_started_at,
-                                success=not tool_error,
+                            tool_error_reason = "answer_tool_fallback"
+                            tool_error_detail = (
+                                "The answer tool is unavailable; extracted the "
+                                "final answer from its arguments and stopped."
                             )
+                            result = (
+                                "[Answer Tool Fallback] The answer tool is not "
+                                "available. The answer was extracted from its "
+                                "arguments."
+                            )
+                        elif tool_name == "PythonInterpreter":
+                            # Keep the legacy compatibility path, but dispatch it
+                            # only by the parsed tool name.  Checking whether the
+                            # raw JSON contains the word "python" would wrongly
+                            # intercept valid search queries such as "Python history".
+                            self._last_tool_execution_timing = {}
+                            tool_started_at = time.perf_counter()
+                            try:
+                                code_raw = str(tool_args.get("code") or "").strip()
+                                if not code_raw:
+                                    result = "[Python Interpreter Error]: Python code is required."
+                                    tool_error = True
+                                    tool_error_reason = "python_missing_code"
+                                else:
+                                    result = await self.execute_python(code_raw)
+                                    if isinstance(result, str) and result.startswith(
+                                        (
+                                            "Python execution error:",
+                                            "PythonInterpreter tool not available",
+                                            "PythonInterpreter tool is not callable",
+                                        )
+                                    ):
+                                        tool_error = True
+                                        tool_error_reason = "python_execution_error"
+                            except Exception as exc:
+                                result = "[Python Interpreter Error]: Python code formatting error."
+                                tool_error = True
+                                tool_error_reason = "python_exception"
+                                tool_error_detail = f"{type(exc).__name__}: {exc}"
+                            finally:
+                                self._record_tool_latency(
+                                    tool_name,
+                                    time.perf_counter() - tool_started_at,
+                                    success=not tool_error,
+                                )
+                        else:
+                            self._last_tool_execution_timing = {}
+                            tool_started_at = time.perf_counter()
+                            try:
+                                result = await self.custom_call_tool(
+                                    tool_name,
+                                    tool_args,
+                                    question_text=question,
+                                    assistant_text=content,
+                                    tool_goal=str(tool_args.get("goal") or ""),
+                                    tool_cache=tool_cache,
+                                )
+                            except Exception as exc:  # noqa: BLE001
+                                result = f"Tool execution error: {type(exc).__name__}: {exc}"
+                                tool_error = True
+                                tool_error_reason = "tool_execution_exception"
+                                tool_error_detail = f"{type(exc).__name__}: {exc}"
+                            finally:
+                                tool_elapsed_s = time.perf_counter() - tool_started_at
+                                self._record_tool_latency(
+                                    tool_name,
+                                    tool_elapsed_s,
+                                    success=not tool_error,
+                                )
+                                self._print_tool_timing(
+                                    tool_name,
+                                    tool_elapsed_s,
+                                    success=not tool_error,
+                                )
 
                 if tool_error:
                     assistant_message["step_error"] = True
@@ -793,8 +1199,26 @@ class MultiTurnReactAgent:
                 self._pending_sft_images = []
                 if assistant_message["step_error"]:
                     consecutive_bad_steps += 1
+                    self._log_step_error(
+                        reason=tool_error_reason or "tool_error",
+                        round_number=round,
+                        consecutive_errors=consecutive_bad_steps,
+                        tool_name=tool_name,
+                        detail=tool_error_detail or str(result),
+                    )
                 else:
                     consecutive_bad_steps = 0
+                if answer_tool_fallback:
+                    termination = "answer_tool_fallback"
+                    return self._build_result(
+                        question=question,
+                        answer=answer,
+                        messages=messages,
+                        prediction=prediction,
+                        termination=termination,
+                        rounds=round,
+                        start_time=start_time,
+                    )
                 if consecutive_bad_steps >= 3:
                     prediction = "Too many consecutive step errors."
                     termination = "consecutive_step_errors"
@@ -854,6 +1278,17 @@ class MultiTurnReactAgent:
                 )
                 messages.append({"role": "user", "content": observation})
                 consecutive_bad_steps += 1
+                self._log_step_error(
+                    reason="invalid_content_format",
+                    round_number=round,
+                    consecutive_errors=consecutive_bad_steps,
+                    detail=(
+                        f"content_len={len(content)} "
+                        f"has_thinking={'<thinking>' in content and '</thinking>' in content} "
+                        f"has_tool_call={'<tool_call>' in content and '</tool_call>' in content} "
+                        f"has_answer={'<answer>' in content and '</answer>' in content}"
+                    ),
+                )
                 if consecutive_bad_steps >= 3:
                     prediction = "Too many consecutive step errors."
                     termination = "consecutive_step_errors"
@@ -902,21 +1337,9 @@ class MultiTurnReactAgent:
             start_time=start_time,
         )
 
-        print("\n DeepResearch completed:")
-        print(f"   Rounds: {round}")
-        print(f"   Time: {result['time_taken']:.1f}s")
-        print(f"   Termination: {termination}")
-        print(
-            "   Token usage: trajectory_context={context}, prompt_requests={prompt}, "
-            "completion={completion}, total={total}, model_calls={calls}, max_prompt={max_prompt}".format(
-                context=self.last_prompt_tokens + self.last_completion_tokens,
-                prompt=self.total_prompt_tokens,
-                completion=self.total_completion_tokens,
-                total=self.total_prompt_tokens + self.total_completion_tokens,
-                calls=self.model_call_count,
-                max_prompt=self.max_prompt_tokens,
-            )
-        )
+        # Temporarily suppress per-trajectory verbose output.  The compact
+        # every-50-rollout summary in AgentWorkflowEngine retains timing and
+        # termination statistics without blocking the event loop per sample.
         return result
 
     async def custom_call_tool(self, tool_name: str, tool_args: dict, **kwargs) -> str:
@@ -946,22 +1369,70 @@ class MultiTurnReactAgent:
             tool_goal = str(kwargs.get("tool_goal") or "")
 
             def execute_sft_tool():
-                execution = sft_api.execute_tool_call(
-                    name=tool_name,
-                    arguments=tool_args,
-                    context=context,
-                    question_text=question_text,
-                    assistant_text=assistant_text,
-                    tool_goal=tool_goal,
-                    tool_cache=kwargs.get("tool_cache"),
-                )
-                return execution
+                worker_started_at[0] = time.perf_counter()
+                try:
+                    return sft_api.execute_tool_call(
+                        name=tool_name,
+                        arguments=tool_args,
+                        context=context,
+                        question_text=question_text,
+                        assistant_text=assistant_text,
+                        tool_goal=tool_goal,
+                        tool_cache=kwargs.get("tool_cache"),
+                    )
+                finally:
+                    # This timestamp is set inside the executor thread.  The
+                    # difference between it and the await-resume timestamp
+                    # below measures event-loop/result-delivery delay.
+                    worker_finished_at[0] = time.perf_counter()
 
             loop = asyncio.get_running_loop()
+            submitted_at = time.perf_counter()
+            worker_started_at = [0.0]
+            worker_finished_at = [0.0]
             execution = await loop.run_in_executor(
                 self.executor,
                 execute_sft_tool,
             )
+            resumed_at = time.perf_counter()
+            timing = dict(getattr(execution, "timing", {}) or {})
+            if worker_started_at[0] > 0.0:
+                timing["executor_wait_s"] = max(
+                    0.0,
+                    worker_started_at[0] - submitted_at,
+                )
+                if worker_finished_at[0] > 0.0:
+                    timing["worker_execute_s"] = max(
+                        0.0,
+                        worker_finished_at[0] - worker_started_at[0],
+                    )
+                    timing["executor_result_wait_s"] = max(
+                        0.0,
+                        resumed_at - worker_finished_at[0],
+                    )
+                timing["sft_execution_s"] = max(
+                    0.0,
+                    resumed_at - worker_started_at[0],
+                )
+                for metric_name in (
+                    "executor_wait_s",
+                    "worker_execute_s",
+                    "executor_result_wait_s",
+                ):
+                    metric_value = timing.get(metric_name)
+                    if isinstance(metric_value, (int, float)):
+                        self._tool_dispatch_latency_samples_s[metric_name].append(
+                            max(0.0, float(metric_value))
+                        )
+            self._last_tool_execution_timing = timing
+            if isinstance(execution.output, dict) and execution.output.get("ok") is False:
+                self._log_step_error(
+                    reason="tool_result_error",
+                    round_number=self._current_round,
+                    tool_name=tool_name,
+                    detail=execution.output.get("error") or execution.output,
+                )
+            self._record_read_url_stage_latency(getattr(execution, "timing", None))
             self._pending_sft_images = list((execution.new_images or {}).values())
             return execution.output_text
 
@@ -1018,6 +1489,7 @@ class MultiTurnReactAgent:
         # Reset token counters for each new task
         self.total_prompt_tokens = 0
         self.total_completion_tokens = 0
+        self._tool_call_counts = {}
 
     async def run(
         self,

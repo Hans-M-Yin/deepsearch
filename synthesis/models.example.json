@@ -10,7 +10,7 @@
       "served_model": "Qwen3-VL-235B",
       "base_url": "http://127.0.0.1:8001/v1",
       "api_key": "EMPTY",
-      "timeout_s": 180
+      "timeout_s": 120
     }
   }
 }

@@ -78,6 +78,14 @@ class Workflow(ABC):
                 return output  # we assume it's already postprocessed
             return self.postprocess_episode(self.collect_trajectories(), TerminationReason.UNKNOWN)
         except asyncio.TimeoutError:
+            timeout_hook = getattr(self, "_on_timeout", None)
+            if callable(timeout_hook):
+                try:
+                    timeout_hook(task=task, uid=uid)
+                except Exception:
+                    # Diagnostics must never replace the original timeout
+                    # handling or create a second failure during cleanup.
+                    pass
             return self.postprocess_episode(self.collect_trajectories(), TerminationReason.TIMEOUT)
         except TerminationEvent as e:
             return self.postprocess_episode(self.collect_trajectories(), e.reason)

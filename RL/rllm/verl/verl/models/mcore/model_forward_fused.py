@@ -72,6 +72,7 @@ def fused_forward_model_gen(vision_model: bool = False):
         labels_mask: Tensor,
         temperature: float,
         multi_modal_inputs: dict,
+        calculate_entropy: bool = True,
     ):
         pre_process: bool = (
             unwrap_model(model).pre_process if not vision_model else False
@@ -103,6 +104,7 @@ def fused_forward_model_gen(vision_model: bool = False):
             packed_seq_params=packed_seq_params,
             labels=labels_rmpad,
             temperature=temperature,
+            calculate_entropy=calculate_entropy,
             **model_kwargs,
         )
 
@@ -149,6 +151,7 @@ def _fused_GPTModel_forward(
     inference_params: Optional[BaseInferenceContext] = None,
     loss_mask: Optional[Tensor] = None,
     temperature: float = 1.0,
+    calculate_entropy: bool = True,
     **kwargs,
 ) -> CausalLMOutputForPPO:
     """
@@ -205,6 +208,7 @@ def _fused_GPTModel_forward(
         temperature,
         "none",
         parallel_state.get_tensor_model_parallel_group(),
+        calculate_entropy,
     )
 
     if has_config_logger_enabled(model.config):

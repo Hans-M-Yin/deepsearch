@@ -230,7 +230,15 @@ class SGLangHttpServer:
     ) -> TokenOutput:
         """Generate sequence with token-in-token-out."""
         # TODO(@wuxibin): switch to `/generate` http endpoint once multi-modal support ready.
-        max_new_tokens = min(self.config.response_length, self.config.max_model_len - len(prompt_ids) - 1)
+        # Respect a per-request limit from the agent.  The rollout config's
+        # response_length is the trajectory-level budget and can be much larger
+        # than one ReAct turn; it must not overwrite sampling_params.max_new_tokens.
+        requested_max_new_tokens = sampling_params.get("max_new_tokens", self.config.response_length)
+        max_new_tokens = min(
+            int(requested_max_new_tokens),
+            self.config.response_length,
+            self.config.max_model_len - len(prompt_ids) - 1,
+        )
         sampling_params["max_new_tokens"] = max_new_tokens
         return_logprob = sampling_params.pop("logprobs", False)
 
@@ -297,12 +305,25 @@ class SGLangReplica(RolloutReplica):
                 if not self.is_reward_model
                 else f"sglang_server_reward_{self.replica_rank}_{node_rank}"
             )
+            # This actor is intentionally not assigned Ray GPU resources: its
+            # SGLang scheduler children use the GPUs already owned by the
+            # corresponding rollout workers.  Set the visibility before the
+            # actor process starts so the HTTP/control process itself does not
+            # initialize on the node's default GPU (usually physical GPU 0).
+            # The __init__ assignment below remains as a defensive check for
+            # subprocesses launched after actor initialization.
+            server_runtime_env = {
+                "env_vars": {
+                    "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1",
+                    "CUDA_VISIBLE_DEVICES": node_cuda_visible_devices,
+                }
+            }
             server = SGLangHttpServer.options(
                 scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
                     node_id=node_id,
                     soft=False,
                 ),
-                runtime_env={"env_vars": {"RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1"}},
+                runtime_env=server_runtime_env,
                 name=name,
             ).remote(
                 config=self.config,

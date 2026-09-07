@@ -45,6 +45,7 @@ class LinearCrossEntropy(torch.autograd.Function):
         temperature: typing.Optional[float] = 1.0,
         reduction: typing.Optional[str] = "none",
         dist_process_group: typing.Optional[dist.ProcessGroup] = None,
+        compute_entropy: bool = True,
     ) -> list[torch.Tensor]:
         """_summary_
 
@@ -75,7 +76,13 @@ class LinearCrossEntropy(torch.autograd.Function):
                 labels = labels.view(-1)
 
             logprobs, entropy, _maximum, _accumulate, _entropy_b = kernels.efficient_entropy_forward(
-                hidden, weight, labels, REDUCTION, temperature, dist_process_group
+                hidden,
+                weight,
+                labels,
+                REDUCTION,
+                temperature,
+                dist_process_group,
+                compute_entropy,
             )
 
             ctx.save_for_backward(hidden, weight, labels, _maximum, _accumulate, _entropy_b)
@@ -84,11 +91,22 @@ class LinearCrossEntropy(torch.autograd.Function):
             ctx.dist_process_group = dist_process_group
             ctx.should_return_fp32_grad = False
             ctx.temperature = temperature
+            ctx.compute_entropy = compute_entropy
+            ctx.num_tokens = labels.shape[0]
         return logprobs, entropy
 
     @staticmethod
     def backward(ctx, dlogprobs: torch.Tensor, dentropy: torch.Tensor) -> list[torch.Tensor]:
         from . import kernels
+
+        # When entropy is disabled, the second output is a compatibility
+        # placeholder and receives no gradient from the loss.  The backward
+        # kernel still expects a tensor, so provide an all-zero entropy
+        # gradient; this preserves the exact log-probability gradient path.
+        if dentropy is None:
+            dentropy = torch.zeros(
+                (ctx.num_tokens,), device=dlogprobs.device, dtype=dlogprobs.dtype
+            )
 
         with torch.cuda.nvtx.range("LinearCrossEntropy-backward"):
             (hidden, weight, labels, _maximum, _accumulate, _entropy_b) = ctx.saved_tensors
@@ -110,10 +128,34 @@ class LinearCrossEntropy(torch.autograd.Function):
                 should_return_fp32_grad,
                 temperature,
                 dist_process_group,
+                ctx.compute_entropy,
             )
             d_hidden = d_hidden.view(ctx.original_hidden_shape)
 
-        return (d_hidden, d_weight, None, None, None, None)
+        return (d_hidden, d_weight, None, None, None, None, None)
 
 
-linear_cross_entropy = LinearCrossEntropy.apply
+def linear_cross_entropy(
+    hidden: torch.Tensor,
+    weight: torch.Tensor,
+    labels: torch.Tensor,
+    temperature: typing.Optional[float] = 1.0,
+    reduction: typing.Optional[str] = "none",
+    dist_process_group: typing.Optional[dist.ProcessGroup] = None,
+    compute_entropy: bool = True,
+):
+    """Compute selected-token log probabilities, optionally with entropy.
+
+    Keep this wrapper instead of exposing ``Function.apply`` directly so the
+    optional argument is always passed through autograd, including for legacy
+    call sites that omit it.
+    """
+    return LinearCrossEntropy.apply(
+        hidden,
+        weight,
+        labels,
+        temperature,
+        reduction,
+        dist_process_group,
+        compute_entropy,
+    )

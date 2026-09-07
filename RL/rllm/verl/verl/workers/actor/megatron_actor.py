@@ -642,6 +642,7 @@ class MegatronPPOActor(BasePPOActor):
                     labels_mask=label_mask,
                     temperature=temperature,
                     multi_modal_inputs=multi_modal_inputs,
+                    calculate_entropy=calculate_entropy,
                 )
             else:
                 forward_fn = get_mcore_forward_fn(self.hf_config)

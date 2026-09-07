@@ -131,9 +131,12 @@ inspect.getargspec = _argspec
 
 try:
     import IPython
+    from IPython.core import oinspect
 except ImportError:
     IPython = None
+    oinspect = None
 else:
+    IPython.core.oinspect = oinspect
     # Replace IPython's argspec - handle both old and new versions
     if hasattr(IPython.core.oinspect, "getargspec"):
         # Older IPython versions

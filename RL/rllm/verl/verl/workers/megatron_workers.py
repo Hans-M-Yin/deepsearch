@@ -744,9 +744,10 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         output = DataProto(meta_info={"metrics": metrics})
         output = output.to("cpu")
 
-        if self._is_offload_param:
-            offload_megatron_model_to_cpu(self.actor_module)
-            log_gpu_memory_usage("After offload actor params and grad during update_actor", logger=logger)
+        # Keep actor parameters resident across compute_log_probs -> update_actor.
+        # The next rollout_mode() exports the current weights and explicitly
+        # offloads the actor before SGLang generation, avoiding an unnecessary
+        # CPU round-trip between these two consecutive training phases.
         if self._is_offload_optimizer:
             offload_megatron_optimizer(self.actor_optimizer)
             log_gpu_memory_usage("After offload actor optimizer during update_actor", logger=logger)
@@ -839,16 +840,25 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         data.meta_info["max_token_len"] = self.config.rollout.log_prob_max_token_len_per_gpu
         data.meta_info["use_dynamic_bsz"] = self.config.rollout.log_prob_use_dynamic_bsz
         data.meta_info["temperature"] = self.config.rollout.temperature
-        output, entropys = self.actor.compute_log_prob(data=data, calculate_entropy=True)
+        # Entropy is only needed when entropy regularization is enabled.  It
+        # used to be computed unconditionally here, even though the RL
+        # configurations currently set entropy_coeff=0.0.
+        calculate_entropy = float(self.config.actor.entropy_coeff) != 0.0
+        output, entropys = self.actor.compute_log_prob(
+            data=data, calculate_entropy=calculate_entropy
+        )
+        tensors = {"old_log_probs": output}
+        if calculate_entropy:
+            tensors["entropys"] = entropys
         output = DataProto.from_dict(
-            tensors={"old_log_probs": output, "entropys": entropys},
+            tensors=tensors,
             meta_info={"temperature": self.config.rollout.temperature},
         )
         output = output.to("cpu")
         # clear kv cache
-        if self._is_offload_param:
-            offload_megatron_model_to_cpu(self.actor_module)
-            log_gpu_memory_usage("After offload actor params and grad during compute_log_prob", logger=logger)
+        # Keep actor parameters resident for a possible immediately following
+        # update_actor() call. rollout_mode() will offload them after exporting
+        # weights, before SGLang starts generation.
         aggressive_empty_cache(force_sync=True)
         return output
 

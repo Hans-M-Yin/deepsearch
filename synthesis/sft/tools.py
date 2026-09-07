@@ -13,8 +13,6 @@ import sys
 import tempfile
 import threading
 import time
-from contextvars import copy_context
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
 from hashlib import sha256
 from io import BytesIO
@@ -40,9 +38,7 @@ if __package__ in (None, ""):
     __package__ = "synthesis.sft"
 
 from synthesis.search_client import (
-    SerperApiKeyPool,
     SerperSearchClient,
-    _is_serper_credit_exhausted,
     acquire_serper_api_key,
 )
 from synthesis.wiki_text_builder import EnhancedReaderClient
@@ -56,13 +52,16 @@ RawDocumentFetcher = Callable[
     [str, str, Callable[[], dict[str, Any]]], dict[str, Any]
 ]
 MAX_SEARCH_RESULTS = 5
-TOOL_NETWORK_TIMEOUT_S = 120
+TOOL_NETWORK_TIMEOUT_S = 60
 # A request is attempted once initially, then at most this many additional
 # times when the failure is a transport timeout.  Keep this distinction
 # explicit: retrying authentication, validation, or quota errors only delays
 # the trajectory and cannot make them succeed.
-TOOL_TIMEOUT_RETRIES = 5
+TOOL_TIMEOUT_RETRIES = 2
 TOOL_RETRY_SLEEP_S = 5
+# Empty Lens results can be transient when the upstream cannot fetch the
+# submitted image URL. Keep this separate from transport-timeout retries.
+I2I_EMPTY_RESULT_RETRIES = 3
 TOOL_429_RETRY_SLEEP_S = 60
 FIRECRAWL_ERROR_RETRIES = 1
 FIRECRAWL_ERROR_RETRY_SLEEP_S = 5
@@ -73,7 +72,7 @@ ENHANCED_READER_RETRIES = 1
 ENHANCED_READER_RETRY_SLEEP_S = 5
 MAX_DOWNLOADED_IMAGE_LONG_EDGE = 1920
 MAX_DOWNLOADED_IMAGE_SHORT_EDGE = 1080
-RESIZED_IMAGE_LONG_EDGE = 1200
+RESIZED_IMAGE_LONG_EDGE = 1000
 MAX_SVG_BYTES = 10 * 1024 * 1024
 MAX_RENDERED_SVG_PIXELS = 20_000_000
 AMBIGUOUS_CONTENT_TYPES = {
@@ -109,9 +108,12 @@ _URL_KEYWORD_CACHE_LOCK = threading.Lock()
 # this transport-level guard isolated and switchable so it can be removed (or
 # disabled) without changing any tool implementation.
 _WIKIMEDIA_UPLOAD_HOST = "upload.wikimedia.org"
+_WIKIMEDIA_PROXY_HOST_SUFFIXES = (".wikimedia.org", ".wikipedia.org")
 _WIKIMEDIA_MAX_CONCURRENCY_ENV = "SFT_WIKIMEDIA_MAX_CONCURRENCY"
 _WIKIMEDIA_DEFAULT_MAX_CONCURRENCY = 3
-_HTTP_RELAY_URL_ENV = "HTTP_RELAY_URL"
+# Keep the worker's Relay endpoint fixed for the current training deployment.
+# Edit this constant when the Relay address changes.
+_HTTP_RELAY_URL = "http://[fdbd:dccd:cde2:1701:3e21:640a:cbaf:b8a3]:18083/"
 
 
 def _configured_wikimedia_max_concurrency() -> int:
@@ -152,8 +154,18 @@ _URL_KEYWORD_NOISE_TOKENS = {
     "files", "content", "assets", "asset", "public", "private", "vision",
     "deepresearch", "synthesis", "trajectory", "turn", "region", "search",
     "hans", "oss", "aliyuncs", "com", "www", "http", "https",
+    "commons", "wiki", "index", "default", "page", "html", "htm",
+    "px", "jpeg", "jpg", "png", "gif", "webp", "svg", "avif",
 }
 
+_URL_KEYWORD_DOMAIN_SUFFIXES = {
+    "com", "org", "net", "edu", "gov", "io", "ai", "co", "uk", "us",
+    "de", "fr", "it", "es", "ca", "au", "jp", "cn", "ru", "ch",
+}
+_URL_KEYWORD_MAX_ITEMS = 12
+
+# Kept for compatibility with code that imports this constant.  Runtime URL
+# hint extraction is rule-based and no longer sends this prompt to an LLM.
 PROMPT_URL_SEMANTIC_KEYWORDS = """Extract retrieval keywords that are explicitly present in URL metadata.
 
 You receive a URL after technical noise, signatures, hashes, resize directives,
@@ -224,6 +236,18 @@ def _is_wikimedia_upload_url(url: str) -> bool:
         return False
 
 
+def _is_wikimedia_image_url(url: str) -> bool:
+    """Return whether an image target belongs to Wikimedia's host families."""
+
+    try:
+        hostname = (urlparse(str(url or "")).hostname or "").lower().rstrip(".")
+    except Exception:
+        return False
+    return hostname in {"wikimedia.org", "wikipedia.org"} or any(
+        hostname.endswith(suffix) for suffix in _WIKIMEDIA_PROXY_HOST_SUFFIXES
+    )
+
+
 def is_compact_resource_id(value: object) -> bool:
     """Return whether ``value`` looks like a search-result resource ID.
 
@@ -276,16 +300,6 @@ def _acquire_wikimedia_request_slot(url: str) -> bool:
     global _WIKIMEDIA_NEXT_REQUEST_AT, _WIKIMEDIA_QUEUED_REQUESTS, _WIKIMEDIA_ACTIVE_REQUESTS
     with _WIKIMEDIA_THROTTLE_LOCK:
         _WIKIMEDIA_QUEUED_REQUESTS += 1
-        queued = _WIKIMEDIA_QUEUED_REQUESTS
-        active = _WIKIMEDIA_ACTIVE_REQUESTS
-    if active >= _WIKIMEDIA_MAX_CONCURRENCY or queued > 1:
-        _wikimedia_throttle_debug(
-            "queued",
-            active=active,
-            queued=queued,
-            max_concurrency=_WIKIMEDIA_MAX_CONCURRENCY,
-            url=url,
-        )
 
     semaphore_acquired = False
     try:
@@ -309,17 +323,6 @@ def _acquire_wikimedia_request_slot(url: str) -> bool:
         with _WIKIMEDIA_THROTTLE_LOCK:
             _WIKIMEDIA_QUEUED_REQUESTS = max(0, _WIKIMEDIA_QUEUED_REQUESTS - 1)
             _WIKIMEDIA_ACTIVE_REQUESTS += 1
-            queued = _WIKIMEDIA_QUEUED_REQUESTS
-            active = _WIKIMEDIA_ACTIVE_REQUESTS
-        if wait_s > 0 or queued > 0:
-            _wikimedia_throttle_debug(
-                "started",
-                active=active,
-                queued=queued,
-                max_concurrency=_WIKIMEDIA_MAX_CONCURRENCY,
-                wait_s=round(wait_s, 3),
-                url=url,
-            )
         return True
     except BaseException:
         with _WIKIMEDIA_THROTTLE_LOCK:
@@ -335,11 +338,7 @@ def _release_wikimedia_request_slot(acquired: bool, url: str = "") -> None:
     global _WIKIMEDIA_ACTIVE_REQUESTS
     with _WIKIMEDIA_THROTTLE_LOCK:
         _WIKIMEDIA_ACTIVE_REQUESTS = max(0, _WIKIMEDIA_ACTIVE_REQUESTS - 1)
-        active = _WIKIMEDIA_ACTIVE_REQUESTS
-        queued = _WIKIMEDIA_QUEUED_REQUESTS
     _WIKIMEDIA_REQUEST_SEMAPHORE.release()
-    if queued > 0:
-        _wikimedia_throttle_debug("finished", active=active, queued=queued, url=url)
 
 
 def _note_wikimedia_429(url: str, retry_after: str | None) -> None:
@@ -398,6 +397,95 @@ def _read_url_timing_add(
     if timings is None:
         return
     timings[key] = timings.get(key, 0.0) + max(0.0, float(elapsed_s))
+
+
+def _read_url_stage_timings(timings: dict[str, float]) -> dict[str, float]:
+    """Collapse private ``read_url`` timers into RL timing buckets.
+
+    ``firecrawl_browser`` is intentionally not reported here. The Browser
+    transport may still exist as a compatibility backend, but it is no longer
+    part of the rollout performance accounting.
+    """
+
+    def value(key: str) -> float:
+        return max(0.0, float(timings.get(key, 0.0) or 0.0))
+
+    def sum_prefixes(*prefixes: str) -> float:
+        total = 0.0
+        for key, elapsed_s in timings.items():
+            if any(
+                key == prefix or key.startswith(f"{prefix}_")
+                for prefix in prefixes
+            ):
+                total += max(0.0, float(elapsed_s or 0.0))
+        return total
+
+    # Include the summarizer in the backend that produced the document. This
+    # keeps the four buckets useful for explaining the end-to-end read_url
+    # latency without exposing the document or any backend payload.
+    stages = {
+        "enhanced_reader": value("enhanced_reader_total_s")
+        + value("enhanced_reader_summary_s"),
+        "http_download": sum_prefixes(
+            "image_http",
+            "image_source_page_http",
+            "pdf_http",
+        ),
+        # The outer fallback timer also covers an injected cache lookup and
+        # any small dispatcher overhead that is not represented by the
+        # individual Firecrawl attempt timers.
+        "firecrawl_scrape": value("firecrawl_fallback_s"),
+        "wikimedia_download": value("wikimedia_download_s"),
+    }
+    # A stage call count is inferred from key presence by the RL layer. Omit
+    # stages that were not entered so averages do not include zero samples.
+    return {
+        name: round(max(0.0, elapsed_s), 6)
+        for name, elapsed_s in stages.items()
+        if elapsed_s > 0.0
+    }
+
+
+def _read_url_component_timings(timings: dict[str, float]) -> dict[str, float]:
+    """Expose detailed scalar read-url timers for private RL diagnostics."""
+
+    components: dict[str, float] = {}
+    for key, elapsed_s in timings.items():
+        if not key.endswith("_s"):
+            continue
+        try:
+            value = max(0.0, float(elapsed_s or 0.0))
+        except (TypeError, ValueError):
+            continue
+        if value > 0.0:
+            components[key] = round(value, 6)
+    return components
+
+
+def _read_url_wikimedia_download_stats(
+    timings: dict[str, float],
+) -> dict[str, int | float]:
+    """Return per-``read_url`` Wikimedia download outcome counters."""
+
+    calls = int(timings.get("wikimedia_download_calls", 0.0) or 0)
+    if calls <= 0:
+        return {}
+    download_success = int(
+        timings.get("wikimedia_download_success", 0.0) or 0
+    )
+    cache_success = int(
+        timings.get("wikimedia_download_cache_success", 0.0) or 0
+    )
+    failure = int(timings.get("wikimedia_download_failure", 0.0) or 0)
+    total_s = max(0.0, float(timings.get("wikimedia_download_s", 0.0) or 0.0))
+    return {
+        "calls": calls,
+        "download_success": download_success,
+        "cache_success": cache_success,
+        "failure": failure,
+        "total_s": round(total_s, 6),
+        "mean_s": round(total_s / calls, 6) if calls else 0.0,
+    }
 
 
 def _read_url_timed_sleep(
@@ -489,10 +577,10 @@ _TOOL_STATS: dict[str, Any] = {
             "image_http_errors": 0,
             "image_http_statuses": {},
         },
-        "firecrawl_browser": {
-            "success": 0,
+        "wikimedia_download": {
+            "download_success": 0,
+            "cache_success": 0,
             "failure": 0,
-            "failure_reasons": {},
         },
     },
 }
@@ -523,13 +611,17 @@ def _tool_stats_snapshot_text() -> str:
         f"image_calls={read_stats['image_calls']} image_http_errors={read_stats['image_http_errors']} "
         f"image_http_statuses={json.dumps(read_stats['image_http_statuses'], ensure_ascii=False, sort_keys=True)}"
     )
-    browser_stats = stats["tools"]["firecrawl_browser"]
-    browser_calls = browser_stats["success"] + browser_stats["failure"]
-    if browser_calls:
+    wikimedia_stats = stats["tools"]["wikimedia_download"]
+    wikimedia_calls = (
+        wikimedia_stats["download_success"]
+        + wikimedia_stats["cache_success"]
+        + wikimedia_stats["failure"]
+    )
+    if wikimedia_calls:
         lines.append(
-            f"[tool-stats] firecrawl_browser success={browser_stats['success']} "
-            f"failure={browser_stats['failure']} "
-            f"failure_reasons={json.dumps(browser_stats['failure_reasons'], ensure_ascii=False, sort_keys=True)}"
+            f"[tool-stats] wikimedia_download download_success={wikimedia_stats['download_success']} "
+            f"cache_success={wikimedia_stats['cache_success']} "
+            f"failure={wikimedia_stats['failure']} "
         )
     return "\n".join(lines)
 
@@ -563,56 +655,6 @@ def _extract_http_status_code(exc: Exception) -> int | None:
     return None
 
 
-def _firecrawl_browser_failure_reason(exc: BaseException) -> str:
-    """Map one final Browser download error to a stable tool-stat label."""
-
-    message = str(exc or "").lower()
-    class_name = exc.__class__.__name__
-    raw_status_code = getattr(exc, "status_code", None)
-    try:
-        status_code = int(raw_status_code) if raw_status_code is not None else None
-    except (TypeError, ValueError):
-        status_code = None
-
-    if "idle firecrawl browser session" in message or "waiting for an idle" in message:
-        return "session_queue_timeout"
-    if "session creation" in message:
-        return "session_create_timeout" if "timeout" in message or "timed out" in message else "session_create_error"
-    if class_name == "FirecrawlBrowserHttpError" or status_code is not None and 400 <= status_code <= 599:
-        return f"target_image_http_{status_code}" if status_code is not None else "target_image_http_error"
-    if "no image payload" in message or "empty image payload" in message:
-        return "empty_image_payload"
-    if "non_image_content_type" in message or "did not return an image" in message:
-        return "non_image_content_type"
-    if "invalid base64" in message or "unparseable image response" in message:
-        return "invalid_browser_response"
-    if "target request" in message and ("timeout" in message or "timed out" in message):
-        return "target_request_timeout"
-    if "target request" in message:
-        return "target_request_error"
-    if "timeout" in message or "timed out" in message:
-        return "image_download_timeout"
-    if "execute" in message or "transport" in class_name.lower():
-        return "browser_execute_error"
-    if "session" in message or "session" in class_name.lower():
-        return "browser_session_error"
-    return "browser_error"
-
-
-def _record_firecrawl_browser_event(*, success: bool, error: BaseException | None = None) -> None:
-    """Record one final Firecrawl Browser image-download outcome."""
-
-    with _TOOL_STATS_LOCK:
-        browser_stats = _TOOL_STATS["tools"]["firecrawl_browser"]
-        if success:
-            browser_stats["success"] += 1
-            return
-        browser_stats["failure"] += 1
-        reason = _firecrawl_browser_failure_reason(error or RuntimeError("unknown Browser error"))
-        reasons = browser_stats["failure_reasons"]
-        reasons[reason] = int(reasons.get(reason) or 0) + 1
-
-
 def _record_read_url_call(
     *,
     branch: str,
@@ -637,6 +679,54 @@ def _record_read_url_call(
             snapshot_text = _tool_stats_snapshot_text()
     if snapshot_text:
         print(snapshot_text, file=sys.stderr, flush=True)
+
+
+def _record_wikimedia_download_event(*, success: bool, from_cache: bool = False) -> None:
+    """Record one Wikimedia image payload outcome.
+
+    This is deliberately separate from the overall ``read_url`` result: one
+    read can try several image candidates, and a later candidate may succeed
+    after an earlier Wikimedia candidate failed. Cache hits are successful
+    payload resolutions but are exposed separately from network downloads.
+    """
+
+    with _TOOL_STATS_LOCK:
+        wikimedia_stats = _TOOL_STATS["tools"]["wikimedia_download"]
+        if success and from_cache:
+            key = "cache_success"
+        elif success:
+            key = "download_success"
+        else:
+            key = "failure"
+        wikimedia_stats[key] += 1
+
+
+def _log_wikimedia_download_failure(
+    *,
+    candidate_kind: str,
+    candidate_url: str,
+    candidate_index: int,
+    error: Exception,
+) -> None:
+    """Emit a stable, always-visible diagnostic for one failed Wikimedia candidate."""
+
+    details: dict[str, object] = {
+        "candidate_index": candidate_index,
+        "candidate_kind": candidate_kind,
+        "url": candidate_url,
+        "error_type": type(error).__name__,
+    }
+    status_code = _extract_http_status_code(error)
+    if status_code is not None:
+        details["http_status"] = status_code
+    reason = " ".join(str(error).split()) or repr(error)
+    details["reason"] = reason[:2000]
+    if isinstance(error, requests.HTTPError) and error.response is not None:
+        response_body = " ".join(_response_body(error.response).split())
+        if response_body:
+            details["response_body"] = response_body[:2000]
+    suffix = " ".join(f"{key}={value!r}" for key, value in details.items())
+    print(f"[wikimedia-download] event=failed {suffix}", file=sys.stderr, flush=True)
 
 
 def _web_request_headers(*, referer_url: str | None = None) -> dict[str, str]:
@@ -946,28 +1036,68 @@ def _sft_worker_metadata(trace_label: str) -> dict[str, Any]:
 
 
 def _url_keyword_tokens(url: str) -> list[str]:
-    """Return non-technical word tokens explicitly present in a URL."""
+    """Return deterministic semantic hints explicitly present in a URL.
+
+    This intentionally does not inspect the target webpage.  It only decodes
+    the host/path, splits filename-like components, removes transport and
+    resizing noise, and returns words that were literally present in the URL.
+    """
     try:
         parsed = urlsplit(str(url or "").strip())
     except ValueError:
         return []
-    hostname = (parsed.hostname or "").lower()
-    raw_parts = [hostname, unquote(parsed.path or "")]
-    tokens: list[str] = []
-    for raw_part in raw_parts:
-        for token in re.findall(r"[A-Za-z][A-Za-z0-9]{1,}", raw_part):
-            normalized = token.lower()
-            if normalized in _URL_KEYWORD_NOISE_TOKENS:
-                continue
-            if normalized.isdigit() or re.fullmatch(r"[a-f0-9]{8,}", normalized):
-                continue
-            # Wire-service IDs, UUID-like strings, and compact cache keys are
-            # usually not meaningful to an agent even when alphabetic.
-            if re.fullmatch(r"[a-z]{1,4}\d[a-z0-9]{4,}", normalized):
-                continue
-            if normalized not in tokens:
-                tokens.append(normalized)
-    return tokens
+    hostname = (parsed.hostname or "").casefold()
+    path = unquote(unquote(parsed.path or ""))
+
+    def split_component(component: str) -> list[str]:
+        # Split camelCase before replacing filename separators.  ``\w`` is
+        # intentionally Unicode-aware so names such as ``rječnik`` survive
+        # URL decoding instead of being split into ASCII fragments.
+        component = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", component)
+        component = re.sub(r"[._+~(),;:=\-]+", " ", component)
+        return re.findall(r"[^\W_]+", component, flags=re.UNICODE)
+
+    def keep_token(token: str) -> bool:
+        normalized = token.casefold().strip()
+        if len(normalized) < 2 or normalized in _URL_KEYWORD_NOISE_TOKENS:
+            return False
+        if normalized in _URL_KEYWORD_DOMAIN_SUFFIXES:
+            return False
+        if normalized.isdigit():
+            return False
+        if re.fullmatch(r"\d+(?:x\d+)?(?:px)?", normalized):
+            return False
+        if re.fullmatch(r"[0-9a-f]{8,}", normalized):
+            return False
+        # Wire-service IDs, UUID-like strings, and compact cache keys are
+        # usually not meaningful even when they contain alphabetic characters.
+        if re.fullmatch(r"[a-z]{1,4}\d[a-z0-9]{4,}", normalized):
+            return False
+        return any(char.isalpha() for char in normalized)
+
+    # Keep phrases from one path/filename component, then their individual
+    # words.  This preserves useful names such as ``srpski rječnik`` without
+    # inventing a phrase across unrelated URL directories.
+    components: list[str] = []
+    components.extend(part for part in hostname.split(".") if part)
+    components.extend(part for part in path.split("/") if part)
+    phrases: list[str] = []
+    words: list[str] = []
+    for component in components:
+        component_words = [
+            token.casefold()
+            for token in split_component(component)
+            if keep_token(token)
+        ]
+        if len(component_words) >= 2:
+            phrase = " ".join(component_words)
+            if phrase not in phrases:
+                phrases.append(phrase)
+        for token in component_words:
+            if token not in words:
+                words.append(token)
+
+    return list(dict.fromkeys(phrases + words))[:_URL_KEYWORD_MAX_ITEMS]
 
 
 def _clean_url_for_keyword_prompt(url: str) -> dict[str, Any]:
@@ -1000,48 +1130,21 @@ def extract_url_semantic_keywords(
     *,
     model_alias: str | None = None,
 ) -> str:
-    """Return a conservative, URL-derived retrieval hint.
+    """Return a conservative, URL-derived retrieval hint without an LLM.
 
-    The returned string contains only words present in the URL host/path. It is
-    discovery metadata, not evidence about the underlying webpage or image.
+    The task only exposes lexical hints already present in the URL, so
+    deterministic extraction is both faster and faithful to the contract.
+    ``model_alias`` remains accepted for API compatibility.
     """
     raw_url = str(url or "").strip()
     if not raw_url:
         return ""
-    model_alias = model_alias or get_sft_qwen_model_alias()
-    cleaned = _clean_url_for_keyword_prompt(raw_url)
-    allowed_tokens = list(cleaned["tokens"])
-    if not allowed_tokens:
-        return ""
-    cache_key = (raw_url, model_alias)
+    cache_key = (raw_url, "rule_based")
     with _URL_KEYWORD_CACHE_LOCK:
         cached = _URL_KEYWORD_CACHE.get(cache_key)
     if cached is not None:
         return cached
-    try:
-        response = LLM_WORKER.generate(
-            ModelRequest(
-                model=model_alias,
-                messages=[
-                    ModelMessage(role="system", content=PROMPT_URL_SEMANTIC_KEYWORDS),
-                    ModelMessage(
-                        role="user",
-                        content=json.dumps(cleaned, ensure_ascii=False, sort_keys=True),
-                    ),
-                ],
-                response_format={"type": "json_object"},
-                max_tokens=128,
-                metadata=_sft_worker_metadata("extract_url_semantic_keywords"),
-            )
-        )
-        parsed = json.loads(response.content or "{}")
-        hint = _validate_url_keyword_hint(
-            parsed.get("keywords") if isinstance(parsed, dict) else "",
-            allowed_tokens=allowed_tokens,
-        )
-    except Exception as exc:  # pragma: no cover - remote model bound
-        logger.warning("URL keyword extraction failed: %s", exc)
-        hint = ""
+    hint = "; ".join(_url_keyword_tokens(raw_url))
     with _URL_KEYWORD_CACHE_LOCK:
         _URL_KEYWORD_CACHE[cache_key] = hint
     return hint
@@ -1088,6 +1191,7 @@ def postprocess_search_output(
     output: dict[str, Any],
     url_keyword_model: str | None = None,
     extract_url_keywords: bool = True,
+    timings: dict[str, float] | None = None,
 ) -> tuple[dict[str, Any], list[UrlResource]]:
     """Convert search results into compact agent output plus private resources.
 
@@ -1108,26 +1212,25 @@ def postprocess_search_output(
         if url
     }
     hints: dict[str, str] = {}
-    if extract_url_keywords:
-        resolved_url_keyword_model = url_keyword_model or get_sft_qwen_model_alias()
-        max_workers = len(unique_urls)
-        if max_workers:
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                future_to_url = {
-                    executor.submit(
-                        copy_context().run,
-                        extract_url_semantic_keywords,
+    keyword_started_at = time.monotonic()
+    try:
+        if extract_url_keywords:
+            # URL hint extraction is deterministic and CPU-local.  The
+            # previous thread pool existed only to overlap auxiliary LLM calls.
+            for url in unique_urls:
+                try:
+                    hints[url] = extract_url_semantic_keywords(
                         url,
-                        model_alias=resolved_url_keyword_model,
-                    ): url
-                    for url in unique_urls
-                }
-                for future in as_completed(future_to_url):
-                    url = future_to_url[future]
-                    try:
-                        hints[url] = future.result()
-                    except Exception:
-                        hints[url] = ""
+                        model_alias=url_keyword_model,
+                    )
+                except Exception:
+                    hints[url] = ""
+    finally:
+        _read_url_timing_add(
+            timings,
+            "url_keyword_extraction_s",
+            time.monotonic() - keyword_started_at,
+        )
 
     resources: list[UrlResource] = []
     agent_results: list[dict[str, Any]] = []
@@ -1210,28 +1313,74 @@ Tool goal:\n{goal or '(empty)'}\n
 Raw webpage content:\n{content[:80000]}\n
 """
     )
-    try:
-        model_alias = _summarizer_model_alias()
-        if not model_alias:
-            raise RuntimeError(
-                "No registered summarizer model alias is available. "
-                "Set SFT_SUMMARIZER_MODEL or SFT_QWEN_MODEL_ALIAS to a registered "
-                "synthesis/models.json alias."
-            )
-        response = LLM_WORKER.generate(
+    model_alias = _summarizer_model_alias()
+    if not model_alias:
+        logger.warning(
+            "Summarization skipped: no registered summarizer model alias is available"
+        )
+        return content[:1000] + ("..." if len(content) > 1000 else "")
+
+    fallback_alias = (
+        os.environ.get("SUMMARIZE_FALLBACK_MODEL_ALIAS")
+        or "gemini35flash_internal_azure"
+    ).strip()
+    messages = [ModelMessage(role="user", content=prompt)]
+    primary_metadata = _sft_worker_metadata("summarize_with_qwen")
+    # Summarization has an explicit model fallback. Do not spend the global
+    # retry budget on the primary model before switching to that fallback.
+    primary_metadata["llm_retry_count"] = 0
+    fallback_metadata = _sft_worker_metadata("summarize_with_qwen_fallback")
+
+    def _generate(alias: str, metadata: dict[str, Any]):
+        # Keep the fallback request identical except for the registered model
+        # alias.  In particular, do not rebuild or truncate the prompt here.
+        return LLM_WORKER.generate(
             ModelRequest(
-                model=model_alias,
-                messages=[ModelMessage(role="user", content=prompt)],
-                metadata=_sft_worker_metadata("summarize_with_qwen"),
+                model=alias,
+                messages=messages,
+                metadata=metadata,
             )
         )
+
+    try:
+        response = _generate(model_alias, primary_metadata)
         content_text = response.content or ""
         if content_text:
             cleaned = _clean_summarizer_output(content_text)
             if cleaned:
                 return cleaned
     except Exception as exc:  # pragma: no cover - network bound
-        logger.warning("Summarization failed: %s", exc)
+        if _is_timeout_error(exc):
+            if fallback_alias:
+                if _resolve_registered_model_alias(fallback_alias) is None:
+                    logger.warning(
+                        "Summarization timed out, but fallback model alias is not "
+                        "registered: %s",
+                        fallback_alias,
+                    )
+                else:
+                    logger.warning(
+                        "Summarization timed out; retrying the same request with "
+                        "fallback model alias=%s",
+                        fallback_alias,
+                    )
+                    try:
+                        fallback_response = _generate(fallback_alias, fallback_metadata)
+                        fallback_content = fallback_response.content or ""
+                        if fallback_content:
+                            fallback_cleaned = _clean_summarizer_output(fallback_content)
+                            if fallback_cleaned:
+                                return fallback_cleaned
+                    except Exception as fallback_exc:  # pragma: no cover - network bound
+                        logger.warning(
+                            "Summarization fallback failed: %s", fallback_exc
+                        )
+            else:
+                logger.warning(
+                    "Summarization timed out and SUMMARIZE_FALLBACK_MODEL_ALIAS is unset"
+                )
+        else:
+            logger.warning("Summarization failed: %s", exc)
     return content[:1000] + ("..." if len(content) > 1000 else "")
 
 
@@ -1432,7 +1581,6 @@ def _download_image_payload_with_cache(
     with _wikimedia_cache_key_lock(url):
         cached = _wikimedia_cache_read(url)
         if cached is not None:
-            _wikimedia_throttle_debug("cache_hit", url=url)
             return cached[0], cached[1], True
 
         payload, downloaded_type = fetch()
@@ -1440,7 +1588,6 @@ def _download_image_payload_with_cache(
         if not content_type.startswith("image/"):
             raise ValueError(f"downloaded fallback is not an image: {content_type or 'unknown'}")
         _wikimedia_cache_write(url, payload, content_type)
-        _wikimedia_throttle_debug("cache_store", url=url, byte_count=len(payload))
         return payload, content_type, False
 
 
@@ -1878,20 +2025,16 @@ def _download_binary(
 
 
 def _http_relay_request_url(url: str) -> str:
-    """Wrap one non-Wikimedia image URL with the optional HTTP Relay.
+    """Wrap one binary download URL with the optional HTTP Relay.
 
     The relay is applied below ``read_url`` so candidate selection, SVG
     conversion, retries, and the agent-facing tool contract remain unchanged.
-    ``HTTP_RELAY_URL`` is deliberately a URL prefix, for example
-    ``http://relay:18083/``.  The default is an empty string, which makes
-    this function return the original URL unchanged.  The target is
+    The Relay endpoint is fixed in ``_HTTP_RELAY_URL``.  The target is
     percent-encoded before it is appended so its own query string cannot
     change the Relay request's path or query parameters.
     """
 
-    if _is_wikimedia_upload_url(url):
-        return url
-    relay_prefix = str(os.environ.get(_HTTP_RELAY_URL_ENV) or "").strip()
+    relay_prefix = _HTTP_RELAY_URL
     if not relay_prefix:
         return url
     target_parts = urlsplit(str(url).strip())
@@ -1917,16 +2060,17 @@ def _configured_image_download_backend(url: str) -> str:
     - ``firecrawl_browser``: Browser only;
     - ``firecrawl_browser_then_http``: Browser first, direct HTTP only if it
       fails;
-    - ``http``: direct HTTP, optionally through the ``HTTP_RELAY_URL`` prefix
-      for non-Wikimedia image URLs.
+    - ``http``: HTTP downloads sent through the fixed ``_HTTP_RELAY_URL``
+      prefix; the Relay chooses direct versus upstream-proxy access by host.
 
-    Wikimedia can be configured independently with
+    Wikimedia/Wikipedia image URLs can be configured independently with
     ``SFT_WIKIMEDIA_IMAGE_DOWNLOAD_BACKEND``.  This lets RL runs move the
-    throttled Wikimedia path to Firecrawl without changing other image hosts.
+    throttled Wikimedia path between HTTP Relay and Firecrawl without changing
+    other image hosts.
     """
 
     configured = ""
-    if _is_wikimedia_upload_url(url):
+    if _is_wikimedia_image_url(url):
         configured = str(os.environ.get("SFT_WIKIMEDIA_IMAGE_DOWNLOAD_BACKEND") or "").strip()
     if not configured:
         configured = str(os.environ.get("SFT_IMAGE_DOWNLOAD_BACKEND") or "http").strip()
@@ -1968,7 +2112,6 @@ def _download_image_with_configured_backend(
 
     backend = _configured_image_download_backend(url)
     if backend in {"firecrawl_browser", "firecrawl_browser_then_http"}:
-        browser_started_at = time.monotonic()
         try:
             from synthesis.firecrawl_client import FirecrawlBrowserImageDownloader
 
@@ -1977,18 +2120,10 @@ def _download_image_with_configured_backend(
                 referer_url=referer_url,
                 timeout_s=timeout,
             )
-            _record_firecrawl_browser_event(success=True)
             return downloaded.payload, downloaded.content_type, "firecrawl_browser"
         except Exception as exc:
-            _record_firecrawl_browser_event(success=False, error=exc)
             if backend == "firecrawl_browser":
                 raise
-        finally:
-            _read_url_timing_add(
-                timings,
-                "image_firecrawl_browser_s",
-                time.monotonic() - browser_started_at,
-            )
 
     payload, content_type = _download_binary(
         url,
@@ -2175,13 +2310,6 @@ def _read_document_with_retry(
         except Exception as exc:
             if attempt > ENHANCED_READER_RETRIES:
                 raise
-            _read_url_debug(
-                "enhanced_reader_retry",
-                url=url,
-                attempt=attempt,
-                max_retries=ENHANCED_READER_RETRIES,
-                error=str(exc),
-            )
             reader_retry_reason = retry_reason_from_exception(
                 exc,
                 default="enhanced_reader_error",
@@ -2289,13 +2417,6 @@ def _read_via_firecrawl_with_timeout_retry(
                 retry_attempt = firecrawl_error_retries
                 max_retries = FIRECRAWL_ERROR_RETRIES
 
-            _read_url_debug(
-                f"firecrawl_{retry_kind}_retry",
-                url=url,
-                attempt=retry_attempt,
-                max_retries=max_retries,
-                error=str(exc),
-            )
             _tool_retry_debug(
                 "firecrawl",
                 attempt=retry_attempt,
@@ -2373,7 +2494,6 @@ def _read_url_with_firecrawl_fallback(
             time.monotonic() - fallback_started_at,
         )
 
-    _read_url_debug("firecrawl_fallback_done", url=url, content_chars=len(content))
     _record_read_url_call(branch="text", success=True)
     return {
         "ok": True,
@@ -2393,7 +2513,7 @@ def read_url(
     resource: UrlResource | None = None,
     raw_document_fetcher: RawDocumentFetcher | None = None,
 ) -> dict[str, Any]:
-    """Read a URL and emit one end-of-call timing summary when debug is enabled."""
+    """Read a URL and attach private timing diagnostics to the result."""
 
     started_at = time.monotonic()
     timings: dict[str, float] = {}
@@ -2409,15 +2529,28 @@ def read_url(
         )
         return result
     finally:
+        read_url_elapsed_s = max(0.0, time.monotonic() - started_at)
+        if isinstance(result, dict):
+            # Consumed by api_tools and never included in the model-visible
+            # observation. Keep this private payload scalar-only.
+            result["_timing"] = {
+                "read_url_stages": _read_url_stage_timings(timings),
+                "read_url_components": _read_url_component_timings(timings),
+                "read_url_total_s": round(read_url_elapsed_s, 6),
+            }
+            wikimedia_download = _read_url_wikimedia_download_stats(timings)
+            if wikimedia_download:
+                result["_timing"]["wikimedia_download"] = wikimedia_download
         summary: dict[str, Any] = {
             "url": (url or "").strip(),
-            "total_s": round(time.monotonic() - started_at, 3),
+            "total_s": round(read_url_elapsed_s, 3),
             "ok": result.get("ok") if isinstance(result, dict) else None,
             "resolved_via": result.get("resolved_via") if isinstance(result, dict) else None,
         }
         for key in sorted(timings):
             summary[key if key.endswith("_s") else f"{key}_s"] = round(timings[key], 3)
-        _read_url_debug("timing_summary", **summary)
+        if not isinstance(result, dict) or not result.get("ok", False):
+            _read_url_debug("timing_summary", **summary)
 
 
 def _read_url_impl(
@@ -2441,8 +2574,6 @@ def _read_url_impl(
     )
     if not normalized_url:
         return {"ok": False, "error": "URL is required."}
-    _read_url_debug("normalized_url", original_url=original_url, normalized_url=normalized_url)
-
     # Do not make a HEAD/streaming-GET round trip merely to classify the URL.
     # Search resources and explicit suffixes provide enough information for
     # the binary paths; all other URLs are sent directly to Enhanced Reader.
@@ -2460,27 +2591,11 @@ def _read_url_impl(
             "classify_s",
             time.monotonic() - classify_started_at,
         )
-    _read_url_debug(
-        "classified_content_type",
-        url=normalized_url,
-        content_type=content_type,
-        source=content_type_source,
-        probe_skipped=True,
-    )
     if is_image_resource or content_type.startswith("image/"):
         image_max_retries = _read_url_image_max_retries()
         image_retry_sleep_s = _read_url_image_retry_sleep_s()
         image_max_429_retries = _read_url_429_max_retries()
         image_429_retry_sleep_s = _read_url_429_retry_sleep_s()
-        _read_url_debug(
-            "image_download_retry_policy",
-            url=normalized_url,
-            max_retries=image_max_retries,
-            max_attempts=image_max_retries + 1,
-            retry_sleep_s=image_retry_sleep_s,
-            max_429_retries=image_max_429_retries,
-            retry_429_sleep_s=image_429_retry_sleep_s,
-        )
         failures: list[str] = []
         candidates = _resource_candidate_urls(resource, normalized_url)
         source_page_checked = False
@@ -2494,6 +2609,11 @@ def _read_url_impl(
                 filename = os.path.basename(urlparse(candidate_url).path) or "downloaded_image"
                 download_backend: dict[str, str] = {}
                 download_started_at = time.monotonic()
+                wikimedia_download = _is_wikimedia_image_url(candidate_url)
+                wikimedia_download_started_at = (
+                    time.monotonic() if wikimedia_download else None
+                )
+                wikimedia_outcome_recorded = False
                 try:
                     def _fetch_candidate_image() -> tuple[bytes, str]:
                         payload, downloaded_type, backend_name = _download_image_with_configured_backend(
@@ -2519,6 +2639,62 @@ def _read_url_impl(
                         ),
                         fetch=_fetch_candidate_image,
                     )
+                    if wikimedia_download:
+                        wikimedia_elapsed_s = time.monotonic() - wikimedia_download_started_at
+                        _read_url_timing_add(
+                            _timings,
+                            "wikimedia_download_s",
+                            wikimedia_elapsed_s,
+                        )
+                        _read_url_timing_add(
+                            _timings,
+                            "wikimedia_download_calls",
+                            1.0,
+                        )
+                        if from_cache:
+                            _read_url_timing_add(
+                                _timings,
+                                "wikimedia_download_cache_success",
+                                1.0,
+                            )
+                        else:
+                            _read_url_timing_add(
+                                _timings,
+                                "wikimedia_download_success",
+                                1.0,
+                            )
+                        _record_wikimedia_download_event(
+                            success=True,
+                            from_cache=from_cache,
+                        )
+                        wikimedia_outcome_recorded = True
+                except Exception as exc:
+                    if wikimedia_download and not wikimedia_outcome_recorded:
+                        _log_wikimedia_download_failure(
+                            candidate_kind=candidate_kind,
+                            candidate_url=candidate_url,
+                            candidate_index=candidate_index,
+                            error=exc,
+                        )
+                        wikimedia_elapsed_s = time.monotonic() - wikimedia_download_started_at
+                        _read_url_timing_add(
+                            _timings,
+                            "wikimedia_download_s",
+                            wikimedia_elapsed_s,
+                        )
+                        _read_url_timing_add(
+                            _timings,
+                            "wikimedia_download_calls",
+                            1.0,
+                        )
+                        _read_url_timing_add(
+                            _timings,
+                            "wikimedia_download_failure",
+                            1.0,
+                        )
+                        _record_wikimedia_download_event(success=False)
+                        wikimedia_outcome_recorded = True
+                    raise
                 finally:
                     _read_url_timing_add(
                         _timings,
@@ -2620,13 +2796,11 @@ def _read_url_impl(
 
     if content_type in PDF_CONTENT_TYPES:
         try:
-            _read_url_debug("pdf_branch_start", url=normalized_url, content_type=content_type)
             temp_dir = tempfile.mkdtemp(prefix="synthesis_sft_read_pdf_")
             filename = os.path.basename(urlparse(normalized_url).path) or "downloaded.pdf"
             if not filename.lower().endswith(".pdf"):
                 filename = f"{os.path.splitext(filename)[0] or 'downloaded'}.pdf"
             save_path = os.path.join(temp_dir, filename)
-            _read_url_debug("pdf_download_start", url=normalized_url, save_path=save_path)
             pdf_download_started_at = time.monotonic()
             try:
                 pdf_bytes, _ = _download_binary(
@@ -2642,12 +2816,6 @@ def _read_url_impl(
                     "pdf_download_s",
                     time.monotonic() - pdf_download_started_at,
                 )
-            _read_url_debug(
-                "pdf_download_done",
-                url=normalized_url,
-                byte_count=len(pdf_bytes),
-                startswith_pdf=pdf_bytes.startswith(b"%PDF-"),
-            )
             pdf_save_started_at = time.monotonic()
             try:
                 with open(save_path, "wb") as handle:
@@ -2658,7 +2826,6 @@ def _read_url_impl(
                     "pdf_save_s",
                     time.monotonic() - pdf_save_started_at,
                 )
-            _read_url_debug("pdf_extract_start", path=save_path)
             pdf_extract_started_at = time.monotonic()
             try:
                 content, title = _extract_pdf_text(save_path)
@@ -2668,13 +2835,6 @@ def _read_url_impl(
                     "pdf_extract_s",
                     time.monotonic() - pdf_extract_started_at,
                 )
-            _read_url_debug(
-                "pdf_extract_done",
-                path=save_path,
-                title=title,
-                text_chars=len(content),
-                text_preview=content[:200].replace("\n", " "),
-            )
             if not content:
                 _record_read_url_call(branch="pdf", success=False)
                 _read_url_debug("pdf_extract_empty", path=save_path)
@@ -2719,7 +2879,6 @@ def _read_url_impl(
             # host. Fall back to the configured reader, which may use a
             # different network path and can return extracted text directly.
             try:
-                _read_url_debug("pdf_reader_fallback_start", url=normalized_url)
                 pdf_reader_started_at = time.monotonic()
                 try:
                     document = _read_document_with_retry(
@@ -2734,13 +2893,6 @@ def _read_url_impl(
                         time.monotonic() - pdf_reader_started_at,
                     )
                 content = str(document.get("content") or "").strip()
-                _read_url_debug(
-                    "pdf_reader_fallback_done",
-                    url=normalized_url,
-                    title=document.get("title"),
-                    content_chars=len(content),
-                    content_preview=content[:200].replace("\n", " "),
-                )
                 if content:
                     pdf_reader_summary_started_at = time.monotonic()
                     try:
@@ -2864,35 +3016,61 @@ def _run_search_with_timeout_retry(
     request: Callable[[], Any],
     *,
     request_url: str = "",
+    timings: dict[str, float] | None = None,
 ) -> Any:
     """Run a search backend request with bounded timeout-only retries."""
 
     for attempt in range(1, TOOL_TIMEOUT_RETRIES + 2):
+        request_started_at = time.monotonic()
         try:
             return request()
         except Exception as exc:
             if not _is_timeout_error(exc) or attempt > TOOL_TIMEOUT_RETRIES:
                 raise
-            _tool_retry_debug(
-                tool_name,
-                attempt=attempt,
-                max_attempts=TOOL_TIMEOUT_RETRIES + 1,
-                sleep_seconds=TOOL_RETRY_SLEEP_S * attempt,
-                error=exc,
+        finally:
+            _read_url_timing_add(
+                timings,
+                "serper_http_s",
+                time.monotonic() - request_started_at,
             )
-            tracked_sleep(
-                TOOL_RETRY_SLEEP_S * attempt,
-                reason=retry_reason_from_exception(exc, default=f"{tool_name}_timeout"),
-                tool=tool_name,
-                error=exc,
-                url=request_url,
-                error_type=type(exc).__name__,
-                fallback_sleep=time.sleep,
+            _read_url_timing_add(timings, "serper_attempts", 1.0)
+
+        # Only timeout/transport failures reach this point. The sleep is kept
+        # separate from the HTTP time so the RL debug line can distinguish a
+        # slow Serper upstream from retry backoff.
+        retry_sleep_started_at = time.monotonic()
+        _tool_retry_debug(
+            tool_name,
+            attempt=attempt,
+            max_attempts=TOOL_TIMEOUT_RETRIES + 1,
+            sleep_seconds=TOOL_RETRY_SLEEP_S * attempt,
+            error=exc,
+        )
+        tracked_sleep(
+            TOOL_RETRY_SLEEP_S * attempt,
+            reason=retry_reason_from_exception(exc, default=f"{tool_name}_timeout"),
+            tool=tool_name,
+            error=exc,
+            url=request_url,
+            error_type=type(exc).__name__,
+            fallback_sleep=time.sleep,
+        )
+        if timings is not None:
+            _read_url_timing_add(
+                timings,
+                "serper_retry_sleep_s",
+                time.monotonic() - retry_sleep_started_at,
             )
     raise AssertionError("unreachable")
 
 
-def t2t_search(query: str, lang: str = "en", top_k: int = DEFAULT_SEARCH_TOP_K) -> dict[str, Any]:
+def t2t_search(
+    query: str,
+    lang: str = "en",
+    top_k: int = DEFAULT_SEARCH_TOP_K,
+    *,
+    timings: dict[str, float] | None = None,
+) -> dict[str, Any]:
     """Search text pages and return search results only."""
     try:
         top_k = max(1, min(int(top_k), MAX_SEARCH_RESULTS))
@@ -2906,6 +3084,7 @@ def t2t_search(query: str, lang: str = "en", top_k: int = DEFAULT_SEARCH_TOP_K) 
                 hl=lang,
             ),
             request_url=os.environ.get("SERPER_SEARCH_URL") or "https://google.serper.dev/search",
+            timings=timings,
         )
         results: list[dict[str, Any]] = []
         for item in response.results:
@@ -2932,7 +3111,13 @@ def t2t_search(query: str, lang: str = "en", top_k: int = DEFAULT_SEARCH_TOP_K) 
         raise
 
 
-def t2i_search(query: str, lang: str = "en", top_k: int = DEFAULT_SEARCH_TOP_K) -> dict[str, Any]:
+def t2i_search(
+    query: str,
+    lang: str = "en",
+    top_k: int = DEFAULT_SEARCH_TOP_K,
+    *,
+    timings: dict[str, float] | None = None,
+) -> dict[str, Any]:
     """Search images from a text query."""
     try:
         top_k = max(1, min(int(top_k), MAX_SEARCH_RESULTS))
@@ -2946,6 +3131,7 @@ def t2i_search(query: str, lang: str = "en", top_k: int = DEFAULT_SEARCH_TOP_K) 
                 hl=lang,
             ),
             request_url=os.environ.get("SERPER_IMAGES_URL") or "https://google.serper.dev/images",
+            timings=timings,
         )
         results: list[dict[str, Any]] = []
         for item in response.results:
@@ -2976,8 +3162,13 @@ def t2i_search(query: str, lang: str = "en", top_k: int = DEFAULT_SEARCH_TOP_K) 
         raise
 
 
-def _image_search_via_serper(image_url: str, top_k: int = MAX_SEARCH_RESULTS) -> object:
-    serper_api_key, pool_metadata = acquire_serper_api_key()
+def _image_search_via_serper(
+    image_url: str,
+    top_k: int = MAX_SEARCH_RESULTS,
+    *,
+    timings: dict[str, float] | None = None,
+) -> object:
+    serper_api_key, _ = acquire_serper_api_key()
     fetch_limit = _search_fetch_limit(max(1, min(int(top_k), MAX_SEARCH_RESULTS)), tool_name="i2i_search")
 
     lens_headers = {
@@ -2988,25 +3179,24 @@ def _image_search_via_serper(image_url: str, top_k: int = MAX_SEARCH_RESULTS) ->
     if relay_token:
         lens_headers["X-Serper-Relay-Token"] = relay_token
     lens_url = os.environ.get("SERPER_LENS_URL") or "https://google.serper.dev/lens"
-    response = requests.post(
-        lens_url,
-        headers=lens_headers,
-        json={"url": image_url},
-        timeout=TOOL_NETWORK_TIMEOUT_S,
-    )
+    request_started_at = time.monotonic()
+    try:
+        response = requests.post(
+            lens_url,
+            headers=lens_headers,
+            json={"url": image_url},
+            timeout=TOOL_NETWORK_TIMEOUT_S,
+        )
+    finally:
+        _read_url_timing_add(
+            timings,
+            "serper_http_s",
+            time.monotonic() - request_started_at,
+        )
+        _read_url_timing_add(timings, "serper_attempts", 1.0)
     try:
         response.raise_for_status()
     except requests.HTTPError:
-        response_body = getattr(response, "text", "") or ""
-        status_code = int(getattr(response, "status_code", 0) or 0)
-        if _is_serper_credit_exhausted(
-            status_code=status_code,
-            response_body=response_body,
-        ):
-            SerperApiKeyPool.from_fixed_pool().mark_credits_exhausted(
-                str(pool_metadata.get("key_id") or ""),
-                reason=f"serper_lens_http_{status_code}_credits_exhausted",
-            )
         raise
     data = response.json()
     organic = data.get("organic", []) or []
@@ -3033,27 +3223,33 @@ def i2i_search(
     top_k: int = DEFAULT_SEARCH_TOP_K,
     max_retries: int = TOOL_TIMEOUT_RETRIES,
     base_delay: int = TOOL_RETRY_SLEEP_S,
+    timings: dict[str, float] | None = None,
 ) -> dict[str, Any]:
     """Reverse-image search using a provided backend or Serper Lens.
 
     A successful Lens response with no matches can be transient when the
-    remote image URL is temporarily inaccessible to the search backend.  Retry
-    that specific case once after a short fixed delay, while retaining the
-    timeouts are retried at most ``max_retries`` times after the initial
-    request.  Other backend errors are returned immediately.
+    remote image URL is temporarily inaccessible to the search backend. Retry
+    that specific case at most ``I2I_EMPTY_RESULT_RETRIES`` times after a
+    short fixed delay, while transport timeouts are retried at most
+    ``max_retries`` times after the initial request. Other backend errors are
+    returned immediately.
     """
 
+    use_default_visual_lookup = visual_lookup is None
     visual_lookup = visual_lookup or _image_search_via_serper
     top_k = max(1, min(int(top_k), MAX_SEARCH_RESULTS))
     last_error: Exception | None = None
-    retried_empty_result = False
+    empty_result_retries = 0
     attempt = 1
     attempts_made = 0
     max_attempts = 1 + max(0, int(max_retries))
     while attempt <= max_attempts:
         attempts_made = attempt
         try:
-            result = visual_lookup(image_url=image_url, top_k=top_k)
+            if use_default_visual_lookup:
+                result = visual_lookup(image_url=image_url, top_k=top_k, timings=timings)
+            else:
+                result = visual_lookup(image_url=image_url, top_k=top_k)
             if isinstance(result, dict) and "error" in result:
                 raise RuntimeError(str(result["error"]))
             matches = summarize_image_search(result)
@@ -3069,14 +3265,20 @@ def i2i_search(
                     )
                 ]
             result_count = len(matches) if isinstance(matches, list) else (1 if matches else 0)
-            if result_count == 0 and not retried_empty_result:
-                retried_empty_result = True
+            if (
+                result_count == 0
+                and empty_result_retries < I2I_EMPTY_RESULT_RETRIES
+            ):
+                failed_attempt = empty_result_retries + 1
+                empty_result_retries += 1
                 _tool_retry_debug(
                     "i2i_search",
-                    attempt=attempt,
-                    max_attempts=max_attempts,
+                    attempt=failed_attempt,
+                    max_attempts=1 + I2I_EMPTY_RESULT_RETRIES,
                     sleep_seconds=5,
                     error="empty result",
+                    result=json.dumps(result, ensure_ascii=False, default=str),
+                    url=image_url,
                     retry_reason="empty_result",
                 )
                 tracked_sleep(
@@ -3087,7 +3289,19 @@ def i2i_search(
                     error_type="EmptySearchResult",
                     fallback_sleep=time.sleep,
                 )
+                _read_url_timing_add(timings, "serper_retry_sleep_s", 5.0)
                 continue
+            if result_count == 0:
+                _record_search_tool_call("i2i_search", success=False, result_count=0)
+                return {
+                    "ok": False,
+                    "top_k": top_k,
+                    "matches": matches,
+                    "error": (
+                        f"i2i_search returned no results after "
+                        f"{1 + empty_result_retries} attempt(s)"
+                    ),
+                }
             _record_search_tool_call("i2i_search", success=True, result_count=result_count)
             return {
                 "ok": True,
@@ -3115,6 +3329,7 @@ def i2i_search(
                     error_type=type(exc).__name__,
                     fallback_sleep=time.sleep,
                 )
+                _read_url_timing_add(timings, "serper_retry_sleep_s", sleep_s)
             elif not _is_timeout_error(exc):
                 break
             attempt += 1

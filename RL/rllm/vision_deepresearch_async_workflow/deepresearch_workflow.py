@@ -142,6 +142,12 @@ def _is_step_error(step: Step) -> bool:
 
 _QUERY_JUDGE_MARKER = os.getenv("JUDGE_MODEL_MARKER", os.getenv("JUDGE_MODEL", "gpt-4o-mini"))
 
+# A trajectory that exhausts the configured turn budget without producing an
+# answer is usually a search/reasoning loop.  Keep this penalty small, but make
+# it strictly negative so these trajectories are not rewarded merely because
+# their intermediate tool-call format was valid.
+_MAX_TURNS_TERMINAL_REWARD = -0.1
+
 _QUERY_UTILITY_PROMPT_TEMPLATE = """\
 You are an impartial judge evaluating the quality and utility of an agent's search trajectory.
 
@@ -284,7 +290,6 @@ async def _judge_query_utility(
         )
 
         if not is_api_gateway_configured():
-            print("[QueryUtilityReward] API gateway not configured, defaulting to 0.0")
             return 0.0
 
         messages = [
@@ -310,7 +315,6 @@ async def _judge_query_utility(
 
         score = _parse_query_utility_score(content)
         if score is not None:
-            print(f"[QueryUtilityReward] score={score:.2f}")
             return score
 
         print(f"[QueryUtilityReward] Failed to parse score from: {content[:200]}")
@@ -329,22 +333,77 @@ def _get_next_observation(messages: list[dict], current_index: int) -> str:
     return ""
 
 
+def _is_max_turns_termination(termination: str) -> bool:
+    normalized = str(termination or "").strip().lower()
+    return normalized in {
+        "max_rounds_reached",
+        "max_rounds_reached_no_answer",
+        "exceed available llm calls",
+        "answer not found",
+    } or normalized.startswith("answer not found after")
+
+
 def _map_termination_reason(termination: str) -> TerminationReason:
+    # The agent uses both fixed names and dynamic strings such as
+    # ``answer not found after 50 rounds`` when it exhausts its call budget.
+    # Normalize all of these to the dedicated max-turns reason instead of
+    # letting the dynamic forms fall through to UNKNOWN.
+    if _is_max_turns_termination(termination):
+        return TerminationReason.MAX_TURNS_EXCEEDED
+
     mapping = {
         "answer": TerminationReason.ENV_DONE,
+        "answer_tool_fallback": TerminationReason.ENV_DONE,
         "timeout": TerminationReason.UNKNOWN,
-        "max_rounds_reached": TerminationReason.UNKNOWN,
         "token_limit_no_answer": TerminationReason.UNKNOWN,
         "answer_token_limit": TerminationReason.UNKNOWN,
-        "exceed available llm calls": TerminationReason.UNKNOWN,
         "prompt_budget_reached": TerminationReason.UNKNOWN,
-        "max_rounds_reached_no_answer": TerminationReason.UNKNOWN,
         "repetition_detected": TerminationReason.UNKNOWN,  # Will be masked
         "tool_errors_too_many": TerminationReason.UNKNOWN,  # Will be masked
         "consecutive_step_errors": TerminationReason.UNKNOWN,  # Will be masked
         "error": TerminationReason.UNKNOWN,  # Will be masked
     }
     return mapping.get(termination, TerminationReason.UNKNOWN)
+
+
+def _build_rollout_markers(
+    termination: str,
+    steps: list[Step],
+    latency: dict,
+) -> list[str]:
+    """Build diagnostic markers without changing reward/masking semantics."""
+    markers: list[str] = []
+
+    # The agent emits either an explicit max-call reason or an
+    # ``answer not found`` reason after exhausting its configured call budget.
+    if _is_max_turns_termination(termination):
+        markers.append("MAX_TURNS")
+
+    raw_termination = str(termination or "").strip().lower()
+
+    tool_error_termination = raw_termination in {
+        "tool_errors_too_many",
+        "consecutive_step_errors",
+        "tool_execution_exception",
+        "tool_call_json_parse",
+        "tool_call_not_object",
+        "tool_call_schema",
+        "answer_tool_fallback",
+    }
+    step_has_error = any(_is_step_error(step) for step in steps)
+    latency_tool_failures = 0
+    if isinstance(latency, dict):
+        tool_summaries = latency.get("tools")
+        if isinstance(tool_summaries, dict):
+            latency_tool_failures = sum(
+                int(summary.get("failures") or 0)
+                for summary in tool_summaries.values()
+                if isinstance(summary, dict)
+            )
+    if tool_error_termination or step_has_error or latency_tool_failures > 0:
+        markers.append("TOOL_ERROR")
+
+    return markers
 
 
 def _evaluate_answer(prediction: str, ground_truth: str) -> bool:
@@ -408,7 +467,7 @@ def _find_fatal_step_index(
             fatal_start = idx - _CONSECUTIVE_ERROR_THRESHOLD + 1
             return fatal_start, "consecutive_errors"
 
-    if termination == "answer":
+    if termination in {"answer", "answer_tool_fallback"}:
         return None, ""
 
     # Abnormal termination without error cascade — all existing steps are
@@ -446,6 +505,8 @@ class DeepResearchWorkflow(Workflow):
         tools: dict | None = None,
         system_prompt: str | None = None,
         reward_function: RewardFunction | None = None,
+        max_llm_calls: int | None = None,
+        max_turns: int | None = None,
         **kwargs,
     ):
         super().__init__(rollout_engine, executor, **kwargs)
@@ -456,12 +517,16 @@ class DeepResearchWorkflow(Workflow):
                 tool.set_executor(self.executor)
         self.system_prompt = system_prompt
         self.reward_function = reward_function
+        configured_max_llm_calls = (
+            max_llm_calls if max_llm_calls is not None else max_turns
+        )
 
         self.agent = DeepResearchAgent(
             rollout_engine=rollout_engine,
             tools=self.tools,
             system_prompt=self.system_prompt,
             executor=executor,
+            max_llm_calls=configured_max_llm_calls,
         )
 
     async def run(self, task: dict, uid: str, **kwargs) -> Episode:
@@ -470,9 +535,6 @@ class DeepResearchWorkflow(Workflow):
         question = task.get("question", task.get("query", "No question provided"))
         answer = task.get("answer", "")
         task_system_prompt = _task_system_prompt(task)
-
-        print(f"🚀 Starting DeepResearch workflow for task {uid}")
-        print(f"   Question: {question}")
 
         try:
             raw_images = None
@@ -495,6 +557,7 @@ class DeepResearchWorkflow(Workflow):
                     images=pil_images,
                     image_path=raw_images[0],
                     system_prompt=task_system_prompt,
+                    trajectory_id=uid,
                     **kwargs,
                 )
             else:
@@ -502,6 +565,7 @@ class DeepResearchWorkflow(Workflow):
                     question=question,
                     answer=answer,
                     system_prompt=task_system_prompt,
+                    trajectory_id=uid,
                     **kwargs,
                 )
 
@@ -574,27 +638,51 @@ class DeepResearchWorkflow(Workflow):
                 episode.info["mask_reason"] = fatal_reason
             else:
                 # Compute full reward for group advantage statistics.
-                # For fatal trajectories, r_format and r_query are scored
-                # only on the learnable prefix (pre-fatal steps).
+                # Query utility remains scoped to the learnable prefix below,
+                # but format is a trajectory-level hard constraint: one
+                # malformed/error step makes the whole format component zero.
                 r_accuracy = 1.0 if episode.is_correct else 0.0
 
-                scored_steps = (
-                    all_steps[:fatal_step_index]
-                    if is_fatal and fatal_step_index < len(all_steps)
-                    else all_steps
-                )
-                if scored_steps:
-                    fmt_scores = [_format_reward_for_step(s) for s in scored_steps]
-                    r_format = sum(fmt_scores) / len(fmt_scores)
+                # Keep checking every generated round, including the part
+                # after a fatal boundary.  The policy may mask that suffix
+                # during the update, but a format error anywhere in the
+                # trajectory must still invalidate the format reward.
+                format_scores = [_format_reward_for_step(s) for s in all_steps]
+                format_error_rounds = [
+                    index + 1
+                    for index, score in enumerate(format_scores)
+                    if score == 0.0
+                ]
+                if format_scores:
+                    r_format = 0.0 if format_error_rounds else 1.0
                 else:
                     r_format = 0.0
+                episode.info["format_error_rounds"] = format_error_rounds
 
                 # Query-utility/quality reward is intentionally disabled for
                 # the current experiment.  Keep the metric field at 0.0 for
                 # backward-compatible logging, but do not issue an additional
                 # LLM judge request and do not include it in policy reward.
                 r_query = 0.0
-                total_reward = r_format * r_accuracy
+                # Keep the two signals additive for normal trajectories, with
+                # final-answer accuracy carrying the dominant weight.  A
+                # max-turns trajectory is a special terminal failure: it must
+                # receive a strictly negative reward even when all
+                # intermediate tool-call formats were valid.
+                base_reward = 0.2 * r_format + 0.8 * r_accuracy
+                max_turns_terminated = _is_max_turns_termination(
+                    result.get("termination", "")
+                )
+                termination_penalty = (
+                    _MAX_TURNS_TERMINAL_REWARD if max_turns_terminated else 0.0
+                )
+                total_reward = (
+                    _MAX_TURNS_TERMINAL_REWARD
+                    if max_turns_terminated
+                    else base_reward
+                )
+                episode.info["reward_base_total"] = base_reward
+                episode.info["max_turns_terminated"] = max_turns_terminated
 
                 for trajectory in episode.trajectories:
                     trajectory.reward = total_reward
@@ -608,6 +696,7 @@ class DeepResearchWorkflow(Workflow):
                     "reward/accuracy": r_accuracy,
                     "reward/query_utility": r_query,
                     "reward/format": r_format,
+                    "reward/termination_penalty": termination_penalty,
                     "reward/total": total_reward,
                     "masked": 0.0,
                     "is_fatal": 1.0 if is_fatal else 0.0,
@@ -617,12 +706,6 @@ class DeepResearchWorkflow(Workflow):
                     "num_turns": num_turns,
                 }
 
-            print(f"✅ DeepResearch workflow completed for task {uid}")
-            print(f"   Prediction: {result.get('prediction', 'No prediction')}")
-            print(f"   True Answer: {answer}")
-            print(f"   Metrics: {episode.metrics}")
-            if episode.info.get("mask_reason"):
-                print(f"   Mask Reason: {episode.info['mask_reason']}")
             return episode
 
         except Exception as exc:  # noqa: BLE001
@@ -640,7 +723,11 @@ class DeepResearchWorkflow(Workflow):
                 "reward/total": 0.0,
                 "masked": 1.0,
             }
-            episode.info = {"error": str(exc)}
+            episode.info = {
+                "error": str(exc),
+                "raw_termination": "error",
+                "rollout_markers": [],
+            }
             return episode
 
     def _convert_result_to_episode(self, result: dict, task: dict, uid: str) -> Episode:
@@ -731,6 +818,10 @@ class DeepResearchWorkflow(Workflow):
             "rounds": rounds,
             "time_taken": time_taken,
             "latency": latency,
+            "raw_termination": termination,
+            "rollout_markers": _build_rollout_markers(
+                termination, steps, latency
+            ),
             "prediction": prediction,
             "answer": answer_text,
             "token_usage": result.get("token_usage", {}),
@@ -738,8 +829,51 @@ class DeepResearchWorkflow(Workflow):
         return episode
 
     def reset(self, task: dict | None = None, uid: str | None = None):
-        # MultiTurnReactAgent handles per-run state; nothing to reset here.
-        return
+        # Keep the Workflow-level lifecycle state in sync with the base class.
+        # MultiTurnReactAgent resets its own per-run state through the base
+        # implementation's agent reset loop, but the Workflow also needs to
+        # retain ``uid`` and ``task`` for timeout/error post-processing.
+        super().reset(task=task, uid=uid)
+
+    def _on_timeout(self, *, task: dict, uid: str) -> None:
+        """Print one compact snapshot before timeout cleanup starts."""
+        if str(os.environ.get("RLLM_TIMEOUT_DEBUG", "1")).strip().lower() in {
+            "0",
+            "false",
+            "no",
+            "off",
+        }:
+            return
+
+        agent = self.agent
+        tool_calls = getattr(agent, "_tool_call_counts", {}) or {}
+        tool_failures = getattr(agent, "_tool_latency_failures", {}) or {}
+        tool_calls_text = ",".join(
+            f"{name}:{count}" for name, count in sorted(tool_calls.items())
+        ) or "-"
+        tool_failures_text = ",".join(
+            f"{name}:{count}" for name, count in sorted(tool_failures.items())
+        ) or "-"
+        attempted_tools = sum(int(count) for count in tool_calls.values())
+        completed_tools = sum(
+            len(samples)
+            for samples in (getattr(agent, "_tool_latency_samples_s", {}) or {}).values()
+        )
+
+        print(
+            "[RL_ROLLOUT_TIMEOUT] "
+            f"task={uid} timeout_s={self.timeout} "
+            f"rounds={getattr(agent, '_current_round', 0)} "
+            f"llm_calls_completed={getattr(agent, 'model_call_count', 0)} "
+            f"prompt_tokens_sum={getattr(agent, 'total_prompt_tokens', 0)} "
+            f"completion_tokens_sum={getattr(agent, 'total_completion_tokens', 0)} "
+            f"last_prompt_tokens={getattr(agent, 'last_prompt_tokens', 0)} "
+            f"last_completion_tokens={getattr(agent, 'last_completion_tokens', 0)} "
+            f"tool_attempts={attempted_tools} tool_completed={completed_tools} "
+            f"tool_calls_by_name={tool_calls_text} "
+            f"tool_failures_by_name={tool_failures_text}",
+            flush=True,
+        )
 
     def is_multithread_safe(self) -> bool:
         return True

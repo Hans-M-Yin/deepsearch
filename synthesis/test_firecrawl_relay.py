@@ -5,12 +5,15 @@ from __future__ import annotations
 import io
 import json
 import threading
+from pathlib import Path
+from tempfile import TemporaryDirectory
 import unittest
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen as client_urlopen
 from unittest import mock
 
 from debug import firecrawl_relay
+from synthesis.firecrawl_client import FirecrawlApiKeyPool
 
 
 class _FakeUpstreamResponse:
@@ -58,6 +61,152 @@ class FirecrawlRelayTest(unittest.TestCase):
         self.server.shutdown()
         self.server.server_close()
         self.thread.join(timeout=2)
+
+    def test_managed_pool_ignores_client_key_and_rotates_after_credit_error(self) -> None:
+        with TemporaryDirectory() as directory:
+            state_path = Path(directory) / "pool.json"
+            self.server.key_pool = FirecrawlApiKeyPool(
+                keys=["empty-key", "good-key"],
+                state_path=state_path,
+            )
+            self.server.browser_session_keys = {}
+            self.server.browser_session_lock = threading.RLock()
+            upstream_keys: list[str] = []
+
+            def fake_upstream(request: Request, *, timeout: float) -> _FakeUpstreamResponse:
+                del timeout
+                api_key = request.get_header("X-api-key") or ""
+                upstream_keys.append(api_key)
+                if api_key == "empty-key":
+                    raise HTTPError(
+                        request.full_url,
+                        402,
+                        "Payment Required",
+                        {},
+                        io.BytesIO(b'{"error":"Insufficient credits"}'),
+                    )
+                return _FakeUpstreamResponse(
+                    {
+                        "success": True,
+                        "data": {
+                            "markdown": "page",
+                            "metadata": {"creditsUsed": 1, "statusCode": 200},
+                        },
+                    }
+                )
+
+            def request_once() -> object:
+                return Request(
+                    self._url("/v2/scrape"),
+                    data=b'{"url":"https://example.com"}',
+                    headers={
+                        "Content-Type": "application/json",
+                        "X-API-KEY": "relay-placeholder",
+                    },
+                    method="POST",
+                )
+
+            with mock.patch.object(firecrawl_relay, "urlopen", side_effect=fake_upstream):
+                with client_urlopen(request_once(), timeout=3) as response:
+                    self.assertEqual(json.loads(response.read())["success"], True)
+
+            self.assertEqual(upstream_keys, ["empty-key", "good-key"])
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            exhausted = state["keys"][FirecrawlApiKeyPool.key_id("empty-key")]
+            self.assertTrue(exhausted["disabled"])
+            self.assertEqual(exhausted["disabled_reason"], "firecrawl_credits_exhausted")
+            self.assertEqual(
+                state["keys"][FirecrawlApiKeyPool.key_id("good-key")]["remaining_credits"],
+                9999,
+            )
+
+    def test_credit_exhaustion_stops_after_all_candidate_keys(self) -> None:
+        with TemporaryDirectory() as directory:
+            state_path = Path(directory) / "pool.json"
+            self.server.key_pool = FirecrawlApiKeyPool(
+                keys=["empty-one", "empty-two"],
+                state_path=state_path,
+            )
+            self.server.browser_session_keys = {}
+            self.server.browser_session_lock = threading.RLock()
+            upstream_keys: list[str] = []
+
+            def fake_upstream(request: Request, *, timeout: float) -> _FakeUpstreamResponse:
+                del timeout
+                upstream_keys.append(request.get_header("X-api-key") or "")
+                raise HTTPError(
+                    request.full_url,
+                    402,
+                    "Payment Required",
+                    {},
+                    io.BytesIO(b'{"error":"Insufficient credits"}'),
+                )
+
+            request = Request(
+                self._url("/v2/scrape"),
+                data=b'{"url":"https://example.com"}',
+                headers={
+                    "Content-Type": "application/json",
+                    "X-API-KEY": "relay-placeholder",
+                },
+                method="POST",
+            )
+            with mock.patch.object(firecrawl_relay, "urlopen", side_effect=fake_upstream):
+                with self.assertRaises(HTTPError) as error:
+                    with client_urlopen(request, timeout=3) as response:
+                        response.read()
+            self.assertEqual(error.exception.code, 402)
+            self.assertEqual(upstream_keys, ["empty-one", "empty-two"])
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertTrue(
+                state["keys"][FirecrawlApiKeyPool.key_id("empty-one")]["disabled"]
+            )
+            self.assertTrue(
+                state["keys"][FirecrawlApiKeyPool.key_id("empty-two")]["disabled"]
+            )
+
+    def test_browser_create_credit_exhaustion_rotates_key(self) -> None:
+        with TemporaryDirectory() as directory:
+            state_path = Path(directory) / "pool.json"
+            self.server.key_pool = FirecrawlApiKeyPool(
+                keys=["empty-key", "browser-key"],
+                state_path=state_path,
+            )
+            self.server.browser_session_keys = {}
+            self.server.browser_session_lock = threading.RLock()
+            upstream_keys: list[str] = []
+
+            def fake_upstream(request: Request, *, timeout: float) -> _FakeUpstreamResponse:
+                del timeout
+                upstream_keys.append(request.get_header("X-api-key") or "")
+                if upstream_keys[-1] == "empty-key":
+                    raise HTTPError(
+                        request.full_url,
+                        402,
+                        "Payment Required",
+                        {},
+                        io.BytesIO(b'{"error":"Insufficient credits"}'),
+                    )
+                return _FakeUpstreamResponse({"success": True, "id": "browser-new"})
+
+            request = Request(
+                self._url("/v2/browser"),
+                data=b'{"ttl":300}',
+                headers={
+                    "Content-Type": "application/json",
+                    "X-API-KEY": "relay-placeholder",
+                },
+                method="POST",
+            )
+            with mock.patch.object(firecrawl_relay, "urlopen", side_effect=fake_upstream):
+                with client_urlopen(request, timeout=3) as response:
+                    self.assertEqual(json.loads(response.read())["id"], "browser-new")
+
+            self.assertEqual(upstream_keys, ["empty-key", "browser-key"])
+            self.assertEqual(
+                self.server.browser_session_keys["browser-new"],
+                FirecrawlApiKeyPool.key_id("browser-key"),
+            )
 
     def _url(self, path: str) -> str:
         host, port = self.server.server_address[:2]

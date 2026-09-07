@@ -1,10 +1,12 @@
-"""Firecrawl URL-scraping backend with a shared API-key pool and optional Relay.
+"""Firecrawl URL-scraping backend with a fixed worker key and Relay pool.
 
 ``FirecrawlClient.scrape`` uses the local SDK by default.  Set
 ``FIRECRAWL_RELAY_URL`` to send text-scrape and Browser requests through
 ``debug/firecrawl_relay.py`` when the worker cannot reach Firecrawl directly.
 Set ``FIRECRAWL_BROWSER_RELAY_URL`` only when Browser traffic should use a
-different Relay endpoint.
+different Relay endpoint.  The request URL determines whether the fixed key
+goes to the official API or to a Relay; a pool-enabled Relay ignores the
+worker key and selects its own upstream key.
 """
 
 from __future__ import annotations
@@ -22,8 +24,9 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Protocol
 from urllib.error import HTTPError
+from urllib.parse import unquote, urlsplit
 from urllib.request import Request, urlopen
 
 from synthesis.retry_monitor import tracked_sleep
@@ -40,8 +43,16 @@ _FIXED_FIRECRAWL_KEYS_FILE = _MODULE_DIR / "firecrawl_keys.txt"
 _FIXED_FIRECRAWL_POOL_STATE_FILE = _MODULE_DIR / "firecrawl_state.json"
 _FIXED_FIRECRAWL_POOL_DEFAULT_CREDITS = 10000
 _FIXED_FIRECRAWL_KEY_POOL: "FirecrawlApiKeyPool | None" = None
-_DEFAULT_FIRECRAWL_RELAY_TIMEOUT_S = 120.0
+_DEFAULT_FIRECRAWL_RELAY_TIMEOUT_S = 60.0
 _DEFAULT_FIRECRAWL_BROWSER_RELAY_TIMEOUT_S = 300.0
+_WIKIMEDIA_UPLOAD_HOST = "upload.wikimedia.org"
+_WIKIMEDIA_VARIANT_MAX_LONG_EDGE = 1000
+_WIKIMEDIA_VARIANT_METADATA_TIMEOUT_S = 8.0
+_WIKIMEDIA_VARIANT_CACHE_ENV = "SFT_WIKIMEDIA_CACHE_DIR"
+_WIKIMEDIA_VARIANT_CACHE_SUBDIR = "browser_variants"
+_WIKIMEDIA_VARIANT_MEMORY_LIMIT = 4096
+_WIKIMEDIA_VARIANT_LOCK = threading.Lock()
+_WIKIMEDIA_VARIANT_MEMORY_CACHE: dict[str, dict[str, Any]] = {}
 _PROCESS_USAGE_LOCK = threading.Lock()
 _PROCESS_USAGE: dict[str, int] = {
     "requests": 0,
@@ -66,6 +77,38 @@ def _status_code_from_exception(exc: BaseException) -> int | None:
             if 100 <= status_code <= 599:
                 return status_code
     return None
+
+
+_FIRECRAWL_CREDIT_ERROR_MARKERS = (
+    "insufficient credits",
+    "not enough credits",
+    "no credits remaining",
+    "credits exhausted",
+    "credit limit exceeded",
+    "quota exhausted",
+    "quota exceeded",
+    "credit balance",
+)
+
+
+def _is_firecrawl_credit_exhausted(
+    *,
+    status_code: int | None = None,
+    response_body: str = "",
+) -> bool:
+    """Recognize API-level Firecrawl credit exhaustion.
+
+    A root-level HTTP 402 is treated as a credit/billing exhaustion response.
+    Other statuses require an explicit credit/quota marker so target-page
+    403/404/5xx responses do not disable a shared API key.
+    """
+
+    if status_code == 402:
+        return True
+    if status_code is not None and status_code >= 500:
+        return False
+    message = str(response_body or "").lower()
+    return any(marker in message for marker in _FIRECRAWL_CREDIT_ERROR_MARKERS)
 
 
 def _utc_now() -> str:
@@ -110,8 +153,169 @@ def _local_browser_lock_path_for_state(state_path: Path) -> Path:
     return Path(tempfile.gettempdir()) / f"firecrawl_browser_state_{state_hash}.lock"
 
 
+def _env_flag(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _is_wikimedia_upload_url(url: str) -> bool:
+    try:
+        return (urlsplit(str(url or "")).hostname or "").lower() == _WIKIMEDIA_UPLOAD_HOST
+    except (TypeError, ValueError):
+        return False
+
+
+def _wikimedia_upload_file_spec(url: str) -> dict[str, str] | None:
+    """Extract the MediaWiki API endpoint and file title from an upload URL."""
+
+    if not _is_wikimedia_upload_url(url):
+        return None
+    try:
+        parts = urlsplit(url)
+    except (TypeError, ValueError):
+        return None
+    segments = parts.path.strip("/").split("/")
+    if len(segments) < 5 or segments[0].lower() != "wikipedia":
+        return None
+    project = segments[1].strip().lower()
+    if not project:
+        return None
+    if segments[2].lower() == "thumb":
+        if len(segments) < 7:
+            return None
+        filename_segment = segments[5]
+    else:
+        filename_segment = segments[4]
+    filename = unquote(filename_segment).replace("_", " ").strip()
+    if not filename:
+        return None
+    api_host = "commons.wikimedia.org" if project == "commons" else f"{project}.wikipedia.org"
+    return {
+        "api_url": f"https://{api_host}/w/api.php",
+        "file_title": f"File:{filename}",
+    }
+
+
+def _wikimedia_variant_cache_root() -> Path:
+    configured = str(os.environ.get(_WIKIMEDIA_VARIANT_CACHE_ENV) or "").strip()
+    root = Path(configured).expanduser() if configured else _MODULE_DIR / ".ignore" / "wiki_caches"
+    return root / _WIKIMEDIA_VARIANT_CACHE_SUBDIR
+
+
+def _wikimedia_variant_cache_key(url: str, max_long_edge: int) -> str:
+    return hashlib.sha256(
+        f"{url}\nmax_long_edge={int(max_long_edge)}".encode("utf-8")
+    ).hexdigest()
+
+
+def _wikimedia_variant_cache_path(url: str, max_long_edge: int) -> Path:
+    digest = _wikimedia_variant_cache_key(url, max_long_edge)
+    return _wikimedia_variant_cache_root() / digest[:2] / f"{digest}.json"
+
+
+def _valid_wikimedia_variant_record(
+    record: object,
+    *,
+    requested_url: str,
+    max_long_edge: int,
+) -> dict[str, Any] | None:
+    if not isinstance(record, dict):
+        return None
+    if str(record.get("requested_url") or "") != requested_url:
+        return None
+    try:
+        if int(record.get("max_long_edge") or 0) != int(max_long_edge):
+            return None
+    except (TypeError, ValueError):
+        return None
+    download_url = str(record.get("download_url") or "").strip()
+    if not download_url or not download_url.startswith(("http://", "https://")):
+        return None
+    if not bool(record.get("resolved")):
+        return None
+    return dict(record)
+
+
+def _read_wikimedia_variant_cache(url: str, max_long_edge: int) -> dict[str, Any] | None:
+    key = _wikimedia_variant_cache_key(url, max_long_edge)
+    with _WIKIMEDIA_VARIANT_LOCK:
+        cached = _valid_wikimedia_variant_record(
+            _WIKIMEDIA_VARIANT_MEMORY_CACHE.get(key),
+            requested_url=url,
+            max_long_edge=max_long_edge,
+        )
+        if cached is not None:
+            return cached
+    path = _wikimedia_variant_cache_path(url, max_long_edge)
+    try:
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return None
+    cached = _valid_wikimedia_variant_record(
+        record,
+        requested_url=url,
+        max_long_edge=max_long_edge,
+    )
+    if cached is not None:
+        with _WIKIMEDIA_VARIANT_LOCK:
+            if len(_WIKIMEDIA_VARIANT_MEMORY_CACHE) >= _WIKIMEDIA_VARIANT_MEMORY_LIMIT:
+                _WIKIMEDIA_VARIANT_MEMORY_CACHE.pop(next(iter(_WIKIMEDIA_VARIANT_MEMORY_CACHE)))
+            _WIKIMEDIA_VARIANT_MEMORY_CACHE[key] = dict(cached)
+    return cached
+
+
+def _write_wikimedia_variant_cache(record: dict[str, Any]) -> None:
+    requested_url = str(record.get("requested_url") or "").strip()
+    try:
+        max_long_edge = int(record.get("max_long_edge") or 0)
+    except (TypeError, ValueError):
+        return
+    validated = _valid_wikimedia_variant_record(
+        record,
+        requested_url=requested_url,
+        max_long_edge=max_long_edge,
+    )
+    if validated is None:
+        return
+    key = _wikimedia_variant_cache_key(requested_url, max_long_edge)
+    with _WIKIMEDIA_VARIANT_LOCK:
+        if len(_WIKIMEDIA_VARIANT_MEMORY_CACHE) >= _WIKIMEDIA_VARIANT_MEMORY_LIMIT:
+            _WIKIMEDIA_VARIANT_MEMORY_CACHE.pop(next(iter(_WIKIMEDIA_VARIANT_MEMORY_CACHE)))
+        _WIKIMEDIA_VARIANT_MEMORY_CACHE[key] = dict(validated)
+    path = _wikimedia_variant_cache_path(requested_url, max_long_edge)
+    temporary_path: Path | None = None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temporary_path = Path(handle.name)
+            json.dump(validated, handle, ensure_ascii=False, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, path)
+    except OSError:
+        # The in-memory entry remains useful even when the optional durable
+        # cache is temporarily unavailable.
+        pass
+    finally:
+        if temporary_path is not None and temporary_path.exists():
+            try:
+                temporary_path.unlink()
+            except OSError:
+                pass
+
+
 class FirecrawlApiKeyPool:
-    """Round-robin, cross-process Firecrawl key pool backed by JSON state."""
+    """Relay-only cross-process Firecrawl key pool backed by JSON state."""
 
     def __init__(
         self,
@@ -119,11 +323,19 @@ class FirecrawlApiKeyPool:
         keys: list[str],
         state_path: str | Path | None = None,
         default_credits: int = _FIXED_FIRECRAWL_POOL_DEFAULT_CREDITS,
+        persist_every: int = 1,
     ) -> None:
         self.keys = list(dict.fromkeys(key.strip() for key in keys if key and key.strip()))
         if not self.keys:
             raise ValueError("Firecrawl API key pool requires at least one key.")
         self.default_credits = max(1, int(default_credits))
+        # Relay mode can keep the pool in memory and checkpoint it
+        # periodically. The default remains one write per operation for
+        # diagnostic/backward-compatible callers.
+        self.persist_every = max(1, int(persist_every))
+        self._state_cache: dict[str, Any] | None = None
+        self._state_cache_lock = threading.RLock()
+        self._uses_since_persist = 0
         configured_path = state_path or os.environ.get("FIRECRAWL_API_POOL_STATE_FILE")
         self.state_path = Path(configured_path) if configured_path else _FIXED_FIRECRAWL_POOL_STATE_FILE
         if not self.state_path.is_absolute():
@@ -187,11 +399,14 @@ class FirecrawlApiKeyPool:
         credits_used: int = 0,
         status_code: int | None = None,
         key_auth_failed: bool = False,
+        key_credits_exhausted: bool = False,
     ) -> dict[str, Any]:
-        """Persist a result, disabling a key only after API-level auth failure.
+        """Persist a result and disable a key on API-level auth/credit failure.
 
         ``status_code`` may be the target page's status code from Firecrawl
-        metadata.  It must never, by itself, disable the API key.
+        metadata.  It never disables the API key by itself.  Callers must set
+        ``key_auth_failed`` or ``key_credits_exhausted`` only for API-level
+        failures.
         """
         def update(state: dict[str, Any]) -> dict[str, Any]:
             state = self._initialize_state(state)
@@ -222,6 +437,15 @@ class FirecrawlApiKeyPool:
                     record["disabled"] = True
                     record["disabled_at"] = now
                     record["disabled_reason"] = "firecrawl_api_auth_failed"
+                elif key_credits_exhausted:
+                    # The provider has explicitly reported that this key has
+                    # no usable credits.  Preserve known consumption, but do
+                    # not leave a stale estimated balance eligible for reuse.
+                    record["remaining_credits"] = 0
+                    record["state"] = "disabled"
+                    record["disabled"] = True
+                    record["disabled_at"] = now
+                    record["disabled_reason"] = "firecrawl_credits_exhausted"
             if int(record.get("remaining_credits") or 0) == 0:
                 record["state"] = "disabled"
                 record["disabled"] = True
@@ -232,10 +456,26 @@ class FirecrawlApiKeyPool:
             self._store_pool_status(state)
             return state
 
-        return self._pool_status(self._with_locked_state(update))
+        return self._pool_status(
+            self._with_locked_state(
+                update,
+                count_use=True,
+                force_persist=key_auth_failed or key_credits_exhausted,
+            )
+        )
 
     def status(self) -> dict[str, Any]:
         return self._pool_status(self._with_locked_state(self._initialize_state))
+
+    def flush(self) -> None:
+        """Persist pending in-memory accounting before a Relay shuts down."""
+
+        if self.persist_every <= 1:
+            return
+        with self._state_cache_lock:
+            if self._state_cache is not None and self._uses_since_persist:
+                self._write_state(self._state_cache)
+                self._uses_since_persist = 0
 
     def active_key_ids(self) -> list[str]:
         """Return usable key ids in configured order without exposing secrets."""
@@ -354,7 +594,20 @@ class FirecrawlApiKeyPool:
     def _store_pool_status(self, state: dict[str, Any]) -> None:
         state["pool_status"] = self._pool_status(state)
 
-    def _with_locked_state(self, callback: Callable[[dict[str, Any]], dict[str, Any]]) -> dict[str, Any]:
+    def _with_locked_state(
+        self,
+        callback: Callable[[dict[str, Any]], dict[str, Any]],
+        *,
+        count_use: bool = False,
+        force_persist: bool = False,
+    ) -> dict[str, Any]:
+        if self.persist_every > 1:
+            return self._with_cached_state(
+                callback,
+                count_use=count_use,
+                force_persist=force_persist,
+            )
+
         # Keep the lock on local storage: concurrent creates on a shared mount
         # can transiently report ENOENT even though its parent exists.
         lock_handle = self._open_lock_file()
@@ -369,6 +622,52 @@ class FirecrawlApiKeyPool:
             finally:
                 if fcntl is not None:
                     fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+
+    def _with_cached_state(
+        self,
+        callback: Callable[[dict[str, Any]], dict[str, Any]],
+        *,
+        count_use: bool,
+        force_persist: bool,
+    ) -> dict[str, Any]:
+        """Run a pool operation in memory and checkpoint periodically.
+
+        This mode is intended for a single Relay process owning the pool. It
+        removes the per-request HDFS read/write from the hot path. The first
+        operation still loads and normalizes the state, and explicit key
+        invalidation is flushed immediately.
+        """
+
+        with self._state_cache_lock:
+            if self._state_cache is None:
+                lock_handle = self._open_lock_file()
+                with lock_handle:
+                    if fcntl is not None:
+                        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+                    try:
+                        state = self._read_state()
+                        updated = callback(state)
+                        # Persist the normalized key set once at startup so
+                        # changed key files and stale pool_status are repaired.
+                        self._write_state(updated)
+                    finally:
+                        if fcntl is not None:
+                            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+                self._state_cache = updated
+                self._uses_since_persist = 1 if count_use else 0
+                return updated
+
+            updated = callback(self._state_cache)
+            self._state_cache = updated
+            if count_use:
+                self._uses_since_persist += 1
+            should_persist = force_persist or (
+                count_use and self._uses_since_persist >= self.persist_every
+            )
+            if should_persist:
+                self._write_state(updated)
+                self._uses_since_persist = 0
+            return updated
 
     def _open_lock_file(self):
         for attempt in range(2):
@@ -408,20 +707,119 @@ class FirecrawlApiKeyPool:
         return key if len(key) <= 8 else f"{key[:4]}...{key[-4:]}"
 
 
-class FirecrawlClient:
-    """Synchronous Firecrawl scraper with local key rotation and optional Relay."""
+class _FirecrawlKeyProvider(Protocol):
+    """Small interface shared by the fixed worker key and Relay pool."""
+
+    def acquire_key(self) -> tuple[str, dict[str, Any]]: ...
+
+    def record_result(self, key_id: str, **kwargs: Any) -> dict[str, Any]: ...
+
+    def status(self) -> dict[str, Any]: ...
+
+    def active_key_ids(self) -> list[str]: ...
+
+    def key_for_id(self, key_id: str) -> str: ...
+
+
+def _firecrawl_fixed_client_key(
+    *,
+    explicit_key: str | None = None,
+    legacy_api_keys: list[str] | None = None,
+) -> str:
+    """Return the one Firecrawl key used by a worker process.
+
+    The environment variable is authoritative for normal workers.  The
+    legacy list argument is accepted only so diagnostic callers can probe one
+    key explicitly; it is never rotated or persisted by the worker.
+    """
+
+    explicit = str(explicit_key or "").strip()
+    if explicit:
+        return explicit
+    value = str(
+        os.environ.get("FIRECRAWL_API_KEY")
+        or (legacy_api_keys[0] if legacy_api_keys else "")
+        or ""
+    ).strip()
+    return value
+
+
+class _FixedFirecrawlKeyProvider:
+    """Worker-side fixed-key provider with no state file or lock."""
 
     def __init__(
         self,
         *,
+        explicit_key: str | None = None,
+        legacy_api_keys: list[str] | None = None,
+    ) -> None:
+        self.api_key = _firecrawl_fixed_client_key(
+            explicit_key=explicit_key,
+            legacy_api_keys=legacy_api_keys,
+        )
+        self.key_id_value = FirecrawlApiKeyPool.key_id(self.api_key) if self.api_key else "fixed-client"
+        self.keys = [self.api_key] if self.api_key else []
+        self.state_path = None
+        self.lock_path = None
+
+    @classmethod
+    def key_id(cls, key: str) -> str:
+        return FirecrawlApiKeyPool.key_id(str(key))
+
+    def acquire_key(self) -> tuple[str, dict[str, Any]]:
+        if not self.api_key:
+            raise ValueError("FIRECRAWL_API_KEY must be set for the fixed-key Firecrawl client.")
+        return self.api_key, {
+            "key_id": self.key_id_value,
+            "masked_key": "fixed-client",
+            "managed_by": "fixed_env_or_relay",
+        }
+
+    def record_result(self, key_id: str, **kwargs: Any) -> dict[str, Any]:
+        # The Relay owns credit accounting and key quarantine.  Direct mode
+        # intentionally does not persist any worker-side pool state either.
+        del key_id, kwargs
+        return self.status()
+
+    def status(self) -> dict[str, Any]:
+        return {
+            "available_key_count": 1 if self.api_key else 0,
+            "total_key_count": 1 if self.api_key else 0,
+            "remaining_credits_total": -1,
+            "credits_consumed": -1,
+            "default_credits": -1,
+            "successful_requests": 0,
+            "failed_requests": 0,
+            "managed_by": "fixed_env_or_relay",
+        }
+
+    def active_key_ids(self) -> list[str]:
+        return [self.key_id_value] if self.api_key else []
+
+    def key_for_id(self, key_id: str) -> str:
+        if key_id != self.key_id_value or not self.api_key:
+            raise KeyError(f"Unknown fixed Firecrawl key id: {key_id}")
+        return self.api_key
+
+
+class FirecrawlClient:
+    """Synchronous Firecrawl scraper using one fixed worker key."""
+
+    def __init__(
+        self,
+        *,
+        api_key: str | None = None,
         api_keys: list[str] | None = None,
         pool_state_path: str | Path | None = None,
         app_factory: Callable[..., Any] | None = None,
     ) -> None:
-        self.key_pool = (
-            FirecrawlApiKeyPool(keys=api_keys, state_path=pool_state_path)
-            if api_keys is not None
-            else FirecrawlApiKeyPool.from_fixed_pool()
+        # Keep old arguments for source compatibility.  Worker runtime never
+        # constructs or touches the Relay pool/state/lock; ``api_keys`` is
+        # reduced to its first item only for legacy diagnostic callers.
+        del pool_state_path
+        self.key_pool: _FirecrawlKeyProvider = _FixedFirecrawlKeyProvider(
+            explicit_key=api_key,
+            legacy_api_keys=api_keys,
         )
         self._app_factory = app_factory
         self.last_pool_metadata: dict[str, Any] | None = None
@@ -460,6 +858,10 @@ class FirecrawlClient:
             raw = self._response_as_dict(result)
         except Exception as exc:  # SDK transport and provider exceptions are recorded identically.
             api_status_code = _status_code_from_exception(exc)
+            key_credits_exhausted = _is_firecrawl_credit_exhausted(
+                status_code=api_status_code,
+                response_body=str(exc),
+            )
             _firecrawl_error_debug(
                 "scrape_failed",
                 url=url,
@@ -473,6 +875,7 @@ class FirecrawlClient:
                 error=str(exc),
                 status_code=api_status_code,
                 key_auth_failed=api_status_code == 401,
+                key_credits_exhausted=key_credits_exhausted,
             )
             _record_process_usage(success=False)
             raise RuntimeError(f"Firecrawl scrape failed for {url}: {exc}") from exc
@@ -501,6 +904,34 @@ class FirecrawlClient:
         status_code = self._non_negative_int(
             response_metadata.get("statusCode", response_metadata.get("status_code"))
         )
+        root_error = str(raw.get("error") or raw.get("message") or "")
+        if _is_firecrawl_credit_exhausted(
+            status_code=root_status_code,
+            response_body=root_error,
+        ):
+            error = root_error or self._status_code_error(
+                raw,
+                response_metadata,
+                root_status_code or 402,
+            )
+            _firecrawl_error_debug(
+                "scrape_failed",
+                url=url,
+                status_code=root_status_code,
+                credits_used=credits_used,
+                error=error,
+                key_credits_exhausted=True,
+            )
+            self.key_pool.record_result(
+                pool_metadata["key_id"],
+                success=False,
+                error=error,
+                credits_used=credits_used,
+                status_code=root_status_code,
+                key_credits_exhausted=True,
+            )
+            _record_process_usage(success=False, credits_used=credits_used)
+            return {"error": error}
         if status_code is not None and status_code != 200:
             error = self._status_code_error(raw, response_metadata, status_code)
             _firecrawl_error_debug(
@@ -888,6 +1319,14 @@ class FirecrawlBrowserImageDownload:
     status_code: int
     session_id: str
     key_id: str
+    download_url: str = ""
+    variant_source: str = "original"
+    variant_resolved: bool = False
+    original_width: int | None = None
+    original_height: int | None = None
+    download_width: int | None = None
+    download_height: int | None = None
+    variant_resolution_error: str = ""
 
 
 @dataclass(slots=True)
@@ -921,11 +1360,10 @@ class _BrowserSessionLease:
 class FirecrawlBrowserSessionManager:
     """File-backed, lease-based pool of reusable Firecrawl Browser sessions.
 
-    It deliberately owns every Browser concern: session creation, session
-    selection, key assignment, expiry, and best-effort cleanup.  Callers only
-    acquire a short lease and execute an operation.  The JSON registry stores
-    opaque key ids rather than API secrets, so workers sharing the same keys
-    file can reuse sessions without persisting credentials.
+    It deliberately owns Browser session creation, selection, expiry, and
+    best-effort cleanup.  Workers use one fixed key provider here; when a
+    Relay is enabled, the Relay owns upstream key assignment and accounting.
+    The JSON registry stores opaque key ids rather than API secrets.
 
     The registry may live on HDFS/shared storage, but its default lock lives on
     the local filesystem because HDFS does not provide the POSIX ``flock``
@@ -940,7 +1378,7 @@ class FirecrawlBrowserSessionManager:
     def __init__(
         self,
         *,
-        key_pool: FirecrawlApiKeyPool,
+        key_pool: _FirecrawlKeyProvider,
         app_factory: Callable[..., Any] | None = None,
         state_path: str | Path | None = None,
         session_ttl_s: int = 300,
@@ -948,7 +1386,7 @@ class FirecrawlBrowserSessionManager:
         max_sessions: int = 4,
         expiry_safety_s: float = 30.0,
         create_timeout_s: float = 90.0,
-        api_timeout_s: float = 120.0,
+        api_timeout_s: float = 60.0,
         relay_timeout_s: float = 180.0,
     ) -> None:
         self.key_pool = key_pool
@@ -978,15 +1416,16 @@ class FirecrawlBrowserSessionManager:
     def from_environment(
         cls,
         *,
+        api_key: str | None = None,
         api_keys: list[str] | None = None,
         app_factory: Callable[..., Any] | None = None,
         pool_state_path: str | Path | None = None,
         session_state_path: str | Path | None = None,
     ) -> "FirecrawlBrowserSessionManager":
-        key_pool = (
-            FirecrawlApiKeyPool(keys=api_keys, state_path=pool_state_path)
-            if api_keys is not None
-            else FirecrawlApiKeyPool.from_fixed_pool()
+        del pool_state_path
+        key_pool = _FixedFirecrawlKeyProvider(
+            explicit_key=api_key,
+            legacy_api_keys=api_keys,
         )
         return cls(
             key_pool=key_pool,
@@ -997,7 +1436,7 @@ class FirecrawlBrowserSessionManager:
             max_sessions=_env_int("FIRECRAWL_BROWSER_MAX_SESSIONS", 4),
             expiry_safety_s=_env_float("FIRECRAWL_BROWSER_EXPIRY_SAFETY_S", 30.0),
             create_timeout_s=_env_float("FIRECRAWL_BROWSER_CREATE_TIMEOUT_S", 90.0),
-            api_timeout_s=_env_float("FIRECRAWL_BROWSER_API_TIMEOUT_S", 120.0),
+            api_timeout_s=_env_float("FIRECRAWL_BROWSER_API_TIMEOUT_S", 60.0),
             relay_timeout_s=_env_float(
                 "FIRECRAWL_BROWSER_RELAY_TIMEOUT_S",
                 max(
@@ -1216,7 +1655,10 @@ class FirecrawlBrowserSessionManager:
             )
             raw = FirecrawlClient._response_as_dict(response)
             if raw.get("success") is False or not raw.get("id"):
-                raise FirecrawlBrowserSessionError(str(raw.get("error") or "Browser session creation returned no id."))
+                raise FirecrawlBrowserSessionError(
+                    str(raw.get("error") or "Browser session creation returned no id."),
+                    status_code=FirecrawlClient._root_status_code(raw),
+                )
         except Exception as exc:
             self._record_key_result(key_id, success=False, error=str(exc), exc=exc)
             self._drop_creation(creation_token)
@@ -1576,6 +2018,10 @@ class FirecrawlBrowserSessionManager:
             credits_used=max(0, int(credits_used)),
             status_code=status_code,
             key_auth_failed=status_code == 401,
+            key_credits_exhausted=_is_firecrawl_credit_exhausted(
+                status_code=status_code,
+                response_body=error or str(exc or ""),
+            ),
         )
 
     def _delete_remote_session(self, session_id: str, key_id: str) -> int | None:
@@ -1660,12 +2106,15 @@ class FirecrawlBrowserImageDownloader:
         *,
         session_manager: FirecrawlBrowserSessionManager,
         max_image_bytes: int = 20 * 1024 * 1024,
-        acquire_timeout_s: float = 120.0,
+        acquire_timeout_s: float = 60.0,
         retries: int = 1,
         retry_sleep_s: float = 0.5,
         timeout_cap_s: float | None = None,
         same_session_timeout_retries: int = 0,
         same_session_retry_sleep_s: float = 1.0,
+        wikimedia_variant_resolution: bool = True,
+        wikimedia_max_long_edge: int = _WIKIMEDIA_VARIANT_MAX_LONG_EDGE,
+        wikimedia_metadata_timeout_s: float = _WIKIMEDIA_VARIANT_METADATA_TIMEOUT_S,
     ) -> None:
         self.session_manager = session_manager
         self.max_image_bytes = max(1024, int(max_image_bytes))
@@ -1679,6 +2128,9 @@ class FirecrawlBrowserImageDownloader:
         )
         self.same_session_timeout_retries = max(0, int(same_session_timeout_retries))
         self.same_session_retry_sleep_s = max(0.0, float(same_session_retry_sleep_s))
+        self.wikimedia_variant_resolution = bool(wikimedia_variant_resolution)
+        self.wikimedia_max_long_edge = max(1, int(wikimedia_max_long_edge))
+        self.wikimedia_metadata_timeout_s = max(1.0, float(wikimedia_metadata_timeout_s))
 
     @classmethod
     def from_environment(
@@ -1697,7 +2149,7 @@ class FirecrawlBrowserImageDownloader:
                 session_state_path=session_state_path,
             ),
             max_image_bytes=_env_int("FIRECRAWL_BROWSER_IMAGE_MAX_BYTES", 20 * 1024 * 1024),
-            acquire_timeout_s=_env_float("FIRECRAWL_BROWSER_POOL_ACQUIRE_TIMEOUT_S", 120.0),
+            acquire_timeout_s=_env_float("FIRECRAWL_BROWSER_POOL_ACQUIRE_TIMEOUT_S", 60.0),
             # The Relay retries the idempotent image execution upstream.  The
             # worker first retries a timeout on the same session, then uses a
             # single worker-side retry for a fresh session.
@@ -1713,6 +2165,17 @@ class FirecrawlBrowserImageDownloader:
             same_session_retry_sleep_s=_env_float(
                 "FIRECRAWL_BROWSER_SAME_SESSION_RETRY_SLEEP_S", 1.0
             ),
+            wikimedia_variant_resolution=_env_flag(
+                "FIRECRAWL_BROWSER_WIKIMEDIA_VARIANT_RESOLUTION", True
+            ),
+            wikimedia_max_long_edge=_env_int(
+                "FIRECRAWL_BROWSER_WIKIMEDIA_MAX_LONG_EDGE",
+                _WIKIMEDIA_VARIANT_MAX_LONG_EDGE,
+            ),
+            wikimedia_metadata_timeout_s=_env_float(
+                "FIRECRAWL_BROWSER_WIKIMEDIA_METADATA_TIMEOUT_S",
+                _WIKIMEDIA_VARIANT_METADATA_TIMEOUT_S,
+            ),
         )
 
     def download(
@@ -1720,15 +2183,16 @@ class FirecrawlBrowserImageDownloader:
         url: str,
         *,
         referer_url: str | None = None,
-        timeout_s: float = 120.0,
+        timeout_s: float = 60.0,
     ) -> FirecrawlBrowserImageDownload:
-        target_url = str(url or "").strip()
-        if not target_url:
+        requested_url = str(url or "").strip()
+        if not requested_url:
             raise FirecrawlBrowserError("Image URL is required.")
         try:
-            target_url = normalize_http_url(target_url)
+            requested_url = normalize_http_url(requested_url)
         except (TypeError, ValueError, UnicodeError) as exc:
             raise FirecrawlBrowserError("Image URL is invalid.") from exc
+        target_url, variant_resolution = self._prepare_wikimedia_download(requested_url)
         timeout_s = max(1.0, min(float(timeout_s), 300.0))
         if self.timeout_cap_s is not None:
             timeout_s = min(timeout_s, self.timeout_cap_s)
@@ -1748,7 +2212,7 @@ class FirecrawlBrowserImageDownloader:
                                 timeout_s + 30.0,
                                 self.session_manager.relay_timeout_s + 30.0,
                             ),
-                            request_url=target_url,
+                            request_url=requested_url,
                         )
                     response = self.session_manager.execute(
                         lease,
@@ -1756,21 +2220,43 @@ class FirecrawlBrowserImageDownloader:
                             target_url,
                             referer_url=referer_url,
                             request_timeout_ms=int(request_timeout_s * 1000),
+                            wikimedia_resolution=variant_resolution,
                         ),
                         timeout_s=timeout_s,
                         request_type="browser_image",
                     )
                     result = self._decode_download_response(
                         response,
-                        requested_url=target_url,
+                        requested_url=requested_url,
                         session_id=lease.session_id,
                         key_id=lease.key_id,
                     )
+                    if (
+                        variant_resolution is not None
+                        and variant_resolution.get("mode") == "lookup"
+                        and result.variant_resolved
+                    ):
+                        _write_wikimedia_variant_cache(
+                            {
+                                "requested_url": requested_url,
+                                "download_url": result.download_url or target_url,
+                                "max_long_edge": self.wikimedia_max_long_edge,
+                                "variant_source": result.variant_source,
+                                "original_width": result.original_width,
+                                "original_height": result.original_height,
+                                "download_width": result.download_width,
+                                "download_height": result.download_height,
+                                "resolved": True,
+                                "resolved_at": time.time(),
+                            }
+                        )
                     self.session_manager._debug_pool_status(
                         "download_succeeded",
                         session_id=lease.session_id,
                         key_id=lease.key_id,
-                        url=target_url,
+                        url=requested_url,
+                        download_url=result.download_url or target_url,
+                        variant_source=result.variant_source,
                         attempt=attempt + 1,
                         session_retry=same_session_retry,
                         http_status=result.status_code,
@@ -1797,7 +2283,8 @@ class FirecrawlBrowserImageDownloader:
                         "download_failed",
                         session_id=lease.session_id if lease is not None else "",
                         key_id=lease.key_id if lease is not None else "",
-                        url=target_url,
+                        url=requested_url,
+                        download_url=target_url,
                         attempt=attempt + 1,
                         session_retry=same_session_retry,
                         http_status=status_code,
@@ -1819,7 +2306,7 @@ class FirecrawlBrowserImageDownloader:
                             reason="firecrawl_browser_same_session_retry",
                             tool="firecrawl_browser",
                             error=exc,
-                            url=target_url,
+                            url=requested_url,
                             error_type=type(exc).__name__,
                             fallback_sleep=time.sleep,
                         )
@@ -1849,7 +2336,7 @@ class FirecrawlBrowserImageDownloader:
                         reason="firecrawl_browser_retry",
                         tool="firecrawl_browser",
                         error=exc,
-                        url=target_url,
+                        url=requested_url,
                         error_type=type(exc).__name__,
                         fallback_sleep=time.sleep,
                     )
@@ -1857,12 +2344,82 @@ class FirecrawlBrowserImageDownloader:
         assert last_error is not None
         raise last_error
 
+    def _prepare_wikimedia_download(
+        self,
+        requested_url: str,
+    ) -> tuple[str, dict[str, Any] | None]:
+        """Prepare a Wikimedia URL and its in-Browser variant resolver.
+
+        The MediaWiki API lookup is deliberately carried out by the Browser
+        JavaScript below.  This keeps Wikimedia traffic out of the worker and
+        lets the existing Firecrawl egress handle both metadata and image
+        requests.  A durable mapping is used only after a successful image
+        download, so a transient API failure never poisons the cache.
+        """
+
+        if not self.wikimedia_variant_resolution or not _is_wikimedia_upload_url(requested_url):
+            return requested_url, None
+        cached = _read_wikimedia_variant_cache(
+            requested_url,
+            self.wikimedia_max_long_edge,
+        )
+        if cached is not None:
+            return str(cached["download_url"]), {
+                "mode": "cached",
+                "download_url": str(cached["download_url"]),
+                "variant_source": str(cached.get("variant_source") or "cache"),
+                "original_width": cached.get("original_width"),
+                "original_height": cached.get("original_height"),
+                "download_width": cached.get("download_width"),
+                "download_height": cached.get("download_height"),
+            }
+        file_spec = _wikimedia_upload_file_spec(requested_url)
+        if file_spec is None:
+            return requested_url, None
+        widths = [self.wikimedia_max_long_edge]
+        for width in (
+            1536,
+            1440,
+            1280,
+            1200,
+            1152,
+            1080,
+            1024,
+            960,
+            800,
+            768,
+            720,
+            640,
+            512,
+            480,
+            400,
+            330,
+            320,
+            256,
+        ):
+            if width <= self.wikimedia_max_long_edge and width not in widths:
+                widths.append(width)
+        # MediaWiki returns the closest available thumbnail at or above the
+        # requested size.  In practice the first few standard widths find the
+        # largest valid variant; cap the probes so a metadata outage cannot
+        # consume the whole Browser execution timeout.
+        widths = widths[:6]
+        return requested_url, {
+            "mode": "lookup",
+            "api_url": file_spec["api_url"],
+            "file_title": file_spec["file_title"],
+            "max_long_edge": self.wikimedia_max_long_edge,
+            "request_widths": widths,
+            "metadata_timeout_ms": int(self.wikimedia_metadata_timeout_s * 1000),
+        }
+
     def _download_code(
         self,
         url: str,
         *,
         referer_url: str | None,
         request_timeout_ms: int,
+        wikimedia_resolution: dict[str, Any] | None = None,
     ) -> str:
         # Referer is optional. If it contains raw Unicode or control
         # characters, omit it instead of making Playwright reject the whole
@@ -1874,23 +2431,201 @@ class FirecrawlBrowserImageDownloader:
                 "url": safe_url,
                 "referer": safe_referer,
                 "timeoutMs": max(1000, min(int(request_timeout_ms), 300000)),
+                "wikimediaResolution": wikimedia_resolution,
             },
             ensure_ascii=True,
         )
         return f"""
 await (async () => {{
 const input = {payload};
+const executionStartedAt = Date.now();
+const remainingExecutionTimeoutMs = () => Math.max(
+  1000,
+  Number(input.timeoutMs) - (Date.now() - executionStartedAt)
+);
 const headers = {{
   "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
   "Accept-Language": "en-US,en;q=0.9",
 }};
 if (input.referer) headers["Referer"] = input.referer;
 const maxBytes = {self.max_image_bytes};
+let downloadUrl = input.url;
+let variantSource = "original";
+let variantResolved = false;
+let originalWidth = null;
+let originalHeight = null;
+let downloadWidth = null;
+let downloadHeight = null;
+let variantResolutionError = null;
+
+const asPositiveNumber = (value) => {{
+  const number = Number(value);
+  return Number.isFinite(number) && number > 0 ? number : null;
+}};
+
+const variantFromCache = (resolution) => {{
+  if (!resolution || resolution.mode !== "cached" || !resolution.download_url) return null;
+  return {{
+    download_url: String(resolution.download_url),
+    variant_source: String(resolution.variant_source || "cache"),
+    resolved: true,
+    original_width: asPositiveNumber(resolution.original_width),
+    original_height: asPositiveNumber(resolution.original_height),
+    download_width: asPositiveNumber(resolution.download_width),
+    download_height: asPositiveNumber(resolution.download_height),
+  }};
+}};
+
+const parseImageInfo = (body) => {{
+  const pages = body && body.query && body.query.pages;
+  const pageInfo = Array.isArray(pages)
+    ? pages[0]
+    : pages && Object.values(pages)[0];
+  const imageInfo = pageInfo && Array.isArray(pageInfo.imageinfo)
+    ? pageInfo.imageinfo[0]
+    : null;
+  return imageInfo || null;
+}};
+
+const resolveWikimediaVariant = async (resolution) => {{
+  const cached = variantFromCache(resolution);
+  if (cached) return cached;
+  if (!resolution || resolution.mode !== "lookup") return null;
+  const apiUrl = String(resolution.api_url || "");
+  const fileTitle = String(resolution.file_title || "");
+  const maxLongEdge = asPositiveNumber(resolution.max_long_edge);
+  const widths = Array.isArray(resolution.request_widths)
+    ? resolution.request_widths
+    : [];
+  if (!apiUrl || !fileTitle || !maxLongEdge || !widths.length) return null;
+  const metadataHeaders = {{
+    "Accept": "application/json",
+    "Accept-Language": "en-US,en;q=0.9",
+    "User-Agent": "OpenSearch-VL-FirecrawlBrowserImageDownloader/1.0",
+  }};
+  for (const requestedWidth of widths) {{
+    const width = asPositiveNumber(requestedWidth);
+    if (!width) continue;
+    let metadataResponse = null;
+    try {{
+      const query = new URLSearchParams({{
+        action: "query",
+        format: "json",
+        formatversion: "2",
+        titles: fileTitle,
+        prop: "imageinfo",
+        iiprop: "url|size|mime|thumbmime",
+        iiurlwidth: String(Math.round(width)),
+        iiurlheight: String(Math.round(width)),
+        maxlag: "5",
+      }}).toString();
+      metadataResponse = await page.request.get(`${{apiUrl}}?${{query}}`, {{
+        failOnStatusCode: false,
+        headers: metadataHeaders,
+        timeout: Math.max(
+          1000,
+          Math.min(
+            Number(resolution.metadata_timeout_ms) || 8000,
+            remainingExecutionTimeoutMs()
+          ),
+        ),
+      }});
+      const status = metadataResponse.status();
+      if (status < 200 || status >= 300) {{
+        throw new Error(`imageinfo_http_status_${{status}}`);
+      }}
+      const body = JSON.parse((await metadataResponse.body()).toString("utf8"));
+      if (body && body.error) {{
+        const errorCode = String(body.error.code || "api_error");
+        throw new Error(`imageinfo_api_error_${{errorCode}}`);
+      }}
+      const info = parseImageInfo(body);
+      if (!info) continue;
+      const sourceWidth = asPositiveNumber(info.width);
+      const sourceHeight = asPositiveNumber(info.height);
+      if (sourceWidth && sourceHeight) {{
+        originalWidth = sourceWidth;
+        originalHeight = sourceHeight;
+      }}
+      const sourceLongEdge = sourceWidth && sourceHeight
+        ? Math.max(sourceWidth, sourceHeight)
+        : null;
+      if (sourceLongEdge && sourceLongEdge <= maxLongEdge) {{
+        return {{
+          download_url: String(info.url || input.url),
+          variant_source: "imageinfo_original",
+          resolved: true,
+          original_width: sourceWidth,
+          original_height: sourceHeight,
+          download_width: sourceWidth,
+          download_height: sourceHeight,
+        }};
+      }}
+      const thumbnailUrl = String(info.thumburl || "");
+      if (!thumbnailUrl || !/^https?:\\/\\//i.test(thumbnailUrl)) continue;
+      let thumbnailWidth = asPositiveNumber(info.thumbwidth);
+      let thumbnailHeight = asPositiveNumber(info.thumbheight);
+      if (!thumbnailWidth || !thumbnailHeight) {{
+        const match = thumbnailUrl.match(/(\\d+)px-[^/]+(?:\\?.*)?$/i);
+        if (match) thumbnailWidth = asPositiveNumber(match[1]);
+      }}
+      if (!thumbnailHeight && thumbnailWidth && sourceWidth && sourceHeight) {{
+        thumbnailHeight = Math.max(1, Math.round(thumbnailWidth * sourceHeight / sourceWidth));
+      }}
+      if (!thumbnailWidth && thumbnailHeight && sourceWidth && sourceHeight) {{
+        thumbnailWidth = Math.max(1, Math.round(thumbnailHeight * sourceWidth / sourceHeight));
+      }}
+      const thumbnailLongEdge = thumbnailWidth && thumbnailHeight
+        ? Math.max(thumbnailWidth, thumbnailHeight)
+        : null;
+      if (thumbnailLongEdge && thumbnailLongEdge <= maxLongEdge) {{
+        return {{
+          download_url: thumbnailUrl,
+          variant_source: "imageinfo_thumbnail",
+          resolved: true,
+          original_width: sourceWidth,
+          original_height: sourceHeight,
+          download_width: thumbnailWidth,
+          download_height: thumbnailHeight,
+        }};
+      }}
+    }} finally {{
+      if (metadataResponse) {{
+        try {{ await metadataResponse.dispose(); }} catch (_) {{}}
+      }}
+    }}
+  }}
+  return null;
+}};
+
+try {{
+  const resolvedVariant = await resolveWikimediaVariant(input.wikimediaResolution);
+  if (resolvedVariant && resolvedVariant.download_url) {{
+    downloadUrl = resolvedVariant.download_url;
+    variantSource = String(resolvedVariant.variant_source || "imageinfo");
+    variantResolved = Boolean(resolvedVariant.resolved);
+    originalWidth = resolvedVariant.original_width || null;
+    originalHeight = resolvedVariant.original_height || null;
+    downloadWidth = resolvedVariant.download_width || null;
+    downloadHeight = resolvedVariant.download_height || null;
+  }}
+}} catch (error) {{
+  variantResolutionError = String(error && error.message ? error.message : error || "variant resolution failed").slice(0, 500);
+}}
+
 let response = null;
 let phase = "request";
 const output = {{
   status: null,
-  resolved_url: input.url,
+  resolved_url: downloadUrl,
+  download_url: downloadUrl,
+  variant_source: variantSource,
+  variant_resolved: variantResolved,
+  original_width: originalWidth,
+  original_height: originalHeight,
+  download_width: downloadWidth,
+  download_height: downloadHeight,
+  variant_resolution_error: variantResolutionError,
   content_type: "",
   body_base64: null,
   byte_count: 0,
@@ -1900,10 +2635,10 @@ const output = {{
   target_phase: phase,
 }};
 try {{
-  response = await page.request.get(input.url, {{
+  response = await page.request.get(downloadUrl, {{
     failOnStatusCode: false,
     headers,
-    timeout: input.timeoutMs,
+    timeout: remainingExecutionTimeoutMs(),
   }});
   phase = "response";
   const responseHeaders = response.headers();
@@ -1981,6 +2716,16 @@ return JSON.stringify(output);
         target_error_type = str(payload.get("target_error_type") or "")
         target_error_message = str(payload.get("target_error_message") or "")
         target_phase = str(payload.get("target_phase") or "request")
+        download_url = str(payload.get("download_url") or requested_url)
+        variant_source = str(payload.get("variant_source") or "original")
+        variant_resolved = payload.get("variant_resolved") is True or str(
+            payload.get("variant_resolved") or ""
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        original_width = _positive_int(payload.get("original_width"))
+        original_height = _positive_int(payload.get("original_height"))
+        download_width = _positive_int(payload.get("download_width"))
+        download_height = _positive_int(payload.get("download_height"))
+        variant_resolution_error = str(payload.get("variant_resolution_error") or "")
         if error in {"target_request_timeout", "target_request_error"} or target_error_type:
             detail = target_error_message or error or target_error_type
             raise FirecrawlBrowserTargetRequestError(
@@ -2041,6 +2786,14 @@ return JSON.stringify(output);
             status_code=status_code,
             session_id=session_id,
             key_id=key_id,
+            download_url=download_url,
+            variant_source=variant_source,
+            variant_resolved=variant_resolved,
+            original_width=original_width,
+            original_height=original_height,
+            download_width=download_width,
+            download_height=download_height,
+            variant_resolution_error=variant_resolution_error,
         )
 
     @staticmethod
@@ -2085,6 +2838,14 @@ def _non_negative_int(value: object) -> int | None:
         return max(0, int(value))
     except (TypeError, ValueError):
         return None
+
+
+def _positive_int(value: object) -> int | None:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
 
 
 def _browser_expiry_timestamp(value: object) -> float | None:
@@ -2141,5 +2902,6 @@ def _sniff_image_content_type(payload: bytes) -> str:
 
 
 def acquire_firecrawl_api_key() -> tuple[str, dict[str, Any]]:
-    """Acquire one key from the process-wide Firecrawl pool."""
-    return FirecrawlApiKeyPool.from_fixed_pool().acquire_key()
+    """Return the fixed worker key; a Relay rotates its own upstream keys."""
+
+    return _FixedFirecrawlKeyProvider().acquire_key()

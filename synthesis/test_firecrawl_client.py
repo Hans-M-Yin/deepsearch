@@ -20,6 +20,7 @@ from synthesis.firecrawl_client import (
     FirecrawlBrowserTargetRequestError,
     FirecrawlBrowserSessionManager,
     FirecrawlClient,
+    _is_firecrawl_credit_exhausted,
 )
 from synthesis.url_utils import normalize_http_referer, normalize_http_url
 
@@ -81,6 +82,168 @@ class _FakeBrowserFirecrawl:
 
 
 class FirecrawlClientTest(unittest.TestCase):
+    def test_deferred_firecrawl_pool_persists_every_n_results_and_flushes(self) -> None:
+        with TemporaryDirectory() as directory:
+            state_path = Path(directory) / "pool.json"
+            pool = FirecrawlApiKeyPool(
+                keys=["one-key"],
+                state_path=state_path,
+                persist_every=3,
+            )
+            pool.status()
+
+            pool.record_result(
+                FirecrawlApiKeyPool.key_id("one-key"),
+                success=True,
+                credits_used=1,
+            )
+            self.assertEqual(
+                json.loads(state_path.read_text(encoding="utf-8"))["keys"][
+                    FirecrawlApiKeyPool.key_id("one-key")
+                ]["remaining_credits"],
+                10000,
+            )
+
+            pool.record_result(
+                FirecrawlApiKeyPool.key_id("one-key"),
+                success=True,
+                credits_used=1,
+            )
+            pool.record_result(
+                FirecrawlApiKeyPool.key_id("one-key"),
+                success=True,
+                credits_used=1,
+            )
+            self.assertEqual(
+                json.loads(state_path.read_text(encoding="utf-8"))["keys"][
+                    FirecrawlApiKeyPool.key_id("one-key")
+                ]["remaining_credits"],
+                9997,
+            )
+
+            pool.record_result(
+                FirecrawlApiKeyPool.key_id("one-key"),
+                success=True,
+                credits_used=1,
+            )
+            pool.flush()
+            self.assertEqual(
+                json.loads(state_path.read_text(encoding="utf-8"))["keys"][
+                    FirecrawlApiKeyPool.key_id("one-key")
+                ]["remaining_credits"],
+                9996,
+            )
+
+    def test_relay_url_uses_fixed_key_without_local_pool_state(self) -> None:
+        calls: list[str] = []
+
+        class RelayManagedFirecrawl:
+            def __init__(self, *, api_key: str) -> None:
+                calls.append(api_key)
+
+            def scrape(self, url: str, **kwargs: object) -> dict:
+                del url, kwargs
+                return {
+                    "success": True,
+                    "data": {"markdown": "page", "metadata": {"creditsUsed": 1, "statusCode": 200}},
+                }
+
+        with TemporaryDirectory() as directory, mock.patch.dict(
+            os.environ,
+            {
+                "FIRECRAWL_API_KEY": "relay-placeholder",
+            },
+            clear=False,
+        ):
+            state_path = Path(directory) / "state.json"
+            client = FirecrawlClient(
+                api_keys=["local-real-key"],
+                pool_state_path=state_path,
+                app_factory=RelayManagedFirecrawl,
+            )
+            result = client.scrape("https://example.com")
+
+            self.assertTrue(result["success"])
+            self.assertEqual(calls, ["relay-placeholder"])
+            self.assertIsNone(client.key_pool.state_path)
+            self.assertFalse(state_path.exists())
+
+    def test_credit_error_markers_only_match_api_credit_failures(self) -> None:
+        self.assertTrue(_is_firecrawl_credit_exhausted(status_code=402))
+        self.assertTrue(
+            _is_firecrawl_credit_exhausted(
+                status_code=400,
+                response_body="Insufficient credits",
+            )
+        )
+        self.assertFalse(
+            _is_firecrawl_credit_exhausted(
+                status_code=403,
+                response_body="Target page access denied",
+            )
+        )
+
+    def test_browser_uses_fixed_key_without_api_pool_state(self) -> None:
+        _FakeBrowserFirecrawl.reset(payload={})
+        with TemporaryDirectory() as directory:
+            pool_state_path = Path(directory) / "api_pool.json"
+            session_state_path = Path(directory) / "browser_sessions.json"
+            manager = FirecrawlBrowserSessionManager.from_environment(
+                api_key="browser-fixed-key",
+                api_keys=["unused-second-key"],
+                pool_state_path=pool_state_path,
+                session_state_path=session_state_path,
+                app_factory=_FakeBrowserFirecrawl,
+            )
+
+            lease = manager.acquire(acquire_timeout_s=1, lease_timeout_s=60)
+            lease.release()
+
+            self.assertEqual(_FakeBrowserFirecrawl.browser_calls[0][0], "browser-fixed-key")
+            self.assertIsNone(manager.key_pool.lock_path)
+            self.assertFalse(pool_state_path.exists())
+            self.assertTrue(session_state_path.exists())
+
+    def test_credit_error_does_not_rotate_or_update_worker_pool_state(self) -> None:
+        calls: list[str] = []
+
+        class CreditExhaustedFirecrawl:
+            def __init__(self, *, api_key: str) -> None:
+                self.api_key = api_key
+
+            def scrape(self, url: str, **kwargs: object) -> dict:
+                del url, kwargs
+                calls.append(self.api_key)
+                if self.api_key == "empty-key":
+                    return {"statusCode": 402, "error": "Insufficient credits"}
+                return {
+                    "success": True,
+                    "data": {
+                        "markdown": "page",
+                        "metadata": {"creditsUsed": 1, "statusCode": 200},
+                    },
+                }
+
+        with TemporaryDirectory() as directory:
+            state_path = Path(directory) / "state.json"
+            client = FirecrawlClient(
+                api_key="empty-key",
+                pool_state_path=state_path,
+                app_factory=CreditExhaustedFirecrawl,
+            )
+
+            self.assertEqual(
+                client.scrape("https://example.com/first"),
+                {"error": "Insufficient credits"},
+            )
+            self.assertEqual(
+                client.scrape("https://example.com/second"),
+                {"error": "Insufficient credits"},
+            )
+
+            self.assertEqual(calls, ["empty-key", "empty-key"])
+            self.assertFalse(state_path.exists())
+
     def test_shared_url_helpers_quote_unicode_and_drop_invalid_referer(self) -> None:
         self.assertEqual(
             normalize_http_url("https://example.com/Kościół"),
@@ -106,6 +269,87 @@ class FirecrawlClientTest(unittest.TestCase):
         self.assertIn('"referer": ""', code)
         self.assertNotIn("source\\rbad", code)
         self.assertIn("Ko%C5%9Bci%C3%B3%C5%82.png", code)
+
+    def test_browser_download_code_resolves_wikimedia_variant_in_browser(self) -> None:
+        manager = mock.Mock()
+        downloader = FirecrawlBrowserImageDownloader(
+            session_manager=manager,
+            wikimedia_max_long_edge=1000,
+            wikimedia_metadata_timeout_s=8,
+        )
+        target_url, resolution = downloader._prepare_wikimedia_download(
+            "https://upload.wikimedia.org/wikipedia/commons/1/10/Some_File.jpg"
+        )
+        code = downloader._download_code(
+            target_url,
+            referer_url=None,
+            request_timeout_ms=115_000,
+            wikimedia_resolution=resolution,
+        )
+
+        self.assertEqual(target_url, "https://upload.wikimedia.org/wikipedia/commons/1/10/Some_File.jpg")
+        self.assertIsNotNone(resolution)
+        self.assertEqual(resolution["mode"], "lookup")
+        self.assertEqual(resolution["api_url"], "https://commons.wikimedia.org/w/api.php")
+        self.assertEqual(resolution["file_title"], "File:Some File.jpg")
+        self.assertIn("prop: \"imageinfo\"", code)
+        self.assertIn("iiurlwidth", code)
+        self.assertIn("iiurlheight", code)
+        self.assertIn("downloadUrl", code)
+        self.assertIn("page.request.get(downloadUrl", code)
+        self.assertIn("variant_resolution_error", code)
+
+    def test_browser_wikimedia_variant_mapping_is_cached_after_success(self) -> None:
+        jpeg = b"\\xff\\xd8\\xff" + b"variant-cache-image"
+        thumb_url = (
+            "https://upload.wikimedia.org/wikipedia/commons/thumb/1/10/Variant_Cache.jpg/"
+            "960px-Variant_Cache.jpg"
+        )
+        _FakeBrowserFirecrawl.reset(
+            payload={
+                "status": 200,
+                "resolved_url": thumb_url,
+                "download_url": thumb_url,
+                "variant_source": "imageinfo_thumbnail",
+                "variant_resolved": True,
+                "original_width": 3812,
+                "original_height": 2551,
+                "download_width": 960,
+                "download_height": 642,
+                "content_type": "image/jpeg",
+                "body_base64": base64.b64encode(jpeg).decode("ascii"),
+                "byte_count": len(jpeg),
+                "error": None,
+            }
+        )
+        source_url = "https://upload.wikimedia.org/wikipedia/commons/1/10/Variant_Cache.jpg"
+        with TemporaryDirectory() as directory, mock.patch.dict(
+            os.environ,
+            {"SFT_WIKIMEDIA_CACHE_DIR": directory},
+            clear=False,
+        ):
+            pool = FirecrawlApiKeyPool(keys=["one-key"], state_path=Path(directory) / "pool.json")
+            manager = FirecrawlBrowserSessionManager(
+                key_pool=pool,
+                app_factory=_FakeBrowserFirecrawl,
+                state_path=Path(directory) / "sessions.json",
+            )
+            downloader = FirecrawlBrowserImageDownloader(session_manager=manager, retries=0)
+
+            first = downloader.download(source_url)
+            second = downloader.download(source_url)
+
+            self.assertEqual(first.download_url, thumb_url)
+            self.assertEqual(second.download_url, thumb_url)
+            self.assertEqual(first.download_width, 960)
+            self.assertEqual(len(_FakeBrowserFirecrawl.execute_calls), 2)
+            first_code = _FakeBrowserFirecrawl.execute_calls[0][2]
+            second_code = _FakeBrowserFirecrawl.execute_calls[1][2]
+            self.assertIn('"mode": "lookup"', first_code)
+            self.assertIn('"mode": "cached"', second_code)
+            self.assertNotIn('"mode": "lookup"', second_code)
+            variant_files = list((Path(directory) / "browser_variants").rglob("*.json"))
+            self.assertEqual(len(variant_files), 1)
 
     def test_scrape_uses_firecrawl_relay_without_constructing_sdk(self) -> None:
         captured: dict[str, object] = {}
@@ -146,6 +390,7 @@ class FirecrawlClientTest(unittest.TestCase):
                 {
                     "FIRECRAWL_RELAY_URL": "http://relay.example:18081",
                     "FIRECRAWL_RELAY_TIMEOUT_S": "17",
+                    "FIRECRAWL_API_KEY": "relay-key",
                 },
                 clear=False,
             ), mock.patch("synthesis.firecrawl_client.urlopen", side_effect=fake_urlopen):
@@ -168,17 +413,14 @@ class FirecrawlClientTest(unittest.TestCase):
             self.assertEqual(body["url"], "https://example.com/relay")
             self.assertEqual(body["formats"], ["markdown"])
             self.assertEqual(captured["timeout"], 17.0)
-            record = json.loads(state_path.read_text(encoding="utf-8"))["keys"][
-                client.key_pool.key_id("relay-key")
-            ]
-            self.assertEqual(record["remaining_credits"], 9998)
+            self.assertFalse(state_path.exists())
 
-    def test_round_robin_and_result_state(self) -> None:
+    def test_fixed_key_and_no_result_state(self) -> None:
         _FakeFirecrawl.calls = []
         with TemporaryDirectory() as directory:
             state_path = Path(directory) / "state.json"
             client = FirecrawlClient(
-                api_keys=["good-key", "bad-key"],
+                api_key="good-key",
                 pool_state_path=state_path,
                 app_factory=_FakeFirecrawl,
             )
@@ -188,24 +430,11 @@ class FirecrawlClientTest(unittest.TestCase):
             # Successful Firecrawl calls intentionally stay quiet; the
             # backend emits structured debug output only for failures.
             self.assertEqual(stderr.getvalue(), "")
-            with self.assertRaisesRegex(RuntimeError, "Unauthorized"):
-                client.scrape("https://example.com/second")
             self.assertTrue(client.scrape("https://example.com/third")["success"])
 
-            self.assertEqual([call[0] for call in _FakeFirecrawl.calls], ["good-key", "bad-key", "good-key"])
+            self.assertEqual([call[0] for call in _FakeFirecrawl.calls], ["good-key", "good-key"])
             self.assertEqual(_FakeFirecrawl.calls[0][2]["formats"], ["markdown"])
-            state = json.loads(state_path.read_text(encoding="utf-8"))
-            bad_record = state["keys"][client.key_pool.key_id("bad-key")]
-            good_record = state["keys"][client.key_pool.key_id("good-key")]
-            self.assertTrue(bad_record["disabled"])
-            self.assertEqual(bad_record["state"], "disabled")
-            self.assertEqual(good_record["initial_credits"], 10000)
-            self.assertEqual(good_record["remaining_credits"], 9972)
-            self.assertEqual(good_record["credits_consumed"], 28)
-            self.assertEqual(good_record["last_credits_used"], 14)
-            self.assertEqual(good_record["last_status_code"], 200)
-            self.assertEqual(client.key_pool.status()["available_key_count"], 1)
-            self.assertTrue(client.key_pool.lock_path.exists())
+            self.assertFalse(state_path.exists())
 
     def test_page_401_does_not_disable_api_key(self) -> None:
         class PageUnauthorizedFirecrawl:
@@ -238,12 +467,7 @@ class FirecrawlClientTest(unittest.TestCase):
                 client.scrape("https://example.com/login"),
                 {"error": "Firecrawl scrape returned statusCode 401: Unauthorized"},
             )
-            record = json.loads(state_path.read_text(encoding="utf-8"))["keys"][
-                client.key_pool.key_id("one-key")
-            ]
-            self.assertFalse(record["disabled"])
-            self.assertEqual(record["remaining_credits"], 9999)
-            self.assertEqual(client.key_pool.status()["available_key_count"], 1)
+            self.assertFalse(state_path.exists())
 
     def test_untyped_invalid_key_text_does_not_disable_api_key(self) -> None:
         class UntypedErrorFirecrawl:
@@ -263,11 +487,7 @@ class FirecrawlClientTest(unittest.TestCase):
             )
 
             self.assertEqual(client.scrape("https://example.com"), {"error": "Invalid API key"})
-            record = json.loads(state_path.read_text(encoding="utf-8"))["keys"][
-                client.key_pool.key_id("one-key")
-            ]
-            self.assertFalse(record["disabled"])
-            self.assertEqual(client.key_pool.status()["available_key_count"], 1)
+            self.assertFalse(state_path.exists())
 
     def test_root_api_401_disables_api_key(self) -> None:
         class RootUnauthorizedFirecrawl:
@@ -290,13 +510,9 @@ class FirecrawlClientTest(unittest.TestCase):
                 client.scrape("https://example.com"),
                 {"error": "Unauthorized"},
             )
-            record = json.loads(state_path.read_text(encoding="utf-8"))["keys"][
-                client.key_pool.key_id("one-key")
-            ]
-            self.assertTrue(record["disabled"])
-            self.assertEqual(record["disabled_reason"], "firecrawl_api_auth_failed")
+            self.assertFalse(state_path.exists())
 
-    def test_recovers_legacy_page_401_disable(self) -> None:
+    def test_legacy_pool_state_is_ignored_by_fixed_client(self) -> None:
         with TemporaryDirectory() as directory:
             state_path = Path(directory) / "state.json"
             key_id = FirecrawlClient(api_keys=["one-key"], pool_state_path=state_path).key_pool.key_id(
@@ -318,12 +534,11 @@ class FirecrawlClientTest(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            client = FirecrawlClient(api_keys=["one-key"], pool_state_path=state_path)
+            client = FirecrawlClient(api_key="one-key", pool_state_path=state_path)
 
             self.assertEqual(client.key_pool.status()["available_key_count"], 1)
             record = json.loads(state_path.read_text(encoding="utf-8"))["keys"][key_id]
-            self.assertFalse(record["disabled"])
-            self.assertEqual(record["state"], "active")
+            self.assertTrue(record["disabled"])
 
     def test_non_200_status_returns_an_error_text_and_charges_actual_credits(self) -> None:
         class Non200Firecrawl:
@@ -349,10 +564,7 @@ class FirecrawlClientTest(unittest.TestCase):
                 client.scrape("https://example.com/protected"),
                 {"error": "Firecrawl scrape returned statusCode 403: Access denied"},
             )
-            record = json.loads(state_path.read_text(encoding="utf-8"))["keys"][client.key_pool.key_id("one-key")]
-            self.assertEqual(record["last_result"], "failure")
-            self.assertEqual(record["last_status_code"], 403)
-            self.assertEqual(record["remaining_credits"], 9997)
+            self.assertFalse(state_path.exists())
 
     def test_direct_snake_case_sdk_response_tracks_credit_and_status(self) -> None:
         class DirectResponseFirecrawl:
@@ -370,9 +582,7 @@ class FirecrawlClientTest(unittest.TestCase):
             )
             response = client.scrape("https://example.com")
             self.assertEqual(response["metadata"]["credits_used"], 14)
-            record = json.loads(state_path.read_text(encoding="utf-8"))["keys"][client.key_pool.key_id("one-key")]
-            self.assertEqual(record["remaining_credits"], 9986)
-            self.assertEqual(record["last_status_code"], 200)
+            self.assertFalse(state_path.exists())
 
     def test_browser_image_download_reuses_one_session_and_returns_raw_bytes(self) -> None:
         jpeg = b"\xff\xd8\xff" + b"image-data"
@@ -418,7 +628,7 @@ class FirecrawlClientTest(unittest.TestCase):
                 _FakeBrowserFirecrawl.execute_calls[1][1],
             )
             self.assertIn("page.request.get", _FakeBrowserFirecrawl.execute_calls[0][2])
-            self.assertIn('"timeoutMs": 115000', _FakeBrowserFirecrawl.execute_calls[0][2])
+            self.assertIn('"timeoutMs": 55000', _FakeBrowserFirecrawl.execute_calls[0][2])
             self.assertIn("body.toString(\"base64\")", _FakeBrowserFirecrawl.execute_calls[0][2])
             self.assertIn("await (async () => {", _FakeBrowserFirecrawl.execute_calls[0][2])
             self.assertIn("return JSON.stringify(output);", _FakeBrowserFirecrawl.execute_calls[0][2])
@@ -476,6 +686,7 @@ class FirecrawlClientTest(unittest.TestCase):
             {
                 "FIRECRAWL_RELAY_URL": "http://relay.example:18081",
                 "FIRECRAWL_BROWSER_RELAY_TIMEOUT_S": "181",
+                "FIRECRAWL_API_KEY": "relay-key",
             },
             clear=False,
         ), mock.patch("synthesis.firecrawl_client.urlopen", side_effect=fake_urlopen):

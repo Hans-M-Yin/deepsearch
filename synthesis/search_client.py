@@ -100,6 +100,19 @@ def _serper_ipv6_enabled(value: bool | None) -> bool:
     return str(raw or "").strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _serper_fixed_client_key(explicit_key: str | None = None) -> str:
+    """Return the one key used by a worker process.
+
+    API-key rotation is Relay-owned.  ``explicit_key`` is kept for diagnostic
+    callers that probe one key at a time; normal workers configure
+    ``SERPER_API_KEY``.  The same fixed key is sent to either the official
+    endpoint or a Relay; a pool-enabled Relay ignores it.
+    """
+
+    value = str(explicit_key or os.environ.get("SERPER_API_KEY") or "").strip()
+    return value
+
+
 def _jsonify(value: Any) -> Any:
     if isinstance(value, Enum):
         return value.value
@@ -306,6 +319,24 @@ def _is_serper_credit_exhausted(*, status_code: int, response_body: str) -> bool
     )
 
 
+def _is_serper_auth_failure(*, status_code: int, response_body: str) -> bool:
+    """Recognize an invalid/unauthorized Serper key without disabling every 403."""
+    if status_code not in {401, 403}:
+        return False
+    message = response_body.lower()
+    return any(
+        marker in message
+        for marker in (
+            "unauthorized",
+            "invalid api key",
+            "invalid key",
+            "authentication failed",
+            "authentication error",
+            "api key is not valid",
+        )
+    )
+
+
 def _log_serper_raw_response(*, url: str, status_code: int, raw: dict[str, Any]) -> None:
     """Log Serper's unmodified parsed JSON response before result parsing."""
 
@@ -345,6 +376,7 @@ class SerperApiKeyPool:
         state_path: str | Path | None = None,
         default_credits: int = 2500,
         min_remaining: int = 100,
+        persist_every: int = 1,
     ) -> None:
         cleaned = list(dict.fromkeys(key.strip() for key in keys if key and key.strip()))
         if not cleaned:
@@ -352,6 +384,13 @@ class SerperApiKeyPool:
         self.keys = cleaned
         self.default_credits = max(1, int(default_credits))
         self.min_remaining = max(0, int(min_remaining))
+        # Relay mode can keep the pool in memory and checkpoint it
+        # periodically. The default remains one write per operation for
+        # diagnostic/backward-compatible callers.
+        self.persist_every = max(1, int(persist_every))
+        self._state_cache: dict[str, Any] | None = None
+        self._state_cache_lock = threading.RLock()
+        self._uses_since_persist = 0
         configured_path = state_path or os.environ.get("SERPER_API_POOL_STATE_FILE")
         self.state_path = (
             Path(configured_path)
@@ -428,7 +467,7 @@ class SerperApiKeyPool:
         return keys
 
     def acquire_key(self) -> tuple[str, dict[str, Any]]:
-        state = self._with_locked_state(self._acquire_from_state)
+        state = self._with_locked_state(self._acquire_from_state, count_use=True)
         key = state.pop("_selected_key")
         metadata = state.pop("_selected_metadata")
         return key, metadata
@@ -437,6 +476,16 @@ class SerperApiKeyPool:
         """Return the shared pool's currently usable keys and estimated credits."""
         state = self._with_locked_state(self._initialize_state)
         return self._pool_status(state)
+
+    def flush(self) -> None:
+        """Persist pending in-memory accounting before a Relay shuts down."""
+
+        if self.persist_every <= 1:
+            return
+        with self._state_cache_lock:
+            if self._state_cache is not None and self._uses_since_persist:
+                self._write_state(self._state_cache)
+                self._uses_since_persist = 0
 
     def mark_credits_exhausted(self, key_id: str, *, reason: str | None = None) -> dict[str, Any]:
         """Disable a key after Serper explicitly reports that its credits are gone."""
@@ -452,7 +501,7 @@ class SerperApiKeyPool:
             self._store_pool_status(state)
             return state
 
-        return self._pool_status(self._with_locked_state(update))
+        return self._pool_status(self._with_locked_state(update, force_persist=True))
 
     def _initialize_state(self, state: dict[str, Any]) -> dict[str, Any]:
         pool = dict(state.get("keys") or {})
@@ -539,7 +588,20 @@ class SerperApiKeyPool:
         }
         return state
 
-    def _with_locked_state(self, callback) -> dict[str, Any]:
+    def _with_locked_state(
+        self,
+        callback,
+        *,
+        count_use: bool = False,
+        force_persist: bool = False,
+    ) -> dict[str, Any]:
+        if self.persist_every > 1:
+            return self._with_cached_state(
+                callback,
+                count_use=count_use,
+                force_persist=force_persist,
+            )
+
         lock_path = _local_lock_path_for_state(self.state_path)
         lock_path.parent.mkdir(parents=True, exist_ok=True)
         with _SERPER_POOL_THREAD_LOCK:
@@ -554,6 +616,53 @@ class SerperApiKeyPool:
                 finally:
                     if fcntl is not None:
                         fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+
+    def _with_cached_state(
+        self,
+        callback,
+        *,
+        count_use: bool,
+        force_persist: bool,
+    ) -> dict[str, Any]:
+        """Run a pool operation in memory and checkpoint periodically.
+
+        This mode is intended for a single Relay process owning the pool. It
+        removes the per-request HDFS read/write from the hot path. The first
+        operation still loads and normalizes the state, and explicit key
+        invalidation is flushed immediately.
+        """
+
+        with self._state_cache_lock:
+            if self._state_cache is None:
+                lock_path = _local_lock_path_for_state(self.state_path)
+                lock_path.parent.mkdir(parents=True, exist_ok=True)
+                with lock_path.open("a+", encoding="utf-8") as lock_handle:
+                    if fcntl is not None:
+                        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+                    try:
+                        state = self._read_state()
+                        updated = callback(state)
+                        # Persist the normalized key set once at startup so
+                        # changed key files and stale pool_status are repaired.
+                        self._write_state(updated)
+                    finally:
+                        if fcntl is not None:
+                            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+                self._state_cache = updated
+                self._uses_since_persist = 1 if count_use else 0
+                return updated
+
+            updated = callback(self._state_cache)
+            self._state_cache = updated
+            if count_use:
+                self._uses_since_persist += 1
+            should_persist = force_persist or (
+                count_use and self._uses_since_persist >= self.persist_every
+            )
+            if should_persist:
+                self._write_state(updated)
+                self._uses_since_persist = 0
+            return updated
 
     def _read_state(self) -> dict[str, Any]:
         if not self.state_path.exists():
@@ -873,7 +982,7 @@ class SerperAdapterSearchClient:
 
 
 class SerperSearchClient:
-    """Direct client for the official Serper.dev API."""
+    """Direct client using one fixed worker key; rotation belongs to Relay."""
 
     def __init__(
         self,
@@ -888,25 +997,12 @@ class SerperSearchClient:
         pool_min_remaining: int | None = None,
         ipv6_only: bool | None = None,
     ) -> None:
-        self.api_key = None
+        # Keep the historical constructor arguments for compatibility with
+        # diagnostic utilities, but never construct or touch a worker-local
+        # key pool/state/lock.  The Relay is the only runtime pool owner.
+        del api_keys, pool_state_path, pool_default_credits, pool_min_remaining
+        self.api_key = _serper_fixed_client_key(api_key)
         self.key_pool: SerperApiKeyPool | None = None
-        if api_keys:
-            self.key_pool = SerperApiKeyPool(
-                keys=api_keys,
-                state_path=pool_state_path if pool_state_path is not None else _FIXED_SERPER_POOL_STATE_FILE,
-                default_credits=(
-                    pool_default_credits
-                    if pool_default_credits is not None
-                    else _FIXED_SERPER_POOL_DEFAULT_CREDITS
-                ),
-                min_remaining=(
-                    pool_min_remaining
-                    if pool_min_remaining is not None
-                    else _FIXED_SERPER_POOL_MIN_REMAINING
-                ),
-            )
-        else:
-            self.key_pool = SerperApiKeyPool.from_fixed_pool()
         self.search_url = search_url or os.environ.get("SERPER_SEARCH_URL") or "https://google.serper.dev/search"
         self.images_url = images_url or os.environ.get("SERPER_IMAGES_URL") or "https://google.serper.dev/images"
         self.timeout_s = timeout_s
@@ -945,14 +1041,13 @@ class SerperSearchClient:
 
     def _post_json(self, url: str, body: dict[str, Any]) -> tuple[dict[str, Any], int, dict[str, Any]]:
         api_key = self.api_key
-        pool_metadata: dict[str, Any] = {}
-        if self.key_pool is not None:
-            api_key, pool_metadata = self.key_pool.acquire_key()
+        pool_metadata: dict[str, Any] = {
+            "key_id": "fixed-client",
+            "managed_by": "fixed_env_or_relay",
+            "masked_key": "fixed-client",
+        }
         if not api_key:
-            raise ValueError(
-                "Serper API key is required. Populate the fixed pool file "
-                f"at {_FIXED_SERPER_KEYS_FILE}."
-            )
+            raise ValueError("SERPER_API_KEY must be set for the fixed-key Serper client.")
 
         _log_serper_key(url=url, api_key=api_key, metadata=pool_metadata)
         _log_serper_request(url=url, body=body)
@@ -1001,20 +1096,6 @@ class SerperSearchClient:
                 error_payload = exc.read().decode("utf-8", errors="replace")
             except Exception:
                 error_payload = ""
-            if self.key_pool is not None and _is_serper_credit_exhausted(
-                status_code=exc.code,
-                response_body=error_payload,
-            ):
-                pool_status = self.key_pool.mark_credits_exhausted(
-                    str(pool_metadata.get("key_id") or ""),
-                    reason=f"serper_http_{exc.code}_credits_exhausted",
-                )
-                _serper_debug(
-                    "key_credits_exhausted",
-                    key_id=pool_metadata.get("key_id"),
-                    status_code=exc.code,
-                    key_pool=pool_status,
-                )
             _serper_debug(
                 "http_error",
                 url=url,
@@ -1152,9 +1233,16 @@ class SerperSearchClient:
 
 
 def acquire_serper_api_key() -> tuple[str, dict[str, Any]]:
-    """Acquire one Serper API key from the fixed cross-process pool."""
+    """Return the fixed worker key; a Relay rotates its own upstream keys."""
 
-    return SerperApiKeyPool.from_fixed_pool().acquire_key()
+    api_key = _serper_fixed_client_key()
+    if not api_key:
+        raise ValueError("SERPER_API_KEY must be set for the fixed-key Serper client.")
+    return api_key, {
+        "key_id": "fixed-client",
+        "managed_by": "fixed_env_or_relay",
+        "masked_key": "fixed-client",
+    }
 
 
 class SerpApiSearchClient:

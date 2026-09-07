@@ -1,15 +1,20 @@
-"""Regression tests for Serper key invalidation and rotation."""
+"""Regression tests for the fixed worker key and Relay-owned pool."""
 
 from __future__ import annotations
 
 import io
-import json
 from pathlib import Path
 import tempfile
 import unittest
 from urllib.error import HTTPError
+from unittest import mock
 
-from synthesis.search_client import SerperApiKeyPool, SerperSearchClient, _is_serper_credit_exhausted
+from synthesis.search_client import (
+    SerperApiKeyPool,
+    SerperSearchClient,
+    _is_serper_auth_failure,
+    _is_serper_credit_exhausted,
+)
 
 
 class _Response:
@@ -50,6 +55,53 @@ class _FakeOpener:
 
 
 class SerperKeyPoolTests(unittest.TestCase):
+    def test_deferred_pool_persists_every_n_uses_and_flushes_pending_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "serper_pool_state.json"
+            pool = SerperApiKeyPool(
+                keys=["one-key"],
+                state_path=state_path,
+                min_remaining=0,
+                persist_every=3,
+            )
+
+            pool.acquire_key()
+            first_persisted = state_path.read_text(encoding="utf-8")
+            pool.acquire_key()
+            self.assertEqual(state_path.read_text(encoding="utf-8"), first_persisted)
+
+            pool.acquire_key()
+            persisted = state_path.read_text(encoding="utf-8")
+            self.assertIn('"remaining_credits": 2497', persisted)
+
+            pool.acquire_key()
+            self.assertIn('"remaining_credits": 2497', state_path.read_text(encoding="utf-8"))
+            pool.flush()
+            self.assertIn('"remaining_credits": 2496', state_path.read_text(encoding="utf-8"))
+
+    def test_relay_url_uses_fixed_key_without_local_pool_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir, mock.patch.dict(
+            "os.environ",
+            {
+                "SERPER_API_KEY": "relay-placeholder",
+            },
+            clear=False,
+        ):
+            state_path = Path(tmpdir) / "serper_pool_state.json"
+            client = SerperSearchClient(
+                api_keys=["local-real-key"],
+                search_url="http://relay/search",
+                pool_state_path=state_path,
+            )
+            opener = _FakeOpener()
+            client._url_opener = opener
+
+            client.search_text("relay test", limit=1)
+
+            self.assertIsNone(client.key_pool)
+            self.assertEqual(opener.keys, ["relay-placeholder"])
+            self.assertFalse(state_path.exists())
+
     def test_not_enough_credits_is_credit_exhaustion_but_rate_limit_is_not(self) -> None:
         self.assertTrue(
             _is_serper_credit_exhausted(
@@ -64,8 +116,30 @@ class SerperKeyPoolTests(unittest.TestCase):
             )
         )
 
-    def test_credit_error_disables_key_and_next_request_skips_it(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
+    def test_unauthorized_is_an_auth_failure_but_generic_403_is_not(self) -> None:
+        self.assertTrue(
+            _is_serper_auth_failure(
+                status_code=403,
+                response_body='{"message":"Unauthorized.","statusCode":403}',
+            )
+        )
+        self.assertTrue(
+            _is_serper_auth_failure(
+                status_code=401,
+                response_body='{"message":"Invalid API key"}',
+            )
+        )
+        self.assertFalse(
+            _is_serper_auth_failure(
+                status_code=403,
+                response_body='{"message":"Forbidden by policy"}',
+            )
+        )
+
+    def test_worker_uses_one_fixed_key_without_local_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir, mock.patch.dict(
+            "os.environ", {"SERPER_API_KEY": "fixed-key"}, clear=False
+        ):
             state_path = Path(tmpdir) / "serper_pool_state.json"
             client = SerperSearchClient(
                 api_keys=["bad-key", "good-key"],
@@ -77,18 +151,11 @@ class SerperKeyPoolTests(unittest.TestCase):
             opener = _FakeOpener()
             client._url_opener = opener
 
-            with self.assertRaisesRegex(RuntimeError, "Not enough credits"):
-                client.search_image("Indian motorcycle first prototype", limit=10, hl="en")
-
+            client.search_image("Indian motorcycle first prototype", limit=10, hl="en")
             client.search_image("Indian motorcycle first prototype", limit=10, hl="en")
 
-            self.assertEqual(opener.keys, ["bad-key", "good-key"])
-            state = json.loads(state_path.read_text(encoding="utf-8"))
-            bad_record = state["keys"][SerperApiKeyPool.key_id("bad-key")]
-            self.assertTrue(bad_record["disabled"])
-            self.assertEqual(bad_record["remaining_credits"], 0)
-            self.assertEqual(bad_record["disabled_reason"], "serper_http_400_credits_exhausted")
-            self.assertEqual(client.key_pool.status()["available_key_count"], 1)
+            self.assertEqual(opener.keys, ["fixed-key", "fixed-key"])
+            self.assertFalse(state_path.exists())
 
 
 if __name__ == "__main__":

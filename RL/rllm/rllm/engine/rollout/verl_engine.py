@@ -56,7 +56,16 @@ class VerlEngine(RolloutEngine):
         sampling_params = self.val_sampling_params.copy() if self.validate or validate else self.train_sampling_params.copy()
         sampling_params.update(kwargs)
 
-        max_tokens = sampling_params.pop("max_tokens", sampling_params.pop("max_new_tokens", self.max_response_length))
+        # ``max_tokens`` is the per-request/per-turn generation limit supplied
+        # by the agent.  Keep the trajectory-level ``max_response_length``
+        # separate: the latter may be very large (e.g. 56000) while a single
+        # ReAct turn is intentionally capped at a much smaller value (currently
+        # 4096 in DeepResearchAgent).
+        max_tokens = sampling_params.pop(
+            "max_tokens", sampling_params.pop("max_new_tokens", self.max_response_length)
+        )
+        max_tokens = min(int(max_tokens), int(self.max_response_length))
+        sampling_params["max_new_tokens"] = max_tokens
 
         prompt = self.chat_parser.parse(messages, add_generation_prompt=True, is_first_msg=True, tools=tools, accumulate_reasoning=accumulate_reasoning)
         request_prompt_ids = self.tokenizer.encode(prompt, add_special_tokens=False)  # list[int]

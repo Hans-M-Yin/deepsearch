@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import random
 from pathlib import Path
 from typing import Any
 
@@ -11,7 +12,12 @@ from rllm.agents.agent import Episode
 class EpisodeLogger:
     """Logger to save episodes to individual JSON files with step and data hash."""
 
-    def __init__(self, base_dir: str, subdirectory: str = "episodes"):
+    def __init__(
+        self,
+        base_dir: str,
+        subdirectory: str = "episodes",
+        max_episodes_per_batch: int | None = 50,
+    ):
         """Initialize the episode logger.
 
         Args:
@@ -23,6 +29,18 @@ class EpisodeLogger:
         """
         self.log_dir = Path(base_dir) / subdirectory
         self.log_dir.mkdir(parents=True, exist_ok=True)
+        # A rollout batch can contain thousands of episodes.  Limit only the
+        # persisted episode files; all episodes still participate in training.
+        self.max_episodes_per_batch = max_episodes_per_batch
+
+    def select_episodes_for_logging(
+        self, episodes: list[Episode]
+    ) -> list[Episode]:
+        """Randomly select the episodes to persist for one rollout batch."""
+        limit = self.max_episodes_per_batch
+        if limit is None or limit <= 0 or len(episodes) <= limit:
+            return list(episodes)
+        return random.sample(episodes, k=limit)
 
     @staticmethod
     def compute_task_hash(task: Any, length: int = 8) -> str:
@@ -76,6 +94,99 @@ class EpisodeLogger:
         filename = f"episode_hash{task_hash}_id{episode_id_safe}.json"
         return filename
 
+    @staticmethod
+    def _image_reference(image: Any) -> Any:
+        """Return a JSON-safe image reference without serializing image bytes.
+
+        Rollout messages may carry URLs, local paths, PIL images, or dictionaries
+        containing bytes. The saved trajectory describes the supplied image slot
+        without copying the image payload into every episode file.
+        """
+        if isinstance(image, str):
+            if image.startswith("data:image/"):
+                return {"type": "data_image", "value": "<inline_image_omitted>"}
+            return image
+
+        if isinstance(image, dict):
+            reference = {}
+            for key in ("url", "path", "name", "id", "mime_type", "media_type"):
+                value = image.get(key)
+                if isinstance(value, (str, int, float, bool)):
+                    reference[key] = value
+            if image.get("bytes") is not None:
+                try:
+                    reference["byte_size"] = len(image["bytes"])
+                except TypeError:
+                    reference["byte_size"] = "<unknown>"
+            if not reference:
+                reference = {"type": type(image).__name__}
+            return reference
+
+        # Avoid importing PIL just for logging. These attributes are available
+        # on PIL.Image.Image and keep the descriptor small and deterministic.
+        if hasattr(image, "size") and hasattr(image, "mode"):
+            return {
+                "type": type(image).__name__,
+                "size": list(image.size),
+                "mode": str(image.mode),
+            }
+
+        return {"type": type(image).__name__, "repr": str(image)[:200]}
+
+    @classmethod
+    def build_model_visible_messages(cls, episode: Episode) -> list[dict[str, Any]]:
+        """Reconstruct the final model-visible conversation for an episode.
+
+        Each DeepResearch ``Step.chat_completions`` is a cumulative prefix ending
+        at one assistant generation. The last step therefore contains the full
+        conversation sent to the last LLM request, including the system prompt,
+        all prior user observations, and all prior assistant tool calls. Using
+        that prefix avoids writing the same long context once per step.
+
+        The observation produced after the final assistant generation is not
+        appended: it was not presented to the model and is not model-visible.
+        Image payloads are represented only by safe references; binary data and
+        ModelOutput tensors are omitted.
+        """
+        last_step = None
+        for trajectory in episode.trajectories or []:
+            if trajectory.steps:
+                last_step = trajectory.steps[-1]
+
+        if last_step is not None and last_step.chat_completions:
+            messages = last_step.chat_completions
+        else:
+            # A rollout can fail before the first assistant generation. Keep a
+            # useful user prompt fallback for those episodes; no system prompt is
+            # available in the Episode object in that exceptional path.
+            task = episode.task if isinstance(episode.task, dict) else {}
+            question = task.get("question")
+            return (
+                [{"role": "user", "content": str(question)}]
+                if question is not None
+                else []
+            )
+
+        serialized_messages: list[dict[str, Any]] = []
+        for message in messages:
+            if not isinstance(message, dict):
+                serialized_messages.append(
+                    {"role": "unknown", "content": str(message)}
+                )
+                continue
+
+            serialized: dict[str, Any] = {
+                "role": message.get("role"),
+                "content": message.get("content", ""),
+            }
+            if "images" in message:
+                serialized["images"] = [
+                    cls._image_reference(image)
+                    for image in (message.get("images") or [])
+                ]
+            serialized_messages.append(serialized)
+        return serialized_messages
+
     def log_episode(self, episode: Episode, step: int, mode: str = "train", epoch: int = 0):
         """Log a single episode to its own JSON file in a step-specific directory.
 
@@ -85,26 +196,40 @@ class EpisodeLogger:
             mode: Mode identifier ('train' or 'val'), defaults to 'train'
             epoch: Current epoch number, defaults to 0
         """
-        episode_data = {"training_step": step, "epoch": epoch, "episode_id": episode.id, "task": episode.task, "task_hash": self.compute_task_hash(episode.task), "is_correct": episode.is_correct, "termination_reason": episode.termination_reason.value if episode.termination_reason else None, "metrics": episode.metrics, "timing": episode.info.get("timing", {}), "trajectories": []}
+        # Keep rollout logs compact and safe: retain the model-visible text
+        # conversation, but never serialize image bytes or ModelOutput tensors.
+        episode_data = {
+            "training_step": step,
+            "epoch": epoch,
+            "mode": mode,
+            "episode_id": episode.id,
+            "task_hash": self.compute_task_hash(episode.task),
+            "is_correct": bool(episode.is_correct),
+            "termination_reason": (
+                episode.termination_reason.value
+                if episode.termination_reason
+                else None
+            ),
+            "raw_termination": (episode.info or {}).get("raw_termination"),
+            "rollout_markers": (episode.info or {}).get(
+                "rollout_markers", []
+            ),
+            # Exact cumulative message prefix used by the last model request:
+            # system prompt, user prompts/tool observations, and assistant
+            # generations including <tool_call> blocks.
+            "messages": self.build_model_visible_messages(episode),
+            "trajectories": [],
+        }
 
         for traj in episode.trajectories:
             traj_data = {
                 "name": traj.name,
                 "uid": traj.uid,
-                "reward": traj.reward,
-                "num_steps": len(traj.steps),
-                "timing": traj.info.get("timing", {}),
-                "steps": [
-                    {
-                        "observation": step.observation,
-                        "thought": step.thought,
-                        "action": step.action,
-                        "reward": step.reward,
-                        "done": step.done,
-                        "model_response": step.model_response,
-                        "chat_completions": step.chat_completions,
-                        "timing": step.info.get("timing", {}),  # Add step-level timing
-                    }
+                "reward": float(traj.reward),
+                "model_responses": [
+                    step.model_response
+                    if isinstance(step.model_response, str)
+                    else str(step.model_response)
                     for step in traj.steps
                 ],
             }
@@ -136,14 +261,22 @@ class EpisodeLogger:
             mode: Mode identifier ('train' or 'val'), defaults to 'train'
             epoch: Current epoch number, defaults to 0
         """
-        print(f"[EpisodeLogger] Logging {len(episodes)} episodes for step={step}, mode={mode}, epoch={epoch}")
+        print(
+            f"[EpisodeLogger] Logging {len(episodes)} episodes for "
+            f"step={step}, mode={mode}, epoch={epoch}"
+        )
+        saved = 0
         for i, episode in enumerate(episodes):
             try:
                 self.log_episode(episode, step, mode, epoch)
-                print(f"[EpisodeLogger] Successfully logged episode {i + 1}/{len(episodes)}: {episode.id}")
+                saved += 1
             except Exception as e:
-                print(f"[EpisodeLogger] Failed to log episode {i + 1}/{len(episodes)}: {e}")
+                print(
+                    f"[EpisodeLogger] Failed to log episode "
+                    f"{i + 1}/{len(episodes)} ({episode.id}): {e}"
+                )
                 raise
+        print(f"[EpisodeLogger] Logged {saved}/{len(episodes)} episodes")
 
     def log_episodes_batch(self, episodes: list[Episode], step: int, mode: str = "train", epoch: int = 0, batch_summary: bool = True):
         """Log multiple episodes and optionally create a batch summary in step-specific directory.
@@ -155,8 +288,10 @@ class EpisodeLogger:
             epoch: Current epoch number, defaults to 0
             batch_summary: Whether to create a summary file for the batch
         """
-        # Log individual episodes
-        self.log_episodes(episodes, step, mode, epoch)
+        # Persist only a random subset. The complete ``episodes`` list is still
+        # retained by the caller and used for training/statistics.
+        episodes_to_save = self.select_episodes_for_logging(episodes)
+        self.log_episodes(episodes_to_save, step, mode, epoch)
 
         # Optionally create batch summary in step-specific directory
         if batch_summary and episodes:
@@ -165,7 +300,11 @@ class EpisodeLogger:
                 "epoch": epoch,
                 "mode": mode,
                 "num_episodes": len(episodes),
-                "episode_files": [self.get_episode_filename(ep, step) for ep in episodes],
+                "num_episodes_saved": len(episodes_to_save),
+                "sampling_limit": self.max_episodes_per_batch,
+                "episode_files": [
+                    self.get_episode_filename(ep, step) for ep in episodes_to_save
+                ],
                 "summary_stats": {
                     "total_correct": sum(1 for ep in episodes if ep.is_correct),
                     "total_incorrect": sum(1 for ep in episodes if not ep.is_correct),

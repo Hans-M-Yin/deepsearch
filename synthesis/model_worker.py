@@ -13,6 +13,7 @@ from enum import Enum
 import json
 import os
 from pathlib import Path
+import socket
 import sys
 import tempfile
 import threading
@@ -27,7 +28,7 @@ VALID_REASONING_EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh", 
 # #### END Response 0720 ####
 FIXED_TT_LOGID = "3200636808"
 # A request is attempted once initially, then retried at most this many times.
-LLM_RETRY_COUNT = 5
+LLM_RETRY_COUNT = 3
 LLM_RETRY_SLEEP_S = 5
 _ADAPTIVE_QPM_ENV = "SYNTHESIS_ADAPTIVE_QPM_ENABLED"
 _ADAPTIVE_QPM_ERROR_WINDOW_S = 60.0
@@ -37,6 +38,7 @@ _ADAPTIVE_QPM_COOLDOWN_S = 30.0
 _RAW_INPUT_ENV = "LLM_WORKER_PRINT_RAW_INPUT"
 _RAW_OUTPUT_ENV = "LLM_WORKER_PRINT_RAW_OUTPUT"
 _USAGE_LOG_ENV = "LLM_WORKER_PRINT_USAGE"
+_TIMEOUT_INPUT_ENV = "LLM_WORKER_PRINT_TIMEOUT_INPUT"
 
 
 def _adaptive_qpm_enabled() -> bool:
@@ -103,6 +105,97 @@ def _print_raw_model_input(*, alias: str, request: ModelRequest | ResponsesModel
         file=sys.stderr,
         flush=True,
     )
+
+
+def _is_model_timeout(exc: BaseException) -> bool:
+    """Return whether an exception looks like a model-request timeout."""
+
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, (TimeoutError, socket.timeout)):
+            return True
+        error_name = type(current).__name__.lower()
+        error_text = str(current).lower()
+        if "timeout" in error_name or "timed out" in error_text or "timeout" in error_text:
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
+def _print_model_timeout_debug(
+    *,
+    alias: str,
+    config: dict[str, Any],
+    request: ModelRequest | ResponsesModelRequest,
+    attempt: int,
+    elapsed_s: float,
+    error: BaseException,
+) -> None:
+    """Print useful context for a timed-out model call.
+
+    The compact line is always emitted for timeouts.  The full routed input is
+    opt-in because it may contain private task text, signed URLs, and large
+    multimodal payloads.  Inline image bytes are redacted in either mode.
+    """
+
+    request_payload = _redact_base64_images_for_debug(request.to_dict())
+    request_json = json.dumps(request_payload, ensure_ascii=False, default=str)
+    retry_count = _request_retry_count(request)
+    messages = getattr(request, "messages", None)
+    if messages is not None:
+        sequence_roles = ",".join(str(getattr(message, "role", "")) for message in messages)
+        sequence_kind = "chat_messages"
+        sequence_count = len(messages)
+    else:
+        sequence_roles = "responses_input"
+        sequence_count = len(getattr(request, "input", []) or [])
+        sequence_kind = "responses_input"
+    endpoint = config.get("base_url") or config.get("azure_endpoint") or ""
+    print(
+        "[llm-timeout]"
+        f" alias={alias}"
+        f" served_model={config.get('served_model') or request.model or ''}"
+        f" attempt={attempt}/{retry_count + 1}"
+        f" timeout_s={config.get('timeout_s')!r}"
+        f" elapsed_s={elapsed_s:.3f}"
+        f" endpoint={endpoint!r}"
+        f" sequence_kind={sequence_kind}"
+        f" sequence_count={sequence_count}"
+        f" sequence_roles={sequence_roles!r}"
+        f" request_chars={len(request_json)}"
+        f" error_type={type(error).__name__}"
+        f" error={str(error)!r}",
+        file=sys.stderr,
+        flush=True,
+    )
+    if _debug_env_enabled(_TIMEOUT_INPUT_ENV):
+        print(
+            f"[llm-timeout-input] alias={alias} attempt={attempt}\n"
+            "--- begin timed-out routed request ---\n"
+            f"{json.dumps(request_payload, ensure_ascii=False, indent=2, default=str)}\n"
+            "--- end timed-out routed request ---",
+            file=sys.stderr,
+            flush=True,
+        )
+
+
+def _request_retry_count(request: ModelRequest | ResponsesModelRequest) -> int:
+    """Return the retry budget for one request.
+
+    Most callers use the process-wide default.  Special workflows can provide
+    ``llm_retry_count`` in request metadata without changing retry behavior for
+    unrelated model calls.
+    """
+
+    configured = getattr(request, "metadata", {}).get("llm_retry_count")
+    if configured is None:
+        return LLM_RETRY_COUNT
+    try:
+        return max(0, int(configured))
+    except (TypeError, ValueError):
+        return LLM_RETRY_COUNT
 
 
 def _jsonify(value: Any) -> Any:
@@ -1020,8 +1113,10 @@ class ModelRouterWorkerClient:
     ) -> ModelResponse:
         served_model = str(config.get("served_model") or request.model or alias)
         last_error: Exception | None = None
-        for attempt_index in range(LLM_RETRY_COUNT + 1):
+        retry_count = _request_retry_count(request)
+        for attempt_index in range(retry_count + 1):
             dispatch_qpm = self._wait_for_qpm_slot(alias=alias, config=config, served_model=served_model)
+            attempt_started_at = time.perf_counter()
             try:
                 response = client.generate(request)
                 response.metadata["dispatch_qpm"] = dispatch_qpm
@@ -1030,6 +1125,15 @@ class ModelRouterWorkerClient:
                 return response
             except Exception as exc:
                 last_error = exc
+                if _is_model_timeout(exc):
+                    _print_model_timeout_debug(
+                        alias=alias,
+                        config=config,
+                        request=request,
+                        attempt=attempt_index + 1,
+                        elapsed_s=time.perf_counter() - attempt_started_at,
+                        error=exc,
+                    )
                 self._record_capacity_rate_limit(
                     alias=alias,
                     config=config,
@@ -1045,7 +1149,7 @@ class ModelRouterWorkerClient:
                     )
                     break
                 # print(request)
-                if attempt_index >= LLM_RETRY_COUNT:
+                if attempt_index >= retry_count:
                     break
                 print(
                     "[llm-retry]"
@@ -1082,8 +1186,10 @@ class ModelRouterWorkerClient:
     ) -> ResponsesModelResponse:
         served_model = str(config.get("served_model") or request.model or alias)
         last_error: Exception | None = None
-        for attempt_index in range(LLM_RETRY_COUNT + 1):
+        retry_count = _request_retry_count(request)
+        for attempt_index in range(retry_count + 1):
             dispatch_qpm = self._wait_for_qpm_slot(alias=alias, config=config, served_model=served_model)
+            attempt_started_at = time.perf_counter()
             try:
                 response = client.responses_generate(request)
                 response.metadata["dispatch_qpm"] = dispatch_qpm
@@ -1092,6 +1198,15 @@ class ModelRouterWorkerClient:
                 return response
             except Exception as exc:
                 last_error = exc
+                if _is_model_timeout(exc):
+                    _print_model_timeout_debug(
+                        alias=alias,
+                        config=config,
+                        request=request,
+                        attempt=attempt_index + 1,
+                        elapsed_s=time.perf_counter() - attempt_started_at,
+                        error=exc,
+                    )
                 self._record_capacity_rate_limit(
                     alias=alias,
                     config=config,
@@ -1107,7 +1222,7 @@ class ModelRouterWorkerClient:
                         api_mode="responses",
                     )
                     break
-                if attempt_index >= LLM_RETRY_COUNT:
+                if attempt_index >= retry_count:
                     break
                 print(
                     "[llm-retry]"

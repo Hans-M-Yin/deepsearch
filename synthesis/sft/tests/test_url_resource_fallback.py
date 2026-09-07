@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import io
 import os
 import tempfile
 import unittest
@@ -38,6 +40,32 @@ class UrlResourceFallbackTests(unittest.TestCase):
         with Image.open(BytesIO(converted)) as image:
             image.load()
             self.assertEqual(image.size, (2, 3))
+
+    def test_read_url_rasterizes_svg_downloaded_from_wikimedia_file_page(self) -> None:
+        url = "https://commons.wikimedia.org/wiki/File:Flag_of_Pak_Commonwealth_of_Nations.svg"
+        svg = b'<?xml version="1.0"?><svg xmlns="http://www.w3.org/2000/svg" width="2" height="3"><rect width="2" height="3" fill="red"/></svg>'
+        png_output = BytesIO()
+        Image.new("RGBA", (2, 3), (255, 0, 0, 255)).save(png_output, format="PNG")
+
+        class FakeCairoSVG:
+            @staticmethod
+            def svg2png(*, bytestring: bytes, unsafe: bool) -> bytes:
+                self.assertEqual(bytestring, svg)
+                self.assertFalse(unsafe)
+                return png_output.getvalue()
+
+        with (
+            mock.patch.object(tools, "_download_binary", return_value=(svg, "image/svg+xml")),
+            mock.patch.object(tools, "cairosvg", FakeCairoSVG),
+        ):
+            result = tools.read_url(url)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["content_type"], "image/png")
+        with open(result["local_path"], "rb") as handle:
+            with Image.open(handle) as image:
+                image.load()
+                self.assertEqual(image.size, (2, 3))
 
     def test_search_result_registers_all_resource_urls(self) -> None:
         context = ToolRuntimeContext(working_dir=tempfile.mkdtemp())
@@ -193,6 +221,27 @@ class UrlResourceFallbackTests(unittest.TestCase):
         self.assertTrue(third["ok"])
         self.assertFalse(third["from_cache"])
         self.assertEqual(download.call_count, 2)
+
+    def test_wikimedia_download_failure_logs_reason(self) -> None:
+        url = "https://upload.wikimedia.org/wikipedia/commons/example.jpg"
+        failure_reason = "upstream proxy connection reset"
+        with tempfile.TemporaryDirectory() as cache_dir, mock.patch.dict(
+            os.environ,
+            {"SFT_WIKIMEDIA_CACHE_DIR": cache_dir},
+            clear=False,
+        ), mock.patch.object(
+            tools, "_probe_content_type", return_value="image/jpeg"
+        ), mock.patch.object(
+            tools, "_download_binary", side_effect=RuntimeError(failure_reason)
+        ), contextlib.redirect_stderr(io.StringIO()) as stderr:
+            result = tools.read_url(url)
+
+        self.assertFalse(result["ok"])
+        log_output = stderr.getvalue()
+        self.assertIn("[wikimedia-download] event=failed", log_output)
+        self.assertIn("candidate_kind='requested'", log_output)
+        self.assertIn("error_type='RuntimeError'", log_output)
+        self.assertIn(f"reason='{failure_reason}'", log_output)
 
 
 if __name__ == "__main__":

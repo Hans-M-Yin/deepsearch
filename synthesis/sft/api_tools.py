@@ -44,6 +44,13 @@ import sys
 logger = logging.getLogger(__name__)
 
 
+# Keep reverse-image-search uploads small enough for the upstream Lens
+# service while preserving the original aspect ratio.  This is applied only
+# to images uploaded on the i2i path; other image uploads keep their existing
+# behavior.
+I2I_UPLOAD_MAX_LONG_EDGE = 1000
+
+
 # Temporary generation diagnostics.  A process-wide batch is intentional:
 # ``debug_vqa_batch`` uses a ThreadPoolExecutor, so this reports the aggregate
 # over the next ten completed trajectories across all workers in the process.
@@ -707,21 +714,41 @@ class ToolRuntimeContext:
     def resolve_resource_id(self, resource_id: str) -> tools.UrlResource | None:
         return self.resource_registry.get(str(resource_id or "").strip())
 
-    def register_search_output(self, tool_name: str, output: dict[str, Any]) -> None:
+    def register_search_output(
+        self,
+        tool_name: str,
+        output: dict[str, Any],
+        *,
+        timings: dict[str, float] | None = None,
+    ) -> None:
         _compact, resources = tools.postprocess_search_output(
             tool_name=tool_name,
             output=output,
+            timings=timings,
         )
+        registration_started_at = time.monotonic()
         for resource in resources:
             self.register_url_resource(resource)
+        if timings is not None:
+            timings["resource_registration_s"] = time.monotonic() - registration_started_at
 
-    def postprocess_search_output(self, tool_name: str, output: dict[str, Any]) -> dict[str, Any]:
+    def postprocess_search_output(
+        self,
+        tool_name: str,
+        output: dict[str, Any],
+        *,
+        timings: dict[str, float] | None = None,
+    ) -> dict[str, Any]:
         compact, resources = tools.postprocess_search_output(
             tool_name=tool_name,
             output=output,
+            timings=timings,
         )
+        registration_started_at = time.monotonic()
         for resource in resources:
             self.register_url_resource(resource)
+        if timings is not None:
+            timings["resource_registration_s"] = time.monotonic() - registration_started_at
         return compact
 
 
@@ -734,6 +761,9 @@ class ToolExecutionResult:
     output: dict[str, Any]
     output_text: str
     new_images: dict[str, Any] = field(default_factory=dict)
+    # Private scalar telemetry. It is separate from ``output`` so timing
+    # metadata never enters the model-visible tool observation.
+    timing: dict[str, Any] = field(default_factory=dict)
 
 
 _DEFAULT_FAILURE_JSONL_PATH = Path("synthesis/ignore/failure.jsonl")
@@ -1239,6 +1269,34 @@ def _ensure_png_compatible_image(image: Image.Image) -> Image.Image:
     return image.convert("RGBA" if has_alpha else "RGB")
 
 
+def _resize_image_for_i2i_upload(
+    image: Image.Image,
+    max_long_edge: int = I2I_UPLOAD_MAX_LONG_EDGE,
+) -> Image.Image:
+    """Downscale an i2i upload while preserving aspect ratio.
+
+    Images at or below the limit are returned unchanged.  A new image is
+    created only when downscaling is necessary, so the caller's image is not
+    mutated.
+    """
+
+    max_long_edge = int(max_long_edge)
+    if max_long_edge <= 0:
+        raise ValueError("max_long_edge must be positive")
+
+    width, height = image.size
+    long_edge = max(width, height)
+    if long_edge <= max_long_edge:
+        return image
+
+    scale = max_long_edge / long_edge
+    resized_size = (
+        max(1, round(width * scale)),
+        max(1, round(height * scale)),
+    )
+    return image.resize(resized_size, resample=Image.Resampling.LANCZOS)
+
+
 def _normalize_image_data_url(data: bytes) -> str:
     """Validate arbitrary image bytes and serialize one API-supported PNG.
 
@@ -1600,8 +1658,12 @@ def _try_upload_pil_image(
     image: Image.Image,
     context: ToolRuntimeContext,
     tool_name: str,
+    *,
+    max_long_edge: int | None = None,
 ) -> str | None:
     image = _ensure_png_compatible_image(image)
+    if max_long_edge is not None:
+        image = _resize_image_for_i2i_upload(image, max_long_edge)
     try:
         from opensearch_vl.opensearch_infer import cos_upload
     except Exception as exc:  # pragma: no cover - optional dependency
@@ -1667,7 +1729,12 @@ def _materialize_remote_image_url(source: Any, context: ToolRuntimeContext, tool
     except Exception as exc:
         return None, f"Failed to load image for {tool_name}: {exc}"
 
-    uploaded_url = _try_upload_pil_image(image, context, tool_name)
+    uploaded_url = _try_upload_pil_image(
+        image,
+        context,
+        tool_name,
+        max_long_edge=(I2I_UPLOAD_MAX_LONG_EDGE if tool_name.startswith("i2i") else None),
+    )
     if uploaded_url:
         return uploaded_url, None
     return None, (
@@ -2123,12 +2190,37 @@ def _call_with_optional_cache(
     tool_name: str,
     arguments: dict[str, Any],
     compute: Callable[[], Any],
+    timings: dict[str, float] | None = None,
 ) -> Any:
     """Use an explicitly injected cache without adding shared cache state."""
 
+    cache_started_at = time.monotonic()
+    compute_started_at: list[float] = []
+
+    def timed_compute() -> Any:
+        compute_started_at.append(time.monotonic())
+        try:
+            return compute()
+        finally:
+            if timings is not None:
+                timings["search_tool_body_s"] = time.monotonic() - compute_started_at[0]
+
     if tool_cache is None:
-        return compute()
-    return tool_cache.get_or_compute(tool_name, arguments, compute)
+        result = timed_compute()
+        if timings is not None:
+            timings["cache_enabled"] = 0.0
+    else:
+        result = tool_cache.get_or_compute(tool_name, arguments, timed_compute)
+        if timings is not None:
+            timings["cache_enabled"] = 1.0
+
+    if timings is not None:
+        cache_or_compute_s = time.monotonic() - cache_started_at
+        timings["cache_or_compute_s"] = cache_or_compute_s
+        timings["cache_hit"] = 1.0 if not compute_started_at else 0.0
+        body_s = float(timings.get("search_tool_body_s", 0.0) or 0.0)
+        timings["cache_overhead_s"] = max(0.0, cache_or_compute_s - body_s)
+    return result
 
 
 def _execute_tool_call(
@@ -2150,6 +2242,7 @@ def _execute_tool_call(
             set_stats_callback(stats_callback)
 
     if name == "t2t_search":
+        search_timing: dict[str, float] = {}
         query = params.get("query") or params.get("q") or ""
         if not query:
             output = {"ok": False, "error": "query is required for t2t_search"}
@@ -2163,13 +2256,30 @@ def _execute_tool_call(
                 tool_cache,
                 name,
                 search_arguments,
-                lambda: tools.t2t_search(**search_arguments),
+                lambda: tools.t2t_search(**search_arguments, timings=search_timing),
+                timings=search_timing,
             )
         if isinstance(output, dict) and output.get("ok"):
-            output = context.postprocess_search_output("t2t_search", output)
-        return ToolExecutionResult(name=name, arguments=params, output=output, output_text=_json_text(output))
+            postprocess_started_at = time.monotonic()
+            output = context.postprocess_search_output(
+                "t2t_search",
+                output,
+                timings=search_timing,
+            )
+            search_timing["search_postprocess_s"] = time.monotonic() - postprocess_started_at
+        serialization_started_at = time.monotonic()
+        output_text = _json_text(output)
+        search_timing["result_serialization_s"] = time.monotonic() - serialization_started_at
+        return ToolExecutionResult(
+            name=name,
+            arguments=params,
+            output=output,
+            output_text=output_text,
+            timing=search_timing,
+        )
 
     if name == "t2i_search":
+        search_timing = {}
         query = params.get("query") or params.get("q") or ""
         if not query:
             output = {"ok": False, "error": "query is required for t2i_search"}
@@ -2183,11 +2293,27 @@ def _execute_tool_call(
                 tool_cache,
                 name,
                 search_arguments,
-                lambda: tools.t2i_search(**search_arguments),
+                lambda: tools.t2i_search(**search_arguments, timings=search_timing),
+                timings=search_timing,
             )
         if isinstance(output, dict) and output.get("ok"):
-            output = context.postprocess_search_output("t2i_search", output)
-        return ToolExecutionResult(name=name, arguments=params, output=output, output_text=_json_text(output))
+            postprocess_started_at = time.monotonic()
+            output = context.postprocess_search_output(
+                "t2i_search",
+                output,
+                timings=search_timing,
+            )
+            search_timing["search_postprocess_s"] = time.monotonic() - postprocess_started_at
+        serialization_started_at = time.monotonic()
+        output_text = _json_text(output)
+        search_timing["result_serialization_s"] = time.monotonic() - serialization_started_at
+        return ToolExecutionResult(
+            name=name,
+            arguments=params,
+            output=output,
+            output_text=output_text,
+            timing=search_timing,
+        )
 
     if name == "read_url":
         resource_id = str(params.get("resource_id") or "").strip()
@@ -2246,6 +2372,11 @@ def _execute_tool_call(
                 tool_cache.fetch_document if tool_cache is not None else None
             ),
         )
+        read_url_timing: dict[str, Any] = {}
+        if isinstance(output, dict):
+            private_timing = output.pop("_timing", None)
+            if isinstance(private_timing, dict):
+                read_url_timing = private_timing
         if isinstance(output, dict) and output.get("ok") is False:
             _record_tool_failure(
                 tool_name=name,
@@ -2269,9 +2400,17 @@ def _execute_tool_call(
                 page_id=page_id,
                 goal=effective_goal,
             )
-        return ToolExecutionResult(name=name, arguments=params, output=output, output_text=_json_text(output), new_images=new_images)
+        return ToolExecutionResult(
+            name=name,
+            arguments=params,
+            output=output,
+            output_text=_json_text(output),
+            new_images=new_images,
+            timing=read_url_timing,
+        )
 
     if name == "i2i_search":
+        search_timing: dict[str, float] = {}
         image_source = params.get("image") or params.get("url") or context.latest_image_reference() or ""
         if not image_source:
             output = {
@@ -2305,6 +2444,7 @@ def _execute_tool_call(
                 cropped,
                 context,
                 f"i2i_region_{uuid.uuid4().hex}",
+                max_long_edge=I2I_UPLOAD_MAX_LONG_EDGE,
             )
             if not uploaded_url:
                 cropped_id, cropped_path = _persist_pil_image_to_cache(cropped, context, "i2i_region")
@@ -2324,12 +2464,29 @@ def _execute_tool_call(
                 image_url=uploaded_url,
                 visual_lookup=context.visual_lookup,
                 top_k=int(params.get("top_k", tools.DEFAULT_SEARCH_TOP_K)),
+                timings=search_timing,
             )
             output = dict(output)
             output["cropped_image_url"] = uploaded_url
             if output.get("ok"):
-                output = context.postprocess_search_output("i2i_search", output)
-            return ToolExecutionResult(name=name, arguments=params, output=output, output_text=_json_text(output), new_images=new_images)
+                postprocess_started_at = time.monotonic()
+                output = context.postprocess_search_output(
+                    "i2i_search",
+                    output,
+                    timings=search_timing,
+                )
+                search_timing["search_postprocess_s"] = time.monotonic() - postprocess_started_at
+            serialization_started_at = time.monotonic()
+            output_text = _json_text(output)
+            search_timing["result_serialization_s"] = time.monotonic() - serialization_started_at
+            return ToolExecutionResult(
+                name=name,
+                arguments=params,
+                output=output,
+                output_text=output_text,
+                new_images=new_images,
+                timing=search_timing,
+            )
 
         remote_url, err = _materialize_remote_image_url(image_source, context, "i2i_search")
         if err:
@@ -2339,10 +2496,26 @@ def _execute_tool_call(
             image_url=remote_url or "",
             visual_lookup=context.visual_lookup,
             top_k=int(params.get("top_k", tools.DEFAULT_SEARCH_TOP_K)),
+            timings=search_timing,
         )
         if isinstance(output, dict) and output.get("ok"):
-            output = context.postprocess_search_output("i2i_search", output)
-        return ToolExecutionResult(name=name, arguments=params, output=output, output_text=_json_text(output))
+            postprocess_started_at = time.monotonic()
+            output = context.postprocess_search_output(
+                "i2i_search",
+                output,
+                timings=search_timing,
+            )
+            search_timing["search_postprocess_s"] = time.monotonic() - postprocess_started_at
+        serialization_started_at = time.monotonic()
+        output_text = _json_text(output)
+        search_timing["result_serialization_s"] = time.monotonic() - serialization_started_at
+        return ToolExecutionResult(
+            name=name,
+            arguments=params,
+            output=output,
+            output_text=output_text,
+            timing=search_timing,
+        )
 
     output = {"ok": False, "error": f"Unknown tool: {name}"}
     return ToolExecutionResult(name=name, arguments=params, output=output, output_text=_json_text(output))
@@ -2358,7 +2531,11 @@ def execute_tool_call(
     tool_cache: Any | None = None,
 ) -> ToolExecutionResult:
     """Execute one tool and record failures before returning or re-raising."""
+    dispatcher_started_at = time.perf_counter()
+    dispatcher_core_elapsed_s = 0.0
+    dispatcher_failure_record_elapsed_s = 0.0
     try:
+        dispatcher_core_started_at = time.perf_counter()
         result = _timed_call(
             f"tool:{name}",
             lambda: _execute_tool_call(
@@ -2371,7 +2548,12 @@ def execute_tool_call(
                 tool_cache=tool_cache,
             ),
         )
+        dispatcher_core_elapsed_s = time.perf_counter() - dispatcher_core_started_at
     except Exception as exc:
+        dispatcher_core_elapsed_s = max(
+            0.0,
+            time.perf_counter() - locals().get("dispatcher_core_started_at", dispatcher_started_at),
+        )
         _record_tool_failure(
             tool_name=name,
             arguments=arguments,
@@ -2382,12 +2564,28 @@ def execute_tool_call(
         )
         raise
 
+    # Keep dispatcher-level timings separate from the tool-specific timings
+    # above.  In particular, this lets the RL caller distinguish time spent
+    # inside this synchronous dispatcher from time spent waiting for the
+    # asyncio event loop to resume after the executor returned.
+    result.timing = dict(result.timing or {})
+    result.timing["dispatcher_core_s"] = max(0.0, dispatcher_core_elapsed_s)
     if isinstance(result.output, dict) and result.output.get("ok") is False:
+        failure_record_started_at = time.perf_counter()
         _record_tool_failure(
             tool_name=name,
             arguments=result.arguments,
             error_output=result.output,
         )
+        dispatcher_failure_record_elapsed_s = time.perf_counter() - failure_record_started_at
+    result.timing["dispatcher_failure_record_s"] = max(
+        0.0,
+        dispatcher_failure_record_elapsed_s,
+    )
+    result.timing["dispatcher_total_s"] = max(
+        0.0,
+        time.perf_counter() - dispatcher_started_at,
+    )
     return result
 
 

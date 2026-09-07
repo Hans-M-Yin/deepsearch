@@ -35,6 +35,10 @@ FORWARD_PREFIXES = [
     "CUDNN_",
     "NV_",
     "NVIDIA_",
+    # W&B configuration must be available inside the remote TaskRunner.  The
+    # launch shell may source RL/.env_remote, but Ray workers do not inherit
+    # arbitrary driver environment variables unless they are forwarded here.
+    "WANDB_",
     # OpenSearch-VL synthesis/SFT tool and reward configuration.
     "SERPER_",
     "SERPAPI_",
@@ -50,6 +54,9 @@ FORWARD_PREFIXES = [
     "TEXT_",
     # Multimodal RL diagnostics (RLLM_MM_DEBUG, log path, rank filter, etc.).
     "RLLM_MM_",
+    # W&B diagnostics used by verl.utils.tracking.  Do not print values from
+    # these variables: this prefix can include credentials and proxy settings.
+    "RLLM_WANDB",
 ]
 
 # ``synthesis`` is a repository package rather than an installed wheel.  The

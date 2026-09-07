@@ -1064,7 +1064,15 @@ class SGLangRollout(BaseRollout):
     async def _handle_engine_generate(
         self, generation_prompt_ids: list[int], sampling_params: dict, image_data: Optional[list[Any]] = None
     ) -> dict:
-        max_new_tokens = min(self.config.response_length, self.config.max_model_len - len(generation_prompt_ids) - 1)
+        # Preserve the per-request/per-turn max_new_tokens when supplied by the
+        # agent instead of replacing it with the trajectory-level response
+        # budget.
+        requested_max_new_tokens = sampling_params.get("max_new_tokens", self.config.response_length)
+        max_new_tokens = min(
+            int(requested_max_new_tokens),
+            self.config.response_length,
+            self.config.max_model_len - len(generation_prompt_ids) - 1,
+        )
 
         kwargs = sampling_params.copy()
         kwargs["max_new_tokens"] = max_new_tokens

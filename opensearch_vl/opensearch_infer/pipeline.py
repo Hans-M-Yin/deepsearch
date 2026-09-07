@@ -22,6 +22,13 @@ from synthesis.sft.qwen3_vl_template import add_sft_image_placeholders
 logger = logging.getLogger(__name__)
 
 
+_MAX_TURNS_FINALIZATION_PROMPT = (
+    "已达到搜索上限，不能再调用工具。请根据现得到的线索以及你的知识，"
+    "直接推理并给出原问题的最终答案。请严格按照"
+    "<thinking>...</thinking><answer>...</answer>的格式回答。"
+)
+
+
 class InferenceTiming:
     """Collect per-sample wall-clock timings for INFO-level diagnostics."""
 
@@ -578,6 +585,29 @@ def process_single_case(
             )
             persist_failure("tool_call_limit", reason, turn_num)
             raise RuntimeError(reason)
+
+        # Reserve the final model turn for an answer.  If the penultimate
+        # turn still asks for a tool, do not execute it: feed back a synthetic
+        # tool response telling the agent to stop searching and answer from
+        # the evidence already collected.  With MAX_TURNS=46 this happens on
+        # the 45th (zero-based turn 44), leaving turn 45 for the final answer.
+        if config.MAX_TURNS >= 2 and turn_num == config.MAX_TURNS - 2:
+            observation_text = (
+                f"<tool_response>\n{_MAX_TURNS_FINALIZATION_PROMPT}"
+                "\n</tool_response>"
+            )
+            turn_record["tool_output"] = observation_text
+            turn_record["tool_output_type"] = "max_turns_finalization"
+            gemini_contents.append(
+                {"role": "user", "parts": [{"text": observation_text}]}
+            )
+            logger.info(
+                "Reached the penultimate turn for case_id=%s case_idx=%s; "
+                "replaced tool output with finalization prompt",
+                case_id,
+                case_idx,
+            )
+            continue
 
         os.makedirs(intermediate_dir, exist_ok=True)
         tool_started_at = time.perf_counter() if timing is not None else 0.0

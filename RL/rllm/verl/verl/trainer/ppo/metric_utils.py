@@ -77,6 +77,108 @@ def _compute_response_info(batch: DataProto) -> dict[str, Any]:
     )
 
 
+def _compute_group_reward_metrics(
+    sequence_reward: torch.Tensor,
+    batch: DataProto,
+    epsilon: float = 1e-8,
+) -> dict[str, Any]:
+    """Compute diagnostics for rewards grouped by the rollout ``uid``.
+
+    GRPO/RLOO use the repeated rollouts for the same prompt as a group when
+    constructing advantages.  The existing reward metrics are batch-level
+    statistics, so they cannot tell whether a group contains useful reward
+    variation.  This helper intentionally computes diagnostics only; it does
+    not change the advantage calculation.
+
+    Within-group standard deviations use the population definition
+    (``unbiased=False``), which gives a well-defined zero for a one-sample
+    group.  Such groups can occur after filtering or padding and are useful to
+    expose through the group-size metrics.
+    """
+    group_ids = batch.non_tensor_batch.get("uid")
+    if group_ids is None or len(group_ids) != sequence_reward.shape[0]:
+        return {}
+
+    grouped_rewards: defaultdict[str, list[float]] = defaultdict(list)
+    reward_values = sequence_reward.detach().float().cpu().tolist()
+    for group_id, reward in zip(group_ids, reward_values, strict=True):
+        grouped_rewards[str(group_id)].append(float(reward))
+
+    if not grouped_rewards:
+        return {}
+
+    group_means: list[float] = []
+    group_stds: list[float] = []
+    group_vars: list[float] = []
+    group_sizes: list[int] = []
+    constant_groups = 0
+
+    for rewards in grouped_rewards.values():
+        rewards_tensor = torch.tensor(rewards, dtype=torch.float32)
+        group_mean = torch.mean(rewards_tensor)
+        group_var = torch.var(rewards_tensor, unbiased=False)
+        group_std = torch.sqrt(group_var)
+
+        group_means.append(float(group_mean.item()))
+        group_vars.append(float(group_var.item()))
+        group_stds.append(float(group_std.item()))
+        group_sizes.append(len(rewards))
+        if float(group_std.item()) <= epsilon:
+            constant_groups += 1
+
+    group_means_tensor = torch.tensor(group_means, dtype=torch.float32)
+    group_stds_tensor = torch.tensor(group_stds, dtype=torch.float32)
+    group_vars_tensor = torch.tensor(group_vars, dtype=torch.float32)
+    group_sizes_tensor = torch.tensor(group_sizes, dtype=torch.float32)
+
+    return {
+        # Mean of the per-group reward means, and variation between groups.
+        "group/reward_mean_mean": torch.mean(group_means_tensor).item(),
+        "group/reward_mean_std": torch.std(group_means_tensor, unbiased=False).item(),
+        # Variation inside each rollout group.
+        "group/reward_std_mean": torch.mean(group_stds_tensor).item(),
+        "group/reward_std_max": torch.max(group_stds_tensor).item(),
+        "group/reward_std_min": torch.min(group_stds_tensor).item(),
+        "group/reward_var_mean": torch.mean(group_vars_tensor).item(),
+        "group/constant_reward_ratio": constant_groups / len(group_sizes),
+        # Group cardinality is important for checking that RLOO/GRPO receives
+        # the expected number of responses per prompt.
+        "group/num_groups": len(group_sizes),
+        "group/size_mean": torch.mean(group_sizes_tensor).item(),
+        "group/size_min": torch.min(group_sizes_tensor).item(),
+        "group/size_max": torch.max(group_sizes_tensor).item(),
+    }
+
+
+def _compute_zero_advantage_metrics(
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    epsilon: float = 1e-8,
+) -> dict[str, Any]:
+    """Measure samples/tokens that receive no policy-gradient signal."""
+    valid_mask = response_mask.bool()
+    absolute_advantages = advantages.detach().float().abs()
+    valid_token_count = int(valid_mask.sum().item())
+
+    zero_advantage_tokens = valid_mask & (absolute_advantages <= epsilon)
+    zero_token_count = int(zero_advantage_tokens.sum().item())
+
+    has_response = valid_mask.any(dim=-1)
+    zero_advantage_samples = (
+        has_response
+        & (absolute_advantages.masked_fill(~valid_mask, 0.0).sum(dim=-1) <= epsilon)
+    )
+    active_sample_count = int(has_response.sum().item())
+    zero_sample_count = int(zero_advantage_samples.sum().item())
+
+    return {
+        "advantage/zero_sample_count": zero_sample_count,
+        "advantage/zero_sample_ratio": zero_sample_count / max(active_sample_count, 1),
+        "advantage/zero_token_count": zero_token_count,
+        "advantage/zero_token_ratio": zero_token_count / max(valid_token_count, 1),
+    }
+
+
 def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str, Any]:
     """
     Computes various metrics from a batch of data for PPO training.
@@ -97,6 +199,8 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
             - critic/returns/mean, max, min: Statistics about returns
             - critic/values/mean, max, min: Statistics about critic values (if use_critic=True)
             - critic/vf_explained_var: Explained variance of the value function (if use_critic=True)
+            - group/*: Reward and cardinality statistics computed per rollout group
+            - advantage/*: Number and ratio of zero-advantage samples/tokens
             - response_length/mean, max, min, clip_ratio: Statistics about response lengths
             - prompt_length/mean, max, min, clip_ratio: Statistics about prompt lengths
             - num_turns/mean, max, min: Statistics about the number of multi-turn conversations
@@ -220,6 +324,12 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         metrics["tool_call_counts/min"] = tool_call_counts.min()
         metrics["tool_call_counts/max"] = tool_call_counts.max()
         metrics["tool_call_counts/mean"] = tool_call_counts.mean()
+
+    # These are diagnostics for the same rollout groups used by RLOO/GRPO.
+    # Keep them in the common data-metrics path so all PPO-style trainers send
+    # them to the configured logger together with the existing metrics.
+    metrics.update(_compute_group_reward_metrics(sequence_reward, batch))
+    metrics.update(_compute_zero_advantage_metrics(advantages, response_mask))
 
     return metrics
 

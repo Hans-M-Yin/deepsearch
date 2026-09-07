@@ -2,10 +2,11 @@
 """Small authenticated Serper relay for an IPv6-only worker.
 
 Run this on a machine that can reach ``google.serper.dev`` and point the
-caller at ``/search``, ``/images`` and ``/lens`` on this relay.  The caller supplies its
-Serper API key in ``X-API-KEY``; the relay forwards only the JSON body and that
-header to the official Serper endpoint.  A shared relay token can optionally
-be enabled when the private network is not sufficient.
+caller at ``/search``, ``/images`` and ``/lens`` on this relay.  The caller
+supplies a compatibility key in ``X-API-KEY``.  When a relay pool
+is configured, that value is ignored and the relay selects the real upstream
+key from its own pool.  A shared relay token can optionally be enabled when
+the private network is not sufficient.
 
 Example on server B:
   SERPER_RELAY_TOKEN='replace-with-a-long-random-token' \
@@ -18,6 +19,8 @@ import argparse
 import hmac
 import json
 import os
+from pathlib import Path
+import signal
 import socket
 import sys
 import time
@@ -25,10 +28,21 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from synthesis.search_client import (
+    SerperApiKeyPool,
+    _is_serper_auth_failure,
+    _is_serper_credit_exhausted,
+)
+
 
 MAX_BODY_BYTES = 2 * 1024 * 1024
 UPSTREAM_MAX_ATTEMPTS = 2
 UPSTREAM_RETRY_DELAY_S = 5.0
+DEFAULT_POOL_PERSIST_EVERY = 10000
 
 
 def _log_upstream(*, path: str, status_code: int | None = None, elapsed_s: float, response_chars: int | None = None, error: Exception | None = None) -> None:
@@ -41,6 +55,39 @@ def _log_upstream(*, path: str, status_code: int | None = None, elapsed_s: float
         fields.append(f"error_type={error.__class__.__name__}")
         fields.append(f"error={str(getattr(error, 'reason', error))!r}")
     print("[serper-relay-upstream] " + " ".join(fields), file=sys.stderr, flush=True)
+
+
+def _install_shutdown_handlers(server: "IPv6ThreadingHTTPServer") -> None:
+    """Flush deferred pool state when the process receives a graceful signal.
+
+    ``SIGKILL`` cannot be handled by user-space code.  For SIGINT/SIGTERM we
+    flush immediately and then raise KeyboardInterrupt so the existing
+    ``finally`` block performs the normal server shutdown and a second flush.
+    """
+
+    def handle_shutdown(signum: int, _frame: object) -> None:
+        try:
+            signal_name = signal.Signals(signum).name
+        except ValueError:
+            signal_name = str(signum)
+        print(
+            f"Received {signal_name}; flushing Serper pool state before shutdown.",
+            flush=True,
+        )
+        relay_pool = getattr(server, "key_pool", None)
+        if relay_pool is not None:
+            try:
+                relay_pool.flush()
+            except Exception as exc:  # pragma: no cover - defensive shutdown path
+                print(
+                    f"Failed to flush Serper pool state during shutdown: {exc!r}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGINT, handle_shutdown)
+    signal.signal(signal.SIGTERM, handle_shutdown)
 
 
 class IPv6ThreadingHTTPServer(ThreadingHTTPServer):
@@ -95,13 +142,106 @@ class SerperRelayHandler(BaseHTTPRequestHandler):
             self._write_json(400, {"error": "request_body_must_be_object"})
             return
 
-        api_key = str(self.headers.get("X-API-KEY", "")).strip()
-        if not api_key:
+        client_api_key = str(self.headers.get("X-API-KEY", "")).strip()
+        if not client_api_key:
             self._write_json(400, {"error": "missing_x_api_key"})
             return
 
+        relay_pool = getattr(self.server, "key_pool", None)
         upstream_base = str(self.server.upstream_base).rstrip("/")
         upstream_url = f"{upstream_base}{path}"
+        if relay_pool is not None:
+            try:
+                pool_status = relay_pool.status()
+                key_attempt_budget = max(1, int(pool_status.get("available_key_count") or 0))
+            except RuntimeError as exc:
+                self._write_json(
+                    503,
+                    {"error": "serper_relay_no_available_key", "detail": str(exc)},
+                )
+                return
+        else:
+            # Backward-compatible mode: without --keys-file, forward the
+            # caller-provided key as the relay did before pool management.
+            key_attempt_budget = 1
+
+        for key_attempt in range(1, key_attempt_budget + 1):
+            key_id: str | None = None
+            if relay_pool is not None:
+                try:
+                    api_key, pool_metadata = relay_pool.acquire_key()
+                    key_id = str(pool_metadata.get("key_id") or "")
+                except RuntimeError as exc:
+                    self._write_json(
+                        503,
+                        {"error": "serper_relay_no_available_key", "detail": str(exc)},
+                    )
+                    return
+            else:
+                api_key = client_api_key
+
+            try:
+                response_body, status_code, content_type = self._fetch_upstream(
+                    path=path,
+                    upstream_url=upstream_url,
+                    body=body,
+                    api_key=api_key,
+                )
+            except (URLError, TimeoutError, OSError) as exc:
+                self._write_json(
+                    502,
+                    {
+                        "error": "upstream_serper_request_failed",
+                        "error_type": exc.__class__.__name__,
+                        "detail": str(getattr(exc, "reason", exc)),
+                    },
+                )
+                return
+
+            self._record_pool_result(
+                key_id=key_id,
+                status_code=status_code,
+                response_body=response_body,
+            )
+            response_text = response_body.decode("utf-8", errors="replace")
+            credit_exhausted = relay_pool is not None and _is_serper_credit_exhausted(
+                status_code=status_code,
+                response_body=response_text,
+            )
+            auth_failure = relay_pool is not None and _is_serper_auth_failure(
+                status_code=status_code,
+                response_body=response_text,
+            )
+            if (credit_exhausted or auth_failure) and key_attempt < key_attempt_budget:
+                failure_kind = (
+                    "credits exhausted" if credit_exhausted else "authentication failed"
+                )
+                print(
+                    f"[serper-relay] upstream key unusable ({failure_kind}); rotating "
+                    f"key_attempt={key_attempt + 1}/{key_attempt_budget} path={path!r}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                continue
+
+            self.send_response(status_code)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(response_body)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(response_body)
+            return
+
+    def _fetch_upstream(
+        self,
+        *,
+        path: str,
+        upstream_url: str,
+        body: bytes,
+        api_key: str,
+    ) -> tuple[bytes, int, str]:
+        """Fetch one request with transient retries, using one selected key."""
+
         upstream_request = Request(
             upstream_url,
             data=body,
@@ -112,11 +252,6 @@ class SerperRelayHandler(BaseHTTPRequestHandler):
             },
             method="POST",
         )
-        response_body: bytes | None = None
-        status_code = 502
-        content_type = "application/json"
-        transport_error: Exception | None = None
-
         for attempt in range(1, UPSTREAM_MAX_ATTEMPTS + 1):
             upstream_started_at = time.perf_counter()
             try:
@@ -130,19 +265,19 @@ class SerperRelayHandler(BaseHTTPRequestHandler):
                     elapsed_s=time.perf_counter() - upstream_started_at,
                     response_chars=len(response_body),
                 )
-                break
+                return response_body, status_code, content_type
             except HTTPError as exc:
                 response_body = exc.read()
                 status_code = int(exc.code)
-                content_type = exc.headers.get("Content-Type", "application/json")
+                content_type = (exc.headers or {}).get("Content-Type", "application/json")
                 _log_upstream(
                     path=path,
                     status_code=status_code,
                     elapsed_s=time.perf_counter() - upstream_started_at,
                     response_chars=len(response_body),
                 )
-                # Retry transient upstream failures, but forward permanent
-                # client/authentication errors immediately.
+                # Retry transient upstream failures, but let the caller
+                # rotate keys when the final response reports exhausted credit.
                 if status_code >= 500 and attempt < UPSTREAM_MAX_ATTEMPTS:
                     print(
                         f"[serper-relay-upstream] retrying path={path!r} "
@@ -153,9 +288,8 @@ class SerperRelayHandler(BaseHTTPRequestHandler):
                     )
                     time.sleep(UPSTREAM_RETRY_DELAY_S)
                     continue
-                break
+                return response_body, status_code, content_type
             except (URLError, TimeoutError, OSError) as exc:
-                transport_error = exc
                 _log_upstream(
                     path=path,
                     elapsed_s=time.perf_counter() - upstream_started_at,
@@ -171,36 +305,37 @@ class SerperRelayHandler(BaseHTTPRequestHandler):
                     )
                     time.sleep(UPSTREAM_RETRY_DELAY_S)
                     continue
-                self._write_json(
-                    502,
-                    {
-                        "error": "upstream_serper_request_failed",
-                        "error_type": exc.__class__.__name__,
-                        "detail": str(getattr(exc, "reason", exc)),
-                    },
-                )
-                return
+                raise
 
-        if response_body is None:
-            # This is defensive: all normal loop exits either produce a
-            # response body or return the 502 transport error above.
-            error = transport_error or RuntimeError("upstream request produced no response")
-            self._write_json(
-                502,
-                {
-                    "error": "upstream_serper_request_failed",
-                    "error_type": error.__class__.__name__,
-                    "detail": str(getattr(error, "reason", error)),
-                },
-            )
+        raise RuntimeError("upstream Serper request produced no response")
+
+    def _record_pool_result(
+        self,
+        *,
+        key_id: str | None,
+        status_code: int,
+        response_body: bytes,
+    ) -> None:
+        relay_pool = getattr(self.server, "key_pool", None)
+        if not key_id or relay_pool is None:
             return
-
-        self.send_response(status_code)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(response_body)))
-        self.send_header("Connection", "close")
-        self.end_headers()
-        self.wfile.write(response_body)
+        body_text = response_body.decode("utf-8", errors="replace")
+        if _is_serper_credit_exhausted(
+            status_code=status_code,
+            response_body=body_text,
+        ):
+            relay_pool.mark_credits_exhausted(
+                key_id,
+                reason=f"serper_relay_http_{status_code}_credits_exhausted",
+            )
+        elif _is_serper_auth_failure(
+            status_code=status_code,
+            response_body=body_text,
+        ):
+            relay_pool.mark_credits_exhausted(
+                key_id,
+                reason=f"serper_relay_http_{status_code}_unauthorized",
+            )
 
     def _write_json(self, status_code: int, payload: dict[str, object]) -> None:
         body = (json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8")
@@ -216,6 +351,35 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bind", default="::", help="IPv6 bind address (default: ::).")
     parser.add_argument("--port", type=int, default=18080, help="Listen port (default: 18080).")
+    parser.add_argument(
+        "--keys-file",
+        default=os.environ.get("SERPER_RELAY_KEYS_FILE"),
+        help="Relay-owned key file; enabling this makes the relay select real upstream keys.",
+    )
+    parser.add_argument(
+        "--state-file",
+        default=os.environ.get("SERPER_RELAY_POOL_STATE_FILE"),
+        help="Relay-owned pool state file; defaults to the normal Serper pool state path.",
+    )
+    parser.add_argument(
+        "--pool-default-credits",
+        type=int,
+        default=int(os.environ.get("SERPER_RELAY_POOL_DEFAULT_CREDITS") or 2500),
+    )
+    parser.add_argument(
+        "--pool-min-remaining",
+        type=int,
+        default=int(os.environ.get("SERPER_RELAY_POOL_MIN_REMAINING") or 100),
+    )
+    parser.add_argument(
+        "--pool-persist-every",
+        type=int,
+        default=int(
+            os.environ.get("SERPER_RELAY_POOL_PERSIST_EVERY")
+            or DEFAULT_POOL_PERSIST_EVERY
+        ),
+        help="Checkpoint the in-memory pool after this many uses (default: 10000).",
+    )
     parser.add_argument(
         "--token",
         default=os.environ.get("SERPER_RELAY_TOKEN"),
@@ -234,23 +398,40 @@ def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     if not 1 <= args.port <= 65535:
         raise SystemExit("--port must be between 1 and 65535.")
-    if args.timeout_s <= 0:
-        raise SystemExit("--timeout-s must be positive.")
+    if args.timeout_s <= 0 or args.pool_persist_every <= 0:
+        raise SystemExit("--timeout-s and --pool-persist-every must be positive.")
 
     server = IPv6ThreadingHTTPServer((args.bind, args.port), SerperRelayHandler)
     server.relay_token = args.token
     server.upstream_base = args.upstream
     server.timeout_s = args.timeout_s
+    server.key_pool = None
+    if args.keys_file:
+        keys = SerperApiKeyPool._load_keys_from_file(args.keys_file)
+        server.key_pool = SerperApiKeyPool(
+            keys=keys,
+            state_path=args.state_file,
+            default_credits=args.pool_default_credits,
+            min_remaining=args.pool_min_remaining,
+            persist_every=args.pool_persist_every,
+        )
     print(
         f"Serper relay listening on [{args.bind}]:{args.port}; "
-        f"upstream={args.upstream}; token_required={bool(args.token)}",
+        f"upstream={args.upstream}; token_required={bool(args.token)}; "
+        f"pool_managed={server.key_pool is not None}; "
+        f"pool_keys={len(server.key_pool.keys) if server.key_pool is not None else 0}; "
+        f"pool_persist_every={args.pool_persist_every}; "
+        f"pool_state={server.key_pool.state_path if server.key_pool is not None else '-'}",
         flush=True,
     )
+    _install_shutdown_handlers(server)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         print("\nStopping Serper relay.", flush=True)
     finally:
+        if server.key_pool is not None:
+            server.key_pool.flush()
         server.server_close()
     return 0
 

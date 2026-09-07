@@ -61,23 +61,24 @@ clip_ratio_high=0.28
 
 # ========= batch / workflow =========
 train_prompt_bsz=192
-n_resp_per_prompt=7
-train_prompt_mini_bsz=64
-n_parallel_tasks=160
-n_parallel_tools=160
+n_resp_per_prompt=6
+train_prompt_mini_bsz=256
+n_parallel_tasks=256
+n_parallel_tools=256
+max_turns=40
 
 # ========= length =========
 max_prompt_length=4096
 max_response_length=56000
 use_dynamic_bsz=True
-actor_ppo_max_token_len_per_gpu=74576
-infer_ppo_max_token_len_per_gpu=74576
+infer_ppo_max_token_len_per_gpu=81920
+actor_ppo_max_token_len_per_gpu=77824
 
 # ========= offload / parallelism =========
-offload=True
-gen_tp=4
-train_tp=4
-train_pp=2
+offload=False
+gen_tp=2
+train_tp=2
+train_pp=1
 train_cp=2
 
 # ========= sampling =========
@@ -85,7 +86,7 @@ temperature=0.7
 top_p=1.0
 top_k=-1
 val_top_p=0.95
-loss_agg_mode="seq-mean-token-sum"
+loss_agg_mode="seq-mean-token-mean"
 
 # ========= cluster =========
 NNODES=2
@@ -115,8 +116,8 @@ N_GPUS_PER_NODE=8
     actor_rollout_ref.rollout.mode=${rollout_mode} \
     actor_rollout_ref.rollout.dtype=${dtype} \
     actor_rollout_ref.rollout.tensor_model_parallel_size=${gen_tp} \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.85 \
-    actor_rollout_ref.rollout.enforce_eager=True \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.70 \
+    actor_rollout_ref.rollout.enforce_eager=False \
     actor_rollout_ref.rollout.temperature=${temperature} \
     actor_rollout_ref.rollout.top_p=${top_p} \
     actor_rollout_ref.rollout.top_k=${top_k} \
@@ -144,8 +145,8 @@ N_GPUS_PER_NODE=8
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1 \
     \
     actor_rollout_ref.actor.megatron.dtype=${dtype} \
-    actor_rollout_ref.actor.megatron.param_offload=${offload} \
-    actor_rollout_ref.actor.megatron.optimizer_offload=${offload} \
+    actor_rollout_ref.actor.megatron.param_offload=True \
+    actor_rollout_ref.actor.megatron.optimizer_offload=True \
     actor_rollout_ref.actor.megatron.grad_offload=${offload} \
     actor_rollout_ref.actor.megatron.pipeline_model_parallel_size=${train_pp} \
     actor_rollout_ref.actor.megatron.tensor_model_parallel_size=${train_tp} \
@@ -159,10 +160,10 @@ N_GPUS_PER_NODE=8
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     \
-    +actor_rollout_ref.actor.optim.override_optimizer_config.optimizer_offload_fraction=1 \
-    +actor_rollout_ref.actor.optim.override_optimizer_config.overlap_cpu_optimizer_d2h_h2d=True \
+    +actor_rollout_ref.actor.optim.override_optimizer_config.optimizer_offload_fraction=0 \
+    +actor_rollout_ref.actor.optim.override_optimizer_config.overlap_cpu_optimizer_d2h_h2d=False \
     +actor_rollout_ref.actor.optim.override_optimizer_config.use_precision_aware_optimizer=True \
-    +actor_rollout_ref.actor.optim.override_optimizer_config.optimizer_cpu_offload=${offload} \
+    +actor_rollout_ref.actor.optim.override_optimizer_config.optimizer_cpu_offload=False \
     +actor_rollout_ref.actor.megatron.override_transformer_config.recompute_method=uniform \
     +actor_rollout_ref.actor.megatron.override_transformer_config.recompute_granularity=full \
     +actor_rollout_ref.actor.megatron.override_transformer_config.recompute_num_layers=1 \
@@ -175,7 +176,8 @@ N_GPUS_PER_NODE=8
     actor_rollout_ref.actor.loss_agg_mode=${loss_agg_mode} \
     \
     rllm.workflow.use_workflow=True \
-    rllm.workflow.workflow_args.timeout=1800 \
+    rllm.workflow.workflow_args.timeout=36000 \
+    +rllm.workflow.workflow_args.max_llm_calls=${max_turns} \
     rllm.workflow.n_parallel_tasks=${n_parallel_tasks} \
     rllm.workflow.n_parallel_tools=${n_parallel_tools} \
     rllm.compact_filtering.enable=True \
@@ -190,10 +192,14 @@ N_GPUS_PER_NODE=8
     trainer.logger='["console","wandb"]' \
     trainer.project_name="${PROJECT_NAME}" \
     trainer.experiment_name="${EXPERIMENT_NAME}" \
+    trainer.log_episodes=True \
+    +trainer.episode_log_max_per_batch=50 \
+    trainer.episode_log_dir="${PROJECT_ROOT}/RL/rollouts/${EXPERIMENT_NAME}" \
     trainer.val_before_train=False \
     trainer.n_gpus_per_node=${N_GPUS_PER_NODE} \
     trainer.nnodes=${NNODES} \
-    trainer.save_freq=30 \
+    trainer.save_freq=5 \
+    trainer.max_actor_ckpt_to_keep=1 \
     trainer.test_freq=10 \
     trainer.resume_mode=disable \
     trainer.total_epochs=2 \

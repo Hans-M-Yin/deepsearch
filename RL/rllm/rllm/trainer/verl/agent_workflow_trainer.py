@@ -6,6 +6,7 @@ import threading
 import uuid
 from collections import Counter, defaultdict
 from functools import reduce
+from pathlib import Path
 from pprint import pprint
 
 import numpy as np
@@ -113,9 +114,22 @@ class AgentWorkflowPPOTrainer(RayPPOTrainer):
                 "episode_log_dir",
                 f"logs/{self.config.trainer.project_name}/{self.config.trainer.experiment_name}",
             )
-            episode_logger = EpisodeLogger(
-                base_dir=episode_log_dir, subdirectory="episodes"
+            episode_log_max_per_batch = self.config.trainer.get(
+                "episode_log_max_per_batch", 50
             )
+            episode_logger = EpisodeLogger(
+                # Keep the configured directory as the rollout root, i.e.
+                # RL/rollouts/<experiment_name>/..., without adding the old
+                # ``episodes`` level.
+                base_dir=episode_log_dir,
+                subdirectory="",
+                max_episodes_per_batch=episode_log_max_per_batch,
+            )
+
+        # Keep the logger on the trainer as well as passing it to the engine.
+        # The training loop uses this attribute to decide whether the legacy
+        # fallback dump is needed.
+        self.episode_logger = episode_logger
 
         self.agent_execution_engine = AgentWorkflowEngine(
             workflow_cls=self.workflow_class,
@@ -145,6 +159,10 @@ class AgentWorkflowPPOTrainer(RayPPOTrainer):
             default_backend=self.config.trainer.logger,
             config=OmegaConf.to_container(self.config, resolve=True),
         )
+        # Keep an explicit owner for tracking cleanup.  Previously W&B was
+        # finalized only from Tracking.__del__, which makes upload timing
+        # depend on Python/Ray object teardown.
+        self._tracking_logger = logger
 
         self.global_steps = 0
 
@@ -232,8 +250,13 @@ class AgentWorkflowPPOTrainer(RayPPOTrainer):
                         tool_cache=epoch_tool_cache,
                     )
 
-                    # dump the first trajectory for inspection
-                    self._dump_first_trajectory(step=self.global_steps, mode="train")
+                    # EpisodeLogger already writes one compact file per
+                    # rollout when enabled.  Keep the fallback dump for
+                    # configurations that leave the logger disabled.
+                    if self.episode_logger is None:
+                        self._dump_trajectories(
+                            step=self.global_steps, mode="train"
+                        )
 
                     rollout_latency_metrics = final_gen_batch_output.meta_info.pop(
                         "rollout_latency", {}
@@ -378,21 +401,22 @@ class AgentWorkflowPPOTrainer(RayPPOTrainer):
                     # recompute old_log_probs
                     with marked_timer("old_log_prob", timing_raw, color="blue"):
                         old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
-                        entropys = old_log_prob.batch["entropys"]
-                        response_masks = batch.batch["response_mask"]
-                        loss_agg_mode = (
-                            self.config.actor_rollout_ref.actor.loss_agg_mode
-                        )
-                        entropy_agg = agg_loss(
-                            loss_mat=entropys,
-                            loss_mask=response_masks,
-                            loss_agg_mode=loss_agg_mode,
-                        )
-                        old_log_prob_metrics = {
-                            "actor/entropy": entropy_agg.detach().item()
-                        }
-                        metrics.update(old_log_prob_metrics)
-                        old_log_prob.batch.pop("entropys")
+                        if "entropys" in old_log_prob.batch:
+                            entropys = old_log_prob.batch["entropys"]
+                            response_masks = batch.batch["response_mask"]
+                            loss_agg_mode = (
+                                self.config.actor_rollout_ref.actor.loss_agg_mode
+                            )
+                            entropy_agg = agg_loss(
+                                loss_mat=entropys,
+                                loss_mask=response_masks,
+                                loss_agg_mode=loss_agg_mode,
+                            )
+                            old_log_prob_metrics = {
+                                "actor/entropy": entropy_agg.detach().item()
+                            }
+                            metrics.update(old_log_prob_metrics)
+                            old_log_prob.batch.pop("entropys")
                         batch = batch.union(old_log_prob)
 
                         if "rollout_log_probs" in batch.batch.keys():
@@ -730,7 +754,8 @@ class AgentWorkflowPPOTrainer(RayPPOTrainer):
             test_batch.meta_info = {"validate": True}
 
             test_output_gen_batch = self.generate_trajectories(batch=test_batch)
-            self._dump_first_trajectory(step=self.global_steps, mode="val")
+            if self.episode_logger is None:
+                self._dump_trajectories(step=self.global_steps, mode="val")
             repeat_counts = test_output_gen_batch.meta_info["repeat_counts"]
             # need to repeat to make shape match
             test_batch = test_batch.sample_level_repeat(repeat_counts)
@@ -794,31 +819,95 @@ class AgentWorkflowPPOTrainer(RayPPOTrainer):
 
         return metrics
 
-    def _dump_first_trajectory(self, step: int, mode: str = "train"):
-        """Save the first episode's trajectory from the latest rollout to disk for inspection."""
+    def _dump_trajectories(self, step: int, mode: str = "train"):
+        """Save every episode from the latest rollout batch individually.
+
+        The rollout engine stores one ``Episode`` per completed rollout in
+        ``_last_episodes``.  Keep the files split by episode so individual
+        rollouts can be inspected without loading a large batch-level JSON.
+        """
         episodes = getattr(self.agent_execution_engine, "_last_episodes", None)
         if not episodes:
             return
-        first_ep = next((ep for ep in episodes if ep is not None and ep.trajectories), None)
-        if first_ep is None:
-            return
 
         exp_name = self.config.trainer.experiment_name
+        # Keep rollout artifacts under the repository's RL directory by
+        # default, independent of the process working directory.  The
+        # environment variable remains available for an explicit override.
+        rl_dir = Path(__file__).resolve().parents[4]
         base_dir = os.getenv(
             "TRAJ_DUMP_DIR",
-            os.path.join(os.getcwd(), "trajectory_dumps", exp_name),
+            str(rl_dir / "rollouts" / exp_name),
         )
         step_dir = os.path.join(base_dir, f"step_{step}")
         os.makedirs(step_dir, exist_ok=True)
 
-        try:
-            ep_dict = first_ep.to_dict()
-            out_path = os.path.join(step_dir, f"{mode}_traj.json")
-            with open(out_path, "w", encoding="utf-8") as f:
-                json.dump(ep_dict, f, ensure_ascii=False, indent=2, default=str)
-            pprint(f"[TrajDump] Saved first trajectory to {out_path}")
-        except Exception as exc:
-            pprint(f"[TrajDump] Failed to dump trajectory: {exc}")
+        saved = 0
+        failed = 0
+        for index, episode in enumerate(episodes):
+            if episode is None or not episode.trajectories:
+                continue
+
+            episode_id = str(getattr(episode, "id", "unknown"))
+            # Episode ids normally contain ``:`` and UUIDs.  Keep the id in
+            # the filename while making it safe on local filesystems/HDFS.
+            safe_episode_id = "".join(
+                character if character.isalnum() or character in "-_." else "_"
+                for character in episode_id
+            )
+            filename = f"{mode}_episode_{index:05d}_{safe_episode_id}.json"
+            out_path = os.path.join(step_dir, filename)
+
+            try:
+                # Keep the model-visible text trajectory, while omitting image
+                # bytes and ModelOutput tensors. The active EpisodeLogger uses
+                # the same serialization policy.
+                ep_dict = {
+                    "training_step": step,
+                    "mode": mode,
+                    "episode_id": episode_id,
+                    "is_correct": bool(getattr(episode, "is_correct", False)),
+                    "termination_reason": (
+                        episode.termination_reason.value
+                        if episode.termination_reason is not None
+                        else None
+                    ),
+                    "raw_termination": (episode.info or {}).get(
+                        "raw_termination"
+                    ),
+                    "rollout_markers": (episode.info or {}).get(
+                        "rollout_markers", []
+                    ),
+                    "messages": EpisodeLogger.build_model_visible_messages(
+                        episode
+                    ),
+                    "trajectories": [
+                        {
+                            "uid": trajectory.uid,
+                            "name": trajectory.name,
+                            "reward": float(trajectory.reward),
+                            "model_responses": [
+                                step.model_response
+                                if isinstance(step.model_response, str)
+                                else str(step.model_response)
+                                for step in trajectory.steps
+                            ],
+                        }
+                        for trajectory in episode.trajectories
+                    ],
+                }
+                with open(out_path, "w", encoding="utf-8") as f:
+                    json.dump(ep_dict, f, ensure_ascii=False, indent=2, default=str)
+                    f.write("\n")
+                saved += 1
+            except Exception as exc:
+                failed += 1
+                pprint(f"[TrajDump] Failed to dump episode {episode_id}: {exc}")
+
+        pprint(
+            f"[TrajDump] Saved {saved}/{len(episodes)} episodes to {step_dir}"
+            + (f"; failed={failed}" if failed else "")
+        )
 
     def generate_trajectories(self, batch, timing_raw=None, **kwargs):
         """
@@ -837,6 +926,12 @@ class AgentWorkflowPPOTrainer(RayPPOTrainer):
             timing_raw = {}
 
         with marked_timer("generate_trajectories", timing_raw, color="red"):
+            if (
+                hasattr(self, "_tracking_logger")
+                and self._tracking_logger is not None
+                and self._tracking_logger.live_enabled
+            ):
+                kwargs["progress_callback"] = self._tracking_logger.log_live
             coro = self.agent_execution_engine.execute_tasks_verl(batch, **kwargs)
             final_gen_batch_output = asyncio.run_coroutine_threadsafe(
                 coro, self._loop
@@ -962,6 +1057,10 @@ class AgentWorkflowPPOTrainer(RayPPOTrainer):
             self._loop.call_soon_threadsafe(self._loop.stop)
         if hasattr(self, "_thread") and self._thread is not None:
             self._thread.join()
+        tracking_logger = getattr(self, "_tracking_logger", None)
+        if tracking_logger is not None:
+            tracking_logger.finish()
+            self._tracking_logger = None
 
     def visualize_trajectory_last_step(self, tensor_batch, sample_idx=0, max_samples=1):
         """

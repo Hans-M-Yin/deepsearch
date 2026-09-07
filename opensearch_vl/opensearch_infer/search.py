@@ -378,6 +378,9 @@ def _search_via_serper(query: str, lang: str, top_k: int) -> List[dict]:
         "X-API-KEY": serper_api_key,
         "Content-Type": "application/json",
     }
+    relay_token = os.environ.get("SERPER_RELAY_TOKEN")
+    if relay_token:
+        headers["X-Serper-Relay-Token"] = relay_token
     body = {
         "q": query,
         "hl": lang,
@@ -401,6 +404,9 @@ def _image_search_via_serper(image_url: str) -> object:
         "X-API-KEY": serper_api_key,
         "Content-Type": "application/json",
     }
+    relay_token = os.environ.get("SERPER_RELAY_TOKEN")
+    if relay_token:
+        headers["X-Serper-Relay-Token"] = relay_token
     response = requests.post(
         config.SERPER_LENS_URL,
         headers=headers,

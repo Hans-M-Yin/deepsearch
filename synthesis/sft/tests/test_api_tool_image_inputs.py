@@ -61,6 +61,24 @@ class ApiToolImageInputTests(unittest.TestCase):
         self.assertEqual(upload.call_count, 2)
         sleep.assert_called_once_with(5)
 
+    def test_i2i_cos_upload_downscales_long_edge_to_1000(self) -> None:
+        from opensearch_vl.opensearch_infer import cos_upload
+
+        image = Image.new("RGB", (4000, 2000), "red")
+        context = ToolRuntimeContext(working_dir=tempfile.gettempdir())
+        with mock.patch.object(cos_upload, "upload_pil_image", return_value="https://cdn.example/i2i.png") as upload:
+            result = _try_upload_pil_image(
+                image,
+                context,
+                "i2i_search",
+                max_long_edge=1000,
+            )
+
+        self.assertEqual(result, "https://cdn.example/i2i.png")
+        uploaded_image = upload.call_args.args[0]
+        self.assertEqual(uploaded_image.size, (1000, 500))
+        self.assertEqual(image.size, (4000, 2000))
+
     def test_cmyk_images_are_converted_before_cos_upload_and_local_save(self) -> None:
         from opensearch_vl.opensearch_infer import cos_upload
 

@@ -23,38 +23,31 @@ from pathlib import Path
 from typing import Any
 
 from synthesis.firecrawl_client import (
-    FirecrawlApiKeyPool,
     FirecrawlBrowserSessionManager,
 )
 
 
 DEFAULT_URLS = (
-    "https://upload.wikimedia.org/wikipedia/commons/thumb/9/9b/"
-    "1_Puerta_de_Bisagra_toledo_2014.jpg/"
-    "1280px-1_Puerta_de_Bisagra_toledo_2014.jpg"
-    "?utm_source=en.wikipedia.org&utm_campaign=index&utm_content=thumbnail",
-    "https://upload.wikimedia.org/wikipedia/commons/9/9e/Pillar_of_Vasco_da_Gama.jpg",
-    "https://upload.wikimedia.org/wikipedia/commons/4/40/"
-    "Th%C3%A9odore_Chass%C3%A9riau_-_Mesdemoiselles_Chass%C3%A9riau_%28Louvre_RF_2214%29_0000787160_OG.JPG",
-    "https://upload.wikimedia.org/wikipedia/commons/3/3f/William_Powell_in_The_Great_Ziegfeld_trailer.jpg",
-    "https://upload.wikimedia.org/wikipedia/commons/9/9d/Bette_Davis_in_The_Letter_3.jpg",
+    "https://upload.wikimedia.org/wikipedia/commons/thumb/3/3f/Fronalpstock_big.jpg/800px-Fronalpstock_big.jpg",
+    "https://upload.wikimedia.org/wikipedia/commons/thumb/4/47/PNG_transparency_demonstration_1.png/800px-PNG_transparency_demonstration_1.png",
+    "https://upload.wikimedia.org/wikipedia/commons/thumb/3/3a/Cat03.jpg/800px-Cat03.jpg",
+    "https://upload.wikimedia.org/wikipedia/commons/thumb/0/02/Great_Wave_off_Kanagawa2.jpg/800px-Great_Wave_off_Kanagawa2.jpg",
+    "https://upload.wikimedia.org/wikipedia/commons/thumb/0/0d/Albert_Einstein_Head.jpg/800px-Albert_Einstein_Head.jpg",
 )
 
 
-def _keys_for_diagnostic_pool() -> list[str]:
-    env_pool = FirecrawlApiKeyPool.from_env()
-    if env_pool is not None:
-        return env_pool.keys
-    single_key = str(os.environ.get("FIRECRAWL_API_KEY") or "").strip()
-    if single_key:
-        return [single_key]
-    return FirecrawlApiKeyPool.from_fixed_pool().keys
+def _diagnostic_api_key() -> str:
+    """Return the one worker key; key rotation is performed by the Relay."""
+
+    return str(
+        os.environ.get("FIRECRAWL_API_KEY")
+        or ""
+    ).strip()
 
 
 def _make_manager(state_dir: Path) -> FirecrawlBrowserSessionManager:
     return FirecrawlBrowserSessionManager.from_environment(
-        api_keys=_keys_for_diagnostic_pool(),
-        pool_state_path=state_dir / "api_pool.json",
+        api_key=_diagnostic_api_key(),
         session_state_path=state_dir / "browser_sessions.json",
     )
 
