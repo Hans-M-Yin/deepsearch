@@ -9,6 +9,14 @@ from typing import Any, List, Optional
 from PIL import Image
 
 from vision_deepresearch_async_workflow.deepresearch_agent import DeepResearchAgent
+from vision_deepresearch_async_workflow.search_redundancy_reward import (
+    score_search_redundancy,
+)
+from vision_deepresearch_async_workflow.partial_credit_reward import (
+    PartialCreditConfig,
+    partial_credit_metrics,
+    score_statement_partial_credit,
+)
 from rllm.agents.agent import Action, Episode, Step, Trajectory
 from rllm.engine.rollout import ModelOutput, RolloutEngine
 from rllm.rewards.reward_fn import RewardFunction
@@ -142,11 +150,21 @@ def _is_step_error(step: Step) -> bool:
 
 _QUERY_JUDGE_MARKER = os.getenv("JUDGE_MODEL_MARKER", os.getenv("JUDGE_MODEL", "gpt-4o-mini"))
 
-# A trajectory that exhausts the configured turn budget without producing an
-# answer is usually a search/reasoning loop.  Keep this penalty small, but make
-# it strictly negative so these trajectories are not rewarded merely because
-# their intermediate tool-call format was valid.
-_MAX_TURNS_TERMINAL_REWARD = -0.1
+# MAX_TURNS remains a diagnostic termination type, but it currently carries no
+# reward adjustment. It is retained as a named constant so experiments can
+# re-enable a terminal penalty without changing reward composition code.
+_MAX_TURNS_TERMINAL_REWARD = 0.0
+_ACCURACY_REWARD_WEIGHT = 0.9
+_FORMAT_REWARD_WEIGHT = 0.1
+
+
+def _base_outcome_reward(r_accuracy: float, r_format: float) -> float:
+    """Combine final-answer correctness and trajectory-wide format reward."""
+
+    return (
+        _ACCURACY_REWARD_WEIGHT * r_accuracy
+        + _FORMAT_REWARD_WEIGHT * r_format
+    )
 
 _QUERY_UTILITY_PROMPT_TEMPLATE = """\
 You are an impartial judge evaluating the quality and utility of an agent's search trajectory.
@@ -446,8 +464,8 @@ def _find_fatal_step_index(
 
     Returns ``(fatal_step_index, reason)`` where *fatal_step_index* is the
     0-based index of the **first step to mask** (this step and all subsequent
-    steps will be masked).  Returns ``(None, "")`` for normal trajectories
-    that terminated with an answer and contain no error cascades.
+    steps will be masked).  Returns ``(None, "")`` for normal trajectories,
+    including a MAX_TURNS terminal failure with otherwise usable steps.
 
     A single error followed by recovery resets the counter — only cascading
     failures (>= threshold consecutive errors) trigger masking.
@@ -468,6 +486,14 @@ def _find_fatal_step_index(
             return fatal_start, "consecutive_errors"
 
     if termination in {"answer", "answer_tool_fallback"}:
+        return None, ""
+
+    # Exhausting the turn budget is an agent-policy failure, not a corrupted
+    # rollout.  Keep the complete trajectory learnable so its terminal -0.1
+    # reward produces a negative group-relative advantage.  Treating it as
+    # fatal would trigger the trainer's one-sided A >= 0 clamp and silently
+    # remove precisely the anti-looping signal this reward was added for.
+    if _is_max_turns_termination(termination):
         return None, ""
 
     # Abnormal termination without error cascade — all existing steps are
@@ -495,6 +521,83 @@ def _to_pil_image(img: Any) -> Optional[Image.Image]:
         except Exception:  # noqa: BLE001
             return None
     return None
+
+
+def _search_redundancy_metrics(record: Any) -> dict[str, float]:
+    """Convert one private scorer record into safe numeric training metrics.
+
+    The trace itself is consumed and discarded before the Episode reaches the
+    trainer. This helper deliberately exports aggregate counts/timings only,
+    so trainer and W&B logs cannot expose retrieved pages or user prompts.
+    """
+
+    record = record if isinstance(record, dict) else {}
+
+    def nonnegative(name: str) -> float:
+        try:
+            return max(0.0, float(record.get(name, 0.0)))
+        except (TypeError, ValueError):
+            return 0.0
+
+    mode = str(record.get("mode") or "").strip().lower()
+    # ``off`` can still calculate observation-only records when an embedding
+    # URL happens to be supplied, but the scorer is not configured as an
+    # enabled experiment mode.  Keep this signal distinct from ``scored``.
+    scoring_enabled = mode in {"shadow", "reward"}
+    reason = str(record.get("reason") or "")
+    raw_penalty = nonnegative("raw_penalty")
+    applied_penalty = nonnegative("penalty")
+    penalty_cap = nonnegative("trajectory_penalty_cap")
+    cap_hit = penalty_cap > 0.0 and raw_penalty >= penalty_cap - 1e-12
+
+    return {
+        "search_redundancy/enabled": float(scoring_enabled),
+        "search_redundancy/observation_only": float(
+            scoring_enabled and mode != "reward"
+        ),
+        "search_redundancy/reward_enabled": float(mode == "reward"),
+        "search_redundancy/mode_shadow": float(mode == "shadow"),
+        "search_redundancy/mode_reward": float(mode == "reward"),
+        # ``scored`` means that the TEI request returned valid embeddings and
+        # the deterministic comparison completed. It is intentionally not the
+        # same as "trajectory had >= 2 searches".
+        "search_redundancy/scored": float(bool(record.get("scored"))),
+        "search_redundancy/embedding_request_failed": float(
+            reason == "embedding_request_failed"
+        ),
+        "search_redundancy/missing_embedding_url": float(
+            reason == "missing_embedding_url"
+        ),
+        "search_redundancy/search_trace_count": nonnegative(
+            "search_trace_count"
+        ),
+        "search_redundancy/eligible_search_count": nonnegative(
+            "eligible_search_count"
+        ),
+        "search_redundancy/embedded_query_count": nonnegative(
+            "embedded_query_count"
+        ),
+        "search_redundancy/pair_count": nonnegative("pair_count"),
+        "search_redundancy/hard_constraint_exempt_pair_count": nonnegative(
+            "hard_constraint_exempt_pair_count"
+        ),
+        "search_redundancy/confirmed_event_count": nonnegative(
+            "confirmed_event_count"
+        ),
+        "search_redundancy/raw_penalty": raw_penalty,
+        "search_redundancy/applied_penalty": applied_penalty,
+        "search_redundancy/raw_penalized_trajectory": float(raw_penalty > 0.0),
+        "search_redundancy/penalized_trajectory": float(
+            applied_penalty > 0.0
+        ),
+        "search_redundancy/cap_hit": float(cap_hit),
+        "search_redundancy/embedding_request_s": nonnegative(
+            "embedding_request_s"
+        ),
+        "search_redundancy/embedding_queue_wait_s": nonnegative(
+            "embedding_queue_wait_s"
+        ),
+    }
 
 
 class DeepResearchWorkflow(Workflow):
@@ -571,6 +674,62 @@ class DeepResearchWorkflow(Workflow):
 
             episode = self._convert_result_to_episode(result, task, uid)
 
+            # The partial-credit audit uses the completed, text-only
+            # trajectory and the question-facing merged statements retained
+            # by synthesis.  It issues one judge request per trajectory (not
+            # one per turn), and fails open so an auxiliary judge outage can
+            # never abort rollout.
+            first_traj = (
+                episode.trajectories[0] if episode.trajectories else None
+            )
+            all_steps = first_traj.steps if first_traj else []
+            try:
+                statement_partial_credit = await score_statement_partial_credit(
+                    task=task,
+                    steps=all_steps,
+                )
+            except Exception as err:  # noqa: BLE001 - reward shaping is optional.
+                print(f"Statement partial-credit scorer failed open: {err}")
+                statement_partial_credit = {
+                    "mode": PartialCreditConfig.from_env().mode,
+                    "reason": "workflow_scorer_failed",
+                    "scored": False,
+                    "raw_bonus": 0.0,
+                    "bonus": 0.0,
+                    "events": [],
+                }
+            statement_partial_metrics = partial_credit_metrics(
+                statement_partial_credit
+            )
+            raw_statement_partial_bonus = float(
+                statement_partial_credit.get("raw_bonus", 0.0)
+            )
+            episode.info["statement_partial_credit"] = {
+                # Keep only scalar/structural audit information; never retain
+                # the full judge prompt, retrieved webpage text, or image data.
+                key: value
+                for key, value in statement_partial_credit.items()
+                if key not in {"judge_error", "events"}
+            }
+
+            # This is intentionally evaluated at the end of *this*
+            # trajectory, alongside its terminal reward. The trace contains
+            # private t2t URLs and is never shown to the rollout model. The
+            # scorer fails open when the auxiliary embedding service is down.
+            search_redundancy = await score_search_redundancy(
+                result.get("search_trace", [])
+            )
+            redundancy_penalty = float(search_redundancy.get("penalty", 0.0))
+            raw_redundancy_penalty = float(
+                search_redundancy.get("raw_penalty", 0.0)
+            )
+            redundancy_metrics = _search_redundancy_metrics(search_redundancy)
+            episode.info["search_redundancy"] = search_redundancy
+            episode.info["search_redundancy_penalty"] = redundancy_penalty
+            # The scorer has consumed the private query/URL trace. Do not
+            # serialize it through Ray, the trainer batch, or trajectory logs.
+            episode.info.pop("search_trace", None)
+
             prediction = result.get("prediction", "")
             if self.reward_function is not None and prediction:
                 try:
@@ -603,11 +762,6 @@ class DeepResearchWorkflow(Workflow):
             # "fatal" point (consecutive-error cascade) and only mask
             # tokens *after* that point.  The prefix is kept for learning
             # with a one-sided advantage clamp (see trainer).
-            first_traj = (
-                episode.trajectories[0] if episode.trajectories else None
-            )
-            all_steps = first_traj.steps if first_traj else []
-
             fatal_step_index, fatal_reason = _find_fatal_step_index(
                 all_steps, result.get("termination", "")
             )
@@ -629,6 +783,18 @@ class DeepResearchWorkflow(Workflow):
                     "reward/accuracy": 0.0,
                     "reward/query_utility": 0.0,
                     "reward/format": 0.0,
+                    "reward/search_redundancy_raw_penalty": raw_redundancy_penalty,
+                    "reward/search_redundancy_penalty": redundancy_penalty,
+                    "reward/search_redundancy_events": float(
+                        search_redundancy.get("confirmed_event_count", 0)
+                    ),
+                    "reward/statement_partial_credit_raw_bonus": raw_statement_partial_bonus,
+                    "reward/statement_partial_credit_applied_bonus": 0.0,
+                    **redundancy_metrics,
+                    **statement_partial_metrics,
+                    "partial_credit/applied_bonus": 0.0,
+                    "partial_credit/reward_suppressed_fatal": 1.0,
+                    "partial_credit/reward_suppressed_max_turns": 0.0,
                     "reward/total": 0.0,
                     "masked": 1.0,
                     "is_fatal": 1.0,
@@ -664,23 +830,30 @@ class DeepResearchWorkflow(Workflow):
                 # backward-compatible logging, but do not issue an additional
                 # LLM judge request and do not include it in policy reward.
                 r_query = 0.0
-                # Keep the two signals additive for normal trajectories, with
-                # final-answer accuracy carrying the dominant weight.  A
-                # max-turns trajectory is a special terminal failure: it must
-                # receive a strictly negative reward even when all
-                # intermediate tool-call formats were valid.
-                base_reward = 0.2 * r_format + 0.8 * r_accuracy
+                # Correctness is the principal objective, with a smaller
+                # independent trajectory-format reward.
+                base_reward = _base_outcome_reward(r_accuracy, r_format)
                 max_turns_terminated = _is_max_turns_termination(
                     result.get("termination", "")
                 )
                 termination_penalty = (
                     _MAX_TURNS_TERMINAL_REWARD if max_turns_terminated else 0.0
                 )
-                total_reward = (
-                    _MAX_TURNS_TERMINAL_REWARD
-                    if max_turns_terminated
-                    else base_reward
+                # Positive process credit remains unavailable for fatal error
+                # cascades, but MAX_TURNS itself no longer changes reward.
+                statement_partial_bonus = float(
+                    statement_partial_credit.get("bonus", 0.0)
                 )
+                partial_credit_suppressed_fatal = bool(is_fatal)
+                partial_credit_suppressed_max_turns = False
+                applied_statement_partial_bonus = (
+                    0.0
+                    if partial_credit_suppressed_fatal
+                    else statement_partial_bonus
+                )
+                total_reward = base_reward
+                total_reward -= redundancy_penalty
+                total_reward += applied_statement_partial_bonus
                 episode.info["reward_base_total"] = base_reward
                 episode.info["max_turns_terminated"] = max_turns_terminated
 
@@ -697,6 +870,22 @@ class DeepResearchWorkflow(Workflow):
                     "reward/query_utility": r_query,
                     "reward/format": r_format,
                     "reward/termination_penalty": termination_penalty,
+                    "reward/search_redundancy_raw_penalty": raw_redundancy_penalty,
+                    "reward/search_redundancy_penalty": redundancy_penalty,
+                    "reward/search_redundancy_events": float(
+                        search_redundancy.get("confirmed_event_count", 0)
+                    ),
+                    "reward/statement_partial_credit_raw_bonus": raw_statement_partial_bonus,
+                    "reward/statement_partial_credit_applied_bonus": applied_statement_partial_bonus,
+                    **redundancy_metrics,
+                    **statement_partial_metrics,
+                    "partial_credit/applied_bonus": applied_statement_partial_bonus,
+                    "partial_credit/reward_suppressed_fatal": float(
+                        partial_credit_suppressed_fatal
+                    ),
+                    "partial_credit/reward_suppressed_max_turns": float(
+                        partial_credit_suppressed_max_turns
+                    ),
                     "reward/total": total_reward,
                     "masked": 0.0,
                     "is_fatal": 1.0 if is_fatal else 0.0,
@@ -720,6 +909,11 @@ class DeepResearchWorkflow(Workflow):
                 "reward/accuracy": 0.0,
                 "reward/query_utility": 0.0,
                 "reward/format": 0.0,
+                "reward/search_redundancy_raw_penalty": 0.0,
+                "reward/search_redundancy_penalty": 0.0,
+                "reward/search_redundancy_events": 0.0,
+                **_search_redundancy_metrics({}),
+                **partial_credit_metrics({}),
                 "reward/total": 0.0,
                 "masked": 1.0,
             }
@@ -825,6 +1019,7 @@ class DeepResearchWorkflow(Workflow):
             "prediction": prediction,
             "answer": answer_text,
             "token_usage": result.get("token_usage", {}),
+            "search_trace": result.get("search_trace", []),
         }
         return episode
 

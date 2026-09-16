@@ -5,6 +5,11 @@ Example:
     python scripts/build_benchmark_dataset.py --benchmark mmsearch
     python scripts/build_benchmark_dataset.py --benchmark mmsearch_plus --split train
     python scripts/build_benchmark_dataset.py --benchmark vdr_bench_testmini --output data/benchmarks/vdr/testmini.parquet
+
+MMSearch-Plus is encrypted on Hugging Face.  The converter performs the
+official XOR decryption in-process by default; pass
+``--mmsearch-plus-decrypt-script`` only when you want to use a checked-out
+copy of the upstream ``decrypt_after_load.py`` instead.
 """
 
 from __future__ import annotations
@@ -356,6 +361,47 @@ def _decrypt_visbrowse_text(ciphertext_b64: str, password: str) -> str:
     encrypted = base64.b64decode(ciphertext_b64)
     key = _derive_repeating_xor_key(password, len(encrypted))
     return bytes(a ^ b for a, b in zip(encrypted, key)).decode()
+
+
+def _decrypt_mmsearch_plus_text(value: Any, canary: str) -> Any:
+    """Decrypt one MMSearch-Plus text field, preserving plaintext on failure.
+
+    The upstream loader intentionally returns the original value when a field
+    is empty, already plaintext, or cannot be decoded.  Matching that behavior
+    lets this converter work with both encrypted Hub snapshots and already
+    decrypted local exports.
+    """
+
+    if not isinstance(value, str) or not value:
+        return value
+    try:
+        encrypted = base64.b64decode(value)
+        key = _derive_repeating_xor_key(canary, len(encrypted))
+        return bytes(a ^ b for a, b in zip(encrypted, key)).decode("utf-8")
+    except (ValueError, UnicodeDecodeError, binascii.Error):
+        return value
+
+
+def _decrypt_mmsearch_plus_record(
+    record: dict[str, Any],
+    canary: str,
+) -> dict[str, Any]:
+    """Decrypt the text fields encrypted by the official MMSearch-Plus loader."""
+
+    decrypted = dict(record)
+    for field in ("question", "video_url", "arxiv_id"):
+        if field in decrypted and decrypted[field]:
+            decrypted[field] = _decrypt_mmsearch_plus_text(decrypted[field], canary)
+
+    answer = decrypted.get("answer")
+    if isinstance(answer, list):
+        decrypted["answer"] = [
+            _decrypt_mmsearch_plus_text(item, canary) if item else item
+            for item in answer
+        ]
+    elif answer:
+        decrypted["answer"] = _decrypt_mmsearch_plus_text(answer, canary)
+    return decrypted
 
 
 def _decrypt_browsecomp_v3_text(encrypted: Any, key_text: str) -> str:
@@ -834,6 +880,11 @@ def _load_dataset_records(
 ) -> list[dict[str, Any]]:
     from datasets import load_dataset
 
+    decrypt_script = (
+        Path(mmsearch_plus_decrypt_script).expanduser().resolve()
+        if mmsearch_plus_decrypt_script
+        else None
+    )
     kwargs: dict[str, Any] = {"split": split}
     if cache_dir:
         kwargs["cache_dir"] = cache_dir
@@ -845,18 +896,23 @@ def _load_dataset_records(
     else:
         dataset = load_dataset(dataset_name, **kwargs)
 
-    if benchmark == "mmsearch_plus":
-        decrypt_script = (
-            Path(mmsearch_plus_decrypt_script).expanduser().resolve()
-            if mmsearch_plus_decrypt_script
-            else None
+    if benchmark == "mmsearch_plus" and not decrypt_script:
+        # Keep the converter self-contained.  The upstream helper is still
+        # supported below for users who want to pin its implementation, but a
+        # normal ``--benchmark mmsearch_plus`` invocation should not silently
+        # emit encrypted questions and answers.
+        canary = mmsearch_plus_canary or "MMSearch-Plus"
+        dataset = [
+            _decrypt_mmsearch_plus_record(dict(item), canary)
+            for item in dataset
+        ]
+
+    if benchmark == "mmsearch_plus" and decrypt_script:
+        dataset = _decrypt_mmsearch_plus_dataset(
+            dataset=dataset,
+            decrypt_script=decrypt_script,
+            canary=mmsearch_plus_canary or "MMSearch-Plus",
         )
-        if decrypt_script:
-            dataset = _decrypt_mmsearch_plus_dataset(
-                dataset=dataset,
-                decrypt_script=decrypt_script,
-                canary=mmsearch_plus_canary or "MMSearch-Plus",
-            )
 
     return [dict(item) for item in dataset]
 
@@ -903,6 +959,15 @@ def _build_rows(
         if limit > 0 and index >= limit:
             break
         row = builder(record, adapter)
+        # Some benchmark sources, including the current MMSearch-Plus train
+        # release, do not provide an ID column.  The unified schema still
+        # needs stable identifiers for parquet joins and trajectory paths.
+        fallback_id = f"{adapter.benchmark}_{index:06d}"
+        data_id = str(row.get("data_id") or "").strip() or fallback_id
+        row["data_id"] = data_id
+        for id_key in ("question_id", "sample_id"):
+            if not str(row.get(id_key) or "").strip():
+                row[id_key] = data_id
         if not row.get("question"):
             raise ValueError(
                 f"Missing question text for benchmark={adapter.benchmark} "
@@ -971,7 +1036,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Path to MMSearch-Plus decrypt_after_load.py. "
-            "Needed when converting the encrypted HF dataset."
+            "Optional override for the built-in decryptor."
         ),
     )
     parser.add_argument(

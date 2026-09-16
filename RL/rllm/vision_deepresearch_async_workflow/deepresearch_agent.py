@@ -399,6 +399,9 @@ class MultiTurnReactAgent:
         self.executor = kwargs.get("executor")
         self._sft_context: ToolRuntimeContext | None = None
         self._pending_sft_images: list[Any] = []
+        # Private trajectory metadata for reward shaping. It never enters the
+        # model-visible tool response.
+        self._search_trace: list[dict[str, Any]] = []
         # Configuration from original DeepResearch.  Keep the historical
         # default, but allow the workflow/configuration to override it for a
         # particular experiment.
@@ -430,6 +433,12 @@ class MultiTurnReactAgent:
             "executor_wait_s": [],
             "worker_execute_s": [],
             "executor_result_wait_s": [],
+            "event_loop_probe_wait_s": [],
+            "worker_to_future_callback_s": [],
+            "future_callback_to_resume_s": [],
+            "event_loop_resume_postprocess_s": [],
+            "tool_result_postprocess_s": [],
+            "llm_response_postprocess_s": [],
         }
         # Private timing for the most recent SFT-dispatched tool call.  It is
         # emitted only by the opt-in per-call timing debug stream and never
@@ -876,6 +885,7 @@ class MultiTurnReactAgent:
             "rounds": rounds,
             "time_taken": time.perf_counter() - start_time,
             "token_usage": token_usage,
+            "search_trace": list(self._search_trace),
         }
         result["latency"] = self._build_latency_stats(result["time_taken"])
         if self._sequence_mode == "stepwise":
@@ -927,6 +937,12 @@ class MultiTurnReactAgent:
             "executor_wait_s": [],
             "worker_execute_s": [],
             "executor_result_wait_s": [],
+            "event_loop_probe_wait_s": [],
+            "worker_to_future_callback_s": [],
+            "future_callback_to_resume_s": [],
+            "event_loop_resume_postprocess_s": [],
+            "tool_result_postprocess_s": [],
+            "llm_response_postprocess_s": [],
         }
         self._last_tool_execution_timing = {}
         self._read_url_stage_latency = {}
@@ -973,6 +989,7 @@ class MultiTurnReactAgent:
             self._sft_context.image_registry["img_1"] = initial_image
             self._sft_context._image_counter = 1
         self._pending_sft_images = []
+        self._search_trace = []
 
         if images:
             user_message = {
@@ -1023,6 +1040,7 @@ class MultiTurnReactAgent:
                     success=llm_succeeded,
                 )
 
+            llm_response_received_at = time.perf_counter()
             self.record_token_usage(response)
             if self._sequence_mode in {"stepwise", "cumulative"}:
                 self.last_model_output = response
@@ -1050,6 +1068,7 @@ class MultiTurnReactAgent:
                 tool_error_detail = ""
                 tool_name = ""
                 answer_tool_fallback = False
+                tool_returned_at = 0.0
 
                 tool_call_text = content.split("<tool_call>")[1].split("</tool_call>")[
                     0
@@ -1091,6 +1110,19 @@ class MultiTurnReactAgent:
                         tool_error = True
                         tool_error_reason = "tool_call_schema"
                     else:
+                        # Measure event-loop work after the LLM Future has
+                        # completed and before the tool executor is entered:
+                        # response bookkeeping, tool-call parsing, and
+                        # message construction.  This is kept in the same
+                        # low-volume aggregate stream as tool dispatch timing.
+                        self._tool_dispatch_latency_samples_s[
+                            "llm_response_postprocess_s"
+                        ].append(
+                            max(
+                                0.0,
+                                time.perf_counter() - llm_response_received_at,
+                            )
+                        )
                         counted_tool_name = tool_name or "<empty>"
                         self._tool_call_counts[counted_tool_name] = (
                             self._tool_call_counts.get(counted_tool_name, 0) + 1
@@ -1149,6 +1181,7 @@ class MultiTurnReactAgent:
                                     time.perf_counter() - tool_started_at,
                                     success=not tool_error,
                                 )
+                                tool_returned_at = time.perf_counter()
                         else:
                             self._last_tool_execution_timing = {}
                             tool_started_at = time.perf_counter()
@@ -1178,6 +1211,7 @@ class MultiTurnReactAgent:
                                     tool_elapsed_s,
                                     success=not tool_error,
                                 )
+                                tool_returned_at = time.perf_counter()
 
                 if tool_error:
                     assistant_message["step_error"] = True
@@ -1208,6 +1242,19 @@ class MultiTurnReactAgent:
                     )
                 else:
                     consecutive_bad_steps = 0
+
+                # Time the synchronous event-loop work after a tool has
+                # returned and before the next LLM request can be issued:
+                # observation construction, message mutation, error-marker
+                # handling, and image-reference handoff.  This is distinct
+                # from the executor/Future callback measurements inside
+                # custom_call_tool().
+                if tool_returned_at > 0.0:
+                    self._tool_dispatch_latency_samples_s[
+                        "tool_result_postprocess_s"
+                    ].append(
+                        max(0.0, time.perf_counter() - tool_returned_at)
+                    )
                 if answer_tool_fallback:
                     termination = "answer_tool_fallback"
                     return self._build_result(
@@ -1368,6 +1415,25 @@ class MultiTurnReactAgent:
             assistant_text = str(kwargs.get("assistant_text") or "")
             tool_goal = str(kwargs.get("tool_goal") or "")
 
+            loop = asyncio.get_running_loop()
+            submitted_at = time.perf_counter()
+            worker_started_at = [0.0]
+            worker_finished_at = [0.0]
+            event_loop_probe_at = [0.0]
+            future_done_callback_at = [0.0]
+
+            def mark_event_loop_probe() -> None:
+                # This callback is scheduled from the executor thread as soon
+                # as the tool worker returns.  Its delay estimates how long
+                # the shared asyncio loop takes to service a ready callback.
+                event_loop_probe_at[0] = time.perf_counter()
+
+            def mark_future_done(_future: asyncio.Future) -> None:
+                # ``run_in_executor`` chains the executor future back onto the
+                # asyncio future.  Recording this callback separately lets us
+                # distinguish loop delivery from the coroutine's own wake-up.
+                future_done_callback_at[0] = time.perf_counter()
+
             def execute_sft_tool():
                 worker_started_at[0] = time.perf_counter()
                 try:
@@ -1386,14 +1452,21 @@ class MultiTurnReactAgent:
                     # below measures event-loop/result-delivery delay.
                     worker_finished_at[0] = time.perf_counter()
 
-            loop = asyncio.get_running_loop()
-            submitted_at = time.perf_counter()
-            worker_started_at = [0.0]
-            worker_finished_at = [0.0]
-            execution = await loop.run_in_executor(
+                    # Keep this callback deliberately lightweight.  It is a
+                    # probe only; no per-tool log is emitted here because
+                    # stdout logging itself can create event-loop pressure.
+                    try:
+                        loop.call_soon_threadsafe(mark_event_loop_probe)
+                    except RuntimeError:
+                        # The loop may be closing while an error is unwinding.
+                        pass
+
+            execution_future = loop.run_in_executor(
                 self.executor,
                 execute_sft_tool,
             )
+            execution_future.add_done_callback(mark_future_done)
+            execution = await execution_future
             resumed_at = time.perf_counter()
             timing = dict(getattr(execution, "timing", {}) or {})
             if worker_started_at[0] > 0.0:
@@ -1410,20 +1483,24 @@ class MultiTurnReactAgent:
                         0.0,
                         resumed_at - worker_finished_at[0],
                     )
+                    if event_loop_probe_at[0] > 0.0:
+                        timing["event_loop_probe_wait_s"] = max(
+                            0.0,
+                            event_loop_probe_at[0] - worker_finished_at[0],
+                        )
+                    if future_done_callback_at[0] > 0.0:
+                        timing["worker_to_future_callback_s"] = max(
+                            0.0,
+                            future_done_callback_at[0] - worker_finished_at[0],
+                        )
+                        timing["future_callback_to_resume_s"] = max(
+                            0.0,
+                            resumed_at - future_done_callback_at[0],
+                        )
                 timing["sft_execution_s"] = max(
                     0.0,
                     resumed_at - worker_started_at[0],
                 )
-                for metric_name in (
-                    "executor_wait_s",
-                    "worker_execute_s",
-                    "executor_result_wait_s",
-                ):
-                    metric_value = timing.get(metric_name)
-                    if isinstance(metric_value, (int, float)):
-                        self._tool_dispatch_latency_samples_s[metric_name].append(
-                            max(0.0, float(metric_value))
-                        )
             self._last_tool_execution_timing = timing
             if isinstance(execution.output, dict) and execution.output.get("ok") is False:
                 self._log_step_error(
@@ -1434,6 +1511,37 @@ class MultiTurnReactAgent:
                 )
             self._record_read_url_stage_latency(getattr(execution, "timing", None))
             self._pending_sft_images = list((execution.new_images or {}).values())
+            # Search redundancy is always measured, including observation-only
+            # runs. The private trace is consumed and discarded at trajectory
+            # completion, so it never reaches model-visible messages or the
+            # training batch payload.
+            self._record_t2t_search_trace(execution, context)
+
+            # This is the synchronous work performed by the event-loop
+            # coroutine after the executor Future has completed: extracting
+            # timing metadata, recording stage counters, and preparing image
+            # references for the next observation.  It must stay separate
+            # from worker_to_future_callback_s so a large postprocess step is
+            # not mistaken for callback-delivery delay.
+            timing["event_loop_resume_postprocess_s"] = max(
+                0.0,
+                time.perf_counter() - resumed_at,
+            )
+            self._last_tool_execution_timing = timing
+            for metric_name in (
+                "executor_wait_s",
+                "worker_execute_s",
+                "executor_result_wait_s",
+                "event_loop_probe_wait_s",
+                "worker_to_future_callback_s",
+                "future_callback_to_resume_s",
+                "event_loop_resume_postprocess_s",
+            ):
+                metric_value = timing.get(metric_name)
+                if isinstance(metric_value, (int, float)):
+                    self._tool_dispatch_latency_samples_s[metric_name].append(
+                        max(0.0, float(metric_value))
+                    )
             return execution.output_text
 
         # Compatibility path for a caller that supplies a legacy non-SFT tool.
@@ -1456,6 +1564,51 @@ class MultiTurnReactAgent:
             return str(result)
         except Exception as exc:  # noqa: BLE001
             return f"Error calling tool {tool_name}: {exc}"
+
+    def _record_t2t_search_trace(
+        self, execution: Any, context: ToolRuntimeContext
+    ) -> None:
+        """Retain private t2t URL provenance for reward-time comparison."""
+
+        if getattr(execution, "name", None) != "t2t_search":
+            return
+        arguments = getattr(execution, "arguments", {})
+        output = getattr(execution, "output", {})
+        if not isinstance(arguments, dict):
+            arguments = {}
+        if not isinstance(output, dict):
+            output = {}
+
+        query = str(arguments.get("query") or arguments.get("q") or "").strip()
+        urls: list[str] = []
+        seen_urls: set[str] = set()
+        results = output.get("results", [])
+        if bool(output.get("ok")) and isinstance(results, list):
+            for item in results:
+                if not isinstance(item, dict):
+                    continue
+                resource_id = str(item.get("source_page_id") or "").strip()
+                resource = context.resolve_resource_id(resource_id) if resource_id else None
+                url = ""
+                if resource is not None:
+                    url = str(
+                        getattr(resource, "primary_url", None)
+                        or getattr(resource, "source_page_url", None)
+                        or ""
+                    ).strip()
+                if url and url not in seen_urls:
+                    seen_urls.add(url)
+                    urls.append(url)
+
+        self._search_trace.append(
+            {
+                "tool_name": "t2t_search",
+                "round": int(getattr(self, "_current_round", 0) or 0),
+                "query": query,
+                "ok": bool(output.get("ok")),
+                "result_urls": urls,
+            }
+        )
 
     async def execute_python(self, code: str) -> str:
         """

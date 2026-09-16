@@ -296,6 +296,26 @@ profiler:
   # specific tool config
   tool_config: ${oc.select:actor_rollout_ref.actor.profiler.tool_config,null}
 
+# HTTP server configuration for SGLang server mode
+server:
+
+  # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
+  _target_: verl.workers.config.ServerConfig
+
+  # Ordinary generation/control request settings.
+  timeout: 60.0
+  max_attempts: 3
+  retry_delay: 2.0
+  max_connections: 1000
+  max_start_wait_time: 300.0
+
+  # Memory-saver release/resume changes CUDA virtual-memory state.  Keep these
+  # operations single-shot and allow enough time for large allocations to be
+  # remapped.  Do not increase lifecycle_max_attempts: a timed-out request may
+  # already have completed on the SGLang side.
+  lifecycle_timeout: 600.0
+  lifecycle_max_attempts: 1
+
 # prometheus configuration for vllm/sglang server mode
 prometheus:
 
@@ -313,4 +333,3 @@ prometheus:
 
   # Specify served_model_name to avoid displaying overly long model paths in Grafana
   served_model_name: ${oc.select:actor_rollout_ref.model.path,null}
-

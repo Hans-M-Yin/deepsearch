@@ -22,6 +22,7 @@ import numpy as np
 import torch
 
 from verl.trainer.ppo.metric_utils import (
+    _compute_group_reward_metrics,
     bootstrap_metric,
     calc_maj_val,
     compute_data_metrics,
@@ -125,6 +126,24 @@ class TestComputeDataMetrics(unittest.TestCase):
         self.assertIn("critic/score/mean", metrics)
         self.assertIn("critic/rewards/mean", metrics)
         self.assertIn("response_length/mean", metrics)
+
+
+class TestGroupAccuracyMetrics(unittest.TestCase):
+    def test_group_accuracy_diversity_metrics(self):
+        batch = MagicMock()
+        batch.non_tensor_batch = {
+            "uid": np.array(["mixed", "mixed", "mixed", "mixed", "constant", "constant"]),
+            "is_correct": np.array([True, True, False, False, False, False]),
+        }
+        metrics = _compute_group_reward_metrics(
+            torch.tensor([1.0, 0.5, 0.2, 0.0, 0.2, 0.2]), batch
+        )
+
+        # The mixed group has binary-accuracy std=0.5; the all-wrong group
+        # has std=0, so the equal-weighted mean across groups is 0.25.
+        self.assertAlmostEqual(metrics["group/accuracy_std_mean"], 0.25)
+        self.assertEqual(metrics["group/constant_accuracy_group_count"], 1)
+        self.assertAlmostEqual(metrics["group/constant_accuracy_group_ratio"], 0.5)
 
 
 class TestComputeTimingMetrics(unittest.TestCase):

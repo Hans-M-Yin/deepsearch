@@ -1586,8 +1586,18 @@ class ServerAdapter(BaseRollout):
             f"server address: {server_address}, port: {server_port}"
         )
         host = f"[{server_address}]" if is_valid_ipv6_address(server_address) else server_address
+        server_config = self.config.server
         self._engine = AsyncHttpServerAdapter(
-            model_path=self.model_config.local_path, host=host, port=server_port, launch_server=False
+            model_path=self.model_config.local_path,
+            host=host,
+            port=server_port,
+            timeout=float(server_config.timeout),
+            max_attempts=int(server_config.max_attempts),
+            retry_delay=float(server_config.retry_delay),
+            max_connections=int(server_config.max_connections),
+            lifecycle_timeout=float(server_config.lifecycle_timeout),
+            lifecycle_max_attempts=int(server_config.lifecycle_max_attempts),
+            launch_server=False,
         )
 
     async def resume(self, tags: list[str]):
@@ -1604,7 +1614,17 @@ class ServerAdapter(BaseRollout):
         """Release weights and kv cache in GPU memory."""
         if self.device_mesh["infer_tp"].get_local_rank() == 0 and self.config.free_cache_engine:
             await self._init_server_adapter()
+            # Ensure cancelled/timeouted generation requests cannot keep the
+            # scheduler busy while SGLang asserts that it is idle.
+            await self._engine.abort_request(abort_all=True)
             await self._engine.release_memory_occupation(tags=["kv_cache", "weights"])
+
+    async def abort_request(self, rid: str = "", abort_all: bool = False):
+        """Abort in-flight SGLang requests before a rollout timeout or sleep."""
+        if self.device_mesh["infer_tp"].get_local_rank() != 0:
+            return {}
+        await self._init_server_adapter()
+        return await self._engine.abort_request(rid=rid, abort_all=abort_all)
 
     async def update_weights(self, weights: Generator[tuple[str, torch.Tensor], None, None], **kwargs):
         """

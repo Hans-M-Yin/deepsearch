@@ -14,6 +14,10 @@ READER_DIR="${READER_DIR:-/workspace/reader}"
 READER_BACKEND_BASE_PORT="${READER_BACKEND_BASE_PORT:-8101}"
 READER_BACKEND_COUNT="${READER_BACKEND_COUNT:-8}"
 READER_BACKEND_PORT_STRIDE="${READER_BACKEND_PORT_STRIDE:-10}"
+READER_WORKER_PID_DIR="${READER_WORKER_PID_DIR:-${PROJECT_DIR}/reader_worker_pids}"
+RAW_READER_PORT="${RAW_READER_PORT:-8002}"
+RAW_MARKDOWN_READER_PORT="${RAW_MARKDOWN_READER_PORT:-8003}"
+ENHANCED_READER_PORT="${ENHANCED_READER_PORT:-8004}"
 
 log() {
   printf '[reader-stop] %s\n' "$*"
@@ -115,6 +119,41 @@ stop_checked_pid() {
     warn "${label} did not exit after 5s; sending SIGKILL to pid=${pid}."
     kill -KILL "${pid}" 2>/dev/null || true
   fi
+}
+
+listener_pids_for_port() {
+  # PID files can become stale after a Ray/task cleanup.  Resolve a listener
+  # by port as a fallback, but leave ownership validation to the caller.
+  local port="$1"
+  local line local_endpoint
+  while IFS= read -r line; do
+    local_endpoint="$(awk '{print $4}' <<<"${line}")"
+    [[ "${local_endpoint}" == *":${port}" ]] || continue
+    printf '%s\n' "${line}" | grep -oE 'pid=[0-9]+' | sed 's/^pid=//'
+  done < <(ss -H -ltnp 2>/dev/null || true) | sort -nu
+}
+
+stop_matching_uvicorn_listener() {
+  local port="$1"
+  local label="$2"
+  local app_fragment="$3"
+  local pid cmd
+
+  while read -r pid; do
+    is_pid "${pid}" || continue
+    is_alive "${pid}" || continue
+    cmd="$(ps -o args= -p "${pid}" 2>/dev/null || true)"
+    if [[ "${cmd}" != *uvicorn* || "${cmd}" != *"${app_fragment}"* || "${cmd}" != *"--port ${port}"* ]]; then
+      warn "Port ${port} is owned by an unexpected process; not stopping: pid=${pid} cmd=${cmd@Q}"
+      continue
+    fi
+    log "Stopping ${label} discovered by listener port ${port}: pid=${pid} cmd=${cmd@Q}"
+    kill -TERM "${pid}" 2>/dev/null || true
+    if ! wait_for_exit "${pid}" 50; then
+      warn "${label} listener pid=${pid} did not exit after 5s; sending SIGKILL."
+      kill -KILL "${pid}" 2>/dev/null || true
+    fi
+  done < <(listener_pids_for_port "${port}")
 }
 
 capture_worker_supervisor() {
@@ -304,7 +343,7 @@ log "Backend ports used for cleanup (h2c + HTTP/1.1): ${READER_PORTS[*]:-none}"
 # Capture dedicated worker process groups before stopping supervisors.  The
 # supervisor itself owns the cleanup path for its setsid-created child group,
 # but capturing the groups first also handles leaked descendants.
-worker_pidfiles=("${READER_DIR}"/reader_worker_*.pid)
+worker_pidfiles=("${READER_WORKER_PID_DIR}"/reader_worker_*.pid)
 for pidfile in "${worker_pidfiles[@]}"; do
   capture_worker_supervisor "${pidfile}"
 done
@@ -326,6 +365,12 @@ stop_all_reader_supervisors
 stop_checked_pid "${PROJECT_DIR}/enhanced_reader.pid" "Enhanced Reader (8004)" "--port 8004"
 stop_checked_pid "${PROJECT_DIR}/raw_markdown_reader.pid" "Raw Markdown Reader (8003)" "--port 8003"
 stop_checked_pid "${PROJECT_DIR}/reader_dispatcher.pid" "Reader dispatcher (8002)" "--port 8002"
+
+# PID files above may refer to an already-exited prior launch.  Do a guarded
+# listener scan to remove only our own stale Uvicorn entrypoints.
+stop_matching_uvicorn_listener "${ENHANCED_READER_PORT}" "Enhanced Reader (8004)" "utils.enhanced_reader:app"
+stop_matching_uvicorn_listener "${RAW_MARKDOWN_READER_PORT}" "Raw Markdown Reader (8003)" "utils.enhanced_reader:app"
+stop_matching_uvicorn_listener "${RAW_READER_PORT}" "Reader dispatcher (8002)" "utils.reader_dispatcher:app"
 
 # Supervisors have already attempted to stop their setsid process groups.
 # Force-kill any captured groups that did not exit cleanly.

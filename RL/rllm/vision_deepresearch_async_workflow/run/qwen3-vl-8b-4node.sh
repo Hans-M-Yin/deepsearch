@@ -70,7 +70,7 @@ max_turns=45
 max_prompt_length=4096
 max_response_length=56000
 use_dynamic_bsz=True
-actor_ppo_max_token_len_per_gpu=74576
+actor_ppo_max_token_len_per_gpu=57344
 infer_ppo_max_token_len_per_gpu=74576
 
 # ========= offload / parallelism =========
@@ -171,6 +171,7 @@ N_GPUS_PER_NODE=8
     actor_rollout_ref.actor.use_kl_loss=${use_kl_loss} \
     actor_rollout_ref.actor.kl_loss_coef=${kl_loss_coef} \
     actor_rollout_ref.actor.entropy_coeff=0.0 \
+    actor_rollout_ref.actor.log_entropy=True \
     actor_rollout_ref.actor.clip_ratio_high=${clip_ratio_high} \
     actor_rollout_ref.actor.loss_agg_mode=${loss_agg_mode} \
     \

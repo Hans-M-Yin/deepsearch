@@ -23,6 +23,7 @@ from pathlib import Path
 import signal
 import socket
 import sys
+import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.error import HTTPError, URLError
@@ -43,6 +44,8 @@ MAX_BODY_BYTES = 2 * 1024 * 1024
 UPSTREAM_MAX_ATTEMPTS = 2
 UPSTREAM_RETRY_DELAY_S = 5.0
 DEFAULT_POOL_PERSIST_EVERY = 10000
+DEFAULT_REQUEST_QUEUE_SIZE = 512
+DEFAULT_MAX_INFLIGHT = 128
 
 
 def _log_upstream(*, path: str, status_code: int | None = None, elapsed_s: float, response_chars: int | None = None, error: Exception | None = None) -> None:
@@ -94,6 +97,31 @@ class IPv6ThreadingHTTPServer(ThreadingHTTPServer):
     address_family = socket.AF_INET6
     daemon_threads = True
     allow_reuse_address = True
+
+    def __init__(
+        self,
+        server_address: tuple[str, int],
+        request_handler_class: type[BaseHTTPRequestHandler],
+        *,
+        request_queue_size: int = DEFAULT_REQUEST_QUEUE_SIZE,
+        max_inflight: int = DEFAULT_MAX_INFLIGHT,
+    ) -> None:
+        # socketserver.TCPServer defaults this to 5.  At high fan-in that
+        # causes connections to be reset before BaseHTTPRequestHandler sees
+        # them, so no relay application log is emitted.  Set it before the
+        # parent constructor calls listen().
+        if request_queue_size <= 0:
+            raise ValueError("request_queue_size must be positive")
+        if max_inflight <= 0:
+            raise ValueError("max_inflight must be positive")
+        self.request_queue_size = int(request_queue_size)
+        self.max_inflight = int(max_inflight)
+        # The stdlib ThreadingHTTPServer creates one handler thread per
+        # accepted connection.  This semaphore limits only the expensive
+        # upstream work, so excess requests wait instead of overwhelming the
+        # relay's egress/NAT gateway or the Serper upstream.
+        self.inflight_semaphore = threading.BoundedSemaphore(self.max_inflight)
+        super().__init__(server_address, request_handler_class)
 
 
 class SerperRelayHandler(BaseHTTPRequestHandler):
@@ -181,7 +209,7 @@ class SerperRelayHandler(BaseHTTPRequestHandler):
                 api_key = client_api_key
 
             try:
-                response_body, status_code, content_type = self._fetch_upstream(
+                response_body, status_code, content_type = self._fetch_upstream_limited(
                     path=path,
                     upstream_url=upstream_url,
                     body=body,
@@ -231,6 +259,49 @@ class SerperRelayHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(response_body)
             return
+
+    def _fetch_upstream_limited(
+        self,
+        *,
+        path: str,
+        upstream_url: str,
+        body: bytes,
+        api_key: str,
+    ) -> tuple[bytes, int, str]:
+        """Run upstream I/O under the relay-wide concurrency limit.
+
+        Some unit tests construct the stdlib ``ThreadingHTTPServer`` directly;
+        those servers do not have a semaphore, so they retain the historical
+        unlimited behavior.  The production IPv6 relay always installs one.
+        """
+        gate = getattr(self.server, "inflight_semaphore", None)
+        if gate is None:
+            return self._fetch_upstream(
+                path=path,
+                upstream_url=upstream_url,
+                body=body,
+                api_key=api_key,
+            )
+
+        wait_started_at = time.perf_counter()
+        gate.acquire()
+        wait_s = time.perf_counter() - wait_started_at
+        if wait_s >= 0.01:
+            print(
+                f"[serper-relay] max-inflight wait_s={wait_s:.3f} "
+                f"max_inflight={self.server.max_inflight} path={path!r}",
+                file=sys.stderr,
+                flush=True,
+            )
+        try:
+            return self._fetch_upstream(
+                path=path,
+                upstream_url=upstream_url,
+                body=body,
+                api_key=api_key,
+            )
+        finally:
+            gate.release()
 
     def _fetch_upstream(
         self,
@@ -352,6 +423,29 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--bind", default="::", help="IPv6 bind address (default: ::).")
     parser.add_argument("--port", type=int, default=18080, help="Listen port (default: 18080).")
     parser.add_argument(
+        "--request-queue-size",
+        type=int,
+        default=int(
+            os.environ.get("SERPER_RELAY_REQUEST_QUEUE_SIZE")
+            or DEFAULT_REQUEST_QUEUE_SIZE
+        ),
+        help=(
+            "TCP listen backlog before requests enter Python handlers "
+            f"(default: {DEFAULT_REQUEST_QUEUE_SIZE}; Python's default is 5)."
+        ),
+    )
+    parser.add_argument(
+        "--max-inflight",
+        type=int,
+        default=int(
+            os.environ.get("SERPER_RELAY_MAX_INFLIGHT") or DEFAULT_MAX_INFLIGHT
+        ),
+        help=(
+            "Maximum number of simultaneous upstream Serper requests. "
+            f"Excess requests wait in handler threads (default: {DEFAULT_MAX_INFLIGHT})."
+        ),
+    )
+    parser.add_argument(
         "--keys-file",
         default=os.environ.get("SERPER_RELAY_KEYS_FILE"),
         help="Relay-owned key file; enabling this makes the relay select real upstream keys.",
@@ -398,10 +492,23 @@ def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     if not 1 <= args.port <= 65535:
         raise SystemExit("--port must be between 1 and 65535.")
-    if args.timeout_s <= 0 or args.pool_persist_every <= 0:
-        raise SystemExit("--timeout-s and --pool-persist-every must be positive.")
+    if (
+        args.timeout_s <= 0
+        or args.pool_persist_every <= 0
+        or args.request_queue_size <= 0
+        or args.max_inflight <= 0
+    ):
+        raise SystemExit(
+            "--timeout-s, --pool-persist-every, --request-queue-size, and "
+            "--max-inflight must be positive."
+        )
 
-    server = IPv6ThreadingHTTPServer((args.bind, args.port), SerperRelayHandler)
+    server = IPv6ThreadingHTTPServer(
+        (args.bind, args.port),
+        SerperRelayHandler,
+        request_queue_size=args.request_queue_size,
+        max_inflight=args.max_inflight,
+    )
     server.relay_token = args.token
     server.upstream_base = args.upstream
     server.timeout_s = args.timeout_s
@@ -419,6 +526,8 @@ def main(argv: list[str] | None = None) -> int:
         f"Serper relay listening on [{args.bind}]:{args.port}; "
         f"upstream={args.upstream}; token_required={bool(args.token)}; "
         f"pool_managed={server.key_pool is not None}; "
+        f"request_queue_size={args.request_queue_size}; "
+        f"max_inflight={args.max_inflight}; "
         f"pool_keys={len(server.key_pool.keys) if server.key_pool is not None else 0}; "
         f"pool_persist_every={args.pool_persist_every}; "
         f"pool_state={server.key_pool.state_path if server.key_pool is not None else '-'}",

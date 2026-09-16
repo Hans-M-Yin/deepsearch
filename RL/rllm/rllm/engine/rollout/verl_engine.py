@@ -1,4 +1,7 @@
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial
+import logging
 import uuid
 
 from verl.experimental.agent_loop.agent_loop import AgentLoopManager, AsyncLLMServerManager
@@ -9,6 +12,8 @@ from rllm.parser import ChatTemplateParser
 from rllm.utils.multimodal_debug import count_token, event
 from rllm.workflows import TerminationEvent, TerminationReason
 
+logger = logging.getLogger(__name__)
+
 
 class VerlEngine(RolloutEngine):
     def __init__(self, config, rollout_manager, tokenizer, processor=None, **kwargs):
@@ -18,10 +23,28 @@ class VerlEngine(RolloutEngine):
             raise ValueError(f"VerlEngine only supports vllm or sglang rollout, but got {config.actor_rollout_ref.rollout.name}")
 
         self.rollout_manager: AgentLoopManager = rollout_manager
-        self.server_manager = AsyncLLMServerManager(config, server_handles=rollout_manager.server_handles)
         self.tokenizer = tokenizer
         self.processor = processor
         self.chat_parser = ChatTemplateParser.get_parser(tokenizer, processor=processor, disable_thinking=config.get("rllm", {}).get("disable_thinking", False))
+
+        # Qwen3-VL image fetching/resizing and patch construction are
+        # synchronous CPU work.  Running them on the workflow asyncio loop
+        # blocks tool-result callbacks and other trajectories.  Keep a
+        # dedicated pool separate from the tool executor so tool bursts
+        # cannot starve multimodal preprocessing.
+        workflow_config = config.get("rllm", {}).get("workflow", {})
+        processor_workers = int(workflow_config.get("n_processor_workers", 128))
+        if processor_workers < 1:
+            raise ValueError("rllm.workflow.n_processor_workers must be at least 1")
+        self.processor_executor = ThreadPoolExecutor(
+            max_workers=processor_workers,
+            thread_name_prefix="qwen-vl-input-preprocess",
+        )
+        self.server_manager = AsyncLLMServerManager(
+            config,
+            server_handles=rollout_manager.server_handles,
+            request_submit_executor=self.processor_executor,
+        )
 
         self.max_prompt_length = config.data.max_prompt_length
         self.max_response_length = config.data.max_response_length
@@ -43,6 +66,48 @@ class VerlEngine(RolloutEngine):
         print(f"val_sampling_params: {self.val_sampling_params}")
 
         self.validate = False  # flag enabled/disabled by AgentWorkflowEngine.execute_tasks_verl
+
+    def _prepare_request_inputs(
+        self,
+        messages: list[dict],
+        tools: list,
+        accumulate_reasoning: bool,
+    ):
+        """Prepare all synchronous model inputs outside the asyncio loop."""
+        prompt = self.chat_parser.parse(
+            messages,
+            add_generation_prompt=True,
+            is_first_msg=True,
+            tools=tools,
+            accumulate_reasoning=accumulate_reasoning,
+        )
+        request_prompt_ids = self.tokenizer.encode(
+            prompt,
+            add_special_tokens=False,
+        )
+
+        has_images = any(
+            msg.get("images", None) is not None and msg["role"] == "user"
+            for msg in messages
+        )
+        if has_images and self.processor is not None:
+            image_data = self.chat_parser.process_image_data(messages)
+            model_inputs = self.processor(
+                text=[prompt],
+                images=image_data,
+                return_tensors="pt",
+            )
+        else:
+            image_data = None
+            model_inputs = None
+
+        return prompt, request_prompt_ids, image_data, model_inputs
+
+    def shutdown(self):
+        """Release the dedicated CPU preprocessing workers."""
+        if self.processor_executor is not None:
+            self.processor_executor.shutdown(wait=True, cancel_futures=True)
+            self.processor_executor = None
 
     async def get_model_response(self, messages: list[dict], **kwargs) -> ModelOutput:
         application_id = kwargs.pop("application_id", str(uuid.uuid4()))
@@ -67,20 +132,21 @@ class VerlEngine(RolloutEngine):
         max_tokens = min(int(max_tokens), int(self.max_response_length))
         sampling_params["max_new_tokens"] = max_tokens
 
-        prompt = self.chat_parser.parse(messages, add_generation_prompt=True, is_first_msg=True, tools=tools, accumulate_reasoning=accumulate_reasoning)
-        request_prompt_ids = self.tokenizer.encode(prompt, add_special_tokens=False)  # list[int]
+        # Prompt rendering, tokenization, image loading/resizing, and Qwen-VL
+        # patch construction are all synchronous CPU work. Submit the whole
+        # preparation pipeline as one task so the event loop only waits for a
+        # Future and remains available for tool callbacks and other samples.
+        prompt, request_prompt_ids, image_data, model_inputs = await asyncio.get_running_loop().run_in_executor(
+            self.processor_executor,
+            partial(
+                self._prepare_request_inputs,
+                messages,
+                tools,
+                accumulate_reasoning,
+            ),
+        )
 
-        if any(msg.get("images", None) is not None and msg["role"] == "user" for msg in messages) and self.processor is not None:
-            image_data = self.chat_parser.process_image_data(messages)  # list[PIL.Image.Image]
-            # Request tensor outputs explicitly.  Without this argument the
-            # Qwen3-VL processor may return ``input_ids`` as a Python list,
-            # while the multimodal alignment/debug path below expects tensor
-            # semantics (``.shape`` and tensor slicing).
-            model_inputs = self.processor(
-                text=[prompt],
-                images=image_data,
-                return_tensors="pt",
-            )
+        if model_inputs is not None:
             image_token_id = getattr(self.processor, "image_token_id", None)
             if image_token_id is None:
                 image_token_id = self.tokenizer.convert_tokens_to_ids("<|image_pad|>")
@@ -100,15 +166,31 @@ class VerlEngine(RolloutEngine):
             model_inputs.pop("attention_mask")
             multi_modal_inputs = dict(model_inputs)
         else:
-            image_data = None
-            multi_modal_inputs = None
             prompt_ids = request_prompt_ids
+            multi_modal_inputs = None
 
         prompt_length = len(prompt_ids)
         if enforce_max_prompt_length and prompt_length > self.max_prompt_length:
             raise TerminationEvent(TerminationReason.MAX_PROMPT_LENGTH_EXCEEDED)
 
-        token_output: TokenOutput = await self.server_manager.generate(request_id=application_id, prompt_ids=request_prompt_ids, image_data=image_data, sampling_params=sampling_params)  # type: ignore
+        try:
+            token_output: TokenOutput = await self.server_manager.generate(
+                request_id=application_id,
+                prompt_ids=request_prompt_ids,
+                image_data=image_data,
+                sampling_params=sampling_params,
+            )  # type: ignore
+        except asyncio.CancelledError:
+            # workflow.wait_for() cancels this coroutine on rollout timeout.
+            # Cancel the corresponding backend request before the next
+            # release/wake cycle; otherwise the backend can retain an
+            # in-flight request after the workflow coroutine is cancelled.
+            if self.config.actor_rollout_ref.rollout.name in ("sglang", "vllm"):
+                try:
+                    await self.server_manager.abort_request(request_id=application_id)
+                except Exception:
+                    logger.exception("Failed to abort cancelled rollout request %s", application_id)
+            raise
         completion_ids: list[int] = token_output.token_ids
 
         finish_reason = "stop"
@@ -148,4 +230,6 @@ class VerlEngine(RolloutEngine):
 
     async def sleep(self):
         """Sleep all rollout replica instances asynchronously."""
+        if self.config.actor_rollout_ref.rollout.name in ("sglang", "vllm"):
+            await self.server_manager.abort_request(abort_all=True)
         await asyncio.gather(*[replica.sleep() for replica in self.rollout_manager.rollout_replicas])

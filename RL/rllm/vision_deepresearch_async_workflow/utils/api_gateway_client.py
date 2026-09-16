@@ -11,6 +11,7 @@ to 0.0 and training proceeds normally.
 Environment variables
 ---------------------
 JUDGE_API_BASE_URL   OpenAI-compatible endpoint (default: ``https://api.openai.com/v1``).
+JUDGE_BASE_URL       Backward-compatible alias for ``JUDGE_API_BASE_URL``.
 JUDGE_API_KEY        Bearer token for the endpoint.
 JUDGE_MODEL          Default model name when the caller does not pass one.
 
@@ -44,7 +45,11 @@ except ImportError:
     pass
 
 
-_BASE_URL = os.getenv("JUDGE_API_BASE_URL", "https://api.openai.com/v1").rstrip("/")
+_BASE_URL = (
+    os.getenv("JUDGE_API_BASE_URL")
+    or os.getenv("JUDGE_BASE_URL")
+    or "https://api.openai.com/v1"
+).rstrip("/")
 _API_KEY = os.getenv("JUDGE_API_KEY", "")
 _DEFAULT_MODEL = os.getenv("JUDGE_MODEL", "gpt-4o-mini")
 

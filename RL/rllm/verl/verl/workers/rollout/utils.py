@@ -54,9 +54,17 @@ async def run_unvicorn(app: FastAPI, server_args, server_address, max_retries=5)
             app.server_args = server_args
             config = uvicorn.Config(app, host=server_address, port=server_port, log_level="warning")
             server = uvicorn.Server(config)
-            server.should_exit = True
-            await server.serve()
-            server_task = asyncio.create_task(server.main_loop())
+            # The previous implementation set ``should_exit=True`` before
+            # ``serve()`` and then started ``main_loop()`` a second time.  It
+            # relied on Uvicorn internals and became version-sensitive.  Run
+            # one normal server task and wait until Uvicorn reports startup.
+            server_task = asyncio.create_task(server.serve(sockets=[sock]))
+            while not server.started and not server_task.done():
+                await asyncio.sleep(0.01)
+            if server_task.done():
+                server_task.result()
+            if not server.started:
+                raise RuntimeError(f"Uvicorn exited before startup on {server_address}:{server_port}")
             break
         except (OSError, SystemExit) as e:
             logger.error(f"Failed to start HTTP server on port {server_port} at try {i}, error: {e}")

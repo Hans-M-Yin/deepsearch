@@ -1,9 +1,9 @@
 """Lightweight HTTP dispatcher for a pool of self-hosted Jina Reader workers.
 
 The dispatcher keeps the public Reader endpoint stable while spreading requests
-across independent Node/Chrome processes.  It deliberately does not impose an
-application-level request semaphore; the configured HTTP connection pool is
-only a transport safeguard.
+across independent Node/Chrome processes.  The configured HTTP connection pool
+is only a transport safeguard.  Per-backend admission control is optional and
+disabled by default to preserve existing throughput behavior.
 """
 
 from __future__ import annotations
@@ -41,6 +41,8 @@ MAX_KEEPALIVE_CONNECTIONS = max(
 )
 READ_TIMEOUT_S = float(os.environ.get("READER_DISPATCHER_READ_TIMEOUT", "300"))
 CONNECT_TIMEOUT_S = float(os.environ.get("READER_DISPATCHER_CONNECT_TIMEOUT", "10"))
+TRUST_ENV = os.environ.get("READER_DISPATCHER_TRUST_ENV", "0").strip().lower() in {"1", "true", "yes", "on"}
+MAX_INFLIGHT_PER_BACKEND = max(0, int(os.environ.get("READER_DISPATCHER_MAX_INFLIGHT_PER_BACKEND", "0")))
 
 HOP_BY_HOP_HEADERS = {
     "connection",
@@ -84,16 +86,28 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             max_keepalive_connections=MAX_KEEPALIVE_CONNECTIONS,
         ),
         follow_redirects=False,
+        trust_env=TRUST_ENV,
     )
     app.state.round_robin_index = 0
     app.state.round_robin_lock = asyncio.Lock()
     app.state.inflight = [0 for _ in BACKEND_URLS]
     app.state.completed = [0 for _ in BACKEND_URLS]
     app.state.failures = [0 for _ in BACKEND_URLS]
+    app.state.backend_semaphores = [
+        asyncio.Semaphore(MAX_INFLIGHT_PER_BACKEND) if MAX_INFLIGHT_PER_BACKEND else None
+        for _ in BACKEND_URLS
+    ]
     print(
         "[reader-dispatcher] backends=%s max_connections=%s "
-        "max_keepalive_connections=%s read_timeout_s=%s"
-        % (BACKEND_URLS, MAX_CONNECTIONS, MAX_KEEPALIVE_CONNECTIONS, READ_TIMEOUT_S),
+        "max_keepalive_connections=%s read_timeout_s=%s trust_env=%s max_inflight_per_backend=%s"
+        % (
+            BACKEND_URLS,
+            MAX_CONNECTIONS,
+            MAX_KEEPALIVE_CONNECTIONS,
+            READ_TIMEOUT_S,
+            TRUST_ENV,
+            MAX_INFLIGHT_PER_BACKEND,
+        ),
         flush=True,
     )
     try:
@@ -109,7 +123,10 @@ async def _ordered_backend_indices() -> list[int]:
     async with app.state.round_robin_lock:
         start = app.state.round_robin_index % len(BACKEND_URLS)
         app.state.round_robin_index += 1
-    return [(start + offset) % len(BACKEND_URLS) for offset in range(len(BACKEND_URLS))]
+    indices = [(start + offset) % len(BACKEND_URLS) for offset in range(len(BACKEND_URLS))]
+    # Under mixed slow/fast sites, least-inflight routing avoids assigning a
+    # new request to a backend that is still busy with many browser renders.
+    return sorted(indices, key=lambda index: app.state.inflight[index])
 
 
 def _target_url(backend: str, target_path: str, query: str) -> str:
@@ -124,6 +141,7 @@ async def health() -> dict[str, Any]:
         "backend_count": len(BACKEND_URLS),
         "backends": BACKEND_URLS,
         "inflight": list(app.state.inflight),
+        "max_inflight_per_backend": MAX_INFLIGHT_PER_BACKEND,
     }
 
 
@@ -141,6 +159,7 @@ async def stats() -> dict[str, Any]:
         ],
         "max_connections": MAX_CONNECTIONS,
         "max_keepalive_connections": MAX_KEEPALIVE_CONNECTIONS,
+        "max_inflight_per_backend": MAX_INFLIGHT_PER_BACKEND,
     }
 
 
@@ -156,6 +175,9 @@ async def proxy(target_path: str, request: Request) -> Response:
 
     for backend_index in await _ordered_backend_indices():
         backend = BACKEND_URLS[backend_index]
+        semaphore = app.state.backend_semaphores[backend_index]
+        if semaphore is not None:
+            await semaphore.acquire()
         app.state.inflight[backend_index] += 1
         started = time.perf_counter()
         try:
@@ -192,6 +214,8 @@ async def proxy(target_path: str, request: Request) -> Response:
             errors.append(f"{backend}: {exc.__class__.__name__}: {exc}")
         finally:
             app.state.inflight[backend_index] -= 1
+            if semaphore is not None:
+                semaphore.release()
 
     return JSONResponse(
         status_code=503,

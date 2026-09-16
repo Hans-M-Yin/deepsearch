@@ -57,6 +57,11 @@ rllm:
       accumulate_response_length: null # defaults to not rllm.stepwise_advantage.enable
     n_parallel_tasks: 256
     n_parallel_tools: null
+    n_processor_workers: 128
+    # Drop only incomplete tail groups after enough complete rollout groups
+    # have finished.  Formal launchers may override this; keep the base
+    # configuration disabled for minimal/smoke runs.
+    rollout_tail_drop_groups: 0
     retry_limit: 3
   disable_thinking: False
   accumulate_reasoning: False
@@ -80,4 +85,6 @@ rllm:
 
 trainer:
   log_episodes: false
+  # Optional human-readable description saved with the resolved experiment config.
+  description: null
   episode_log_dir: logs/${trainer.project_name}/${trainer.experiment_name}

@@ -59,6 +59,9 @@ logs/
 *.safetensors
 *.ckpt
 
+# Downloaded local embedding checkpoint (managed by utils/download_qwen3_embedding.sh)
+/models/Qwen3-Embedding-0.6B/
+
 # --- IDE / OS ---
 *.bak
 *.tmp
@@ -95,3 +98,18 @@ opensearch_infer/*
 /debug/image_download_resolver_cache/
 /debug/image_download_resolver_report.json
 /verification_sample_*.json
+
+# --- Experiment artifacts and visual outputs ---
+RL/rollouts_saved/
+RL/.env_remote
+*.out
+debug/partial_credit_*.json
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.webp
+*.bmp
+*.tif
+*.tiff
+*.ico

@@ -23,9 +23,14 @@ logger = logging.getLogger(__name__)
 
 
 _MAX_TURNS_FINALIZATION_PROMPT = (
-    "已达到搜索上限，不能再调用工具。请根据现得到的线索以及你的知识，"
-    "直接推理并给出原问题的最终答案。请严格按照"
-    "<thinking>...</thinking><answer>...</answer>的格式回答。"
+    "已达到搜索上限，不能再调用任何工具。这是最后一次回答机会。"
+    "请根据现有线索和你的知识直接给出原问题的最终答案；即使证据不完整，"
+    "也必须给出最可能的答案，不能要求继续搜索或调用工具。"
+    "请直接根据历史搜索记录以及输入问题进行回答。"
+    "你的完整回复必须且只能是"
+    "<thinking>...</thinking><answer>...</answer>。"
+    "严禁输出<tool_call>、任何工具调用 JSON、工具名或工具参数；"
+    "除这两个标签外，不得输出任何文本。"
 )
 
 
@@ -44,7 +49,7 @@ class InferenceTiming:
     def emit(self, *, case_id: str, case_idx: int, status: str) -> None:
         """Write one summary plus one line per module at INFO level."""
 
-        if not logger.isEnabledFor(logging.INFO):
+        if not config.TRACE_LOGS or not logger.isEnabledFor(logging.INFO):
             return
 
         elapsed_s = time.perf_counter() - self.started_at
@@ -230,14 +235,96 @@ def _save_failure_trajectory(
 # ---------------------------------------------------------------------------
 
 
+DYNAMIC_RESOLUTION_MAX_SIDE = 1600
+
+
+def _resize_image_bytes(
+    payload: bytes,
+    max_side: int = DYNAMIC_RESOLUTION_MAX_SIDE,
+) -> bytes:
+    """Downscale an image so its longest side is at most ``max_side``."""
+
+    try:
+        with Image.open(io.BytesIO(payload)) as source:
+            if max(source.size) <= max_side:
+                return payload
+
+            image = source.copy()
+            resampling = getattr(Image, "Resampling", Image)
+            image.thumbnail((max_side, max_side), resampling.LANCZOS)
+            output_format = (
+                source.format
+                if source.format in {"JPEG", "PNG", "WEBP"}
+                else "PNG"
+            )
+            if output_format == "JPEG" and image.mode not in {"L", "RGB"}:
+                image = image.convert("RGB")
+            output = io.BytesIO()
+            image.save(output, format=output_format)
+            return output.getvalue()
+    except Exception as exc:
+        logger.warning(
+            "Could not resize image for dynamic resolution; using original: %s",
+            exc,
+        )
+        return payload
+
+
+def _model_image_part(
+    value: Any,
+    dynamic_resolution: bool = False,
+) -> Optional[Dict[str, Any]]:
+    """Convert an image reference into the content part sent to the model."""
+
+    payload: Optional[bytes] = None
+    if isinstance(value, bytes):
+        payload = value
+    elif isinstance(value, str):
+        if value.startswith(("http://", "https://")):
+            if dynamic_resolution:
+                payload = image_io.download_image_bytes(value)
+                if payload is None:
+                    logger.warning(
+                        "Dynamic resolution could not download %s; keeping URL input",
+                        value[:120],
+                    )
+            if payload is None:
+                return {"image_url": {"url": value}}
+        else:
+            local_path = image_io.local_image_path_from_reference(value)
+            if local_path and os.path.exists(local_path):
+                try:
+                    with open(local_path, "rb") as fh:
+                        payload = fh.read()
+                except OSError as exc:
+                    logger.warning("Could not read image %s: %s", local_path, exc)
+
+    if payload is None:
+        return None
+    if dynamic_resolution:
+        payload = _resize_image_bytes(payload)
+    encoded = image_io.image_to_base64(payload)
+    if not encoded:
+        return None
+    return {
+        "inline_data": {
+            "mime_type": image_io.detect_image_format(encoded),
+            "data": encoded,
+        }
+    }
+
+
 def _add_image_url(
     image_paths_dict: Dict[str, Any],
     initial_parts: List[Dict[str, Any]],
     url: str,
+    dynamic_resolution: bool = False,
 ) -> None:
     image_id = f"img_{len(image_paths_dict) + 1}"
     image_paths_dict[image_id] = url
-    initial_parts.append({"image_url": {"url": url}})
+    image_part = _model_image_part(url, dynamic_resolution)
+    if image_part is not None:
+        initial_parts.append(image_part)
 
 
 def _add_inline_image(
@@ -245,20 +332,14 @@ def _add_inline_image(
     initial_parts: List[Dict[str, Any]],
     payload: bytes | str,
     raw_storage: Any,
+    dynamic_resolution: bool = False,
 ) -> None:
-    encoded = image_io.image_to_base64(payload) if isinstance(payload, bytes) else payload
-    if not encoded:
+    image_part = _model_image_part(payload, dynamic_resolution)
+    if image_part is None:
         return
     image_id = f"img_{len(image_paths_dict) + 1}"
     image_paths_dict[image_id] = raw_storage
-    initial_parts.append(
-        {
-            "inline_data": {
-                "mime_type": image_io.detect_image_format(encoded),
-                "data": encoded,
-            }
-        }
-    )
+    initial_parts.append(image_part)
 
 
 def _bootstrap_images(
@@ -267,6 +348,7 @@ def _bootstrap_images(
     case_idx: int,
     filename_prefix: str,
     image_urls_dict: Optional[Dict[str, List[Any]]],
+    dynamic_resolution: bool = False,
 ) -> tuple[Dict[str, Any], List[Dict[str, Any]]]:
     """Build the initial (image_paths_dict, parts) pair from row data.
 
@@ -298,7 +380,12 @@ def _bootstrap_images(
             else:
                 url = str(entry)
             if url:
-                _add_image_url(image_paths_dict, initial_parts, url)
+                _add_image_url(
+                    image_paths_dict,
+                    initial_parts,
+                    url,
+                    dynamic_resolution=dynamic_resolution,
+                )
 
     if not initial_parts and config.FVQA_IMAGE_DIR:
         local = image_io._try_local_image(case_id)
@@ -306,7 +393,13 @@ def _bootstrap_images(
             try:
                 with open(local, "rb") as fh:
                     payload = fh.read()
-                _add_inline_image(image_paths_dict, initial_parts, payload, local)
+                _add_inline_image(
+                    image_paths_dict,
+                    initial_parts,
+                    payload,
+                    local,
+                    dynamic_resolution=dynamic_resolution,
+                )
             except OSError as exc:
                 logger.warning("Failed to read local image %s: %s", local, exc)
 
@@ -326,14 +419,23 @@ def _bootstrap_images(
                 payload = entry
 
             if url:
-                _add_image_url(image_paths_dict, initial_parts, url)
+                _add_image_url(
+                    image_paths_dict,
+                    initial_parts,
+                    url,
+                    dynamic_resolution=dynamic_resolution,
+                )
                 continue
             if payload:
                 # For benchmark/parquet inputs, inline the bytes directly.
                 # External upload is only needed later for search tools that
                 # require a publicly reachable URL.
                 _add_inline_image(
-                    image_paths_dict, initial_parts, payload, payload
+                    image_paths_dict,
+                    initial_parts,
+                    payload,
+                    payload,
+                    dynamic_resolution=dynamic_resolution,
                 )
     return image_paths_dict, initial_parts
 
@@ -425,6 +527,7 @@ def process_single_case(
     visual_lookup: Optional[Callable[..., object]] = None,
     inference_cfg: Optional[InferenceConfig] = None,
     timing: Optional[InferenceTiming] = None,
+    dynamic_resolution: bool = False,
 ) -> Dict[str, Any]:
     """Drive one benchmark example through the agent."""
 
@@ -454,7 +557,12 @@ def process_single_case(
     )
 
     image_paths_dict, initial_parts = _bootstrap_images(
-        row, case_id, case_idx, filename_prefix, image_urls_dict
+        row,
+        case_id,
+        case_idx,
+        filename_prefix,
+        image_urls_dict,
+        dynamic_resolution=dynamic_resolution,
     )
     url_registry: dict[str, Any] = {}
 
@@ -505,18 +613,44 @@ def process_single_case(
             logger.error("Could not save failure trajectory: %s", save_exc, exc_info=True)
 
     for turn_num in range(config.MAX_TURNS):
-        llm_started_at = time.perf_counter() if timing is not None else 0.0
+        llm_started_at = time.perf_counter()
+        llm_status = "exception"
+        response: Dict[str, Any] = {}
+        if config.TRACE_LOGS:
+            logger.info(
+                "[inference-trace] LLM_START case_id=%s case_idx=%s turn=%d model=%s",
+                case_id,
+                case_idx,
+                turn_num,
+                runner.display_name,
+            )
         try:
             response = runner.infer(
                 contents=gemini_contents,
                 system_instruction=system_prompt,
                 cfg=cfg,
             )
+            llm_status = (
+                "error_response"
+                if response.get("inference_error")
+                else "ok"
+            )
         except Exception as exc:
             logger.error("Inference failed on turn %d: %s", turn_num, exc, exc_info=True)
             persist_failure("inference_error", str(exc), turn_num)
             raise RuntimeError(f"Inference failed on turn {turn_num}: {exc}") from exc
         finally:
+            if config.TRACE_LOGS:
+                logger.info(
+                    "[inference-trace] LLM_END case_id=%s case_idx=%s turn=%d "
+                    "model=%s status=%s elapsed_s=%.3f",
+                    case_id,
+                    case_idx,
+                    turn_num,
+                    runner.display_name,
+                    llm_status,
+                    time.perf_counter() - llm_started_at,
+                )
             if timing is not None:
                 timing.record("llm", time.perf_counter() - llm_started_at)
 
@@ -592,6 +726,7 @@ def process_single_case(
         # the evidence already collected.  With MAX_TURNS=46 this happens on
         # the 45th (zero-based turn 44), leaving turn 45 for the final answer.
         if config.MAX_TURNS >= 2 and turn_num == config.MAX_TURNS - 2:
+            skipped_tool = _tool_name(tool_call_json)
             observation_text = (
                 f"<tool_response>\n{_MAX_TURNS_FINALIZATION_PROMPT}"
                 "\n</tool_response>"
@@ -601,17 +736,32 @@ def process_single_case(
             gemini_contents.append(
                 {"role": "user", "parts": [{"text": observation_text}]}
             )
-            logger.info(
-                "Reached the penultimate turn for case_id=%s case_idx=%s; "
-                "replaced tool output with finalization prompt",
-                case_id,
-                case_idx,
-            )
+            if config.TRACE_LOGS:
+                logger.info(
+                    "Reached the penultimate turn for case_id=%s case_idx=%s; "
+                    "skipped tool=%s and replaced its output with finalization prompt",
+                    case_id,
+                    case_idx,
+                    skipped_tool,
+                )
             continue
 
         os.makedirs(intermediate_dir, exist_ok=True)
-        tool_started_at = time.perf_counter() if timing is not None else 0.0
         tool_module = _tool_name(tool_call_json)
+        tool_started_at = time.perf_counter()
+        tool_status = "exception"
+        tool_message = ""
+        new_images: Dict[str, Any] = {}
+        if config.TRACE_LOGS:
+            logger.info(
+                "[inference-trace] TOOL_START case_id=%s case_idx=%s turn=%d "
+                "tool_call_index=%d tool=%s",
+                case_id,
+                case_idx,
+                turn_num,
+                tool_call_count,
+                tool_module,
+            )
         try:
             tool_message, new_images = tools.execute_tool(
                 tool_call_json,
@@ -624,10 +774,29 @@ def process_single_case(
                 visual_lookup=visual_lookup,
                 url_registry=url_registry,
             )
+            tool_status = (
+                "error_result"
+                if str(tool_message).startswith("Tool execution error:")
+                else "ok"
+            )
         except Exception as exc:
             persist_failure("tool_execution_error", str(exc), turn_num)
             raise
         finally:
+            if config.TRACE_LOGS:
+                logger.info(
+                    "[inference-trace] TOOL_END case_id=%s case_idx=%s turn=%d "
+                    "tool_call_index=%d tool=%s status=%s elapsed_s=%.3f "
+                    "new_images=%d",
+                    case_id,
+                    case_idx,
+                    turn_num,
+                    tool_call_count,
+                    tool_module,
+                    tool_status,
+                    time.perf_counter() - tool_started_at,
+                    len(new_images),
+                )
             if timing is not None:
                 timing.record(tool_module, time.perf_counter() - tool_started_at)
         observation_text = f"<tool_response>\n{tool_message}\n</tool_response>"

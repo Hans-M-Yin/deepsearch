@@ -90,6 +90,13 @@ class ServerConfig(BaseConfig):
     retry_delay: float = 2.0
     max_connections: int = 1000
     max_start_wait_time: float = 300.0
+    # Memory-saver lifecycle operations (release/resume) are stateful.  A
+    # timed-out request may already have changed the server state, so these
+    # operations must not be blindly retried.  They also need a longer timeout
+    # than ordinary generation/control requests when remapping large CUDA
+    # allocations.
+    lifecycle_timeout: float = 600.0
+    lifecycle_max_attempts: int = 1
 
 
 @dataclass

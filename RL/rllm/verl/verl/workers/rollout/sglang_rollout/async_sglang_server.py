@@ -221,6 +221,14 @@ class SGLangHttpServer:
         elif self.rollout_mode == RolloutMode.STANDALONE:
             logger.info("skip sleep in standalone mode")
 
+    async def abort_request(self, rid: str = "", abort_all: bool = False):
+        """Abort requests before a rollout timeout or memory-saver release."""
+        if self.rollout_mode == RolloutMode.HYBRID:
+            return self.tokenizer_manager.abort_request(rid=rid, abort_all=abort_all)
+        if self.rollout_mode == RolloutMode.COLOCATED:
+            return self.tokenizer_manager.abort_request(rid=rid, abort_all=abort_all)
+        return {}
+
     async def generate(
         self,
         prompt_ids: torch.Tensor,

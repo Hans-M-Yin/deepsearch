@@ -52,11 +52,17 @@ FORWARD_PREFIXES = [
     "IMAGE_",
     "VISUAL_",
     "TEXT_",
+    # Outcome-reward augmentations must be explicitly propagated because Ray
+    # workers on remote nodes do not inherit arbitrary driver-shell variables.
+    "SEARCH_REDUNDANCY_",
+    "PARTIAL_CREDIT_",
     # Multimodal RL diagnostics (RLLM_MM_DEBUG, log path, rank filter, etc.).
     "RLLM_MM_",
     # W&B diagnostics used by verl.utils.tracking.  Do not print values from
     # these variables: this prefix can include credentials and proxy settings.
     "RLLM_WANDB",
+    # DeepResearch's SQLite tool-cache location must reach remote Ray workers.
+    "CACHE_",
 ]
 
 # ``synthesis`` is a repository package rather than an installed wheel.  The

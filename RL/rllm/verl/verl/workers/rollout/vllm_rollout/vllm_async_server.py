@@ -25,6 +25,7 @@ import ray
 import vllm.entrypoints.cli.serve
 import zmq
 from ray.actor import ActorHandle
+from omegaconf import OmegaConf
 from vllm import SamplingParams
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.entrypoints.openai.api_server import (
@@ -200,6 +201,25 @@ class vLLMHttpServerBase:
         # 1. setup vllm serve cli args
         engine_kwargs = self.config.get("engine_kwargs", {}).get("vllm", {}) or {}
         engine_kwargs = {key: val for key, val in engine_kwargs.items() if val is not None}
+        # The server is rebuilt from CLI-style arguments below.  Preserve
+        # nested Hydra/OmegaConf values such as
+        # compilation_config.cudagraph_mode as valid JSON instead of relying
+        # on Python's single-quoted dict representation.
+        compilation_config = engine_kwargs.get("compilation_config")
+        if OmegaConf.is_config(compilation_config):
+            compilation_config = OmegaConf.to_container(compilation_config, resolve=True)
+        elif isinstance(compilation_config, dict):
+            # Hydra may already have materialized this value as a plain dict.
+            # Re-create it as an OmegaConf object before normalizing nested
+            # DictConfig values, since to_container() rejects plain dicts.
+            compilation_config = OmegaConf.to_container(
+                OmegaConf.create(compilation_config), resolve=True
+            )
+
+        if compilation_config is not None:
+            engine_kwargs["compilation_config"] = json.dumps(
+                compilation_config
+            )
         if self.config.get("limit_images", None):  # support for multi-image data
             engine_kwargs["limit_mm_per_prompt"] = {"image": self.config.get("limit_images")}
         if self.config.cudagraph_capture_sizes:
@@ -379,7 +399,17 @@ class vLLMHttpServerBase:
     ) -> TokenOutput:
         """Generate sequence with token-in-token-out."""
         # TODO(@wuxibin): switch to `/generate` http endpoint once multi-modal support ready.
-        max_tokens = self.config.max_model_len - len(prompt_ids)
+        # VerlEngine uses ``max_new_tokens`` for a per-turn limit, while vLLM's
+        # SamplingParams uses ``max_tokens``. Consume the former here instead
+        # of forwarding it as an unknown SamplingParams argument. Keep the
+        # context-window limit as a second bound.
+        requested_max_tokens = sampling_params.pop("max_new_tokens", None)
+        if requested_max_tokens is None:
+            requested_max_tokens = sampling_params.pop("max_tokens", None)
+        context_max_tokens = max(0, self.config.max_model_len - len(prompt_ids))
+        max_tokens = context_max_tokens if requested_max_tokens is None else min(
+            max(0, int(requested_max_tokens)), context_max_tokens
+        )
         sampling_params["logprobs"] = 0 if sampling_params.pop("logprobs", False) else None
         sampling_params.setdefault("repetition_penalty", self.config.get("repetition_penalty", 1.0))
         sampling_params = SamplingParams(max_tokens=max_tokens, **sampling_params)
@@ -413,6 +443,29 @@ class vLLMHttpServerBase:
         if sampling_params.logprobs is not None:
             log_probs = [logprobs[token_ids[i]].logprob for i, logprobs in enumerate(final_res.outputs[0].logprobs)]
         return TokenOutput(token_ids=token_ids, log_probs=log_probs)
+
+    async def abort_request(self, rid: str = "", abort_all: bool = False):
+        """Abort an in-flight vLLM request before timeout or sleep.
+
+        Only the node-0 server owns the V1 ``AsyncLLM`` frontend. The rollout
+        manager routes lifecycle calls to that server, matching SGLang.
+        """
+        if self.node_rank != 0 or not hasattr(self, "engine"):
+            return {}
+
+        request_ids = []
+        if abort_all:
+            output_processor = getattr(self.engine, "output_processor", None)
+            if output_processor is not None:
+                request_ids.extend(getattr(output_processor, "request_states", {}).keys())
+                request_ids.extend(getattr(output_processor, "parent_requests", {}).keys())
+        elif rid:
+            request_ids.append(rid)
+
+        request_ids = list(dict.fromkeys(request_ids))
+        for request_id in request_ids:
+            await self.engine.abort(request_id)
+        return {"aborted": len(request_ids)}
 
     async def wake_up(self):
         if self.rollout_mode == RolloutMode.HYBRID:

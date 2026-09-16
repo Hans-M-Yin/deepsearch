@@ -120,6 +120,84 @@ class FirecrawlRelayTest(unittest.TestCase):
                 9999,
             )
 
+    def test_account_banned_error_disables_key_even_without_http_401(self) -> None:
+        with TemporaryDirectory() as directory:
+            state_path = Path(directory) / "pool.json"
+            self.server.key_pool = FirecrawlApiKeyPool(
+                keys=["banned-key"],
+                state_path=state_path,
+            )
+            self.server.browser_session_keys = {}
+            self.server.browser_session_lock = threading.RLock()
+
+            def fake_upstream(request: Request, *, timeout: float) -> _FakeUpstreamResponse:
+                del request, timeout
+                return _FakeUpstreamResponse(
+                    {
+                        "error": "Unauthorized: This account has been banned. "
+                        "Contact support@firecrawl.com if you believe this is a mistake."
+                    }
+                )
+
+            request = Request(
+                self._url("/v2/scrape"),
+                data=b'{"url":"https://example.com"}',
+                headers={
+                    "Content-Type": "application/json",
+                    "X-API-KEY": "relay-placeholder",
+                },
+                method="POST",
+            )
+            with mock.patch.object(firecrawl_relay, "urlopen", side_effect=fake_upstream):
+                with client_urlopen(request, timeout=3) as response:
+                    self.assertEqual(json.loads(response.read())["error"].split(":", 1)[0], "Unauthorized")
+
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            banned = state["keys"][FirecrawlApiKeyPool.key_id("banned-key")]
+            self.assertTrue(banned["disabled"])
+            self.assertEqual(banned["disabled_reason"], "firecrawl_api_auth_failed")
+            self.assertEqual(self.server.key_pool.status()["available_key_count"], 0)
+
+    def test_target_page_401_does_not_disable_key(self) -> None:
+        with TemporaryDirectory() as directory:
+            state_path = Path(directory) / "pool.json"
+            self.server.key_pool = FirecrawlApiKeyPool(
+                keys=["page-key"],
+                state_path=state_path,
+            )
+            self.server.browser_session_keys = {}
+            self.server.browser_session_lock = threading.RLock()
+
+            def fake_upstream(request: Request, *, timeout: float) -> _FakeUpstreamResponse:
+                del request, timeout
+                return _FakeUpstreamResponse(
+                    {
+                        "success": True,
+                        "data": {
+                            "markdown": "login page",
+                            "metadata": {"statusCode": 401, "creditsUsed": 1},
+                        },
+                    }
+                )
+
+            request = Request(
+                self._url("/v2/scrape"),
+                data=b'{"url":"https://example.com/login"}',
+                headers={
+                    "Content-Type": "application/json",
+                    "X-API-KEY": "relay-placeholder",
+                },
+                method="POST",
+            )
+            with mock.patch.object(firecrawl_relay, "urlopen", side_effect=fake_upstream):
+                with client_urlopen(request, timeout=3) as response:
+                    self.assertTrue(json.loads(response.read())["success"])
+
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            page_key = state["keys"][FirecrawlApiKeyPool.key_id("page-key")]
+            self.assertFalse(page_key["disabled"])
+            self.assertEqual(page_key["remaining_credits"], 9999)
+
     def test_credit_exhaustion_stops_after_all_candidate_keys(self) -> None:
         with TemporaryDirectory() as directory:
             state_path = Path(directory) / "pool.json"

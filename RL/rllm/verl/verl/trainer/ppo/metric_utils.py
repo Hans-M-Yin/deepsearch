@@ -112,8 +112,17 @@ def _compute_group_reward_metrics(
     group_vars: list[float] = []
     group_sizes: list[int] = []
     constant_groups = 0
+    is_correct = batch.non_tensor_batch.get("is_correct")
+    has_group_accuracy = is_correct is not None and len(is_correct) == len(reward_values)
+    grouped_accuracies: defaultdict[str, list[float]] = defaultdict(list)
+    if has_group_accuracy:
+        for group_id, correct in zip(group_ids, is_correct, strict=True):
+            grouped_accuracies[str(group_id)].append(float(bool(correct)))
 
-    for rewards in grouped_rewards.values():
+    accuracy_stds: list[float] = []
+    constant_accuracy_groups = 0
+
+    for group_id, rewards in grouped_rewards.items():
         rewards_tensor = torch.tensor(rewards, dtype=torch.float32)
         group_mean = torch.mean(rewards_tensor)
         group_var = torch.var(rewards_tensor, unbiased=False)
@@ -126,12 +135,21 @@ def _compute_group_reward_metrics(
         if float(group_std.item()) <= epsilon:
             constant_groups += 1
 
+        if has_group_accuracy:
+            accuracies_tensor = torch.tensor(
+                grouped_accuracies[group_id], dtype=torch.float32
+            )
+            accuracy_std = torch.std(accuracies_tensor, unbiased=False)
+            accuracy_stds.append(float(accuracy_std.item()))
+            if float(accuracy_std.item()) <= epsilon:
+                constant_accuracy_groups += 1
+
     group_means_tensor = torch.tensor(group_means, dtype=torch.float32)
     group_stds_tensor = torch.tensor(group_stds, dtype=torch.float32)
     group_vars_tensor = torch.tensor(group_vars, dtype=torch.float32)
     group_sizes_tensor = torch.tensor(group_sizes, dtype=torch.float32)
 
-    return {
+    metrics = {
         # Mean of the per-group reward means, and variation between groups.
         "group/reward_mean_mean": torch.mean(group_means_tensor).item(),
         "group/reward_mean_std": torch.std(group_means_tensor, unbiased=False).item(),
@@ -148,6 +166,21 @@ def _compute_group_reward_metrics(
         "group/size_min": torch.min(group_sizes_tensor).item(),
         "group/size_max": torch.max(group_sizes_tensor).item(),
     }
+    if has_group_accuracy:
+        metrics.update(
+            {
+                # Outcome diversity within repeated rollouts for the same
+                # prompt. Unlike reward variation, this is based strictly on
+                # binary final-answer correctness: zero means all rollouts in
+                # a group were either correct or incorrect.
+                "group/accuracy_std_mean": float(np.mean(accuracy_stds)),
+                "group/constant_accuracy_group_count": constant_accuracy_groups,
+                "group/constant_accuracy_group_ratio": (
+                    constant_accuracy_groups / len(group_sizes)
+                ),
+            }
+        )
+    return metrics
 
 
 def _compute_zero_advantage_metrics(

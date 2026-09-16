@@ -18,6 +18,7 @@ from hashlib import sha256
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Callable
+from urllib.error import HTTPError as UrllibHTTPError
 from urllib.parse import quote, unquote, urlparse, urlsplit
 
 import requests
@@ -52,7 +53,10 @@ RawDocumentFetcher = Callable[
     [str, str, Callable[[], dict[str, Any]]], dict[str, Any]
 ]
 MAX_SEARCH_RESULTS = 5
-TOOL_NETWORK_TIMEOUT_S = 60
+# This deadline is shared by read_url's Enhanced Reader request and its
+# direct HTTP image/PDF paths.  It intentionally exceeds the historical
+# 60-second deadline because slow Reader fetches are common under rollout load.
+TOOL_NETWORK_TIMEOUT_S = 120
 # A request is attempted once initially, then at most this many additional
 # times when the failure is a transport timeout.  Keep this distinction
 # explicit: retrying authentication, validation, or quota errors only delays
@@ -62,6 +66,7 @@ TOOL_RETRY_SLEEP_S = 5
 # Empty Lens results can be transient when the upstream cannot fetch the
 # submitted image URL. Keep this separate from transport-timeout retries.
 I2I_EMPTY_RESULT_RETRIES = 3
+I2I_EMPTY_RESULT_RETRY_SLEEP_S = 2
 TOOL_429_RETRY_SLEEP_S = 60
 FIRECRAWL_ERROR_RETRIES = 1
 FIRECRAWL_ERROR_RETRY_SLEEP_S = 5
@@ -70,8 +75,10 @@ FIRECRAWL_ERROR_RETRY_SLEEP_S = 5
 # budget so unrelated tools cannot silently lengthen this fallback boundary.
 ENHANCED_READER_RETRIES = 1
 ENHANCED_READER_RETRY_SLEEP_S = 5
-MAX_DOWNLOADED_IMAGE_LONG_EDGE = 1920
-MAX_DOWNLOADED_IMAGE_SHORT_EDGE = 1080
+# Keep downloaded images at their source resolution only while the long edge
+# is strictly below this threshold.  Larger images are resized below before
+# being attached to the model context.
+MAX_DOWNLOADED_IMAGE_LONG_EDGE = 1200
 RESIZED_IMAGE_LONG_EDGE = 1000
 MAX_SVG_BYTES = 10 * 1024 * 1024
 MAX_RENDERED_SVG_PIXELS = 20_000_000
@@ -514,6 +521,141 @@ def _read_url_timed_sleep(
     _read_url_timing_add(timings, key, time.monotonic() - started_at)
 
 
+def _header_value(headers: object, *names: str) -> str | None:
+    """Read one HTTP header from requests or urllib header containers."""
+
+    if headers is None:
+        return None
+    for name in names:
+        try:
+            value = headers.get(name)  # type: ignore[union-attr]
+        except (AttributeError, TypeError):
+            value = None
+        if value is not None and str(value).strip():
+            return str(value).strip()
+    # ``requests`` and urllib's ``HTTPMessage`` provide case-insensitive
+    # ``get``.  Unit-test doubles and a few custom transports use plain dicts,
+    # so retain HTTP's case-insensitive semantics explicitly for those too.
+    try:
+        normalized_names = {name.casefold() for name in names}
+        for key, value in headers.items():  # type: ignore[union-attr]
+            if str(key).casefold() in normalized_names and str(value).strip():
+                return str(value).strip()
+    except (AttributeError, TypeError):
+        pass
+    return None
+
+
+def _response_error_messages(payload: object, *, limit: int = 3) -> list[str]:
+    """Extract compact, nested error messages from the Reader JSON response."""
+
+    messages: list[str] = []
+    current = payload
+    # 8004 embeds 8003's response in ``upstream_error.body``, and 8003 can in
+    # turn embed the 8002 browser error.  A small bounded traversal is enough
+    # to expose the cause without trusting an arbitrarily deep response body.
+    for _ in range(4):
+        if not isinstance(current, dict):
+            break
+        for key in ("readableMessage", "message", "detail", "error"):
+            value = current.get(key)
+            if isinstance(value, str):
+                normalized = re.sub(r"\s+", " ", value).strip()
+                if normalized and normalized not in messages:
+                    messages.append(normalized[:1600])
+                    if len(messages) >= limit:
+                        return messages
+        nested = current.get("upstream_error")
+        if not isinstance(nested, dict):
+            break
+        current = nested.get("body", nested)
+    return messages
+
+
+def _http_retry_debug_details(error: object) -> dict[str, object]:
+    """Return useful, bounded diagnostics for HTTP errors in retry logs.
+
+    ``EnhancedReaderClient`` uses ``urllib``.  Unlike ``requests``, its
+    ``HTTPError.__str__`` contains only ``HTTP Error 502: Bad Gateway`` even
+    when the JSON response has the real Jina browser failure.  Consume and
+    cache a small body preview only for the failed attempt that is about to be
+    retried, then report the semantic fields rather than the large timing and
+    cache payload.
+    """
+
+    status_code: int | None = None
+    headers: object | None = None
+    body_text: str | None = None
+
+    if isinstance(error, requests.HTTPError) and error.response is not None:
+        response = error.response
+        status_code = response.status_code
+        headers = response.headers
+        try:
+            body_text = response.text
+        except Exception:  # pragma: no cover - diagnostics must not mask retry
+            body_text = None
+    elif isinstance(error, UrllibHTTPError):
+        status_code = error.code
+        headers = error.headers
+        cached_body = getattr(error, "_tool_retry_response_body", None)
+        if isinstance(cached_body, str):
+            body_text = cached_body
+        else:
+            try:
+                # Reader errors are JSON and normally tiny.  Cap the read so a
+                # faulty upstream never turns an observability line into a
+                # large allocation.  This exception is discarded after the
+                # retry diagnostic, so consuming its body is safe.
+                raw_body = error.read(16 * 1024)
+                body_text = raw_body.decode("utf-8", errors="replace")
+                setattr(error, "_tool_retry_response_body", body_text)
+            except Exception:  # pragma: no cover - failed diagnostics are nonfatal
+                body_text = None
+    else:
+        return {}
+
+    details: dict[str, object] = {}
+    if status_code is not None:
+        details["http_status"] = int(status_code)
+
+    backend = _header_value(headers, "x-reader-dispatcher-backend")
+    if backend:
+        details["reader_backend"] = backend
+    header_upstream_status = _header_value(headers, "x-reader-upstream-status")
+    if header_upstream_status:
+        details["reader_upstream_status"] = header_upstream_status
+
+    payload: object | None = None
+    if body_text:
+        try:
+            payload = json.loads(body_text)
+        except (TypeError, ValueError):
+            compact_body = re.sub(r"\s+", " ", body_text).strip()
+            if compact_body:
+                details["http_response_body"] = compact_body[:1600]
+
+    if isinstance(payload, dict):
+        upstream = payload.get("upstream_error")
+        if isinstance(upstream, dict):
+            upstream_status = upstream.get("status_code") or upstream.get("status")
+            if upstream_status is not None:
+                details["reader_upstream_status"] = upstream_status
+            upstream_headers = upstream.get("headers")
+            if not backend:
+                backend = _header_value(upstream_headers, "x-reader-dispatcher-backend")
+                if backend:
+                    details["reader_backend"] = backend
+        messages = _response_error_messages(payload)
+        if messages:
+            # The last message is usually the deepest error, e.g. the Jina
+            # browser's navigation timeout or ERR_BLOCKED_BY_CLIENT.
+            details["reader_error"] = messages[-1]
+            if len(messages) > 1:
+                details["reader_error_chain"] = " <- ".join(messages)
+    return details
+
+
 def _tool_retry_debug(
     tool: str,
     *,
@@ -537,6 +679,7 @@ def _tool_retry_debug(
         "max_attempts": max_attempts,
         "sleep_seconds": round(float(sleep_seconds), 3),
         "error": str(error)[:1000],
+        **_http_retry_debug_details(error),
         **kwargs,
     }
     suffix = " ".join(f"{key}={value!r}" for key, value in details.items())
@@ -1380,7 +1523,7 @@ Raw webpage content:\n{content[:80000]}\n
                     "Summarization timed out and SUMMARIZE_FALLBACK_MODEL_ALIAS is unset"
                 )
         else:
-            logger.warning("Summarization failed: %s", exc)
+            logger.warning(f"{model_alias} Summarization failed: %s", exc)
     return content[:1000] + ("..." if len(content) > 1000 else "")
 
 
@@ -2195,11 +2338,7 @@ def _maybe_resize_downloaded_image(
                     "Rasterized SVG exceeds the rendered pixel safety limit"
                 )
             long_edge = max(width, height)
-            short_edge = min(width, height)
-            if (
-                long_edge <= MAX_DOWNLOADED_IMAGE_LONG_EDGE
-                and short_edge <= MAX_DOWNLOADED_IMAGE_SHORT_EDGE
-            ):
+            if long_edge < MAX_DOWNLOADED_IMAGE_LONG_EDGE:
                 return payload, _sniff_image_content_type(payload) or content_type
 
             resized = normalized.copy()
@@ -2446,6 +2585,54 @@ def _read_via_firecrawl_with_timeout_retry(
 
 def _is_blocked_summary(content: str) -> bool:
     return "BLOCKED" in str(content or "").upper()
+
+
+def _enhanced_reader_unusable_reason(document: dict[str, Any]) -> str | None:
+    """Return a Firecrawl trigger for an unusable Enhanced Reader response.
+
+    The reader service can return HTTP 200 with an empty/anti-bot document.
+    Such a response is not an exception, so the older retry boundary would
+    incorrectly pass it to the summarizer and potentially return an empty
+    successful observation.  Prefer the service's explicit content-quality
+    metadata, then apply conservative short interstitial checks for direct
+    ``403 Forbidden``/CAPTCHA bodies.
+    """
+
+    content = str(document.get("content") or "").strip()
+    raw = document.get("raw")
+    raw_payload: dict[str, Any] = raw if isinstance(raw, dict) else {}
+    nested = raw_payload.get("data")
+    payload = nested if isinstance(nested, dict) else raw_payload
+
+    quality = str(
+        payload.get("content_quality")
+        or raw_payload.get("content_quality")
+        or ""
+    ).strip().lower()
+    if not content:
+        return "Enhanced Reader returned empty content"
+    if quality in {"empty", "anti_bot", "blocked"}:
+        return f"Enhanced Reader returned unusable content_quality={quality}"
+
+    # Do not classify ordinary long articles mentioning words such as
+    # "forbidden" as blocked pages.  These checks are deliberately limited to
+    # short interstitial/error bodies.
+    normalized = re.sub(r"\s+", " ", content).strip().casefold()
+    if len(normalized) <= 4096:
+        blocked_markers = (
+            r"\b403\s+forbidden\b",
+            r"\b401\s+unauthorized\b",
+            r"\baccess\s+denied\b",
+            r"\b(?:re?captcha|captcha)\b",
+            r"\bverification\s+(?:required|successful|failed)\b",
+            r"\bchecking\s+your\s+browser\b",
+            r"\bverify\s+you\s+are\s+not\s+a\s+bot\b",
+        )
+        if any(re.search(pattern, normalized) for pattern in blocked_markers):
+            return "Enhanced Reader returned a blocked/interstitial page"
+        if normalized.startswith("forbidden"):
+            return "Enhanced Reader returned a Forbidden page"
+    return None
 
 
 def _read_url_with_firecrawl_fallback(
@@ -2973,6 +3160,22 @@ def _read_url_impl(
 
     content = document.get("content", "") or ""
     title = document.get("title", "") or ""
+    unusable_reason = _enhanced_reader_unusable_reason(document)
+    if unusable_reason:
+        _read_url_debug(
+            "enhanced_reader_unusable",
+            url=normalized_url,
+            reason=unusable_reason,
+        )
+        return _read_url_with_firecrawl_fallback(
+            url=normalized_url,
+            goal=goal,
+            assistant_output=assistant_output,
+            original_title=title,
+            trigger=unusable_reason,
+            timings=_timings,
+            raw_document_fetcher=raw_document_fetcher,
+        )
     should_return_summary = bool(goal or assistant_output)
     reader_summary_started_at = time.monotonic()
     try:
@@ -3224,6 +3427,7 @@ def i2i_search(
     max_retries: int = TOOL_TIMEOUT_RETRIES,
     base_delay: int = TOOL_RETRY_SLEEP_S,
     timings: dict[str, float] | None = None,
+    debug_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Reverse-image search using a provided backend or Serper Lens.
 
@@ -3275,21 +3479,28 @@ def i2i_search(
                     "i2i_search",
                     attempt=failed_attempt,
                     max_attempts=1 + I2I_EMPTY_RESULT_RETRIES,
-                    sleep_seconds=5,
+                    sleep_seconds=I2I_EMPTY_RESULT_RETRY_SLEEP_S,
                     error="empty result",
                     result=json.dumps(result, ensure_ascii=False, default=str),
                     url=image_url,
                     retry_reason="empty_result",
+                    original_image_url=(debug_context or {}).get("original_image_url"),
+                    region=(debug_context or {}).get("region"),
+                    cropped_image_oss_url=(debug_context or {}).get("cropped_image_oss_url"),
                 )
                 tracked_sleep(
-                    5,
+                    I2I_EMPTY_RESULT_RETRY_SLEEP_S,
                     reason="empty_result",
                     tool="i2i_search",
                     url=image_url,
                     error_type="EmptySearchResult",
                     fallback_sleep=time.sleep,
                 )
-                _read_url_timing_add(timings, "serper_retry_sleep_s", 5.0)
+                _read_url_timing_add(
+                    timings,
+                    "serper_retry_sleep_s",
+                    float(I2I_EMPTY_RESULT_RETRY_SLEEP_S),
+                )
                 continue
             if result_count == 0:
                 _record_search_tool_call("i2i_search", success=False, result_count=0)

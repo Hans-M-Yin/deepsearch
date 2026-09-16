@@ -54,7 +54,7 @@ import socket
 import sys
 import threading
 import time
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer as _StdThreadingHTTPServer
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, quote, unquote, urlencode, urljoin, urlsplit, urlunsplit
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
@@ -68,6 +68,7 @@ DEFAULT_MAX_INFLIGHT = 8
 DEFAULT_UPSTREAM_ATTEMPTS = 2
 DEFAULT_RETRY_DELAY_S = 2.0
 DEFAULT_MAX_REDIRECTS = 5
+DEFAULT_REQUEST_QUEUE_SIZE = 512
 DEFAULT_NAT64_PREFIXES = (ipaddress.ip_network("64:ff9b::/96"),)
 UPSTREAM_PROXY_ENV = "HTTP_RELAY_UPSTREAM_PROXY_URL"
 WIKIMEDIA_MAX_LONG_EDGE_ENV = "HTTP_RELAY_WIKIMEDIA_MAX_LONG_EDGE"
@@ -883,6 +884,22 @@ def _log_proxy_response(*, target_url: str, status_code: int, byte_count: int) -
     )
 
 
+class ThreadingHTTPServer(_StdThreadingHTTPServer):
+    def __init__(
+        self,
+        server_address: tuple[str, int],
+        request_handler_class: type[BaseHTTPRequestHandler],
+        *,
+        request_queue_size: int = DEFAULT_REQUEST_QUEUE_SIZE,
+    ) -> None:
+        # socketserver.TCPServer defaults this to 5. Set it before the parent
+        # constructor calls listen() so high fan-in connections reach handlers.
+        if request_queue_size <= 0:
+            raise ValueError("request_queue_size must be positive")
+        self.request_queue_size = int(request_queue_size)
+        super().__init__(server_address, request_handler_class)
+
+
 class IPv6ThreadingHTTPServer(ThreadingHTTPServer):
     address_family = socket.AF_INET6
     daemon_threads = True
@@ -1130,6 +1147,18 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bind", default="::", help="Bind address; default is all IPv6 interfaces.")
     parser.add_argument("--port", type=int, default=18083, help="Listen port; default is 18083.")
+    parser.add_argument(
+        "--request-queue-size",
+        type=int,
+        default=int(
+            os.environ.get("HTTP_RELAY_REQUEST_QUEUE_SIZE")
+            or DEFAULT_REQUEST_QUEUE_SIZE
+        ),
+        help=(
+            "TCP listen backlog before requests enter Python handlers "
+            f"(default: {DEFAULT_REQUEST_QUEUE_SIZE}; Python's default is 5)."
+        ),
+    )
     parser.add_argument("--timeout-s", type=float, default=DEFAULT_TIMEOUT_S)
     parser.add_argument("--queue-timeout-s", type=float, default=DEFAULT_QUEUE_TIMEOUT_S)
     parser.add_argument("--max-inflight", type=int, default=DEFAULT_MAX_INFLIGHT)
@@ -1189,13 +1218,24 @@ def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     if not 1 <= args.port <= 65535:
         raise SystemExit("--port must be between 1 and 65535.")
-    if args.timeout_s <= 0 or args.queue_timeout_s < 0 or args.retry_delay_s < 0:
-        raise SystemExit("timeout must be positive; queue timeout and retry delay must be non-negative.")
+    if (
+        args.timeout_s <= 0
+        or args.queue_timeout_s < 0
+        or args.retry_delay_s < 0
+        or args.request_queue_size <= 0
+    ):
+        raise SystemExit(
+            "timeout and request queue size must be positive; queue timeout and retry delay must be non-negative."
+        )
     if args.max_inflight <= 0 or args.upstream_attempts <= 0 or args.max_redirects < 0:
         raise SystemExit("max-inflight and upstream-attempts must be positive; max-redirects must be non-negative.")
 
     server_class = IPv6ThreadingHTTPServer if ":" in args.bind else ThreadingHTTPServer
-    server = server_class((args.bind, args.port), HttpRelayHandler)
+    server = server_class(
+        (args.bind, args.port),
+        HttpRelayHandler,
+        request_queue_size=args.request_queue_size,
+    )
     server.timeout_s = args.timeout_s
     server.queue_timeout_s = args.queue_timeout_s
     server.max_inflight = args.max_inflight
@@ -1222,6 +1262,7 @@ def main(argv: list[str] | None = None) -> int:
     print(
         f"HTTP relay listening on {args.bind}:{args.port}; "
         f"max_inflight={args.max_inflight}; timeout_s={args.timeout_s:g}; "
+        f"request_queue_size={args.request_queue_size}; "
         f"attempts={args.upstream_attempts}; "
         f"nat64_prefixes={','.join(map(str, server.nat64_prefixes))}; "
         f"wikimedia_max_long_edge={server.wikimedia_max_long_edge}; authentication=disabled",

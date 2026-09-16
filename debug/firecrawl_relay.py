@@ -43,7 +43,7 @@ import socket
 import sys
 import threading
 import time
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer as _StdThreadingHTTPServer
 from urllib.error import HTTPError, URLError
 from urllib.parse import unquote, urlsplit
 from urllib.request import Request, urlopen
@@ -69,7 +69,12 @@ DEFAULT_BROWSER_DELETE_ATTEMPTS = 1
 DEFAULT_RETRY_DELAY_S = 3.0
 DEFAULT_BROWSER_RETRY_DELAY_S = 2.0
 DEFAULT_POOL_PERSIST_EVERY = 10000
+DEFAULT_REQUEST_QUEUE_SIZE = 512
 _TRANSIENT_HTTP_STATUS_CODES = {408, 429, 500, 502, 503, 504}
+_FIRECRAWL_ACCOUNT_AUTH_ERROR_MARKERS = (
+    "account has been banned",
+    "account is banned",
+)
 _SNAKE_TO_CAMEL = {
     "include_tags": "includeTags",
     "exclude_tags": "excludeTags",
@@ -234,7 +239,11 @@ def _firecrawl_response_details(
         status_code=api_status_code,
         response_body=root_error,
     )
-    auth_error = api_status_code == 401 and target_status is None
+    auth_error = _is_firecrawl_account_auth_error(
+        status_code=api_status_code,
+        response_body=root_error,
+        target_status=target_status,
+    )
     target_failure = target_status is not None and target_status != 200
     success = (
         200 <= http_status_code < 300
@@ -248,6 +257,22 @@ def _firecrawl_response_details(
     if not error and not success:
         error = f"Firecrawl HTTP {http_status_code}"
     return success, api_status_code or target_status, credits_used, error, auth_error, credit_error
+
+
+def _is_firecrawl_account_auth_error(
+    *,
+    status_code: int | None,
+    response_body: str,
+    target_status: int | None,
+) -> bool:
+    """Recognize account-level auth failures without treating page 401s as key failures."""
+
+    if target_status is not None:
+        return False
+    if status_code == 401:
+        return True
+    message = str(response_body or "").lower()
+    return any(marker in message for marker in _FIRECRAWL_ACCOUNT_AUTH_ERROR_MARKERS)
 
 
 def _browser_image_diagnostics(response_body: bytes) -> dict[str, object]:
@@ -338,6 +363,23 @@ def _log_upstream(
         fields.append(f"error_type={error.__class__.__name__}")
         fields.append(f"error={str(getattr(error, 'reason', error))!r}")
     print("[firecrawl-relay-upstream] " + " ".join(fields), file=sys.stderr, flush=True)
+
+
+class ThreadingHTTPServer(_StdThreadingHTTPServer):
+    def __init__(
+        self,
+        server_address: tuple[str, int],
+        request_handler_class: type[BaseHTTPRequestHandler],
+        *,
+        request_queue_size: int = DEFAULT_REQUEST_QUEUE_SIZE,
+    ) -> None:
+        # socketserver.TCPServer defaults this to 5. Set it before the parent
+        # constructor calls listen(), otherwise high fan-in connections can be
+        # reset before they reach the relay handler.
+        if request_queue_size <= 0:
+            raise ValueError("request_queue_size must be positive")
+        self.request_queue_size = int(request_queue_size)
+        super().__init__(server_address, request_handler_class)
 
 
 class IPv6ThreadingHTTPServer(ThreadingHTTPServer):
@@ -870,6 +912,18 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--bind", default="::", help="Bind address; default is all IPv6 interfaces.")
     parser.add_argument("--port", type=int, default=18081, help="Listen port.")
     parser.add_argument(
+        "--request-queue-size",
+        type=int,
+        default=int(
+            os.environ.get("FIRECRAWL_RELAY_REQUEST_QUEUE_SIZE")
+            or DEFAULT_REQUEST_QUEUE_SIZE
+        ),
+        help=(
+            "TCP listen backlog before requests enter Python handlers "
+            f"(default: {DEFAULT_REQUEST_QUEUE_SIZE}; Python's default is 5)."
+        ),
+    )
+    parser.add_argument(
         "--keys-file",
         default=os.environ.get("FIRECRAWL_RELAY_KEYS_FILE"),
         help="Relay-owned key file; enabling this makes the relay select real upstream keys.",
@@ -964,10 +1018,11 @@ def main(argv: list[str] | None = None) -> int:
         or args.queue_timeout_s < 0
         or args.retry_delay_s < 0
         or args.pool_persist_every <= 0
+        or args.request_queue_size <= 0
     ):
         raise SystemExit(
             "timeouts and retry delay must be non-negative; "
-            "timeout and --pool-persist-every must be positive."
+            "timeout, --pool-persist-every, and --request-queue-size must be positive."
         )
     text_attempts = args.text_upstream_attempts if args.text_upstream_attempts is not None else args.upstream_attempts
     text_timeout_s = args.text_timeout_s if args.text_timeout_s is not None else args.timeout_s
@@ -992,7 +1047,11 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit("retry delays must be non-negative.")
 
     server_class = IPv6ThreadingHTTPServer if ":" in args.bind else ThreadingHTTPServer
-    server = server_class((args.bind, args.port), FirecrawlRelayHandler)
+    server = server_class(
+        (args.bind, args.port),
+        FirecrawlRelayHandler,
+        request_queue_size=args.request_queue_size,
+    )
     server.upstream_base = args.upstream
     server.timeout_s = args.timeout_s
     server.queue_timeout_s = args.queue_timeout_s
@@ -1021,6 +1080,7 @@ def main(argv: list[str] | None = None) -> int:
     print(
         f"Firecrawl relay listening on {args.bind}:{args.port}; "
         f"upstream={args.upstream}; max_inflight={args.max_inflight}; "
+        f"request_queue_size={args.request_queue_size}; "
         f"text_attempts={server.text_upstream_attempts}; "
         f"browser_image_attempts={server.browser_image_attempts}; "
         f"browser_execute_attempts={server.browser_execute_attempts}; "

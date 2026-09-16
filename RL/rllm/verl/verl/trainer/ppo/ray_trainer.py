@@ -777,7 +777,11 @@ class RayPPOTrainer:
     def _save_checkpoint(self):
         from verl.utils.fs import local_mkdir_safe
 
-        # path: given_path + `/global_step_{global_steps}` + `/actor`
+        # The tracker is updated only after the distributed checkpoint
+        # metadata, extra state, and dataloader state are all present.  This
+        # prevents a worker failure during save from making a partially
+        # written checkpoint look resumable, while preserving the existing
+        # max_actor_ckpt_to_keep cleanup bookkeeping.
         local_global_step_folder = os.path.join(
             self.config.trainer.default_local_dir, f"global_step_{self.global_steps}"
         )
@@ -788,7 +792,11 @@ class RayPPOTrainer:
         actor_remote_path = (
             None
             if self.config.trainer.default_hdfs_dir is None
-            else os.path.join(self.config.trainer.default_hdfs_dir, f"global_step_{self.global_steps}", "actor")
+            else os.path.join(
+                self.config.trainer.default_hdfs_dir,
+                f"global_step_{self.global_steps}",
+                "actor",
+            )
         )
 
         remove_previous_ckpt_in_save = self.config.trainer.get("remove_previous_ckpt_in_save", False)
@@ -827,12 +835,78 @@ class RayPPOTrainer:
         dataloader_state_dict = self.train_dataloader.state_dict()
         torch.save(dataloader_state_dict, dataloader_local_path)
 
-        # latest checkpointed iteration tracker (for atomic usage)
+        # Megatron torch_dist checkpoints are not loadable without the
+        # metadata file.  transformer_config.json is the saved "extra" state
+        # required by the Megatron checkpoint manager.  When Megatron uses
+        # the HF bridge for model weights, also require the HF config and at
+        # least one model weight file.  Check these before publishing the
+        # tracker so a partial save cannot be selected by resume=auto.
+        actor_path = os.path.join(local_global_step_folder, "actor")
+        actor_strategy = self.config.actor_rollout_ref.actor.get("strategy", "")
+        required_paths = [dataloader_local_path]
+        if actor_strategy == "megatron":
+            actor_dist_path = os.path.join(actor_path, "dist_ckpt")
+            required_paths.extend(
+                [
+                    os.path.join(actor_dist_path, ".metadata"),
+                    os.path.join(actor_path, "transformer_config.json"),
+                ]
+            )
+
+            use_dist_checkpointing = bool(
+                self.config.actor_rollout_ref.actor.megatron.get("use_dist_checkpointing", False)
+            )
+            if not use_dist_checkpointing:
+                hf_path = os.path.join(actor_path, "huggingface")
+                required_paths.append(os.path.join(hf_path, "config.json"))
+                try:
+                    hf_weight_files = [
+                        name
+                        for name in os.listdir(hf_path)
+                        if name.endswith((".safetensors", ".bin", ".pt"))
+                        and ("model" in name or name.startswith("pytorch_"))
+                    ]
+                except FileNotFoundError:
+                    hf_weight_files = []
+                if not hf_weight_files:
+                    required_paths.append(os.path.join(hf_path, "<model weights>"))
+        else:
+            # FSDP checkpoints use rank-sharded .pt files rather than the
+            # Megatron dist_ckpt layout.  Requiring one model, optimizer, and
+            # extra shard keeps this guard safe for the other trainer path.
+            try:
+                actor_files = os.listdir(actor_path)
+            except FileNotFoundError:
+                actor_files = []
+            fsdp_missing = []
+            if not any(name.startswith("model_world_size_") and name.endswith(".pt") for name in actor_files):
+                fsdp_missing.append(os.path.join(actor_path, "<model shard>"))
+            if not any(name.startswith("optim_world_size_") and name.endswith(".pt") for name in actor_files):
+                fsdp_missing.append(os.path.join(actor_path, "<optimizer shard>"))
+            if not any(name.startswith("extra_state_world_size_") and name.endswith(".pt") for name in actor_files):
+                fsdp_missing.append(os.path.join(actor_path, "<extra shard>"))
+            required_paths.extend(fsdp_missing)
+        missing_paths = [path for path in required_paths if not os.path.isfile(path) or os.path.getsize(path) == 0]
+        if missing_paths:
+            print(
+                "WARNING: checkpoint validation failed; keeping the incomplete directory but "
+                "leaving the previous resume tracker unchanged. "
+                f"Missing/empty files: {missing_paths}. "
+                f"Incomplete directory: {local_global_step_folder}"
+            )
+            return
+
+        # latest checkpointed iteration tracker (for atomic usage).  This is
+        # deliberately written last, so resume=auto can only select a
+        # checkpoint that passed the completeness checks above.
         local_latest_checkpointed_iteration = os.path.join(
             self.config.trainer.default_local_dir, "latest_checkpointed_iteration.txt"
         )
-        with open(local_latest_checkpointed_iteration, "w") as f:
+        local_latest_checkpointed_iteration_tmp = f"{local_latest_checkpointed_iteration}.tmp.{os.getpid()}"
+        with open(local_latest_checkpointed_iteration_tmp, "w") as f:
             f.write(str(self.global_steps))
+        os.replace(local_latest_checkpointed_iteration_tmp, local_latest_checkpointed_iteration)
+        print(f"Published complete checkpoint: {local_global_step_folder}")
 
     def _load_checkpoint(self):
         if self.config.trainer.resume_mode == "disable":

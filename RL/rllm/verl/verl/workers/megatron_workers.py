@@ -840,10 +840,13 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         data.meta_info["max_token_len"] = self.config.rollout.log_prob_max_token_len_per_gpu
         data.meta_info["use_dynamic_bsz"] = self.config.rollout.log_prob_use_dynamic_bsz
         data.meta_info["temperature"] = self.config.rollout.temperature
-        # Entropy is only needed when entropy regularization is enabled.  It
-        # used to be computed unconditionally here, even though the RL
-        # configurations currently set entropy_coeff=0.0.
-        calculate_entropy = float(self.config.actor.entropy_coeff) != 0.0
+        # Entropy is normally needed for entropy regularization.  DeepResearch
+        # can additionally request it as a monitoring-only signal; this keeps
+        # entropy_coeff=0.0 from changing the PPO objective.
+        calculate_entropy = (
+            float(self.config.actor.entropy_coeff) != 0.0
+            or bool(self.config.actor.log_entropy)
+        )
         output, entropys = self.actor.compute_log_prob(
             data=data, calculate_entropy=calculate_entropy
         )

@@ -46,7 +46,7 @@ import socket
 import sys
 import threading
 import time
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer as _StdThreadingHTTPServer
 
 
 MAX_REQUEST_BODY_BYTES = 64 * 1024 * 1024
@@ -56,6 +56,7 @@ DEFAULT_QUEUE_TIMEOUT_S = 60.0
 DEFAULT_MAX_INFLIGHT = 8
 DEFAULT_UPSTREAM_ATTEMPTS = 2
 DEFAULT_RETRY_DELAY_S = 3.0
+DEFAULT_REQUEST_QUEUE_SIZE = 512
 _SAFE_SEGMENT_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
 
@@ -214,6 +215,22 @@ def _log_upload(
     print("[oss-relay-upload] " + " ".join(fields), file=sys.stderr, flush=True)
 
 
+class ThreadingHTTPServer(_StdThreadingHTTPServer):
+    def __init__(
+        self,
+        server_address: tuple[str, int],
+        request_handler_class: type[BaseHTTPRequestHandler],
+        *,
+        request_queue_size: int = DEFAULT_REQUEST_QUEUE_SIZE,
+    ) -> None:
+        # socketserver.TCPServer defaults this to 5. Set it before the parent
+        # constructor calls listen() so high fan-in connections reach handlers.
+        if request_queue_size <= 0:
+            raise ValueError("request_queue_size must be positive")
+        self.request_queue_size = int(request_queue_size)
+        super().__init__(server_address, request_handler_class)
+
+
 class IPv6ThreadingHTTPServer(ThreadingHTTPServer):
     address_family = socket.AF_INET6
     daemon_threads = True
@@ -348,6 +365,18 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--bind", default="::", help="Bind address; default is all IPv6 interfaces.")
     parser.add_argument("--port", type=int, default=18082, help="Listen port; default is 18082.")
     parser.add_argument(
+        "--request-queue-size",
+        type=int,
+        default=int(
+            os.environ.get("OSS_RELAY_REQUEST_QUEUE_SIZE")
+            or DEFAULT_REQUEST_QUEUE_SIZE
+        ),
+        help=(
+            "TCP listen backlog before requests enter Python handlers "
+            f"(default: {DEFAULT_REQUEST_QUEUE_SIZE}; Python's default is 5)."
+        ),
+    )
+    parser.add_argument(
         "--token",
         default=os.environ.get("OSS_RELAY_TOKEN"),
         help="Optional shared relay token; defaults to OSS_RELAY_TOKEN.",
@@ -384,13 +413,25 @@ def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     if not 1 <= args.port <= 65535:
         raise SystemExit("--port must be between 1 and 65535.")
-    if args.timeout_s <= 0 or args.queue_timeout_s < 0 or args.retry_delay_s < 0:
-        raise SystemExit("timeouts and retry delay must be non-negative; timeout must be positive.")
+    if (
+        args.timeout_s <= 0
+        or args.queue_timeout_s < 0
+        or args.retry_delay_s < 0
+        or args.request_queue_size <= 0
+    ):
+        raise SystemExit(
+            "timeout and request queue size must be positive; "
+            "queue timeout and retry delay must be non-negative."
+        )
     if args.max_inflight <= 0 or args.upstream_attempts <= 0:
         raise SystemExit("--max-inflight and --upstream-attempts must be positive.")
 
     server_class = IPv6ThreadingHTTPServer if ":" in args.bind else ThreadingHTTPServer
-    server = server_class((args.bind, args.port), OSSRelayHandler)
+    server = server_class(
+        (args.bind, args.port),
+        OSSRelayHandler,
+        request_queue_size=args.request_queue_size,
+    )
     server.relay_token = args.token
     server.timeout_s = args.timeout_s
     server.queue_timeout_s = args.queue_timeout_s
@@ -400,7 +441,9 @@ def main(argv: list[str] | None = None) -> int:
     server.upstream_slots = threading.BoundedSemaphore(args.max_inflight)
     print(
         f"OSS relay listening on {args.bind}:{args.port}; "
-        f"max_inflight={args.max_inflight}; token_required={bool(args.token)}",
+        f"max_inflight={args.max_inflight}; "
+        f"request_queue_size={args.request_queue_size}; "
+        f"token_required={bool(args.token)}",
         flush=True,
     )
     try:

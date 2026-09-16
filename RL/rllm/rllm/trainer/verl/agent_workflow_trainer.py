@@ -1,8 +1,10 @@
 import asyncio
 import json
+import logging
 import math
 import os
 import threading
+import time
 import uuid
 from collections import Counter, defaultdict
 from functools import reduce
@@ -39,6 +41,42 @@ from rllm.engine.rollout.verl_engine import VerlEngine
 from rllm.engine.tool_cache import EpochToolCache
 from rllm.utils.episode_logger import EpisodeLogger
 from rllm.workflows.workflow import TerminationReason
+
+
+logger = logging.getLogger(__name__)
+
+
+def _signal_pre_update_restart(watcher_path: str | None) -> bool:
+    """Write a restart request when the configured watcher file is empty.
+
+    The trainer is the only writer on this path. Opening in append/update mode
+    creates a missing file without truncating a pending command. Returning a
+    boolean keeps the helper easy to verify and lets callers distinguish a new
+    signal from an already-pending one.
+    """
+    if not watcher_path:
+        return False
+
+    try:
+        with open(watcher_path, "a+", encoding="utf-8") as watcher_file:
+            watcher_file.seek(0, os.SEEK_END)
+            if watcher_file.tell() != 0:
+                return False
+            watcher_file.write("RESTART")
+            watcher_file.flush()
+        logger.info("[RL_PRE_UPDATE_EVENT] wrote RESTART to %s", watcher_path)
+        return True
+    except Exception:
+        # A watcher-side filesystem problem must not discard an expensive
+        # rollout batch or terminate training immediately before its update.
+        # The context manager closes an opened file even when seek/write/flush
+        # raises; failures before open completes have no handle to close.
+        logger.warning(
+            "[RL_PRE_UPDATE_EVENT] failed to inspect/write %s; continuing update",
+            watcher_path,
+            exc_info=True,
+        )
+        return False
 
 
 class AgentWorkflowPPOTrainer(RayPPOTrainer):
@@ -198,6 +236,10 @@ class AgentWorkflowPPOTrainer(RayPPOTrainer):
         metrics = {}
         timing_raw = {}
         rollout_latency_metrics = {}
+        rollout_dropped_groups = 0
+        rollout_tail_dropped_groups = 0
+        rollout_multimodal_alignment_dropped_groups = 0
+        rejection_dropped_groups = 0
         last_checkpoint_step = None
 
         for epoch in range(self.config.trainer.total_epochs):
@@ -261,6 +303,46 @@ class AgentWorkflowPPOTrainer(RayPPOTrainer):
                     rollout_latency_metrics = final_gen_batch_output.meta_info.pop(
                         "rollout_latency", {}
                     )
+                    rollout_dropped_groups += int(
+                        final_gen_batch_output.meta_info.pop(
+                            "rollout_dropped_group_count", 0
+                        )
+                    )
+                    rollout_tail_dropped_groups += int(
+                        final_gen_batch_output.meta_info.pop(
+                            "rollout_tail_dropped_group_count", 0
+                        )
+                    )
+                    rollout_multimodal_alignment_dropped_groups += int(
+                        final_gen_batch_output.meta_info.pop(
+                            "rollout_multimodal_alignment_dropped_group_count",
+                            0,
+                        )
+                    )
+
+                    # If every group in this rollout batch was discarded
+                    # (for example, due to multimodal alignment failures),
+                    # there is no valid update to perform.  Skip this
+                    # dataloader item instead of passing a zero-row batch to
+                    # Megatron/FSDP.
+                    if final_gen_batch_output.batch["input_ids"].shape[0] == 0:
+                        _empty_batch = True
+                        continue
+
+                    # The rollout collector may intentionally return only
+                    # complete RLOO/GRPO groups after dropping the unfinished
+                    # long-tail groups.  Select the matching repeated input
+                    # rows before applying repeat_counts; otherwise the
+                    # generated rows and source batch would be misaligned.
+                    rollout_task_ids = final_gen_batch_output.meta_info.pop(
+                        "rollout_task_ids", None
+                    )
+                    if rollout_task_ids is not None:
+                        kept_task_ids = np.unique(rollout_task_ids)
+                        source_task_ids = new_batch.non_tensor_batch["task_ids"]
+                        keep_mask = np.isin(source_task_ids, kept_task_ids)
+                        if not np.all(keep_mask):
+                            new_batch = new_batch[keep_mask]
 
                     # need to repeat to make shape match
                     repeat_counts = final_gen_batch_output.meta_info["repeat_counts"]
@@ -290,6 +372,9 @@ class AgentWorkflowPPOTrainer(RayPPOTrainer):
                             solve_all += 1
                         else:
                             solve_partial += 1
+
+                    if self.config.rllm.rejection_sample.enable:
+                        rejection_dropped_groups += len(drop_uids)
 
                     # Build a view with a single item per episode_id for metrics/logging
                     seen_episodes = set()
@@ -412,8 +497,19 @@ class AgentWorkflowPPOTrainer(RayPPOTrainer):
                                 loss_mask=response_masks,
                                 loss_agg_mode=loss_agg_mode,
                             )
+                            entropy_token_mean = torch.sum(
+                                entropys * response_masks
+                            ) / torch.clamp(
+                                torch.sum(response_masks), min=1
+                            )
                             old_log_prob_metrics = {
-                                "actor/entropy": entropy_agg.detach().item()
+                                # This follows the configured loss aggregation
+                                # and can therefore scale with response length
+                                # under seq-mean-token-sum.
+                                "actor/entropy": entropy_agg.detach().item(),
+                                # Length-normalized entropy is the stable
+                                # policy-exploration diagnostic for W&B.
+                                "actor/entropy_token_mean": entropy_token_mean.detach().item(),
                             }
                             metrics.update(old_log_prob_metrics)
                             old_log_prob.batch.pop("entropys")
@@ -594,6 +690,9 @@ class AgentWorkflowPPOTrainer(RayPPOTrainer):
                         # implement critic warmup
                         if self.config.trainer.critic_warmup <= self.global_steps:
                             # update actor
+                            _signal_pre_update_restart(
+                                os.getenv("RLLM_PRE_UPDATE_WATCHER_PATH")
+                            )
                             with marked_timer("update_actor", timing_raw, color="red"):
                                 actor_output = self.actor_rollout_wg.update_actor(batch)
                             actor_output_metrics = reduce_metrics(
@@ -663,9 +762,63 @@ class AgentWorkflowPPOTrainer(RayPPOTrainer):
                 metrics["batch/solve_none"] = solve_none / max(num_tasks, 1)
                 metrics["batch/solve_all"] = solve_all / max(num_tasks, 1)
                 metrics["batch/solve_partial"] = solve_partial / max(num_tasks, 1)
+                metrics["batch/rollout_dropped_groups"] = rollout_dropped_groups
+                metrics["batch/rollout_tail_dropped_groups"] = (
+                    rollout_tail_dropped_groups
+                )
+                metrics["batch/rollout_multimodal_alignment_dropped_groups"] = (
+                    rollout_multimodal_alignment_dropped_groups
+                )
+                metrics["batch/rejection_dropped_groups"] = rejection_dropped_groups
+                metrics["batch/dropped_groups"] = (
+                    rollout_dropped_groups + rejection_dropped_groups
+                )
 
                 for key, value in workflow_metrics.items():
                     metrics[f"batch/{key}"] = np.mean(value)
+
+                # Per-episode workflow metrics are averaged above. Derive
+                # conditional duplicate-search scorer rates here so a zero
+                # from trajectories with fewer than two eligible searches is
+                # not mistaken for an unusually fast embedding request.
+                redundancy_prefix = "batch/search_redundancy"
+                redundancy_enabled = metrics.get(f"{redundancy_prefix}/enabled", 0.0)
+                redundancy_scored = metrics.get(f"{redundancy_prefix}/scored", 0.0)
+                if redundancy_enabled > 0.0:
+                    metrics[f"{redundancy_prefix}/scored_rate"] = (
+                        redundancy_scored / redundancy_enabled
+                    )
+                    metrics[f"{redundancy_prefix}/embedding_failure_rate"] = (
+                        metrics.get(
+                            f"{redundancy_prefix}/embedding_request_failed", 0.0
+                        )
+                        / redundancy_enabled
+                    )
+                    metrics[f"{redundancy_prefix}/raw_penalized_rate"] = (
+                        metrics.get(
+                            f"{redundancy_prefix}/raw_penalized_trajectory", 0.0
+                        )
+                        / redundancy_enabled
+                    )
+                    metrics[f"{redundancy_prefix}/penalized_rate"] = (
+                        metrics.get(
+                            f"{redundancy_prefix}/penalized_trajectory", 0.0
+                        )
+                        / redundancy_enabled
+                    )
+                if redundancy_scored > 0.0:
+                    metrics[f"{redundancy_prefix}/embedding_request_avg_s"] = (
+                        metrics.get(
+                            f"{redundancy_prefix}/embedding_request_s", 0.0
+                        )
+                        / redundancy_scored
+                    )
+                    metrics[f"{redundancy_prefix}/embedding_queue_wait_avg_s"] = (
+                        metrics.get(
+                            f"{redundancy_prefix}/embedding_queue_wait_s", 0.0
+                        )
+                        / redundancy_scored
+                    )
 
                 if "num_turns" in workflow_metrics and workflow_metrics["num_turns"]:
                     turns = workflow_metrics["num_turns"]
@@ -695,6 +848,10 @@ class AgentWorkflowPPOTrainer(RayPPOTrainer):
                 solve_all = 0
                 solve_partial = 0
                 num_tasks = 0
+                rollout_dropped_groups = 0
+                rollout_tail_dropped_groups = 0
+                rollout_multimodal_alignment_dropped_groups = 0
+                rejection_dropped_groups = 0
                 termination_counts = Counter()
                 workflow_metrics = defaultdict(list)
                 metrics = {}
@@ -740,6 +897,15 @@ class AgentWorkflowPPOTrainer(RayPPOTrainer):
 
         for test_data in self.val_dataloader:
             test_batch = DataProto.from_single_dict(test_data)
+
+            # The workflow rebuilds ``multi_modal_inputs`` from the exact
+            # payload used during rollout.  Dataset batches can already carry
+            # an independently constructed (and potentially stale) copy of
+            # this field.  Keep the rollout-owned value so DataProto.union()
+            # does not compare two different PIL/tensor payload objects.  The
+            # training path applies the same cleanup above.
+            test_batch.non_tensor_batch.pop("multi_modal_inputs", None)
+
             test_batch.non_tensor_batch["task_ids"] = np.array(
                 [str(uuid.uuid4()) for _ in range(len(test_batch.batch))], dtype=object
             )
@@ -756,6 +922,21 @@ class AgentWorkflowPPOTrainer(RayPPOTrainer):
             test_output_gen_batch = self.generate_trajectories(batch=test_batch)
             if self.episode_logger is None:
                 self._dump_trajectories(step=self.global_steps, mode="val")
+
+            # Multimodal alignment validation may discard a complete task
+            # group.  Mirror the training path and align the source rows with
+            # the task ids that survived rollout before applying
+            # ``repeat_counts`` and merging the two DataProto objects.
+            rollout_task_ids = test_output_gen_batch.meta_info.pop(
+                "rollout_task_ids", None
+            )
+            if rollout_task_ids is not None:
+                kept_task_ids = np.unique(rollout_task_ids)
+                source_task_ids = test_batch.non_tensor_batch["task_ids"]
+                keep_mask = np.isin(source_task_ids, kept_task_ids)
+                if not np.all(keep_mask):
+                    test_batch = test_batch[keep_mask]
+
             repeat_counts = test_output_gen_batch.meta_info["repeat_counts"]
             # need to repeat to make shape match
             test_batch = test_batch.sample_level_repeat(repeat_counts)

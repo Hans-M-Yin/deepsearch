@@ -592,6 +592,8 @@ class AsyncHttpServerAdapter(HttpServerAdapter):
         max_attempts: int = DEFAULT_MAX_ATTEMPTS,
         retry_delay: float = DEFAULT_RETRY_DELAY,
         max_connections: int = DEFAULT_MAX_CONNECTIONS,
+        lifecycle_timeout: float = 600.0,
+        lifecycle_max_attempts: int = 1,
         first_rank_in_node: bool = False,
         launch_server: bool = True,
         **kwargs: Any,
@@ -626,6 +628,11 @@ class AsyncHttpServerAdapter(HttpServerAdapter):
             **kwargs,
         )
         self.max_connections: int = max_connections
+        self.lifecycle_timeout: float = max(float(lifecycle_timeout), float(timeout))
+        # Never retry release/resume.  They mutate CUDA virtual-memory state;
+        # after a client-side timeout the first request may already have run.
+        self.lifecycle_max_attempts: int = max(1, min(int(lifecycle_max_attempts), 1))
+        self._lifecycle_lock = asyncio.Lock()
 
     @asynccontextmanager
     async def _get_session(self) -> aiohttp.ClientSession:
@@ -662,6 +669,7 @@ class AsyncHttpServerAdapter(HttpServerAdapter):
         method: str = "POST",
         timeout: float = DEFAULT_TIMEOUT,
         only_master: bool = True,
+        max_attempts: Optional[int] = None,
     ) -> dict[str, Any]:
         """Make an async HTTP request with retry logic and consistent error handling.
 
@@ -688,7 +696,8 @@ class AsyncHttpServerAdapter(HttpServerAdapter):
 
         url = f"http://{self.server_args.host}:{self.server_args.port}/{endpoint}"
 
-        for attempt in range(self.max_attempts):
+        attempts = max(1, int(self.max_attempts if max_attempts is None else max_attempts))
+        for attempt in range(attempts):
             try:
                 async with self._get_session() as session:
                     if method.upper() == "GET":
@@ -709,13 +718,55 @@ class AsyncHttpServerAdapter(HttpServerAdapter):
                 raise
             except Exception as e:
                 logger.error(f"Unexpected error for {endpoint}: {e}")
-                if attempt == self.max_attempts - 1:
+                if attempt == attempts - 1:
                     raise
 
-            if attempt < self.max_attempts - 1:
+            if attempt < attempts - 1:
                 await asyncio.sleep(self.retry_delay * (2**attempt))
 
-        raise RuntimeError(f"Failed to complete async request to {endpoint} after {self.max_attempts} attempts")
+        raise RuntimeError(f"Failed to complete async request to {endpoint} after {attempts} attempts")
+
+    async def _make_lifecycle_request(
+        self,
+        endpoint: str,
+        payload: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        """Run one serialized, non-retriable memory-saver lifecycle request.
+
+        ``release_memory_occupation`` and ``resume_memory_occupation`` are not
+        ordinary idempotent HTTP calls.  If the server completes the CUDA
+        operation but the response is lost, retrying can allocate/map the same
+        memory state a second time and surface as a misleading cuMemCreate OOM.
+        """
+        async with self._lifecycle_lock:
+            started = time.monotonic()
+            logger.warning(
+                "[SGLANG_LIFECYCLE] endpoint=%s timeout_s=%.1f attempts=%d",
+                endpoint,
+                self.lifecycle_timeout,
+                self.lifecycle_max_attempts,
+            )
+            try:
+                result = await self._make_async_request(
+                    endpoint,
+                    payload,
+                    timeout=self.lifecycle_timeout,
+                    max_attempts=self.lifecycle_max_attempts,
+                )
+            except Exception:
+                logger.exception(
+                    "[SGLANG_LIFECYCLE_ERROR] endpoint=%s elapsed_s=%.3f "
+                    "request_state=unknown; refusing automatic retry",
+                    endpoint,
+                    time.monotonic() - started,
+                )
+                raise
+            logger.warning(
+                "[SGLANG_LIFECYCLE_DONE] endpoint=%s elapsed_s=%.3f",
+                endpoint,
+                time.monotonic() - started,
+            )
+            return result
 
     async def release_memory_occupation(self, tags: Optional[list[str]] = None) -> dict[str, Any]:
         """Release GPU memory occupation temporarily (async version).
@@ -727,7 +778,7 @@ class AsyncHttpServerAdapter(HttpServerAdapter):
         Returns:
             Dict[str, Any]: Server response indicating memory release status
         """
-        return await self._make_async_request("release_memory_occupation", {"tags": tags})
+        return await self._make_lifecycle_request("release_memory_occupation", {"tags": tags})
 
     async def resume_memory_occupation(self, tags: Optional[list[str]] = None) -> dict[str, Any]:
         """Resume GPU memory occupation (async version).
@@ -742,7 +793,7 @@ class AsyncHttpServerAdapter(HttpServerAdapter):
         Returns:
             Dict[str, Any]: Server response indicating memory resume status
         """
-        return await self._make_async_request("resume_memory_occupation", {"tags": tags})
+        return await self._make_lifecycle_request("resume_memory_occupation", {"tags": tags})
 
     async def update_weights_from_tensor(
         self,
@@ -951,4 +1002,9 @@ class AsyncHttpServerAdapter(HttpServerAdapter):
         Returns:
             Dict[str, Any]: Server response indicating abort status
         """
-        return await self._make_async_request("abort_request", {"rid": rid, "abort_all": abort_all})
+        return await self._make_async_request(
+            "abort_request",
+            {"rid": rid, "abort_all": abort_all},
+            timeout=min(self.timeout, 15.0),
+            max_attempts=1,
+        )

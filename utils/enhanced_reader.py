@@ -16,17 +16,20 @@ from html.parser import HTMLParser
 import hashlib
 import itertools
 import json
+import logging
+from logging.handlers import RotatingFileHandler
 import os
 from pathlib import Path
 import re
 import sys
 import time
-from typing import Any
+from typing import Any, AsyncIterator
 from urllib.parse import urlparse
 
 import httpx
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
+from contextlib import asynccontextmanager
 
 
 RAW_READER_URL = os.environ.get("RAW_READER_URL", "http://127.0.0.1:8002")
@@ -52,9 +55,123 @@ RAW_MARKDOWN_CACHE_DIR = Path(os.environ.get("RAW_MARKDOWN_CACHE_DIR", str(ENHAN
 RAW_MARKDOWN_CACHE_TTL_S = float(os.environ.get("RAW_MARKDOWN_CACHE_TTL_S", str(ENHANCED_READER_CACHE_TTL_S)))
 RAW_MARKDOWN_CACHE_NEGATIVE_TTL_S = float(os.environ.get("RAW_MARKDOWN_CACHE_NEGATIVE_TTL_S", str(ENHANCED_READER_CACHE_NEGATIVE_TTL_S)))
 ENHANCED_READER_MODE = os.environ.get("ENHANCED_READER_MODE", "full").strip().lower()
+ENHANCED_READER_TIMING_LOG = Path(
+    os.environ.get("ENHANCED_READER_TIMING_LOG", "/tmp/enhanced_reader_timing_log")
+)
+ENHANCED_READER_TIMING_LOG_MAX_BYTES = int(
+    os.environ.get("ENHANCED_READER_TIMING_LOG_MAX_BYTES", str(64 * 1024 * 1024))
+)
+ENHANCED_READER_TIMING_LOG_BACKUP_COUNT = int(
+    os.environ.get("ENHANCED_READER_TIMING_LOG_BACKUP_COUNT", "2")
+)
+ENHANCED_READER_TIMING_ENABLED = os.environ.get("ENHANCED_READER_TIMING_ENABLED", "1").strip().lower() not in {
+    "0",
+    "false",
+    "no",
+    "off",
+}
+ENHANCED_READER_TIMING_STDERR = os.environ.get("ENHANCED_READER_TIMING_STDERR", "1").strip().lower() not in {
+    "0",
+    "false",
+    "no",
+    "off",
+}
+INTERNAL_READER_TRUST_ENV = os.environ.get("ENHANCED_READER_INTERNAL_TRUST_ENV", "0").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+INTERNAL_READER_MAX_CONNECTIONS = max(1, int(os.environ.get("ENHANCED_READER_INTERNAL_MAX_CONNECTIONS", "1024")))
+INTERNAL_READER_MAX_KEEPALIVE_CONNECTIONS = max(
+    1,
+    min(
+        INTERNAL_READER_MAX_CONNECTIONS,
+        int(os.environ.get("ENHANCED_READER_INTERNAL_MAX_KEEPALIVE_CONNECTIONS", "256")),
+    ),
+)
 
 
-app = FastAPI(title="Enhanced Reader API")
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    # 8004 -> 8003 -> 8002 is always a local service chain.  Reusing one
+    # client per Uvicorn worker preserves keep-alive connections under load.
+    # trust_env=False prevents HTTP_PROXY from accidentally proxying ::1 or
+    # 127.0.0.1 when NO_PROXY is incomplete.
+    app.state.internal_reader_client = httpx.AsyncClient(
+        timeout=httpx.Timeout(READER_TIMEOUT),
+        limits=httpx.Limits(
+            max_connections=INTERNAL_READER_MAX_CONNECTIONS,
+            max_keepalive_connections=INTERNAL_READER_MAX_KEEPALIVE_CONNECTIONS,
+        ),
+        trust_env=INTERNAL_READER_TRUST_ENV,
+    )
+    try:
+        yield
+    finally:
+        await app.state.internal_reader_client.aclose()
+
+
+app = FastAPI(title="Enhanced Reader API", lifespan=lifespan)
+
+
+@app.get("/__enhanced_reader/health")
+async def health() -> dict[str, Any]:
+    """A local readiness probe; it does not fetch an external webpage."""
+    return {
+        "status": "ok",
+        "mode": ENHANCED_READER_MODE,
+        "fetch_strategy": ENHANCED_READER_FETCH_STRATEGY,
+        "internal_reader_trust_env": INTERNAL_READER_TRUST_ENV,
+    }
+
+
+@asynccontextmanager
+async def _shared_internal_reader_client(request: Request) -> AsyncIterator[httpx.AsyncClient]:
+    """Borrow the worker-wide pooled client without closing it per request."""
+    yield request.app.state.internal_reader_client
+
+
+@asynccontextmanager
+async def _new_request_client() -> AsyncIterator[httpx.AsyncClient]:
+    """Use an isolated client when a request may also call a remote ReaderLM."""
+    async with httpx.AsyncClient() as client:
+        yield client
+
+
+def _build_timing_logger() -> logging.Logger:
+    logger = logging.getLogger("enhanced_reader.timing")
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    if logger.handlers:
+        return logger
+
+    formatter = logging.Formatter("%(message)s")
+    try:
+        ENHANCED_READER_TIMING_LOG.parent.mkdir(parents=True, exist_ok=True)
+        file_handler = RotatingFileHandler(
+            ENHANCED_READER_TIMING_LOG,
+            maxBytes=max(1, ENHANCED_READER_TIMING_LOG_MAX_BYTES),
+            backupCount=max(0, ENHANCED_READER_TIMING_LOG_BACKUP_COUNT),
+            encoding="utf-8",
+        )
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
+    except Exception as exc:
+        print(
+            f"[enhanced_reader][timing_log_init_error] path={ENHANCED_READER_TIMING_LOG} error={exc!r}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+    if ENHANCED_READER_TIMING_STDERR:
+        stream_handler = logging.StreamHandler(sys.stderr)
+        stream_handler.setFormatter(formatter)
+        logger.addHandler(stream_handler)
+    return logger
+
+
+_TIMING_LOGGER = _build_timing_logger() if ENHANCED_READER_TIMING_ENABLED else None
 
 
 def _parse_readerlm_api_bases() -> list[str]:
@@ -186,6 +303,161 @@ class StageError(Exception):
         super().__init__(f"{stage} failed: {cause}")
         self.stage = stage
         self.cause = cause
+
+
+class UpstreamHTTPError(RuntimeError):
+    """An HTTP failure whose useful upstream diagnostic data is retained.
+
+    ``httpx.Response.raise_for_status()`` keeps the response on its exception,
+    but its string form omits the response body.  That body is where Jina
+    Reader reports browser errors such as ``ERR_BLOCKED_BY_CLIENT``.  The
+    Enhanced Reader has two proxy hops (8004 -> 8003 -> 8002), so dropping it
+    at either hop makes a downstream failure needlessly opaque.
+    """
+
+    _FORWARDED_HEADERS = ("x-reader-dispatcher-backend",)
+    _BODY_FIELDS = ("code", "status", "name", "message", "readableMessage", "cause")
+
+    def __init__(self, response: httpx.Response) -> None:
+        self.status_code = int(response.status_code)
+        self.reason_phrase = response.reason_phrase
+        self.upstream_url = str(response.request.url)
+        self.headers = {
+            name: value
+            for name in self._FORWARDED_HEADERS
+            if (value := response.headers.get(name))
+        }
+        self.body_preview: str | None = None
+        self.body_json: dict[str, Any] | None = None
+
+        try:
+            payload = response.json()
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            payload = None
+
+        if isinstance(payload, dict):
+            self.body_json = self._compact_body_json(payload)
+        else:
+            try:
+                self.body_preview = _shorten(response.text, limit=1600)
+            except Exception:
+                self.body_preview = None
+
+        detail = self._message_detail()
+        description = f"Upstream HTTP {self.status_code} {self.reason_phrase} for {self.upstream_url}"
+        if detail:
+            description += f": {detail}"
+        super().__init__(description)
+
+    @classmethod
+    def _compact_body_json(cls, payload: dict[str, Any]) -> dict[str, Any]:
+        """Keep error semantics without forwarding arbitrary large payloads."""
+        compact = {name: payload[name] for name in cls._BODY_FIELDS if name in payload}
+        nested = payload.get("upstream_error")
+        if isinstance(nested, dict):
+            compact["upstream_error"] = nested
+        return compact
+
+    def _message_detail(self) -> str | None:
+        if self.body_json is not None:
+            messages = self._body_messages(self.body_json)
+            if messages:
+                # Keep the local hop's summary, then append the deepest
+                # upstream cause when this is 8004 receiving an 8003 error.
+                if len(messages) == 1:
+                    return messages[0]
+                return f"{messages[0]}; root cause: {messages[-1]}"
+        return self.body_preview
+
+    @classmethod
+    def _body_messages(cls, payload: dict[str, Any]) -> list[str]:
+        messages: list[str] = []
+        current: Any = payload
+        # An error produced by 8003 embeds the error it received from 8002 in
+        # ``upstream_error.body``. Follow a short bounded chain so 8004's
+        # plain-text error remains useful without recursively trusting input.
+        for _ in range(4):
+            if not isinstance(current, dict):
+                break
+            message = current.get("readableMessage") or current.get("message")
+            if message:
+                text = _shorten(message, limit=1600)
+                if text and text not in messages:
+                    messages.append(text)
+            nested = current.get("upstream_error")
+            if not isinstance(nested, dict):
+                break
+            current = nested.get("body", nested)
+        return messages
+
+    def details(self) -> dict[str, Any]:
+        details: dict[str, Any] = {
+            "status_code": self.status_code,
+            "reason": self.reason_phrase,
+            "url": self.upstream_url,
+        }
+        if self.headers:
+            details["headers"] = dict(self.headers)
+        if self.body_json is not None:
+            details["body"] = dict(self.body_json)
+        elif self.body_preview:
+            details["body_preview"] = self.body_preview
+        return details
+
+    def response_headers(self) -> dict[str, str]:
+        headers = {"X-Reader-Upstream-Status": str(self.status_code)}
+        backend = self.headers.get("x-reader-dispatcher-backend")
+        if backend:
+            headers["X-Reader-Dispatcher-Backend"] = backend
+        return headers
+
+
+def _raise_for_upstream_error(response: httpx.Response) -> None:
+    if response.is_error:
+        raise UpstreamHTTPError(response)
+
+
+def _propagated_status_code(exc: Exception) -> int:
+    if isinstance(exc, UpstreamHTTPError) and 400 <= exc.status_code <= 599:
+        return exc.status_code
+    return 502
+
+
+def _propagated_error_headers(exc: Exception, *, total_s: float | None = None) -> dict[str, str]:
+    headers: dict[str, str] = {}
+    if isinstance(exc, UpstreamHTTPError):
+        headers.update(exc.response_headers())
+    if total_s is not None:
+        headers["X-Debug-Timing-Total-S"] = f"{total_s:.6f}"
+    return headers
+
+
+def _stage_failure_payload(
+    *,
+    endpoint_name: str,
+    url: str,
+    stage: str,
+    exc: Exception,
+    timing: dict[str, Any],
+) -> tuple[int, str, dict[str, Any], dict[str, str]]:
+    """Build the same diagnosable failure envelope at 8003 and 8004."""
+    status_code = _propagated_status_code(exc)
+    message = f"{endpoint_name} error for {url}: {stage} failed: {exc}"
+    payload: dict[str, Any] = {
+        "data": None,
+        "code": status_code,
+        "status": status_code,
+        "message": message,
+        "debug_timing": timing,
+    }
+    if isinstance(exc, UpstreamHTTPError):
+        payload["upstream_error"] = exc.details()
+    return (
+        status_code,
+        message,
+        payload,
+        _propagated_error_headers(exc, total_s=timing.get("total_s")),
+    )
 
 
 def normalize_url(target_url: str) -> str:
@@ -1035,7 +1307,7 @@ async def fetch_html(client: httpx.AsyncClient, url: str) -> str:
         },
         timeout=READER_TIMEOUT,
     )
-    response.raise_for_status()
+    _raise_for_upstream_error(response)
     return response.text
 
 
@@ -1045,18 +1317,30 @@ async def fetch_markdown(client: httpx.AsyncClient, url: str) -> str:
         headers={"Accept": "text/plain"},
         timeout=READER_TIMEOUT,
     )
-    response.raise_for_status()
+    _raise_for_upstream_error(response)
     return response.text
 
 
 async def fetch_raw_markdown_via_cache_layer(client: httpx.AsyncClient, url: str) -> str:
     response = await client.get(
         f"{RAW_MARKDOWN_READER_URL.rstrip('/')}/{url}",
-        headers={"Accept": "text/plain"},
+        # 8003 returns plain Markdown on success, but its structured JSON
+        # response retains the 8002 diagnostic payload on failure.  Asking for
+        # JSON at this internal boundary therefore preserves both cases.
+        headers={"Accept": "application/json"},
         timeout=READER_TIMEOUT,
     )
-    response.raise_for_status()
-    return response.text
+    _raise_for_upstream_error(response)
+    try:
+        payload = response.json()
+        markdown = payload["data"]["content"]
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError(
+            f"Raw markdown reader returned a malformed success payload for {url}: {exc}"
+        ) from exc
+    if not isinstance(markdown, str):
+        raise RuntimeError(f"Raw markdown reader returned non-text content for {url}")
+    return markdown
 
 
 async def convert_html_to_markdown(
@@ -1209,6 +1493,29 @@ def _shorten(value: Any, limit: int = 800) -> str | None:
     return text[:limit] + "...<truncated>"
 
 
+def log_request_timing(
+    *,
+    endpoint: str,
+    url: str,
+    status: int,
+    timing: dict[str, Any],
+) -> None:
+    if not ENHANCED_READER_TIMING_ENABLED or _TIMING_LOGGER is None:
+        return
+    record = {
+        "event": "request_timing",
+        "endpoint": endpoint,
+        "url": _shorten(url, limit=1000),
+        "status": status,
+        "pid": os.getpid(),
+        "timing": timing,
+    }
+    _TIMING_LOGGER.info(
+        "[ENHANCED_READER_TIMING] "
+        + json.dumps(record, ensure_ascii=False, sort_keys=True, default=str)
+    )
+
+
 def record_failure_debug(
     timing: dict[str, Any],
     *,
@@ -1218,6 +1525,13 @@ def record_failure_debug(
     timing["failure_stage"] = stage
     timing["failure_exception_type"] = exc.__class__.__name__
     timing["failure_exception"] = _shorten(repr(exc), limit=1200)
+
+    if isinstance(exc, UpstreamHTTPError):
+        timing["failure_upstream_status_code"] = exc.status_code
+        timing["failure_upstream_reason"] = exc.reason_phrase
+        timing["failure_upstream_url"] = exc.upstream_url
+        timing["failure_upstream_error"] = exc.details()
+        return
 
     if isinstance(exc, httpx.HTTPStatusError):
         response = exc.response
@@ -1255,10 +1569,30 @@ async def read(target_url: str, request: Request):
     debug_timing: dict[str, Any] = {}
     refresh_cache = request.query_params.get("refresh", "").strip().lower() in {"1", "true", "yes"}
 
+    cache_path = _cache_path(url, wants_json=wants_json)
+    cache_started = time.perf_counter()
     if refresh_cache:
-        _delete_cache_path(_cache_path(url, wants_json=wants_json), label="enhanced_reader")
+        delete_started = time.perf_counter()
+        _delete_cache_path(cache_path, label="enhanced_reader")
+        debug_timing["cache_delete_s"] = time.perf_counter() - delete_started
+    cache_read_started = time.perf_counter()
     cached_payload = None if refresh_cache else _read_cache(url, wants_json=wants_json)
+    debug_timing["cache_read_s"] = time.perf_counter() - cache_read_started
+    debug_timing["cache_lookup_s"] = time.perf_counter() - cache_started
+    debug_timing["cache_path"] = str(cache_path)
+    debug_timing["cache_hit"] = cached_payload is not None
     if cached_payload is not None:
+        cached_payload = dict(cached_payload)
+        cached_debug_timing = dict(cached_payload.get("debug_timing") or {})
+        cached_debug_timing.update(debug_timing)
+        cached_debug_timing["total_s"] = time.perf_counter() - total_started
+        cached_payload["debug_timing"] = cached_debug_timing
+        cached_data = cached_payload.get("data")
+        if isinstance(cached_data, dict):
+            cached_data = dict(cached_data)
+            cached_data["debug_timing"] = dict(cached_debug_timing)
+            cached_payload["data"] = cached_data
+        log_request_timing(endpoint="enhanced", url=url, status=200, timing=cached_debug_timing)
         if wants_json:
             return cached_payload
         cached_data = cached_payload.get("data") or {}
@@ -1266,10 +1600,23 @@ async def read(target_url: str, request: Request):
         return Response(
             body,
             media_type="text/plain; charset=utf-8",
-            headers={"X-Enhanced-Reader-Cache": "hit"},
+            headers={
+                "X-Enhanced-Reader-Cache": "hit",
+                "X-Debug-Timing-Cache-Read-S": f"{debug_timing['cache_read_s']:.6f}",
+                # ``total_s`` is merged into the cached payload's timing,
+                # rather than the per-request ``debug_timing`` dictionary.
+                "X-Debug-Timing-Total-S": f"{cached_debug_timing['total_s']:.6f}",
+            },
         )
 
-    async with httpx.AsyncClient() as client:
+    # markdown_clean only talks to the local raw-markdown service.  Use the
+    # per-worker pooled client to avoid one TCP connection per request.
+    if ENHANCED_READER_FETCH_STRATEGY == "markdown_clean":
+        client_context = _shared_internal_reader_client(request)
+    else:
+        client_context = _new_request_client()
+
+    async with client_context as client:
         try:
             debug_timing["fetch_strategy"] = ENHANCED_READER_FETCH_STRATEGY
             if ENHANCED_READER_FETCH_STRATEGY == "parallel":
@@ -1300,7 +1647,9 @@ async def read(target_url: str, request: Request):
                 )
                 debug_timing["raw_markdown_chars"] = len(markdown_response or "")
                 debug_timing["raw_markdown_antibot"] = looks_like_antibot(markdown_response)
+                cleaning_started = time.perf_counter()
                 markdown, cleaning = clean_raw_markdown(markdown_response)
+                debug_timing["markdown_cleaning_s"] = time.perf_counter() - cleaning_started
                 debug_timing["markdown_cleaning"] = cleaning
                 debug_timing["cleaning_original_chars"] = cleaning["original_chars"]
                 debug_timing["cleaning_cleaned_chars"] = cleaning["cleaned_chars"]
@@ -1345,21 +1694,21 @@ async def read(target_url: str, request: Request):
         except StageError as exc:
             debug_timing["total_s"] = time.perf_counter() - total_started
             record_failure_debug(debug_timing, stage=exc.stage, exc=exc.cause)
-            message = f"Enhanced Reader error for {url}: {exc.stage} failed: {exc.cause}"
-            error_payload = {
-                "data": None,
-                "code": 502,
-                "status": 502,
-                "message": message,
-                "debug_timing": debug_timing,
-            }
+            status_code, message, error_payload, response_headers = _stage_failure_payload(
+                endpoint_name="Enhanced Reader",
+                url=url,
+                stage=exc.stage,
+                exc=exc.cause,
+                timing=debug_timing,
+            )
+            log_request_timing(endpoint="enhanced", url=url, status=status_code, timing=debug_timing)
             if wants_json:
-                return JSONResponse(status_code=502, content=error_payload)
+                return JSONResponse(status_code=status_code, content=error_payload, headers=response_headers)
             return Response(
                 message,
-                status_code=502,
+                status_code=status_code,
                 media_type="text/plain",
-                headers={"X-Debug-Timing-Total-S": f"{debug_timing['total_s']:.6f}"},
+                headers=response_headers,
             )
         except Exception as exc:
             debug_timing["total_s"] = time.perf_counter() - total_started
@@ -1372,6 +1721,7 @@ async def read(target_url: str, request: Request):
                 "message": message,
                 "debug_timing": debug_timing,
             }
+            log_request_timing(endpoint="enhanced", url=url, status=502, timing=debug_timing)
             if wants_json:
                 return JSONResponse(status_code=502, content=error_payload)
             return Response(
@@ -1400,7 +1750,12 @@ async def read(target_url: str, request: Request):
     }
     if isinstance(cleaning, dict):
         payload["data"]["cleaning"] = cleaning
+    cache_write_started = time.perf_counter()
     _write_cache(url, wants_json=wants_json, payload=payload, negative=content_quality in {"anti_bot", "empty"})
+    debug_timing["cache_write_s"] = time.perf_counter() - cache_write_started
+    debug_timing["cache_total_s"] = debug_timing.get("cache_lookup_s", 0.0) + debug_timing["cache_write_s"]
+    debug_timing["total_s"] = time.perf_counter() - total_started
+    log_request_timing(endpoint="enhanced", url=url, status=200, timing=debug_timing)
 
     if wants_json:
         return payload
@@ -1429,46 +1784,80 @@ async def read_raw_markdown(target_url: str, request: Request):
     wants_json = "application/json" in request.headers.get("accept", "")
     refresh_cache = request.query_params.get("refresh", "").strip().lower() in {"1", "true", "yes"}
 
+    cache_path = _raw_markdown_cache_path(url)
+    cache_started = time.perf_counter()
     if refresh_cache:
-        _delete_cache_path(_raw_markdown_cache_path(url), label="raw_markdown")
+        delete_started = time.perf_counter()
+        _delete_cache_path(cache_path, label="raw_markdown")
+    else:
+        delete_started = None
+    cache_read_started = time.perf_counter()
     cached_payload = None if refresh_cache else _read_raw_markdown_cache(url)
+    cache_read_s = time.perf_counter() - cache_read_started
     if cached_payload is not None:
         payload = dict(cached_payload)
-        payload.setdefault("debug_timing", {})
-        payload["debug_timing"].update(
+        debug_timing = dict(payload.get("debug_timing") or {})
+        if delete_started is not None:
+            debug_timing["cache_delete_s"] = time.perf_counter() - delete_started
+        debug_timing.update(
             {
+                "cache_read_s": cache_read_s,
+                "cache_lookup_s": time.perf_counter() - cache_started,
                 "cache_hit": True,
-                "cache_path": str(_raw_markdown_cache_path(url)),
-                "total_s": time.perf_counter() - total_started,
+                "cache_path": str(cache_path),
             }
         )
+        payload.setdefault("debug_timing", {})
+        debug_timing["total_s"] = time.perf_counter() - total_started
+        payload["debug_timing"] = debug_timing
+        payload_data = payload.get("data")
+        if isinstance(payload_data, dict):
+            payload_data = dict(payload_data)
+            payload_data["debug_timing"] = dict(debug_timing)
+            payload["data"] = payload_data
+        log_request_timing(endpoint="raw_markdown", url=url, status=200, timing=debug_timing)
         if wants_json:
             return payload
         cached_data = payload.get("data") or {}
         return Response(
             str(cached_data.get("content") or ""),
             media_type="text/plain; charset=utf-8",
-            headers={"X-Raw-Markdown-Cache": "hit"},
+            headers={
+                "X-Raw-Markdown-Cache": "hit",
+                "X-Debug-Timing-Cache-Read-S": f"{cache_read_s:.6f}",
+                "X-Debug-Timing-Total-S": f"{debug_timing['total_s']:.6f}",
+            },
         )
 
     debug_timing: dict[str, Any] = {}
-    async with httpx.AsyncClient() as client:
+    if delete_started is not None:
+        debug_timing["cache_delete_s"] = time.perf_counter() - delete_started
+    debug_timing["cache_read_s"] = cache_read_s
+    debug_timing["cache_lookup_s"] = time.perf_counter() - cache_started
+    debug_timing["cache_hit"] = False
+    debug_timing["cache_path"] = str(cache_path)
+    async with _shared_internal_reader_client(request) as client:
         try:
             markdown = await timed_stage_call("fetch_markdown", fetch_markdown(client, url), debug_timing)
         except StageError as exc:
             debug_timing["total_s"] = time.perf_counter() - total_started
             record_failure_debug(debug_timing, stage=exc.stage, exc=exc.cause)
-            message = f"Raw markdown reader error for {url}: {exc.stage} failed: {exc.cause}"
-            error_payload = {
-                "data": None,
-                "code": 502,
-                "status": 502,
-                "message": message,
-                "debug_timing": debug_timing,
-            }
+            status_code, message, error_payload, response_headers = _stage_failure_payload(
+                endpoint_name="Raw markdown reader",
+                url=url,
+                stage=exc.stage,
+                exc=exc.cause,
+                timing=debug_timing,
+            )
+            log_request_timing(endpoint="raw_markdown", url=url, status=status_code, timing=debug_timing)
             if wants_json:
-                return JSONResponse(status_code=502, content=error_payload)
-            return Response(message, status_code=502, media_type="text/plain")
+                return JSONResponse(status_code=status_code, content=error_payload, headers=response_headers)
+            return Response(
+                message,
+                status_code=status_code,
+                media_type="text/plain",
+                headers=response_headers,
+            )
 
     debug_timing["total_s"] = time.perf_counter() - total_started
     debug_timing["cache_hit"] = False
@@ -1486,7 +1875,12 @@ async def read_raw_markdown(target_url: str, request: Request):
         "status": 200,
         "debug_timing": debug_timing,
     }
+    cache_write_started = time.perf_counter()
     _write_raw_markdown_cache(url, payload=payload)
+    debug_timing["cache_write_s"] = time.perf_counter() - cache_write_started
+    debug_timing["cache_total_s"] = debug_timing["cache_lookup_s"] + debug_timing["cache_write_s"]
+    debug_timing["total_s"] = time.perf_counter() - total_started
+    log_request_timing(endpoint="raw_markdown", url=url, status=200, timing=debug_timing)
     if wants_json:
         return payload
     return Response(markdown, media_type="text/plain; charset=utf-8")

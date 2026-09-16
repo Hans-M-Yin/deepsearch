@@ -81,12 +81,13 @@ class PipelineMaxTurnsTests(unittest.TestCase):
             self.assertEqual(len(runner.contents_seen), 2)
             self.assertFalse(execute_tool.called)
             finalization_text = runner.contents_seen[1][-1]["parts"][0]["text"]
-            self.assertIn("已达到搜索上限，不能再调用工具", finalization_text)
-            self.assertIn("直接推理并给出原问题的最终答案", finalization_text)
-            self.assertIn(
-                "<thinking>...</thinking><answer>...</answer>的格式回答",
-                finalization_text,
-            )
+            self.assertIn("已达到搜索上限，不能再调用任何工具", finalization_text)
+            self.assertIn("直接给出原问题的最终答案", finalization_text)
+            self.assertIn("请直接根据历史搜索记录以及输入问题进行回答", finalization_text)
+            self.assertIn("<thinking>...</thinking><answer>...</answer>", finalization_text)
+            self.assertIn("完整回复必须且只能是", finalization_text)
+            self.assertIn("严禁输出<tool_call>", finalization_text)
+            self.assertIn("除这两个标签外，不得输出任何文本", finalization_text)
             self.assertEqual(
                 trajectory["turns"][0]["tool_output_type"],
                 "max_turns_finalization",

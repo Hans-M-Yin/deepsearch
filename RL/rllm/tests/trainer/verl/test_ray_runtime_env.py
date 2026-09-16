@@ -27,6 +27,25 @@ def test_forward_basic_env_vars():
     assert "PATH" not in forwarded
 
 
+def test_forward_outcome_reward_augmentation_env_vars():
+    """Remote Ray workers must receive DeepResearch reward configuration."""
+    test_env = {
+        "SEARCH_REDUNDANCY_MODE": "reward",
+        "SEARCH_REDUNDANCY_EMBEDDING_URL": "http://embedding.example/embed",
+        "PARTIAL_CREDIT_MODE": "shadow",
+    }
+
+    with patch.dict(os.environ, test_env, clear=True):
+        forwarded = _get_forwarded_env_vars()
+
+    assert forwarded["SEARCH_REDUNDANCY_MODE"] == "reward"
+    assert (
+        forwarded["SEARCH_REDUNDANCY_EMBEDDING_URL"]
+        == "http://embedding.example/embed"
+    )
+    assert forwarded["PARTIAL_CREDIT_MODE"] == "shadow"
+
+
 def test_no_matching_env_vars():
     """Test when no environment variables match any prefix."""
     test_env = {

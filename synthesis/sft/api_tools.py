@@ -1325,6 +1325,30 @@ def _resolve_image_payload(source: Any, context: ToolRuntimeContext) -> Any:
     return source
 
 
+def _i2i_empty_debug_context(
+    *,
+    image_source: Any,
+    region: Any,
+    cropped_image_oss_url: str | None,
+    context: ToolRuntimeContext,
+) -> dict[str, Any]:
+    """Return non-model-visible provenance for a persistent Lens empty result."""
+
+    resolved_source = _resolve_image_payload(image_source, context)
+    original_url = (
+        resolved_source
+        if isinstance(resolved_source, str) and resolved_source.startswith(("http://", "https://"))
+        else None
+    )
+    reference = image_source if isinstance(image_source, str) else None
+    return {
+        "original_image_url": original_url,
+        "original_image_reference": reference,
+        "region": _json_safe(region),
+        "cropped_image_oss_url": cropped_image_oss_url,
+    }
+
+
 def _image_source_to_model_url(source: Any, context: ToolRuntimeContext) -> str:
     payload = _resolve_image_payload(source, context)
     if isinstance(payload, str):
@@ -2412,6 +2436,7 @@ def _execute_tool_call(
     if name == "i2i_search":
         search_timing: dict[str, float] = {}
         image_source = params.get("image") or params.get("url") or context.latest_image_reference() or ""
+        requested_region = params.get("region")
         if not image_source:
             output = {
                 "ok": False,
@@ -2465,6 +2490,12 @@ def _execute_tool_call(
                 visual_lookup=context.visual_lookup,
                 top_k=int(params.get("top_k", tools.DEFAULT_SEARCH_TOP_K)),
                 timings=search_timing,
+                debug_context=_i2i_empty_debug_context(
+                    image_source=image_source,
+                    region=requested_region,
+                    cropped_image_oss_url=uploaded_url,
+                    context=context,
+                ),
             )
             output = dict(output)
             output["cropped_image_url"] = uploaded_url
@@ -2497,6 +2528,12 @@ def _execute_tool_call(
             visual_lookup=context.visual_lookup,
             top_k=int(params.get("top_k", tools.DEFAULT_SEARCH_TOP_K)),
             timings=search_timing,
+            debug_context=_i2i_empty_debug_context(
+                image_source=image_source,
+                region=requested_region,
+                cropped_image_oss_url=None,
+                context=context,
+            ),
         )
         if isinstance(output, dict) and output.get("ok"):
             postprocess_started_at = time.monotonic()

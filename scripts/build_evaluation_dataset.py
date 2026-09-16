@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """Build a small, deterministic mixed evaluation dataset.
 
-The five benchmark sources are sampled by row index at approximately uniform
-intervals.  The output keeps the common OpenSearch-VL schema and adds one
-extra top-level field, ``source``, for per-benchmark scoring.
+The five default benchmark sources are sampled by row index at approximately
+uniform intervals.  ``--include-mmsearch-plus`` adds a sixth source.  The
+output keeps the common OpenSearch-VL schema and adds one extra top-level
+field, ``source``, for per-benchmark scoring.
 
 Example:
     python scripts/build_evaluation_dataset.py
     python scripts/build_evaluation_dataset.py --samples-per-benchmark 40 \
         --output ../data/benchmarks/evaluation/test.parquet
+    python scripts/build_evaluation_dataset.py --include-mmsearch-plus
 """
 
 from __future__ import annotations
@@ -50,6 +52,10 @@ BENCHMARKS = (
     BenchmarkSpec("MMSearch", "mmsearch/end2end/data.parquet"),
     BenchmarkSpec("VDR-Bench", "vdr_bench/train.parquet"),
     BenchmarkSpec("BrowseComp-VL", "browsecomp_vl/test.parquet"),
+)
+
+OPTIONAL_BENCHMARKS = (
+    BenchmarkSpec("MMSearch-Plus", "mmsearch_plus/train.parquet"),
 )
 
 
@@ -180,11 +186,15 @@ def build_evaluation_dataset(
     benchmark_root: Path,
     output_path: Path,
     samples_per_benchmark: int = 40,
+    include_mmsearch_plus: bool = False,
 ) -> None:
     rows: list[dict[str, Any]] = []
     counts: dict[str, int] = {}
 
-    for spec in BENCHMARKS:
+    benchmark_specs = BENCHMARKS + (
+        OPTIONAL_BENCHMARKS if include_mmsearch_plus else ()
+    )
+    for spec in benchmark_specs:
         input_path = benchmark_root / spec.relative_path
         if not input_path.exists():
             raise FileNotFoundError(f"Missing {spec.source} dataset: {input_path}")
@@ -227,12 +237,21 @@ def main() -> None:
         default=40,
         help="Number of uniformly sampled rows from each benchmark",
     )
+    parser.add_argument(
+        "--include-mmsearch-plus",
+        action="store_true",
+        help=(
+            "Include data/benchmarks/mmsearch_plus/train.parquet in the mixed "
+            "evaluation set. This adds one benchmark quota."
+        ),
+    )
     args = parser.parse_args()
 
     build_evaluation_dataset(
         benchmark_root=args.benchmark_root.expanduser().resolve(),
         output_path=args.output.expanduser().resolve(),
         samples_per_benchmark=args.samples_per_benchmark,
+        include_mmsearch_plus=args.include_mmsearch_plus,
     )
 
 

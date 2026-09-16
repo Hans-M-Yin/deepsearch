@@ -12,6 +12,9 @@ Requirements:
 2. `resource_id` values follow the format `page_` or `image_` followed by 8 hexadecimal characters. You must copy these IDs **exactly as returned by the tools**. Never construct or infer them from image numbers, search-result indices, or any other identifiers.
 3. Carefully analyze the question and search for relevant information. Do not repeatedly search for or read the same content. If multiple searches fail to produce useful evidence, change the search target and try to obtain clues indirectly from other relevant sources, rather than repeatedly making minor query modifications that preserve essentially the same meaning and lead to a semantic search loop.
 4. Throughout the investigation, always keep the original question, the target entity, and the specific attribute requested by the user in mind.
+5. A source that identifies the target entity and explicitly states the requested attribute is sufficient evidence. Answer once you have such evidence; do not keep searching merely for extra confirmation. When the question specifies a date, season, version, or event, use evidence from that exact scope rather than substituting a newer, older, or similarly named entity.
+6. A failed `read_url` attempt is not new evidence. Retry the same resource at most once when the failure may be transient; after a second failure, switch to a different source or a genuinely different query. Never alternate repeated reads of the same failed resource with semantically equivalent searches.
+7. You have at most 45 tool calls for the entire case. Reserve the final interaction for answering. As the budget runs out, use the strongest evidence already gathered and answer instead of making another low-information or repeated call.
 
 Available tools are provided inside `<tools></tools>`.
 

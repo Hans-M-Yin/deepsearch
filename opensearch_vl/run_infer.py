@@ -32,8 +32,14 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+from datetime import datetime, timezone
+import json
 import logging
 import os
+from pathlib import Path
+import platform
+import shlex
+import subprocess
 import sys
 import traceback
 from typing import Any, Optional
@@ -42,6 +48,186 @@ from tqdm.auto import tqdm
 
 from opensearch_infer import config
 from synthesis.retry_monitor import RetryMonitor, case_context, install_monitor
+
+
+_REDACTED_VALUE = "<redacted>"
+_SENSITIVE_ARGUMENT_TOKENS = ("api-key", "token", "secret", "password")
+_REPRO_ENVIRONMENT_NAMES = (
+    "AGENT_BASE_URL",
+    "OPENAI_BASE_URL",
+    "AGENT_API_KEY",
+    "OPENAI_API_KEY",
+    "QWEN3VL_8B_PATH",
+    "QWEN3VL_32B_PATH",
+    "QWEN3VL_30B_A3B_PATH",
+    "AGENT_MAX_TURNS",
+    "AGENT_MAX_TOOL_CALLS",
+    "AGENT_TRACE_LOGS",
+    "CUDA_VISIBLE_DEVICES",
+)
+
+
+def _is_sensitive_name(name: str) -> bool:
+    normalized = name.lower().replace("_", "-")
+    return any(token in normalized for token in _SENSITIVE_ARGUMENT_TOKENS)
+
+
+def _redact_argv(argv: list[str]) -> list[str]:
+    """Return CLI arguments with values for secret-like flags redacted."""
+
+    redacted: list[str] = []
+    redact_next = False
+    for token in argv:
+        if redact_next:
+            redacted.append(_REDACTED_VALUE)
+            redact_next = False
+            continue
+
+        option, separator, _ = token.partition("=")
+        if option.startswith("--") and _is_sensitive_name(option):
+            redacted.append(f"{option}={_REDACTED_VALUE}" if separator else option)
+            redact_next = not separator
+        else:
+            redacted.append(token)
+    return redacted
+
+
+def _redact_mapping(values: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: _REDACTED_VALUE if _is_sensitive_name(key) and value else value
+        for key, value in values.items()
+    }
+
+
+def _file_metadata(path_value: str) -> dict[str, Any]:
+    path = Path(path_value).expanduser().resolve()
+    metadata: dict[str, Any] = {
+        "requested_path": path_value,
+        "resolved_path": str(path),
+    }
+    try:
+        stat = path.stat()
+    except OSError:
+        metadata["exists"] = False
+        return metadata
+
+    metadata.update(
+        {
+            "exists": True,
+            "size_bytes": stat.st_size,
+            "modified_at_utc": datetime.fromtimestamp(
+                stat.st_mtime, tz=timezone.utc
+            ).isoformat(),
+        }
+    )
+    return metadata
+
+
+def _git_output(*args: str) -> Optional[str]:
+    try:
+        result = subprocess.run(
+            ["git", *args],
+            cwd=Path(__file__).resolve().parents[1],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return result.stdout.strip()
+
+
+def _runner_metadata(runner: Any) -> dict[str, Any]:
+    """Capture reproducibility-relevant runner fields without credentials."""
+
+    metadata = {
+        "class": type(runner).__name__,
+        "display_name": getattr(runner, "display_name", None),
+    }
+    for field in ("model", "checkpoint", "base_url"):
+        value = getattr(runner, field, None)
+        if value is not None:
+            metadata[field] = str(value)
+    return metadata
+
+
+def _run_configuration_snapshot(
+    args: argparse.Namespace,
+    raw_argv: list[str],
+    runner: Any,
+) -> dict[str, Any]:
+    redacted_argv = _redact_argv(raw_argv)
+    replay_command = [sys.executable, str(Path(__file__).resolve()), *redacted_argv]
+    environment = {
+        name: (_REDACTED_VALUE if _is_sensitive_name(name) else os.environ[name])
+        for name in _REPRO_ENVIRONMENT_NAMES
+        if name in os.environ
+    }
+    return {
+        "schema_version": 1,
+        "captured_at_utc": datetime.now(timezone.utc).isoformat(),
+        "command": {
+            "entrypoint": str(Path(__file__).resolve()),
+            "argv": redacted_argv,
+            "replay_command": shlex.join(replay_command),
+        },
+        "arguments": _redact_mapping(vars(args)),
+        "runner": _runner_metadata(runner),
+        "inference": {
+            "temperature": args.temperature,
+            "max_tokens": args.max_tokens,
+            "top_p": args.top_p,
+            "top_k": args.top_k,
+            "repetition_penalty": args.repetition_penalty,
+            "presence_penalty": args.presence_penalty,
+        },
+        "agent_limits": {
+            "max_turns": config.MAX_TURNS,
+            "max_tool_calls": config.MAX_TOOL_CALLS,
+            "trace_logs": config.TRACE_LOGS,
+        },
+        "dataset": _file_metadata(args.data_path),
+        "environment": environment,
+        "code": {
+            "git_commit": _git_output("rev-parse", "HEAD"),
+            "git_dirty": bool(_git_output("status", "--porcelain")),
+            "python_version": platform.python_version(),
+        },
+    }
+
+
+def _write_json_atomically(path: Path, payload: dict[str, Any]) -> None:
+    temporary_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    with temporary_path.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
+        handle.write("\n")
+    os.replace(temporary_path, path)
+
+
+def _persist_run_configuration(
+    args: argparse.Namespace,
+    raw_argv: list[str],
+    runner: Any,
+    logger: logging.Logger,
+) -> None:
+    """Save an immutable initial config plus one record for every invocation."""
+
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    snapshot = _run_configuration_snapshot(args, raw_argv, runner)
+    config_path = output_dir / "run_config.json"
+    if not config_path.exists():
+        _write_json_atomically(config_path, snapshot)
+        logger.info("Saved reproducibility config to %s", config_path)
+    else:
+        logger.info("Keeping existing initial reproducibility config at %s", config_path)
+
+    invocations_path = output_dir / "run_invocations.jsonl"
+    with invocations_path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(snapshot, ensure_ascii=False, sort_keys=True))
+        handle.write("\n")
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
@@ -148,6 +334,14 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="Process at most N rows starting from --start.",
+    )
+    parser.add_argument(
+        "--dynamic-resolution",
+        action="store_true",
+        help=(
+            "Resize every image before it is sent to the model so its longest "
+            "side is at most 1600 pixels."
+        ),
     )
     parser.add_argument(
         "--category",
@@ -259,7 +453,8 @@ def _completed_case_ids(output_dir: str) -> set[str]:
 
 def main(argv: Optional[list[str]] = None) -> int:
     parser = _build_arg_parser()
-    args = parser.parse_args(argv)
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    args = parser.parse_args(raw_argv)
 
     _configure_logging(args.log_level)
     logger = logging.getLogger("run_infer")
@@ -280,6 +475,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         max_retries=args.api_max_retries,
     )
     logger.info("Model: %s (backend=%s)", runner.display_name, args.backend)
+
+    try:
+        _persist_run_configuration(args, raw_argv, runner, logger)
+    except OSError as exc:
+        logger.warning("Could not save reproducibility config: %s", exc)
 
     try:
         runner.load()
@@ -343,6 +543,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                     dataset_type=args.dataset,
                     inference_cfg=inference_cfg,
                     timing=timing,
+                    dynamic_resolution=args.dynamic_resolution,
                 )
                 status = "completed"
                 return idx, True, None

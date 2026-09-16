@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import asyncio
+from concurrent.futures import Executor
+from functools import partial
 import heapq
 import logging
 import os
@@ -56,7 +58,13 @@ class AsyncLLMServerManager:
     - Sticky session: send multi-turn chat completions to same server for automatic prefix caching
     """
 
-    def __init__(self, config: DictConfig, server_handles: list[ray.actor.ActorHandle], max_cache_size: int = 10000):
+    def __init__(
+        self,
+        config: DictConfig,
+        server_handles: list[ray.actor.ActorHandle],
+        max_cache_size: int = 10000,
+        request_submit_executor: Executor | None = None,
+    ):
         """Initialize the AsyncLLMServerManager.
 
         Args:
@@ -66,6 +74,7 @@ class AsyncLLMServerManager:
         """
         self.config = config
         self.server_handles = server_handles
+        self.request_submit_executor = request_submit_executor
         random.shuffle(self.server_handles)
 
         # Least requests load balancing
@@ -106,13 +115,37 @@ class AsyncLLMServerManager:
             TokenOutput: token output
         """
         server = self._choose_server(request_id)
-        output = await server.generate.remote(
+        submit_request = partial(
+            server.generate.remote,
             request_id=request_id,
             prompt_ids=prompt_ids,
             sampling_params=sampling_params,
             image_data=image_data,
         )
-        return output
+        if self.request_submit_executor is None:
+            output_ref = submit_request()
+        else:
+            # Ray serializes remote-call arguments synchronously inside
+            # ``remote``. Keep PIL.Image.__getstate__()/tobytes() out of
+            # the asyncio event-loop thread.
+            output_ref = await asyncio.get_running_loop().run_in_executor(
+                self.request_submit_executor,
+                submit_request,
+            )
+        return await output_ref
+
+    async def abort_request(self, request_id: str = "", abort_all: bool = False):
+        """Abort a request on the sticky server selected for its request id."""
+        if abort_all:
+            return await asyncio.gather(
+                *[
+                    server.abort_request.remote(rid="", abort_all=True)
+                    for server in self.server_handles
+                ],
+                return_exceptions=True,
+            )
+        server = self._choose_server(request_id)
+        return await server.abort_request.remote(rid=request_id, abort_all=False)
 
 
 class AgentLoopMetrics(BaseModel):

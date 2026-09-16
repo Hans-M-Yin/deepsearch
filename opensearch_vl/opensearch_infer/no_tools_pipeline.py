@@ -5,9 +5,11 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
+from . import config
 from .no_tools_prompts import SYSTEM_PROMPT
 from .pipeline import (
     _bootstrap_images,
@@ -31,6 +33,7 @@ def process_single_case(
     image_urls_dict: Optional[Dict[str, List[Any]]] = None,
     dataset_type: str = "train",
     inference_cfg: Optional[InferenceConfig] = None,
+    dynamic_resolution: bool = False,
 ) -> Dict[str, Any]:
     """Run one benchmark example through a no-tools single-turn baseline."""
 
@@ -60,7 +63,12 @@ def process_single_case(
     )
 
     image_paths_dict, initial_parts = _bootstrap_images(
-        row, case_id, case_idx, filename_prefix, image_urls_dict
+        row,
+        case_id,
+        case_idx,
+        filename_prefix,
+        image_urls_dict,
+        dynamic_resolution=dynamic_resolution,
     )
     initial_image_count = sum(1 for part in initial_parts if "image_url" in part or "inline_data" in part)
     prompt_text = add_sft_image_placeholders(prompt_text, initial_image_count)
@@ -81,12 +89,22 @@ def process_single_case(
 
     cfg = inference_cfg or InferenceConfig()
 
+    llm_started_at = time.perf_counter()
+    llm_status = "exception"
+    if config.TRACE_LOGS:
+        logger.info(
+            "[inference-trace] LLM_START case_id=%s case_idx=%s turn=0 model=%s mode=no_tools",
+            case_id,
+            case_idx,
+            runner.display_name,
+        )
     try:
         response = runner.infer(
             contents=gemini_contents,
             system_instruction=SYSTEM_PROMPT,
             cfg=cfg,
         )
+        llm_status = "error_response" if response.get("inference_error") else "ok"
     except Exception as exc:
         logger.error("Inference failed: %s", exc, exc_info=True)
         trajectory["turns"].append({"turn": 0, "error": str(exc)})
@@ -105,6 +123,17 @@ def process_single_case(
             }
         )
         trajectory["final_response_text"] = response_text
+    finally:
+        if config.TRACE_LOGS:
+            logger.info(
+                "[inference-trace] LLM_END case_id=%s case_idx=%s turn=0 "
+                "model=%s mode=no_tools status=%s elapsed_s=%.3f",
+                case_id,
+                case_idx,
+                runner.display_name,
+                llm_status,
+                time.perf_counter() - llm_started_at,
+            )
 
     if "final_response_text" not in trajectory:
         trajectory["final_response_text"] = "\n\n".join(

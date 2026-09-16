@@ -318,6 +318,16 @@ class AgentWorkflowEngine:
             if n_parallel_tools is not None
             else self.n_parallel_tasks * 8
         )
+        workflow_config = (
+            config.get("rllm", {}).get("workflow", {})
+            if config is not None
+            else {}
+        )
+        self.rollout_tail_drop_groups = int(
+            workflow_config.get("rollout_tail_drop_groups", 0) or 0
+        )
+        if self.rollout_tail_drop_groups < 0:
+            raise ValueError("rollout_tail_drop_groups must be non-negative")
         self.executor = ThreadPoolExecutor(max_workers=self.n_parallel_tools)
         self.workflow_queue = None
 
@@ -329,6 +339,7 @@ class AgentWorkflowEngine:
 
         # Stores the raw Episode list from the most recent execute_tasks call
         self._last_episodes: list[Episode] = []
+        self._last_result_task_ids: list[str] = []
 
     def set_training_step(self, step: int, mode: str = "train", epoch: int = 0):
         """Set current training step for episode logging.
@@ -479,14 +490,51 @@ class AgentWorkflowEngine:
                 else:
                     rollout_kwargs["tool_cache"] = tool_cache
             futures.append(
-                self.process_task_with_retry(
-                    task, task_id, rollout_idx, **rollout_kwargs
+                asyncio.create_task(
+                    self.process_task_with_retry(
+                        task, task_id, rollout_idx, **rollout_kwargs
+                    )
                 )
             )
             state["total_rollouts"] += 1
 
+        # A tail-drop policy is group-aware: each task_id represents one
+        # RLOO/GRPO group and must contribute all of its repeated rollouts.
+        # We therefore stop after enough *complete* groups, never after an
+        # arbitrary number of individual trajectories.
+        group_sizes = {
+            task_id: state["total_rollouts"]
+            for task_id, state in task_states.items()
+        }
+        group_count = len(group_sizes)
+        group_size_values = set(group_sizes.values())
+        # Tail dropping is a training-only optimization.  Validation should
+        # always evaluate the complete requested set, even when the same
+        # engine instance is reused by the trainer.
+        requested_tail_drop_groups = (
+            self.rollout_tail_drop_groups if self.current_mode == "train" else 0
+        )
+        tail_drop_groups = min(requested_tail_drop_groups, max(group_count - 1, 0))
+        tail_drop_enabled = (
+            tail_drop_groups > 0
+            and group_count > 1
+            and len(group_size_values) == 1
+        )
+        target_complete_groups = (
+            group_count - tail_drop_groups if tail_drop_enabled else group_count
+        )
+        if requested_tail_drop_groups > 0 and not tail_drop_enabled:
+            logger.warning(
+                "Disabling rollout tail drop: task groups are not uniform "
+                "(groups=%s, sizes=%s)",
+                group_count,
+                sorted(group_size_values),
+            )
+
         completed_count = 0
         correct_count = 0
+        completed_groups = 0
+        early_stop_triggered = False
         trajectory_time_sum = 0.0
         trajectory_time_count = 0
         termination_counts: dict[str, int] = defaultdict(int)
@@ -506,6 +554,10 @@ class AgentWorkflowEngine:
             lambda: {"total_s": 0.0, "calls": 0.0}
         )
         wikimedia_download_stats: dict[str, float] = defaultdict(float)
+        # Search-redundancy scoring is attached to each completed Episode by
+        # the workflow. Keep only aggregate numeric counters here: the raw
+        # trace holds private queries/URLs and must never enter live logs.
+        search_redundancy_stats: dict[str, float] = defaultdict(float)
 
         # Windowed counters are reset after every progress report. The window
         # is over completed rollouts (not individual LLM/tool calls), which
@@ -526,6 +578,7 @@ class AgentWorkflowEngine:
             lambda: {"total_s": 0.0, "calls": 0.0}
         )
         recent_wikimedia_download_stats: dict[str, float] = defaultdict(float)
+        recent_search_redundancy_stats: dict[str, float] = defaultdict(float)
 
         def add_timing(
             target: dict[str, dict[str, float]],
@@ -573,6 +626,99 @@ class AgentWorkflowEngine:
                 f"failure={int(stats.get('failure', 0.0))},"
                 f"avg_s={avg_s:.2f},total_s={total_s:.1f},calls={calls}"
             )
+
+        def _nonnegative_record_value(record: dict, key: str) -> float:
+            try:
+                return max(0.0, float(record.get(key) or 0.0))
+            except (TypeError, ValueError):
+                return 0.0
+
+        def add_search_redundancy_stats(
+            target: dict[str, float], record: object
+        ) -> None:
+            """Aggregate a safe scorer summary without retaining its trace."""
+
+            if not isinstance(record, dict):
+                return
+            target["records"] += 1.0
+            mode = str(record.get("mode") or "off").strip().lower()
+            if mode not in {"off", "shadow", "reward"}:
+                return
+
+            target["enabled"] += 1.0
+            target["mode_off"] += float(mode == "off")
+            target["mode_shadow"] += float(mode == "shadow")
+            target["mode_reward"] += float(mode == "reward")
+            scored = bool(record.get("scored"))
+            target["scored"] += float(scored)
+            reason = str(record.get("reason") or "")
+            target["embedding_failed"] += float(
+                reason == "embedding_request_failed"
+            )
+            target["missing_embedding_url"] += float(
+                reason == "missing_embedding_url"
+            )
+
+            for source_key, target_key in (
+                ("search_trace_count", "search_trace_count"),
+                ("eligible_search_count", "eligible_search_count"),
+                ("embedded_query_count", "embedded_query_count"),
+                ("pair_count", "pair_count"),
+                (
+                    "hard_constraint_exempt_pair_count",
+                    "hard_constraint_exempt_pair_count",
+                ),
+                ("confirmed_event_count", "confirmed_event_count"),
+                ("raw_penalty", "raw_penalty"),
+                ("penalty", "applied_penalty"),
+            ):
+                target[target_key] += _nonnegative_record_value(record, source_key)
+
+            raw_penalty = _nonnegative_record_value(record, "raw_penalty")
+            applied_penalty = _nonnegative_record_value(record, "penalty")
+            penalty_cap = _nonnegative_record_value(
+                record, "trajectory_penalty_cap"
+            )
+            target["raw_penalized_trajectory"] += float(raw_penalty > 0.0)
+            target["penalized_trajectory"] += float(applied_penalty > 0.0)
+            target["cap_hit"] += float(
+                penalty_cap > 0.0 and raw_penalty >= penalty_cap - 1e-12
+            )
+            if scored:
+                target["embedding_request_s"] += _nonnegative_record_value(
+                    record, "embedding_request_s"
+                )
+                target["embedding_queue_wait_s"] += _nonnegative_record_value(
+                    record, "embedding_queue_wait_s"
+                )
+
+        def format_search_redundancy_stats(stats: dict[str, float]) -> str:
+            enabled = int(stats.get("enabled", 0.0))
+            if enabled <= 0:
+                return "disabled"
+            scored = int(stats.get("scored", 0.0))
+            score_rate = scored / enabled
+            raw_penalty_mean = stats.get("raw_penalty", 0.0) / enabled
+            applied_penalty_mean = stats.get("applied_penalty", 0.0) / enabled
+            embedding_avg_s = (
+                stats.get("embedding_request_s", 0.0) / scored if scored else 0.0
+            )
+            queue_avg_s = (
+                stats.get("embedding_queue_wait_s", 0.0) / scored if scored else 0.0
+            )
+            return (
+                f"enabled={enabled},scored={scored},score_rate={score_rate:.2f},"
+                f"reward_enabled={int(stats.get('mode_reward', 0.0))},"
+                f"embed_failed={int(stats.get('embedding_failed', 0.0))},"
+                f"eligible={int(stats.get('eligible_search_count', 0.0))},"
+                f"pairs={int(stats.get('pair_count', 0.0))},"
+                f"exempt_pairs={int(stats.get('hard_constraint_exempt_pair_count', 0.0))},"
+                f"events={int(stats.get('confirmed_event_count', 0.0))},"
+                f"raw_penalty_mean={raw_penalty_mean:.4f},"
+                f"applied_penalty_mean={applied_penalty_mean:.4f},"
+                f"cap_hit={int(stats.get('cap_hit', 0.0))},"
+                f"embed_avg_s={embedding_avg_s:.3f},queue_avg_s={queue_avg_s:.3f}"
+            )
         progress_started_at = time.monotonic()
 
         with tqdm(total=len(tasks), desc="Generating trajectories") as pbar:
@@ -594,6 +740,15 @@ class AgentWorkflowEngine:
                 episode_info = getattr(episode, "info", None)
                 if not isinstance(episode_info, dict):
                     episode_info = {}
+
+                add_search_redundancy_stats(
+                    search_redundancy_stats,
+                    episode_info.get("search_redundancy"),
+                )
+                add_search_redundancy_stats(
+                    recent_search_redundancy_stats,
+                    episode_info.get("search_redundancy"),
+                )
 
                 raw_termination = episode_info.get("raw_termination")
                 if raw_termination:
@@ -739,6 +894,16 @@ class AgentWorkflowEngine:
 
                 pbar.update(1)
 
+                if state["completed"] == state["total_rollouts"]:
+                    state["is_complete"] = True
+                    completed_groups += 1
+                    if (
+                        tail_drop_enabled
+                        and completed_groups >= target_complete_groups
+                    ):
+                        early_stop_triggered = True
+                        break
+
                 if completed_count % ROLLOUT_PROGRESS_INTERVAL == 0:
                     elapsed = max(time.monotonic() - progress_started_at, 1e-6)
                     rate = completed_count / elapsed
@@ -804,7 +969,9 @@ class AgentWorkflowEngine:
                         f"read_url_stages(overall={format_read_url_stage_timing(read_url_stage_timing)};"
                         f"recent50={format_read_url_stage_timing(recent_read_url_stage_timing)}) "
                         f"wikimedia_download(overall={format_wikimedia_download_stats(wikimedia_download_stats)};"
-                        f"recent50={format_wikimedia_download_stats(recent_wikimedia_download_stats)})"
+                        f"recent50={format_wikimedia_download_stats(recent_wikimedia_download_stats)}) "
+                        f"search_redundancy(overall={format_search_redundancy_stats(search_redundancy_stats)};"
+                        f"recent50={format_search_redundancy_stats(recent_search_redundancy_stats)})"
                     )
                     sys.stdout.flush()
 
@@ -855,6 +1022,101 @@ class AgentWorkflowEngine:
                             "live/wikimedia_download/recent50_total_s": recent_wikimedia_download_stats.get(
                                 "total_s", 0.0
                             ),
+                            "live/search_redundancy/enabled": search_redundancy_stats.get(
+                                "enabled", 0.0
+                            ),
+                            "live/search_redundancy/scored": search_redundancy_stats.get(
+                                "scored", 0.0
+                            ),
+                            "live/search_redundancy/reward_enabled": search_redundancy_stats.get(
+                                "mode_reward", 0.0
+                            ),
+                            "live/search_redundancy/scored_rate": (
+                                search_redundancy_stats.get("scored", 0.0)
+                                / search_redundancy_stats["enabled"]
+                                if search_redundancy_stats.get("enabled", 0.0)
+                                else 0.0
+                            ),
+                            "live/search_redundancy/embedding_request_failed": search_redundancy_stats.get(
+                                "embedding_failed", 0.0
+                            ),
+                            "live/search_redundancy/eligible_search_count": search_redundancy_stats.get(
+                                "eligible_search_count", 0.0
+                            ),
+                            "live/search_redundancy/pair_count": search_redundancy_stats.get(
+                                "pair_count", 0.0
+                            ),
+                            "live/search_redundancy/hard_constraint_exempt_pair_count": search_redundancy_stats.get(
+                                "hard_constraint_exempt_pair_count", 0.0
+                            ),
+                            "live/search_redundancy/confirmed_event_count": search_redundancy_stats.get(
+                                "confirmed_event_count", 0.0
+                            ),
+                            "live/search_redundancy/raw_penalty": search_redundancy_stats.get(
+                                "raw_penalty", 0.0
+                            ),
+                            "live/search_redundancy/applied_penalty": search_redundancy_stats.get(
+                                "applied_penalty", 0.0
+                            ),
+                            "live/search_redundancy/raw_penalty_mean": (
+                                search_redundancy_stats.get("raw_penalty", 0.0)
+                                / search_redundancy_stats["enabled"]
+                                if search_redundancy_stats.get("enabled", 0.0)
+                                else 0.0
+                            ),
+                            "live/search_redundancy/applied_penalty_mean": (
+                                search_redundancy_stats.get("applied_penalty", 0.0)
+                                / search_redundancy_stats["enabled"]
+                                if search_redundancy_stats.get("enabled", 0.0)
+                                else 0.0
+                            ),
+                            "live/search_redundancy/penalized_trajectory_count": search_redundancy_stats.get(
+                                "penalized_trajectory", 0.0
+                            ),
+                            "live/search_redundancy/cap_hit": search_redundancy_stats.get(
+                                "cap_hit", 0.0
+                            ),
+                            "live/search_redundancy/embedding_request_avg_s": (
+                                search_redundancy_stats.get(
+                                    "embedding_request_s", 0.0
+                                )
+                                / search_redundancy_stats["scored"]
+                                if search_redundancy_stats.get("scored", 0.0)
+                                else 0.0
+                            ),
+                            "live/search_redundancy/embedding_queue_wait_avg_s": (
+                                search_redundancy_stats.get(
+                                    "embedding_queue_wait_s", 0.0
+                                )
+                                / search_redundancy_stats["scored"]
+                                if search_redundancy_stats.get("scored", 0.0)
+                                else 0.0
+                            ),
+                            "live/search_redundancy/recent50_scored": recent_search_redundancy_stats.get(
+                                "scored", 0.0
+                            ),
+                            "live/search_redundancy/recent50_embedding_request_failed": recent_search_redundancy_stats.get(
+                                "embedding_failed", 0.0
+                            ),
+                            "live/search_redundancy/recent50_confirmed_event_count": recent_search_redundancy_stats.get(
+                                "confirmed_event_count", 0.0
+                            ),
+                            "live/search_redundancy/recent50_raw_penalty_mean": (
+                                recent_search_redundancy_stats.get(
+                                    "raw_penalty", 0.0
+                                )
+                                / recent_search_redundancy_stats["enabled"]
+                                if recent_search_redundancy_stats.get("enabled", 0.0)
+                                else 0.0
+                            ),
+                            "live/search_redundancy/recent50_applied_penalty_mean": (
+                                recent_search_redundancy_stats.get(
+                                    "applied_penalty", 0.0
+                                )
+                                / recent_search_redundancy_stats["enabled"]
+                                if recent_search_redundancy_stats.get("enabled", 0.0)
+                                else 0.0
+                            ),
                         }
                         for stage_name, stage_values in read_url_stage_timing.items():
                             stage_prefix = f"live/read_url/{stage_name}"
@@ -889,16 +1151,45 @@ class AgentWorkflowEngine:
                     recent_tool_dispatch_timing.clear()
                     recent_read_url_stage_timing.clear()
                     recent_wikimedia_download_stats.clear()
+                    recent_search_redundancy_stats.clear()
+
+        if early_stop_triggered:
+            pending = [future for future in futures if not future.done()]
+            for future in pending:
+                future.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+            logger.info(
+                "[RL_ROLLOUT_EARLY_STOP] completed_groups=%s/%s "
+                "target_groups=%s kept_rollouts=%s total_rollouts=%s "
+                "dropped_groups=%s",
+                completed_groups,
+                group_count,
+                target_complete_groups,
+                target_complete_groups * next(iter(group_size_values)),
+                len(tasks),
+                group_count - target_complete_groups,
+            )
 
         results = []
+        result_task_ids = []
         sorted_tasks = sorted(
             task_states.keys(), key=lambda task_id: task_states[task_id]["idx"]
         )
         for task_id in sorted_tasks:
-            results.extend(task_states[task_id]["episodes"])
+            state = task_states[task_id]
+            if not state["is_complete"]:
+                continue
+            results.extend(state["episodes"])
+            result_task_ids.extend([task_id] * len(state["episodes"]))
 
         # Keep a reference so the trainer can inspect raw episodes
         self._last_episodes = results
+        self._last_result_task_ids = result_task_ids
+        kept_task_id_set = set(result_task_ids)
+        self._last_rollout_dropped_group_count = max(
+            len(task_states) - len(kept_task_id_set), 0
+        )
 
         # Log episodes if logger is provided
         if self.episode_logger is not None:
@@ -945,8 +1236,38 @@ class AgentWorkflowEngine:
         await self.rollout_engine.sleep()
 
         self.current_mode = "train"
-        transformed = self.transform_results_for_verl(results, task_ids)
+        result_task_ids = list(getattr(self, "_last_result_task_ids", task_ids))
+        transformed = self.transform_results_for_verl(results, result_task_ids)
+        multimodal_alignment_dropped_task_ids = set(
+            transformed.meta_info.pop(
+                "multimodal_alignment_dropped_group_task_ids", []
+            )
+        )
+        if multimodal_alignment_dropped_task_ids:
+            result_task_ids = [
+                task_id
+                for task_id in result_task_ids
+                if task_id not in multimodal_alignment_dropped_task_ids
+            ]
+        tail_dropped_group_count = int(
+            getattr(self, "_last_rollout_dropped_group_count", 0)
+        )
+        alignment_dropped_group_count = len(
+            multimodal_alignment_dropped_task_ids
+        )
         transformed.meta_info["rollout_latency"] = _aggregate_rollout_latency(results)
+        transformed.meta_info["rollout_task_ids"] = np.asarray(
+            result_task_ids, dtype=object
+        )
+        transformed.meta_info["rollout_tail_dropped_group_count"] = (
+            tail_dropped_group_count
+        )
+        transformed.meta_info["rollout_multimodal_alignment_dropped_group_count"] = (
+            alignment_dropped_group_count
+        )
+        transformed.meta_info["rollout_dropped_group_count"] = (
+            tail_dropped_group_count + alignment_dropped_group_count
+        )
         return transformed
 
     def transform_results_for_verl(
@@ -983,6 +1304,11 @@ class AgentWorkflowEngine:
         multi_modal_inputs_list = []
         is_fatal_flags = []
         fatal_step_indices = []
+        # One task_id identifies one RLOO/GRPO group.  Keep the task id for
+        # every constructed training row so a malformed multimodal row can
+        # be removed together with all of its sibling rollouts.
+        row_task_ids = []
+        episode_task_ids = []
 
         multimodal_mode = sequence_mode()
         configured_stepwise = bool(self.config.rllm.stepwise_advantage.enable)
@@ -1003,6 +1329,8 @@ class AgentWorkflowEngine:
 
         for i, episode in enumerate(episodes):
             total_steps = 0
+            episode_task_id = task_ids[i]
+            episode_task_ids.append(episode_task_id)
 
             if episode is None:
                 print(f"Episode {i} is None (failed task), dropping it from the batch")
@@ -1200,39 +1528,45 @@ class AgentWorkflowEngine:
             else:
                 episode_markers = str(episode_markers or "")
             rollout_markers.extend([episode_markers] * total_steps)
+            row_task_ids.extend([episode_task_id] * total_steps)
             repeat_counts.append(total_steps)
 
-        prompts_batch = torch.nn.utils.rnn.pad_sequence(
-            [torch.flip(i, dims=[0]) for i in prompts],
-            batch_first=True,
-            padding_value=self.rollout_engine.tokenizer.pad_token_id,
-        ).flip(dims=[1])
         max_prompt_length = self.config.data.max_prompt_length
-        prompts_batch = pad_sequence_to_length(
-            prompts_batch,
-            max_prompt_length,
-            self.rollout_engine.tokenizer.pad_token_id,
-            left_pad=True,
-        )
-        prompts_batch = prompts_batch[:, -max_prompt_length:]  # truncate if necessary
-
-        response_batch = torch.nn.utils.rnn.pad_sequence(
-            responses,
-            batch_first=True,
-            padding_value=self.rollout_engine.tokenizer.pad_token_id,
-        )
         max_response_length = self.config.data.max_response_length
-        response_batch = pad_sequence_to_length(
-            response_batch,
-            max_response_length,
-            self.rollout_engine.tokenizer.pad_token_id,
-            left_pad=False,
-        )
-        response_batch = response_batch[
-            :, :max_response_length
-        ]  # truncate if necessary
 
-        input_ids = torch.concat([prompts_batch, response_batch], dim=1)
+        def build_sequence_batches(prompt_rows, response_rows):
+            prompt_batch = torch.nn.utils.rnn.pad_sequence(
+                [torch.flip(row, dims=[0]) for row in prompt_rows],
+                batch_first=True,
+                padding_value=self.rollout_engine.tokenizer.pad_token_id,
+            ).flip(dims=[1])
+            prompt_batch = pad_sequence_to_length(
+                prompt_batch,
+                max_prompt_length,
+                self.rollout_engine.tokenizer.pad_token_id,
+                left_pad=True,
+            )
+            prompt_batch = prompt_batch[:, -max_prompt_length:]
+
+            response_batch = torch.nn.utils.rnn.pad_sequence(
+                response_rows,
+                batch_first=True,
+                padding_value=self.rollout_engine.tokenizer.pad_token_id,
+            )
+            response_batch = pad_sequence_to_length(
+                response_batch,
+                max_response_length,
+                self.rollout_engine.tokenizer.pad_token_id,
+                left_pad=False,
+            )
+            response_batch = response_batch[:, :max_response_length]
+            return prompt_batch, response_batch, torch.concat(
+                [prompt_batch, response_batch], dim=1
+            )
+
+        prompts_batch, response_batch, input_ids = build_sequence_batches(
+            prompts, responses
+        )
 
         # This is the boundary between workflow rollout and policy/ref-policy
         # computation.  Log only metadata: never serialize image tensors.
@@ -1246,6 +1580,7 @@ class AgentWorkflowEngine:
                 1,
             )
         )
+        multimodal_alignment_dropped_task_ids = set()
         for row_idx, mm_inputs in enumerate(multi_modal_inputs_list):
             mm_keys = sorted(mm_inputs.keys()) if isinstance(mm_inputs, dict) else []
             has_visual_payload = isinstance(mm_inputs, dict) and (
@@ -1281,20 +1616,154 @@ class AgentWorkflowEngine:
                 and image_token_count
                 and not has_visual_payload
             ):
-                raise RuntimeError(
-                    "[RLLM_MM_DEBUG] multimodal payload is missing at "
-                    f"trajectory_to_batch row={row_idx}: "
-                    f"image_token_count={image_token_count}, keys={mm_keys}"
+                multimodal_alignment_dropped_task_ids.add(row_task_ids[row_idx])
+                logger.error(
+                    "[RLLM_MM_SEQUENCE] dropping group due to missing visual "
+                    "payload at row=%s task_id=%s: image_token_count=%s keys=%s",
+                    row_idx,
+                    row_task_ids[row_idx],
+                    image_token_count,
+                    mm_keys,
                 )
+                continue
 
             if multimodal_mode in {"stepwise", "cumulative"}:
-                _validate_multimodal_alignment(
-                    input_ids=input_ids[row_idx],
-                    multimodal_inputs=mm_inputs,
-                    image_token_id=image_token_id,
-                    merge_size=merge_size,
-                    row_idx=row_idx,
+                try:
+                    _validate_multimodal_alignment(
+                        input_ids=input_ids[row_idx],
+                        multimodal_inputs=mm_inputs,
+                        image_token_id=image_token_id,
+                        merge_size=merge_size,
+                        row_idx=row_idx,
+                    )
+                except RuntimeError as exc:
+                    # A token/payload mismatch is row-local in appearance but
+                    # group-level in effect: dropping only this row would
+                    # corrupt the RLOO/GRPO group cardinality and advantage
+                    # normalization.  Keep the remaining groups and discard
+                    # every rollout for this task_id instead.
+                    if str(exc).startswith("[RLLM_MM_SEQUENCE]"):
+                        multimodal_alignment_dropped_task_ids.add(
+                            row_task_ids[row_idx]
+                        )
+                        logger.error(
+                            "%s; dropping task_id=%s and all sibling rollouts",
+                            exc,
+                            row_task_ids[row_idx],
+                        )
+                    else:
+                        raise
+
+        if multimodal_alignment_dropped_task_ids:
+            dropped_task_ids = multimodal_alignment_dropped_task_ids
+            keep_rows = [task_id not in dropped_task_ids for task_id in row_task_ids]
+            logger.warning(
+                "[RLLM_MM_SEQUENCE] dropped_groups=%s dropped_task_ids=%s "
+                "kept_rows=%s/%s",
+                len(dropped_task_ids),
+                sorted(str(task_id) for task_id in dropped_task_ids),
+                sum(keep_rows),
+                len(keep_rows),
+            )
+
+            def filter_rows(rows):
+                return [row for row, keep in zip(rows, keep_rows, strict=True) if keep]
+
+            prompts = filter_rows(prompts)
+            responses = filter_rows(responses)
+            traj_mask = filter_rows(traj_mask)
+            multi_modal_inputs_list = filter_rows(multi_modal_inputs_list)
+            step_rewards = filter_rows(step_rewards)
+            step_ids = filter_rows(step_ids)
+            trajectory_ids = filter_rows(trajectory_ids)
+            step_nums = filter_rows(step_nums)
+            traj_rewards = filter_rows(traj_rewards)
+            is_last_step = filter_rows(is_last_step)
+            is_fatal_flags = filter_rows(is_fatal_flags)
+            fatal_step_indices = filter_rows(fatal_step_indices)
+            episode_ids = filter_rows(episode_ids)
+            is_correct = filter_rows(is_correct)
+            termination_reasons = filter_rows(termination_reasons)
+            metrics = filter_rows(metrics)
+            rollout_markers = filter_rows(rollout_markers)
+            row_task_ids = filter_rows(row_task_ids)
+
+            kept_episode_mask = [
+                task_id not in dropped_task_ids for task_id in episode_task_ids
+            ]
+            repeat_counts = [
+                count
+                for count, keep in zip(
+                    repeat_counts, kept_episode_mask, strict=True
                 )
+                if keep
+            ]
+            episode_task_ids = [
+                task_id
+                for task_id, keep in zip(
+                    episode_task_ids, kept_episode_mask, strict=True
+                )
+                if keep
+            ]
+
+            if not prompts:
+                # This is rare, but returning a valid empty DataProto lets the
+                # trainer skip this update instead of crashing the whole run.
+                empty_length = max_prompt_length + max_response_length
+                empty_non_tensors = {
+                    "episode_ids": np.array([], dtype=object),
+                    "trajectory_ids": np.array([], dtype=object),
+                    "step_ids": np.array([], dtype=object),
+                    "batch_ids": np.array([], dtype=object),
+                    "step_nums": np.array([], dtype=np.int64),
+                    "is_correct": np.array([], dtype=bool),
+                    "termination_reasons": np.array([], dtype=object),
+                    "rollout_markers": np.array([], dtype=object),
+                    "metrics": np.array([], dtype=object),
+                    "is_valid": np.array([], dtype=bool),
+                    "is_last_step": np.array([], dtype=bool),
+                    "is_pad_step": np.array([], dtype=bool),
+                    "is_fatal": np.array([], dtype=bool),
+                }
+                return DataProto.from_dict(
+                    tensors={
+                        "input_ids": torch.empty(
+                            (0, empty_length), dtype=torch.long
+                        ),
+                        "attention_mask": torch.empty(
+                            (0, empty_length), dtype=torch.long
+                        ),
+                        "position_ids": torch.empty(
+                            (0, empty_length), dtype=torch.long
+                        ),
+                        "prompts": torch.empty(
+                            (0, max_prompt_length), dtype=torch.long
+                        ),
+                        "responses": torch.empty(
+                            (0, max_response_length), dtype=torch.long
+                        ),
+                        "response_mask": torch.empty(
+                            (0, max_response_length), dtype=torch.long
+                        ),
+                        "traj_rewards": torch.empty(
+                            (0, max_response_length), dtype=torch.float32
+                        ),
+                        "step_rewards": torch.empty(
+                            (0, max_response_length), dtype=torch.float32
+                        ),
+                    },
+                    non_tensors=empty_non_tensors,
+                    meta_info={
+                        "repeat_counts": [],
+                        "multimodal_alignment_dropped_group_task_ids": list(
+                            dropped_task_ids
+                        ),
+                    },
+                )
+
+            prompts_batch, response_batch, input_ids = build_sequence_batches(
+                prompts, responses
+            )
 
         prompt_lengths = torch.as_tensor([len(t) for t in prompts]).clamp_(
             min=0, max=max_prompt_length
@@ -1446,6 +1915,12 @@ class AgentWorkflowEngine:
             non_tensors=non_tensors,
             meta_info={
                 "repeat_counts": repeat_counts,
+                "multimodal_alignment_dropped_group_task_ids": list(
+                    multimodal_alignment_dropped_task_ids
+                ),
+                "kept_rollout_task_ids": list(
+                    dict.fromkeys(episode_task_ids)
+                ),
             },
         )
 
@@ -1504,3 +1979,9 @@ class AgentWorkflowEngine:
         if hasattr(self, "executor") and self.executor is not None:
             self.executor.shutdown(wait=True)
             self.executor = None
+        if (
+            hasattr(self, "rollout_engine")
+            and self.rollout_engine is not None
+            and hasattr(self.rollout_engine, "shutdown")
+        ):
+            self.rollout_engine.shutdown()

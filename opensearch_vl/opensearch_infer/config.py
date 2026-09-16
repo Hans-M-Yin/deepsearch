@@ -25,6 +25,15 @@ MAX_TURNS: int = int(os.environ.get("AGENT_MAX_TURNS", "46"))
 # MAX_TURNS so the agent still has room to produce a final answer.
 MAX_TOOL_CALLS: int = int(os.environ.get("AGENT_MAX_TOOL_CALLS", "100"))
 
+# Detailed per-turn LLM/tool timing logs. Disabled by default to keep normal
+# inference output concise; set AGENT_TRACE_LOGS=1 when diagnosing latency.
+TRACE_LOGS: bool = os.environ.get("AGENT_TRACE_LOGS", "0").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+
 # Optional retrieval server (used when the agent runs against a local index).
 RETRIEVAL_SERVER_URL: str = os.environ.get(
     "RETRIEVAL_SERVER_URL", "http://127.0.0.1:8000"

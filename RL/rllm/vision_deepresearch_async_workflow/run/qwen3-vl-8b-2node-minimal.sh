@@ -84,7 +84,11 @@ actor_ppo_max_token_len_per_gpu=74576
 infer_ppo_max_token_len_per_gpu=74576
 
 # ========= 2-node x 8-GPU parallelism =========
-offload=True
+# Match the formal run's offload topology: reference parameters stay on GPU,
+# actor parameters and the Megatron optimizer are offloaded, and gradients stay
+# on GPU. The optimizer-specific CPU offload below remains enabled so this
+# smoke test exercises the resumable optimizer checkpoint path.
+offload=False
 gen_tp=2
 train_tp=4
 train_pp=2
@@ -152,9 +156,9 @@ loss_agg_mode="seq-mean-token-sum"
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1 \
     \
     actor_rollout_ref.actor.megatron.dtype=${dtype} \
-    actor_rollout_ref.actor.megatron.param_offload=${offload} \
-    actor_rollout_ref.actor.megatron.optimizer_offload=${offload} \
-    actor_rollout_ref.actor.megatron.grad_offload=${offload} \
+    actor_rollout_ref.actor.megatron.param_offload=True \
+    actor_rollout_ref.actor.megatron.optimizer_offload=True \
+    actor_rollout_ref.actor.megatron.grad_offload=False \
     actor_rollout_ref.actor.megatron.pipeline_model_parallel_size=${train_pp} \
     actor_rollout_ref.actor.megatron.tensor_model_parallel_size=${train_tp} \
     actor_rollout_ref.actor.megatron.expert_model_parallel_size=1 \
@@ -170,7 +174,7 @@ loss_agg_mode="seq-mean-token-sum"
     +actor_rollout_ref.actor.optim.override_optimizer_config.optimizer_offload_fraction=1 \
     +actor_rollout_ref.actor.optim.override_optimizer_config.overlap_cpu_optimizer_d2h_h2d=True \
     +actor_rollout_ref.actor.optim.override_optimizer_config.use_precision_aware_optimizer=True \
-    +actor_rollout_ref.actor.optim.override_optimizer_config.optimizer_cpu_offload=${offload} \
+    +actor_rollout_ref.actor.optim.override_optimizer_config.optimizer_cpu_offload=True \
     +actor_rollout_ref.actor.megatron.override_transformer_config.recompute_method=uniform \
     +actor_rollout_ref.actor.megatron.override_transformer_config.recompute_granularity=full \
     +actor_rollout_ref.actor.megatron.override_transformer_config.recompute_num_layers=1 \
