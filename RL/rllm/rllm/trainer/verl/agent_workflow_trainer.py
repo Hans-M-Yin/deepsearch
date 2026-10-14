@@ -39,11 +39,29 @@ from verl.utils.debug import marked_timer
 from rllm.engine.agent_workflow_engine import AgentWorkflowEngine
 from rllm.engine.rollout.verl_engine import VerlEngine
 from rllm.engine.tool_cache import EpochToolCache
+from rllm.utils.partial_credit_shaping import apply_credit_turn_advantage_shaping
+from rllm.utils.rollout_consistency import consistency_metrics
 from rllm.utils.episode_logger import EpisodeLogger
+from rllm.utils.model_format import (
+    clamp_external_fatal_advantages,
+    model_failure_advantage_metrics,
+)
+from rllm.utils.remote_holder import RemoteHolder
 from rllm.workflows.workflow import TerminationReason
 
 
 logger = logging.getLogger(__name__)
+
+
+def _partial_credit_advantage_shaping_enabled() -> bool:
+    """Return whether explicit process-credit advantage shaping is enabled."""
+
+    return str(os.getenv("PARTIAL_CREDIT_ADVANTAGE_SHAPING", "0")).strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
 
 def _signal_pre_update_restart(watcher_path: str | None) -> bool:
@@ -107,6 +125,7 @@ class AgentWorkflowPPOTrainer(RayPPOTrainer):
         self.workflow_class = workflow_class
         self.workflow_args = workflow_args or {}
         self._validate_config()
+        self._holder_monitor = RemoteHolder.from_environment()
 
         self._loop = asyncio.new_event_loop()
         self._thread = threading.Thread(target=self._loop.run_forever, daemon=True)
@@ -133,6 +152,84 @@ class AgentWorkflowPPOTrainer(RayPPOTrainer):
         # TODO: revisit whether this is now supported by Verl
         if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
             raise NotImplementedError("REMAX is not supported yet")
+
+    def _apply_partial_credit_advantage_shaping(self, batch, metrics) -> None:
+        """Apply optional per-action process credit after trajectory advantage computation.
+
+        This deliberately changes ``advantages`` only.  ``returns`` remain
+        the trajectory-level GRPO targets, so a future critic is not silently
+        trained on a different target merely because the actor uses a local
+        credit assignment rule.
+        """
+
+        enabled = _partial_credit_advantage_shaping_enabled()
+        metrics["partial_credit/advantage_shaping_enabled"] = float(enabled)
+        if not enabled:
+            return
+
+        required = {
+            "is_correct",
+            "partial_credit_turns",
+            "partial_credit_expected_turn_counts",
+            "partial_credit_turn_alignment",
+        }
+        if not required.issubset(batch.non_tensor_batch.keys()):
+            metrics["partial_credit/advantage_shaping_metadata_missing"] = 1.0
+            logger.warning(
+                "[PARTIAL_CREDIT_SHAPING] metadata missing; skipping shaping "
+                "(present=%s)",
+                sorted(batch.non_tensor_batch.keys()),
+            )
+            return
+
+        try:
+            alignment = np.asarray(
+                batch.non_tensor_batch["partial_credit_turn_alignment"]
+            ).astype(bool, copy=False)
+            valid = np.asarray(
+                batch.non_tensor_batch.get(
+                    "is_valid", np.ones(len(alignment), dtype=bool)
+                )
+            ).astype(bool, copy=False)
+            is_pad = np.asarray(
+                batch.non_tensor_batch.get(
+                    "is_pad_step", np.zeros(len(alignment), dtype=bool)
+                )
+            ).astype(bool, copy=False)
+            eligible_rows = torch.as_tensor(
+                valid & ~is_pad & alignment,
+                dtype=torch.bool,
+                device=batch.batch["advantages"].device,
+            )
+            shaped, shaping_stats = apply_credit_turn_advantage_shaping(
+                advantages=batch.batch["advantages"],
+                response_mask=batch.batch["response_mask"],
+                credit_turns_by_row=batch.non_tensor_batch[
+                    "partial_credit_turns"
+                ],
+                expected_turn_counts=batch.non_tensor_batch[
+                    "partial_credit_expected_turn_counts"
+                ],
+                eligible_rows=eligible_rows,
+                is_correct_by_row=batch.non_tensor_batch["is_correct"],
+            )
+        except Exception:  # noqa: BLE001 - optional shaping must fail closed.
+            metrics["partial_credit/advantage_shaping_error"] = 1.0
+            logger.exception(
+                "[PARTIAL_CREDIT_SHAPING] failed closed; keeping unmodified advantages"
+            )
+            return
+
+        batch.batch["advantages"] = shaped
+        metrics.update(
+            {
+                f"partial_credit/advantage_shaping_{name}": value
+                for name, value in shaping_stats.items()
+            }
+        )
+        metrics["partial_credit/advantage_shaping_precomputed_alignment_mismatch_rows"] = float(
+            (~alignment).sum()
+        )
 
     def init_workers(self):
         super().init_workers()
@@ -190,6 +287,11 @@ class AgentWorkflowPPOTrainer(RayPPOTrainer):
         The training loop of PPO. Adapted to train the underlying model of agent.
         """
         from verl.utils.tracking import Tracking
+
+        tis_enabled = os.environ.get("RLLM_MM_TIS", "0") == "1"
+        if tis_enabled:
+            from rllm.utils.token_tis import validate_tis_config
+            validate_tis_config(self.config)
 
         logger = Tracking(
             project_name=self.config.trainer.project_name,
@@ -515,6 +617,47 @@ class AgentWorkflowPPOTrainer(RayPPOTrainer):
                             old_log_prob.batch.pop("entropys")
                         batch = batch.union(old_log_prob)
 
+                        if "diagnostic_rollout_log_probs" in batch.batch:
+                            legacy_metrics = consistency_metrics(
+                                batch.batch["old_log_probs"],
+                                batch.batch["diagnostic_rollout_log_probs"],
+                                batch.batch["diagnostic_rollout_log_probs_mask"],
+                                batch.batch["response_mask"],
+                            )
+                            processed = (self.config.actor_rollout_ref.rollout.get("engine_kwargs", {}).get("vllm", {}) or {}).get("logprobs_mode") == "processed_logprobs"
+                            namespace = "processed_consistency" if processed else "cross_definition"
+                            metrics.update({k.replace("training/", f"training/{namespace}/"): v
+                                            for k, v in legacy_metrics.items()})
+                            if processed:
+                                metrics.update(legacy_metrics)
+                                metrics["training/rollout_logprob_comparison_temperature"] = float(self.config.actor_rollout_ref.rollout.temperature)
+                            if "diagnostic_actor_raw_log_probs" in batch.batch:
+                                raw_metrics = consistency_metrics(
+                                    batch.batch["diagnostic_actor_raw_log_probs"],
+                                    batch.batch["diagnostic_rollout_log_probs"],
+                                    batch.batch["diagnostic_rollout_log_probs_mask"],
+                                    batch.batch["response_mask"],
+                                )
+                                metrics.update({k.replace("training/", "training/raw_consistency/"): v
+                                                for k, v in raw_metrics.items()})
+                                # Keep established metric names, with an explicit
+                                # marker identifying their corrected semantics.
+                                metrics.update(raw_metrics)
+                                metrics["training/rollout_logprob_comparison_temperature"] = 1.0
+                                batch.batch.pop("diagnostic_actor_raw_log_probs")
+
+                        if tis_enabled:
+                            from rllm.utils.token_tis import compute_token_tis
+                            weights, tis_metrics = compute_token_tis(
+                                batch.batch["old_log_probs"],
+                                batch.batch["diagnostic_rollout_log_probs"],
+                                batch.batch["diagnostic_rollout_log_probs_mask"],
+                                batch.batch["response_mask"],
+                                threshold=float(os.environ.get("RLLM_MM_TIS_THRESHOLD", "2.0")),
+                            )
+                            batch.batch["rollout_is_weights"] = weights
+                            metrics.update(tis_metrics)
+
                         if "rollout_log_probs" in batch.batch.keys():
                             # TODO: we may want to add diff of probs too.
                             rollout_old_log_probs = batch.batch["rollout_log_probs"]
@@ -623,19 +766,10 @@ class AgentWorkflowPPOTrainer(RayPPOTrainer):
                             config=self.config.algorithm,
                         )
 
-                        # One-sided advantage clamp for fatal trajectories.
-                        # Fatal trajectories participate in group statistics
-                        # (above), but their prefix tokens should only receive
-                        # positive gradient.  Clamping A >= 0 ensures worst
-                        # case degenerates to hard mask (zero gradient).
-                        if "is_fatal" in batch.non_tensor_batch:
-                            _fatal_mask = batch.non_tensor_batch["is_fatal"]
-                            if hasattr(_fatal_mask, "astype"):
-                                _fatal_mask = _fatal_mask.astype(bool)
-                            if np.any(_fatal_mask):
-                                for _fi in np.where(_fatal_mask)[0]:
-                                    batch.batch["advantages"][_fi].clamp_(min=0.0)
-                                    batch.batch["returns"][_fi].clamp_(min=0.0)
+                        # Infrastructure failures retain one-sided protection.
+                        # Model format/argument failures keep their signed
+                        # group-relative advantage, including negative values.
+                        clamp_external_fatal_advantages(batch)
 
                         if (
                             self.config.rllm.stepwise_advantage.enable
@@ -646,6 +780,16 @@ class AgentWorkflowPPOTrainer(RayPPOTrainer):
                                 batch, non_last_step_batch
                             )
                             batch = DataProto.concat([batch, non_last_step_batch])
+
+                        # RLOO/GRPO first computes the trajectory-level scalar
+                        # advantage. Apply local credit assignment only
+                        # afterwards, on the original response-mask layout.
+                        # This is also after broadcast-mode reconstruction so
+                        # every agent action row sees its own credit mask.
+                        self._apply_partial_credit_advantage_shaping(
+                            batch, metrics
+                        )
+                        metrics.update(model_failure_advantage_metrics(batch))
 
                     # remove invalid items filtered out due to compact filtering
                     is_valid = batch.non_tensor_batch["is_valid"]
@@ -1106,17 +1250,20 @@ class AgentWorkflowPPOTrainer(RayPPOTrainer):
         if timing_raw is None:
             timing_raw = {}
 
-        with marked_timer("generate_trajectories", timing_raw, color="red"):
-            if (
-                hasattr(self, "_tracking_logger")
-                and self._tracking_logger is not None
-                and self._tracking_logger.live_enabled
-            ):
-                kwargs["progress_callback"] = self._tracking_logger.log_live
-            coro = self.agent_execution_engine.execute_tasks_verl(batch, **kwargs)
-            final_gen_batch_output = asyncio.run_coroutine_threadsafe(
-                coro, self._loop
-            ).result()
+        # This shared boundary covers train, validation, and rejection-sampling
+        # rollouts. execute_tasks_verl returns after reward/judge post-processing.
+        with self._holder_monitor.rollout():
+            with marked_timer("generate_trajectories", timing_raw, color="red"):
+                if (
+                    hasattr(self, "_tracking_logger")
+                    and self._tracking_logger is not None
+                    and self._tracking_logger.live_enabled
+                ):
+                    kwargs["progress_callback"] = self._tracking_logger.log_live
+                coro = self.agent_execution_engine.execute_tasks_verl(batch, **kwargs)
+                final_gen_batch_output = asyncio.run_coroutine_threadsafe(
+                    coro, self._loop
+                ).result()
 
         return final_gen_batch_output
 
@@ -1210,6 +1357,8 @@ class AgentWorkflowPPOTrainer(RayPPOTrainer):
             batch.non_tensor_batch["is_valid"][idx] = False
             if "is_fatal" in batch.non_tensor_batch:
                 batch.non_tensor_batch["is_fatal"][idx] = False
+            if "is_model_failure" in batch.non_tensor_batch:
+                batch.non_tensor_batch["is_model_failure"][idx] = False
 
         return batch
 
@@ -1224,6 +1373,9 @@ class AgentWorkflowPPOTrainer(RayPPOTrainer):
 
     def shutdown(self):
         """A cleanup method to gracefully stop the background event loop."""
+        holder_monitor = getattr(self, "_holder_monitor", None)
+        if holder_monitor is not None:
+            holder_monitor.close()
         if (
             hasattr(self, "agent_execution_engine")
             and self.agent_execution_engine is not None

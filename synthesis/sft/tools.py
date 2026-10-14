@@ -40,6 +40,8 @@ if __package__ in (None, ""):
 
 from synthesis.search_client import (
     SerperSearchClient,
+    _new_serper_request_id,
+    _serper_timing_debug,
     acquire_serper_api_key,
 )
 from synthesis.wiki_text_builder import EnhancedReaderClient
@@ -2699,6 +2701,8 @@ def read_url(
     assistant_output: str = "",
     resource: UrlResource | None = None,
     raw_document_fetcher: RawDocumentFetcher | None = None,
+    *,
+    allow_images: bool = True,
 ) -> dict[str, Any]:
     """Read a URL and attach private timing diagnostics to the result."""
 
@@ -2713,6 +2717,7 @@ def read_url(
             resource=resource,
             _timings=timings,
             raw_document_fetcher=raw_document_fetcher,
+            allow_images=allow_images,
         )
         return result
     finally:
@@ -2748,6 +2753,7 @@ def _read_url_impl(
     *,
     _timings: dict[str, float] | None = None,
     raw_document_fetcher: RawDocumentFetcher | None = None,
+    allow_images: bool = True,
 ) -> dict[str, Any]:
     """Read a URL as either text content or a downloadable image."""
 
@@ -2779,6 +2785,12 @@ def _read_url_impl(
             time.monotonic() - classify_started_at,
         )
     if is_image_resource or content_type.startswith("image/"):
+        if not allow_images:
+            return {
+                "ok": False,
+                "error": "Image downloading is disabled for this ablation. read_url supports webpage/PDF text only.",
+                "error_code": "image_download_disabled",
+            }
         image_max_retries = _read_url_image_max_retries()
         image_retry_sleep_s = _read_url_image_retry_sleep_s()
         image_max_429_retries = _read_url_429_max_retries()
@@ -3226,10 +3238,31 @@ def _run_search_with_timeout_retry(
     for attempt in range(1, TOOL_TIMEOUT_RETRIES + 2):
         request_started_at = time.monotonic()
         try:
-            return request()
+            result = request()
+            _serper_timing_debug(
+                "tool_attempt",
+                elapsed_s=time.monotonic() - request_started_at,
+                tool=tool_name,
+                attempt=attempt,
+                outcome="success",
+                request_url=request_url,
+            )
+            return result
         except Exception as exc:
+            _serper_timing_debug(
+                "tool_attempt",
+                elapsed_s=time.monotonic() - request_started_at,
+                force=True,
+                tool=tool_name,
+                attempt=attempt,
+                outcome="error",
+                request_url=request_url,
+                error_type=type(exc).__name__,
+                error=str(exc)[:500],
+            )
             if not _is_timeout_error(exc) or attempt > TOOL_TIMEOUT_RETRIES:
                 raise
+            retry_error = exc
         finally:
             _read_url_timing_add(
                 timings,
@@ -3247,15 +3280,15 @@ def _run_search_with_timeout_retry(
             attempt=attempt,
             max_attempts=TOOL_TIMEOUT_RETRIES + 1,
             sleep_seconds=TOOL_RETRY_SLEEP_S * attempt,
-            error=exc,
+            error=retry_error,
         )
         tracked_sleep(
             TOOL_RETRY_SLEEP_S * attempt,
-            reason=retry_reason_from_exception(exc, default=f"{tool_name}_timeout"),
+            reason=retry_reason_from_exception(retry_error, default=f"{tool_name}_timeout"),
             tool=tool_name,
-            error=exc,
+            error=retry_error,
             url=request_url,
-            error_type=type(exc).__name__,
+            error_type=type(retry_error).__name__,
             fallback_sleep=time.sleep,
         )
         if timings is not None:
@@ -3264,6 +3297,13 @@ def _run_search_with_timeout_retry(
                 "serper_retry_sleep_s",
                 time.monotonic() - retry_sleep_started_at,
             )
+        _serper_timing_debug(
+            "tool_retry_sleep",
+            elapsed_s=TOOL_RETRY_SLEEP_S * attempt,
+            tool=tool_name,
+            attempt=attempt,
+            request_url=request_url,
+        )
     raise AssertionError("unreachable")
 
 
@@ -3370,38 +3410,66 @@ def _image_search_via_serper(
     top_k: int = MAX_SEARCH_RESULTS,
     *,
     timings: dict[str, float] | None = None,
+    requested_results: int | None = None,
 ) -> object:
     serper_api_key, _ = acquire_serper_api_key()
     fetch_limit = _search_fetch_limit(max(1, min(int(top_k), MAX_SEARCH_RESULTS)), tool_name="i2i_search")
+    if requested_results is not None:
+        fetch_limit = max(1, int(requested_results))
 
     lens_headers = {
         "X-API-KEY": serper_api_key,
         "Content-Type": "application/json",
+        "X-Request-ID": _new_serper_request_id(),
     }
     relay_token = os.environ.get("SERPER_RELAY_TOKEN")
     if relay_token:
         lens_headers["X-Serper-Relay-Token"] = relay_token
     lens_url = os.environ.get("SERPER_LENS_URL") or "https://google.serper.dev/lens"
     request_started_at = time.monotonic()
+    response = None
     try:
         response = requests.post(
             lens_url,
             headers=lens_headers,
-            json={"url": image_url},
+            json={"url": image_url, **({"num": fetch_limit} if requested_results is not None else {})},
             timeout=TOOL_NETWORK_TIMEOUT_S,
+            stream=True,
         )
-    finally:
-        _read_url_timing_add(
-            timings,
-            "serper_http_s",
-            time.monotonic() - request_started_at,
-        )
-        _read_url_timing_add(timings, "serper_attempts", 1.0)
-    try:
+        headers_elapsed_s = time.monotonic() - request_started_at
         response.raise_for_status()
-    except requests.HTTPError:
+        body_started_at = time.monotonic()
+        data = response.json()
+        body_read_elapsed_s = time.monotonic() - body_started_at
+        elapsed_s = time.monotonic() - request_started_at
+        _read_url_timing_add(timings, "serper_http_s", elapsed_s)
+        _read_url_timing_add(timings, "serper_attempts", 1.0)
+        _serper_timing_debug(
+            "client_http",
+            elapsed_s=elapsed_s,
+            request_id=lens_headers["X-Request-ID"],
+            url=lens_url,
+            status_code=response.status_code,
+            headers_s=round(headers_elapsed_s, 3),
+            body_read_s=round(body_read_elapsed_s, 3),
+        )
+    except Exception as exc:
+        elapsed_s = time.monotonic() - request_started_at
+        _read_url_timing_add(timings, "serper_http_s", elapsed_s)
+        _read_url_timing_add(timings, "serper_attempts", 1.0)
+        _serper_timing_debug(
+            "client_http_error",
+            elapsed_s=elapsed_s,
+            force=True,
+            request_id=lens_headers["X-Request-ID"],
+            url=lens_url,
+            error_type=type(exc).__name__,
+            error=str(exc)[:500],
+        )
         raise
-    data = response.json()
+    finally:
+        if response is not None:
+            response.close()
     organic = data.get("organic", []) or []
     if not organic:
         return data
@@ -3428,6 +3496,7 @@ def i2i_search(
     base_delay: int = TOOL_RETRY_SLEEP_S,
     timings: dict[str, float] | None = None,
     debug_context: dict[str, Any] | None = None,
+    private_result_limit: int | None = None,
 ) -> dict[str, Any]:
     """Reverse-image search using a provided backend or Serper Lens.
 
@@ -3441,7 +3510,8 @@ def i2i_search(
 
     use_default_visual_lookup = visual_lookup is None
     visual_lookup = visual_lookup or _image_search_via_serper
-    top_k = max(1, min(int(top_k), MAX_SEARCH_RESULTS))
+    limit = MAX_SEARCH_RESULTS if private_result_limit is None else max(1, int(private_result_limit))
+    top_k = max(1, min(int(top_k), limit))
     last_error: Exception | None = None
     empty_result_retries = 0
     attempt = 1
@@ -3451,7 +3521,8 @@ def i2i_search(
         attempts_made = attempt
         try:
             if use_default_visual_lookup:
-                result = visual_lookup(image_url=image_url, top_k=top_k, timings=timings)
+                result = visual_lookup(image_url=image_url, top_k=top_k, timings=timings,
+                    **({"requested_results": limit} if private_result_limit is not None else {}))
             else:
                 result = visual_lookup(image_url=image_url, top_k=top_k)
             if isinstance(result, dict) and "error" in result:
@@ -3501,6 +3572,14 @@ def i2i_search(
                     "serper_retry_sleep_s",
                     float(I2I_EMPTY_RESULT_RETRY_SLEEP_S),
                 )
+                _serper_timing_debug(
+                    "tool_retry_sleep",
+                    elapsed_s=I2I_EMPTY_RESULT_RETRY_SLEEP_S,
+                    tool="i2i_search",
+                    attempt=failed_attempt,
+                    retry_reason="empty_result",
+                    request_url=os.environ.get("SERPER_LENS_URL") or "https://google.serper.dev/lens",
+                )
                 continue
             if result_count == 0:
                 _record_search_tool_call("i2i_search", success=False, result_count=0)
@@ -3541,6 +3620,14 @@ def i2i_search(
                     fallback_sleep=time.sleep,
                 )
                 _read_url_timing_add(timings, "serper_retry_sleep_s", sleep_s)
+                _serper_timing_debug(
+                    "tool_retry_sleep",
+                    elapsed_s=sleep_s,
+                    tool="i2i_search",
+                    attempt=attempt,
+                    retry_reason="timeout",
+                    request_url=os.environ.get("SERPER_LENS_URL") or "https://google.serper.dev/lens",
+                )
             elif not _is_timeout_error(exc):
                 break
             attempt += 1

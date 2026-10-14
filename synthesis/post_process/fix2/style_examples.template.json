@@ -1,0 +1,7 @@
+{
+  "examples": [
+    "Replace this with a sanitized visual-candidate comparison anchor. Keep only reasoning structure and generic tool names; remove all named entities, answers, URLs, source titles, snippets, resource IDs, and image content.",
+    "Replace this with a sanitized visual-to-text anchor. It should show: state a visible clue, search for candidates, open candidate images, reject an ambiguous candidate from visible evidence, then use a separate page read for the requested fact.",
+    "Replace this with a sanitized recovery anchor. It should show one failed or ambiguous visual check followed by a grounded query reformulation, not a fabricated conclusion."
+  ]
+}

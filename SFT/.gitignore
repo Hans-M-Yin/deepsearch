@@ -181,4 +181,4 @@ wandb/
 swanlog/
 generated_predictions.jsonl
 predictions_score.json
-data
+/data/

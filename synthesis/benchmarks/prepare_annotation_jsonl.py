@@ -483,10 +483,12 @@ class TextSegments:
 
 def _parse_model_json(raw: str) -> dict[str, Any]:
     text = str(raw or "").strip()
-    fenced = re.search(r"```(?:json)?\s*(.*?)```", text, re.DOTALL | re.IGNORECASE)
-    if fenced:
-        text = fenced.group(1).strip()
+    # Parse the response itself first: valid JSON values may contain Markdown
+    # fences, which must not be mistaken for the response's outer wrapper.
     candidates = [text]
+    fenced = re.fullmatch(r"```(?:json)?\s*(.*?)```", text, re.DOTALL | re.IGNORECASE)
+    if fenced:
+        candidates.append(fenced.group(1).strip())
     object_match = re.search(r"\{.*\}", text, re.DOTALL)
     if object_match:
         candidates.append(object_match.group(0))

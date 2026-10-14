@@ -594,6 +594,14 @@ def efficient_entropy_forward(
     assert maximum.is_contiguous() and accumulate.is_contiguous() and entropy_b.is_contiguous()
 
     vocab_per_split = 1024
+    from verl.utils.consistency_debug import enabled, emit
+    if enabled() and not getattr(efficient_entropy_forward, "_debug_reported", False):
+        emit("fused_vocab_boundary", local_vocab_size=vocab_size,
+             block_size_n=256, vocab_per_split=vocab_per_split,
+             incomplete_vocab_tile=bool(vocab_size % 256),
+             hidden_dtype=hidden.dtype, weight_dtype=weight.dtype,
+             note="Local forward uses zero-padded out-of-vocab logits in LSE; compare unfused probe")
+        efficient_entropy_forward._debug_reported = True
     assert vocab_per_split % 128 == 0
     num_splits = (vocab_size + vocab_per_split - 1) // vocab_per_split
 

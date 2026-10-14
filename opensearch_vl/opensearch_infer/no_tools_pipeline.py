@@ -14,9 +14,12 @@ from .no_tools_prompts import SYSTEM_PROMPT
 from .pipeline import (
     _bootstrap_images,
     _first_present,
+    _format_inference_error,
     _prompt_from_row,
     _row_to_dict,
+    _save_failure_trajectory,
     _strip_base64_payloads,
+    InferenceTiming,
 )
 from .runners import BaseRunner, InferenceConfig
 from synthesis.sft.qwen3_vl_template import add_sft_image_placeholders
@@ -34,6 +37,7 @@ def process_single_case(
     dataset_type: str = "train",
     inference_cfg: Optional[InferenceConfig] = None,
     dynamic_resolution: bool = False,
+    timing: Optional[InferenceTiming] = None,
 ) -> Dict[str, Any]:
     """Run one benchmark example through a no-tools single-turn baseline."""
 
@@ -89,6 +93,23 @@ def process_single_case(
 
     cfg = inference_cfg or InferenceConfig()
 
+    def fail(kind: str, reason: str) -> None:
+        try:
+            _save_failure_trajectory(
+                trajectory,
+                output_dir,
+                image_paths_dict,
+                {},
+                failure_kind=kind,
+                failure_reason=reason,
+                failed_turn=0,
+                tool_call_count=0,
+                max_turns=1,
+                max_tool_calls=0,
+            )
+        except Exception as save_exc:
+            logger.error("Could not save failure trajectory: %s", save_exc, exc_info=True)
+
     llm_started_at = time.perf_counter()
     llm_status = "exception"
     if config.TRACE_LOGS:
@@ -108,6 +129,8 @@ def process_single_case(
     except Exception as exc:
         logger.error("Inference failed: %s", exc, exc_info=True)
         trajectory["turns"].append({"turn": 0, "error": str(exc)})
+        fail("inference_error", str(exc))
+        raise RuntimeError(f"No-tools inference failed: {exc}") from exc
     else:
         response_text = ""
         for cand in response.get("candidates", []) or []:
@@ -123,7 +146,18 @@ def process_single_case(
             }
         )
         trajectory["final_response_text"] = response_text
+        if response.get("inference_error"):
+            reason = _format_inference_error(response["inference_error"], 0)
+            fail("inference_error", reason)
+            raise RuntimeError(reason)
+        if not response_text.strip():
+            llm_status = "invalid_response"
+            reason = "No-tools inference returned an empty response."
+            fail("invalid_response", reason)
+            raise RuntimeError(reason)
     finally:
+        if timing is not None:
+            timing.record("llm", time.perf_counter() - llm_started_at)
         if config.TRACE_LOGS:
             logger.info(
                 "[inference-trace] LLM_END case_id=%s case_idx=%s turn=0 "
@@ -135,12 +169,7 @@ def process_single_case(
                 time.perf_counter() - llm_started_at,
             )
 
-    if "final_response_text" not in trajectory:
-        trajectory["final_response_text"] = "\n\n".join(
-            turn.get("response_text", "")
-            for turn in trajectory["turns"]
-            if turn.get("response_text")
-        )
+    trajectory["status"] = "completed"
 
     image_urls = {
         img_id: data

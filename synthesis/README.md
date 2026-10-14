@@ -53,8 +53,20 @@ On the Relay host:
 python debug/serper_relay.py --bind '::' --port 18080 \
   --keys-file /path/to/serper_keys.txt \
   --state-file /path/to/serper_pool_state.json \
-  --pool-default-credits 2500 --pool-min-remaining 100
+  --pool-default-credits 2500 --pool-min-remaining 100 \
+  --request-queue-size 512 \
+  --max-inflight 128
 ```
+
+`--request-queue-size` controls the TCP listen backlog before requests enter
+the Python handlers.  The relay defaults to 512 (the Python standard-library
+default is only 5), which is important for high-concurrency workers.  It can
+also be set with `SERPER_RELAY_REQUEST_QUEUE_SIZE`.
+
+`--max-inflight` limits the number of requests being forwarded to Serper at
+the same time.  Excess requests wait in the handler threads.  It defaults to
+128 and can also be set with `SERPER_RELAY_MAX_INFLIGHT`; tune it separately
+from the TCP listen backlog based on the relay's egress capacity.
 
 On every worker, point all three Serper endpoints at the Relay and configure
 one fixed `SERPER_API_KEY`:
@@ -88,6 +100,7 @@ requests, so Browser image downloads also use the public-egress node:
 ```bash
 # On the public-egress/state-owning node
 python debug/firecrawl_relay.py --bind '::' --port 18081 --max-inflight 8 \
+  --request-queue-size 512 \
   --keys-file /path/to/firecrawl_keys.txt \
   --state-file /path/to/firecrawl_pool_state.json \
   --pool-default-credits 10000 \
@@ -99,6 +112,11 @@ export FIRECRAWL_RELAY_TIMEOUT_S=180
 export FIRECRAWL_BROWSER_RELAY_TIMEOUT_S=300
 export FIRECRAWL_API_KEY=relay-worker
 ```
+
+The relay's TCP listen backlog defaults to 512; override it with
+`--request-queue-size` or `FIRECRAWL_RELAY_REQUEST_QUEUE_SIZE` when running a
+larger concurrency test. This is separate from `--max-inflight`, which limits
+requests forwarded to Firecrawl.
 
 The Relay exposes `GET /healthz`, `POST /v2/scrape`, and the Browser lifecycle
 routes `POST /v2/browser`, `POST /v2/browser/{session_id}/execute`, and

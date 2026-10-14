@@ -58,6 +58,8 @@ FORWARD_PREFIXES = [
     "PARTIAL_CREDIT_",
     # Multimodal RL diagnostics (RLLM_MM_DEBUG, log path, rank filter, etc.).
     "RLLM_MM_",
+    # The trainer runs inside Ray's TaskRunner and needs monitor URL/token.
+    "RLLM_HOLDER_",
     # W&B diagnostics used by verl.utils.tracking.  Do not print values from
     # these variables: this prefix can include credentials and proxy settings.
     "RLLM_WANDB",

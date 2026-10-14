@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 import re
 from copy import deepcopy
 
@@ -175,6 +176,19 @@ class ChatTemplateParser:
         avoids downloading the same URL again while converting the trajectory
         for update.  Only the response mask is reconstructed from messages.
         """
+        stored_mask = getattr(model_output, "cumulative_loss_mask", None)
+        if stored_mask is not None:
+            initial = model_output.cumulative_initial_prompt_length
+            ids = torch.cat([
+                torch.as_tensor(model_output.prompt_ids, dtype=torch.long).reshape(-1),
+                torch.as_tensor(model_output.completion_ids, dtype=torch.long).reshape(-1),
+            ])
+            mask = torch.as_tensor(stored_mask, dtype=torch.long)
+            if initial is None or not 0 <= initial <= len(ids) or mask.shape != ids.shape:
+                raise ValueError("Invalid continuous TITO sequence/mask boundary")
+            if mask[:initial].any() or not torch.all((mask == 0) | (mask == 1)):
+                raise ValueError("Invalid continuous TITO loss mask")
+            return ids[:initial], ids[initial:], mask[initial:], dict(model_output.multi_modal_inputs or {})
         multimodal_inputs = dict(model_output.multi_modal_inputs or {})
         image_token_id = getattr(self.processor, "image_token_id", None)
         if image_token_id is None:
@@ -339,6 +353,8 @@ class ChatTemplateParser:
         Returns:
             ``(prompt_ids, response_ids, response_mask, multi_modal_inputs)``.
         """
+        if os.environ.get("RLLM_MM_TITO", "0") == "1" and getattr(model_output, "cumulative_loss_mask", None) is None:
+            raise ValueError("Continuous TITO output missing; refusing legacy history re-tokenization")
         if model_output is not None and getattr(model_output, "prompt_ids", None) is not None:
             return self._tokenize_cumulative_multimodal_from_model_output(
                 messages, model_output

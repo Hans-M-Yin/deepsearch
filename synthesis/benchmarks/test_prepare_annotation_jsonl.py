@@ -5,7 +5,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from synthesis.benchmarks.prepare_annotation_jsonl import main
+from synthesis.benchmarks.prepare_annotation_jsonl import _parse_model_json, main
 from synthesis.model_worker import ModelResponse
 
 
@@ -22,6 +22,13 @@ class _FakeTranslator:
 
 
 class PrepareAnnotationJsonlTest(unittest.TestCase):
+    def test_translation_preserves_markdown_fences_inside_json_values(self) -> None:
+        expected = {"translations": {"segment": "```markdown\n# 加拿大\n加拿大位于北美洲。\n```"}}
+        raw = json.dumps(expected, ensure_ascii=False)
+        for response in (raw, f"```json\n{raw}\n```", f"Translation result:\n{raw}"):
+            with self.subTest(response=response):
+                self.assertEqual(_parse_model_json(response), expected)
+
     def test_join_graph_and_translate(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

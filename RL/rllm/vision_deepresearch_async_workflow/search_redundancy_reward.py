@@ -41,15 +41,6 @@ _LIMITERS: weakref.WeakKeyDictionary[
     asyncio.AbstractEventLoop, tuple[int, asyncio.Semaphore]
 ] = weakref.WeakKeyDictionary()
 
-# One compact configuration diagnostic per rollout process proves the *remote
-# worker's* effective configuration without flooding logs or exposing
-# queries/URLs.  In contrast, the caller intentionally asked for one result
-# diagnostic per completed trajectory, so score-result diagnostics are not
-# deduplicated.
-_RUNTIME_CONFIG_LOGGED = False
-_DEBUG_LOG_PREFIX = "##############3"
-
-
 def _env_int(name: str, default: int, *, minimum: int = 1) -> int:
     try:
         return max(minimum, int(os.environ.get(name, default)))
@@ -370,43 +361,6 @@ def _get_limiter(limit: int) -> asyncio.Semaphore:
     return existing[1]
 
 
-def _log_runtime_config_once(config: SearchRedundancyConfig) -> None:
-    """Log only safe, process-local scorer configuration diagnostics."""
-
-    global _RUNTIME_CONFIG_LOGGED
-    if _RUNTIME_CONFIG_LOGGED:
-        return
-    _RUNTIME_CONFIG_LOGGED = True
-    print(
-        f"{_DEBUG_LOG_PREFIX} [SearchRedundancy][WorkerConfig] "
-        f"mode={config.mode} "
-        f"embedding_url_configured={bool(config.embedding_url)} "
-        f"semantic_threshold={config.semantic_threshold:.3f} "
-        f"url_overlap_threshold={config.url_overlap_threshold:.3f} "
-        f"min_urls_per_search={config.min_urls_per_search}",
-        flush=True,
-    )
-
-
-def _log_score_result(result: Mapping[str, Any]) -> None:
-    """Log one safe result summary for every completed trajectory."""
-
-    print(
-        f"{_DEBUG_LOG_PREFIX} [SearchRedundancy][WorkerResult] "
-        f"reason={str(result.get('reason') or 'unknown')} "
-        f"scored={bool(result.get('scored'))} "
-        f"search_trace_count={int(result.get('search_trace_count', 0) or 0)} "
-        f"eligible_search_count={int(result.get('eligible_search_count', 0) or 0)} "
-        f"embedded_query_count={int(result.get('embedded_query_count', 0) or 0)} "
-        f"embedding_request_executed="
-        f"{bool(result.get('embedding_request_executed'))} "
-        f"embedding_response_valid="
-        f"{bool(result.get('embedding_response_valid'))} "
-        f"confirmed_event_count={int(result.get('confirmed_event_count', 0) or 0)}",
-        flush=True,
-    )
-
-
 async def _request_embeddings(
     inputs: list[str], config: SearchRedundancyConfig
 ) -> tuple[list[Sequence[float]], float, float]:
@@ -435,7 +389,6 @@ async def score_search_redundancy(
     """Embed one completed trajectory and return a fail-open reward record."""
 
     config = config or SearchRedundancyConfig.from_env()
-    _log_runtime_config_once(config)
     if not isinstance(search_trace, Sequence) or isinstance(search_trace, (str, bytes)):
         search_trace = []
     trace_count = len(search_trace)
@@ -443,7 +396,6 @@ async def score_search_redundancy(
         result = _empty_result(
             config, reason="missing_embedding_url", search_trace_count=trace_count
         )
-        _log_score_result(result)
         return result
 
     eligible = _eligible_events(search_trace, config)
@@ -452,7 +404,6 @@ async def score_search_redundancy(
             config, reason="fewer_than_two_eligible_searches", search_trace_count=trace_count
         )
         result["eligible_search_count"] = len(eligible)
-        _log_score_result(result)
         return result
 
     unique_queries: dict[str, str] = {}
@@ -479,7 +430,6 @@ async def score_search_redundancy(
                 "embedding_error": str(exc),
             }
         )
-        _log_score_result(result)
         return result
 
     embeddings_by_query = dict(zip(unique_queries.keys(), vectors, strict=True))
@@ -490,7 +440,6 @@ async def score_search_redundancy(
     result["embedding_queue_wait_s"] = queue_wait_s
     result["embedding_request_executed"] = True
     result["embedding_response_valid"] = True
-    _log_score_result(result)
     return result
 
 

@@ -37,6 +37,7 @@ from synthesis.search_client import (
     SerperApiKeyPool,
     _is_serper_auth_failure,
     _is_serper_credit_exhausted,
+    _serper_timing_debug,
 )
 
 
@@ -48,8 +49,10 @@ DEFAULT_REQUEST_QUEUE_SIZE = 512
 DEFAULT_MAX_INFLIGHT = 128
 
 
-def _log_upstream(*, path: str, status_code: int | None = None, elapsed_s: float, response_chars: int | None = None, error: Exception | None = None) -> None:
-    fields = [f"path={path!r}", f"elapsed_s={elapsed_s:.3f}"]
+def _log_upstream(*, path: str, request_id: str = "-", attempt: int | None = None, status_code: int | None = None, elapsed_s: float, response_chars: int | None = None, error: Exception | None = None) -> None:
+    fields = [f"request_id={request_id!r}", f"path={path!r}", f"elapsed_s={elapsed_s:.3f}"]
+    if attempt is not None:
+        fields.append(f"attempt={attempt}")
     if status_code is not None:
         fields.append(f"status_code={status_code}")
     if response_chars is not None:
@@ -140,6 +143,8 @@ class SerperRelayHandler(BaseHTTPRequestHandler):
         self._write_json(200, {"ok": True, "service": "serper-relay"})
 
     def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
+        request_started_at = time.perf_counter()
+        request_id = self.headers.get("X-Request-ID", "-")
         path = self.path.split("?", 1)[0]
         if path not in {"/search", "/images", "/lens"}:
             self._write_json(404, {"error": "unsupported_path"})
@@ -160,7 +165,9 @@ class SerperRelayHandler(BaseHTTPRequestHandler):
             self._write_json(400, {"error": "invalid_content_length"})
             return
 
+        body_read_started_at = time.perf_counter()
         body = self.rfile.read(content_length)
+        body_read_elapsed_s = time.perf_counter() - body_read_started_at
         try:
             payload = json.loads(body)
         except json.JSONDecodeError:
@@ -178,9 +185,12 @@ class SerperRelayHandler(BaseHTTPRequestHandler):
         relay_pool = getattr(self.server, "key_pool", None)
         upstream_base = str(self.server.upstream_base).rstrip("/")
         upstream_url = f"{upstream_base}{path}"
+        pool_status_elapsed_s = 0.0
         if relay_pool is not None:
             try:
+                pool_status_started_at = time.perf_counter()
                 pool_status = relay_pool.status()
+                pool_status_elapsed_s = time.perf_counter() - pool_status_started_at
                 key_attempt_budget = max(1, int(pool_status.get("available_key_count") or 0))
             except RuntimeError as exc:
                 self._write_json(
@@ -193,11 +203,17 @@ class SerperRelayHandler(BaseHTTPRequestHandler):
             # caller-provided key as the relay did before pool management.
             key_attempt_budget = 1
 
+        key_acquire_total_s = 0.0
+        first_upstream_started_at: float | None = None
         for key_attempt in range(1, key_attempt_budget + 1):
             key_id: str | None = None
             if relay_pool is not None:
                 try:
-                    api_key, pool_metadata = relay_pool.acquire_key()
+                    key_acquire_started_at = time.perf_counter()
+                    try:
+                        api_key, pool_metadata = relay_pool.acquire_key()
+                    finally:
+                        key_acquire_total_s += time.perf_counter() - key_acquire_started_at
                     key_id = str(pool_metadata.get("key_id") or "")
                 except RuntimeError as exc:
                     self._write_json(
@@ -208,6 +224,9 @@ class SerperRelayHandler(BaseHTTPRequestHandler):
             else:
                 api_key = client_api_key
 
+            upstream_started_at = time.perf_counter()
+            if first_upstream_started_at is None:
+                first_upstream_started_at = upstream_started_at
             try:
                 response_body, status_code, content_type = self._fetch_upstream_limited(
                     path=path,
@@ -216,6 +235,16 @@ class SerperRelayHandler(BaseHTTPRequestHandler):
                     api_key=api_key,
                 )
             except (URLError, TimeoutError, OSError) as exc:
+                _serper_timing_debug(
+                    "relay_upstream_error",
+                    elapsed_s=time.perf_counter() - request_started_at,
+                    force=True,
+                    request_id=request_id,
+                    path=path,
+                    queue_wait_s=round(float(getattr(self, "_last_queue_wait_s", 0.0)), 3),
+                    error_type=type(exc).__name__,
+                    error=str(getattr(exc, "reason", exc))[:500],
+                )
                 self._write_json(
                     502,
                     {
@@ -225,6 +254,8 @@ class SerperRelayHandler(BaseHTTPRequestHandler):
                     },
                 )
                 return
+            upstream_elapsed_s = time.perf_counter() - upstream_started_at
+            queue_wait_s = float(getattr(self, "_last_queue_wait_s", 0.0))
 
             self._record_pool_result(
                 key_id=key_id,
@@ -257,7 +288,41 @@ class SerperRelayHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(response_body)))
             self.send_header("Connection", "close")
             self.end_headers()
-            self.wfile.write(response_body)
+            write_started_at = time.perf_counter()
+            write_error: Exception | None = None
+            try:
+                self.wfile.write(response_body)
+            except (BrokenPipeError, ConnectionResetError) as exc:
+                # The caller may have timed out while this request was waiting
+                # for max-inflight.  Keep the relay alive and retain timing
+                # information without emitting a full handler traceback.
+                write_error = exc
+                self.close_connection = True
+            write_elapsed_s = time.perf_counter() - write_started_at
+            total_elapsed_s = time.perf_counter() - request_started_at
+            _serper_timing_debug(
+                "relay_request",
+                elapsed_s=total_elapsed_s,
+                force=write_error is not None,
+                request_id=request_id,
+                path=path,
+                status_code=status_code,
+                queue_wait_s=round(queue_wait_s, 3),
+                upstream_s=round(upstream_elapsed_s, 3),
+                response_write_s=round(write_elapsed_s, 3),
+                body_read_s=round(body_read_elapsed_s, 3),
+                pool_status_s=round(pool_status_elapsed_s, 3),
+                key_acquire_s=round(key_acquire_total_s, 3),
+                pre_upstream_s=round(
+                    (first_upstream_started_at - request_started_at)
+                    if first_upstream_started_at is not None
+                    else 0.0,
+                    3,
+                ),
+                response_bytes=len(response_body),
+                client_disconnected=write_error is not None,
+                error_type=type(write_error).__name__ if write_error else None,
+            )
             return
 
     def _fetch_upstream_limited(
@@ -276,6 +341,7 @@ class SerperRelayHandler(BaseHTTPRequestHandler):
         """
         gate = getattr(self.server, "inflight_semaphore", None)
         if gate is None:
+            self._last_queue_wait_s = 0.0
             return self._fetch_upstream(
                 path=path,
                 upstream_url=upstream_url,
@@ -286,10 +352,12 @@ class SerperRelayHandler(BaseHTTPRequestHandler):
         wait_started_at = time.perf_counter()
         gate.acquire()
         wait_s = time.perf_counter() - wait_started_at
+        self._last_queue_wait_s = wait_s
         if wait_s >= 0.01:
             print(
                 f"[serper-relay] max-inflight wait_s={wait_s:.3f} "
-                f"max_inflight={self.server.max_inflight} path={path!r}",
+                f"max_inflight={self.server.max_inflight} path={path!r} "
+                f"request_id={self.headers.get('X-Request-ID', '-')!r}",
                 file=sys.stderr,
                 flush=True,
             )
@@ -332,6 +400,8 @@ class SerperRelayHandler(BaseHTTPRequestHandler):
                     content_type = response.headers.get("Content-Type", "application/json")
                 _log_upstream(
                     path=path,
+                    request_id=self.headers.get("X-Request-ID", "-"),
+                    attempt=attempt,
                     status_code=status_code,
                     elapsed_s=time.perf_counter() - upstream_started_at,
                     response_chars=len(response_body),
@@ -343,6 +413,8 @@ class SerperRelayHandler(BaseHTTPRequestHandler):
                 content_type = (exc.headers or {}).get("Content-Type", "application/json")
                 _log_upstream(
                     path=path,
+                    request_id=self.headers.get("X-Request-ID", "-"),
+                    attempt=attempt,
                     status_code=status_code,
                     elapsed_s=time.perf_counter() - upstream_started_at,
                     response_chars=len(response_body),
@@ -351,7 +423,8 @@ class SerperRelayHandler(BaseHTTPRequestHandler):
                 # rotate keys when the final response reports exhausted credit.
                 if status_code >= 500 and attempt < UPSTREAM_MAX_ATTEMPTS:
                     print(
-                        f"[serper-relay-upstream] retrying path={path!r} "
+                        f"[serper-relay-upstream] retrying "
+                        f"request_id={self.headers.get('X-Request-ID', '-')!r} path={path!r} "
                         f"attempt={attempt + 1}/{UPSTREAM_MAX_ATTEMPTS} "
                         f"after_s={UPSTREAM_RETRY_DELAY_S}",
                         file=sys.stderr,
@@ -363,12 +436,15 @@ class SerperRelayHandler(BaseHTTPRequestHandler):
             except (URLError, TimeoutError, OSError) as exc:
                 _log_upstream(
                     path=path,
+                    request_id=self.headers.get("X-Request-ID", "-"),
+                    attempt=attempt,
                     elapsed_s=time.perf_counter() - upstream_started_at,
                     error=exc,
                 )
                 if attempt < UPSTREAM_MAX_ATTEMPTS:
                     print(
-                        f"[serper-relay-upstream] retrying path={path!r} "
+                        f"[serper-relay-upstream] retrying "
+                        f"request_id={self.headers.get('X-Request-ID', '-')!r} path={path!r} "
                         f"attempt={attempt + 1}/{UPSTREAM_MAX_ATTEMPTS} "
                         f"after_s={UPSTREAM_RETRY_DELAY_S}",
                         file=sys.stderr,
@@ -415,7 +491,10 @@ class SerperRelayHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Connection", "close")
         self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            self.close_connection = True
 
 
 def _build_parser() -> argparse.ArgumentParser:

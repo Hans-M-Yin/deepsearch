@@ -12,6 +12,7 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 from collections import deque
 from dataclasses import asdict, dataclass, field
 from enum import Enum
@@ -226,6 +227,67 @@ def _serper_debug(event: str, **kwargs: Any) -> None:
     details = " ".join(f"{key}={value!r}" for key, value in kwargs.items())
     suffix = f" {details}" if details else ""
     print(f"[serper-debug] {event}{suffix}", file=sys.stderr, flush=True)
+
+
+def _serper_timing_enabled() -> bool:
+    raw = os.environ.get("SFT_SERPER_TIMING_DEBUG")
+    if raw is None:
+        raw = os.environ.get("SERPER_TIMING_DEBUG", "1")
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _serper_timing_threshold_s() -> float:
+    raw = os.environ.get("SFT_SERPER_TIMING_MIN_S")
+    if raw is None:
+        raw = os.environ.get("SERPER_TIMING_MIN_S", "5")
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        return 5.0
+
+
+def _new_serper_request_id() -> str:
+    return uuid.uuid4().hex[:12]
+
+
+def _serper_timing_debug(
+    event: str,
+    *,
+    elapsed_s: float,
+    force: bool = False,
+    **kwargs: Any,
+) -> None:
+    """Log slow Serper phases without logging request bodies or API keys."""
+
+    if not _serper_timing_enabled():
+        return
+    if not force and elapsed_s < _serper_timing_threshold_s():
+        return
+    fields = {"event": event, "elapsed_s": round(float(elapsed_s), 3), **kwargs}
+    details = " ".join(f"{key}={value!r}" for key, value in fields.items())
+    print(f"[serper-timing] {details}", file=sys.stderr, flush=True)
+
+
+def _serper_pool_timing_debug(
+    event: str,
+    *,
+    elapsed_s: float,
+    **kwargs: Any,
+) -> None:
+    """Log slow pool operations separately from HTTP timing."""
+
+    if not _serper_timing_enabled():
+        return
+    raw = os.environ.get("SERPER_POOL_TIMING_MIN_S", "0.1")
+    try:
+        threshold_s = max(0.0, float(raw))
+    except (TypeError, ValueError):
+        threshold_s = 0.1
+    if elapsed_s < threshold_s:
+        return
+    fields = {"event": event, "elapsed_s": round(float(elapsed_s), 3), **kwargs}
+    details = " ".join(f"{key}={value!r}" for key, value in fields.items())
+    print(f"[serper-pool-timing] {details}", file=sys.stderr, flush=True)
 
 
 def _serper_qpm_debug_enabled() -> bool:
@@ -467,14 +529,37 @@ class SerperApiKeyPool:
         return keys
 
     def acquire_key(self) -> tuple[str, dict[str, Any]]:
-        state = self._with_locked_state(self._acquire_from_state, count_use=True)
+        started_at = time.perf_counter()
+        try:
+            state = self._with_locked_state(
+                self._acquire_from_state,
+                count_use=True,
+                operation_name="acquire_key",
+            )
+        finally:
+            _serper_pool_timing_debug(
+                "pool_operation",
+                elapsed_s=time.perf_counter() - started_at,
+                operation="acquire_key",
+            )
         key = state.pop("_selected_key")
         metadata = state.pop("_selected_metadata")
         return key, metadata
 
     def status(self) -> dict[str, Any]:
         """Return the shared pool's currently usable keys and estimated credits."""
-        state = self._with_locked_state(self._initialize_state)
+        started_at = time.perf_counter()
+        try:
+            state = self._with_locked_state(
+                self._initialize_state,
+                operation_name="status",
+            )
+        finally:
+            _serper_pool_timing_debug(
+                "pool_operation",
+                elapsed_s=time.perf_counter() - started_at,
+                operation="status",
+            )
         return self._pool_status(state)
 
     def flush(self) -> None:
@@ -501,7 +586,20 @@ class SerperApiKeyPool:
             self._store_pool_status(state)
             return state
 
-        return self._pool_status(self._with_locked_state(update, force_persist=True))
+        started_at = time.perf_counter()
+        try:
+            state = self._with_locked_state(
+                update,
+                force_persist=True,
+                operation_name="mark_credits_exhausted",
+            )
+        finally:
+            _serper_pool_timing_debug(
+                "pool_operation",
+                elapsed_s=time.perf_counter() - started_at,
+                operation="mark_credits_exhausted",
+            )
+        return self._pool_status(state)
 
     def _initialize_state(self, state: dict[str, Any]) -> dict[str, Any]:
         pool = dict(state.get("keys") or {})
@@ -594,12 +692,38 @@ class SerperApiKeyPool:
         *,
         count_use: bool = False,
         force_persist: bool = False,
+        operation_name: str = "state_operation",
+    ) -> dict[str, Any]:
+        operation_started_at = time.perf_counter()
+        try:
+            return self._with_locked_state_impl(
+                callback,
+                count_use=count_use,
+                force_persist=force_persist,
+                operation_name=operation_name,
+            )
+        finally:
+            _serper_pool_timing_debug(
+                "state_operation",
+                elapsed_s=time.perf_counter() - operation_started_at,
+                operation=operation_name,
+                persist_every=self.persist_every,
+            )
+
+    def _with_locked_state_impl(
+        self,
+        callback,
+        *,
+        count_use: bool,
+        force_persist: bool,
+        operation_name: str,
     ) -> dict[str, Any]:
         if self.persist_every > 1:
             return self._with_cached_state(
                 callback,
                 count_use=count_use,
                 force_persist=force_persist,
+                operation_name=operation_name,
             )
 
         lock_path = _local_lock_path_for_state(self.state_path)
@@ -623,6 +747,7 @@ class SerperApiKeyPool:
         *,
         count_use: bool,
         force_persist: bool,
+        operation_name: str,
     ) -> dict[str, Any]:
         """Run a pool operation in memory and checkpoint periodically.
 
@@ -632,7 +757,14 @@ class SerperApiKeyPool:
         invalidation is flushed immediately.
         """
 
+        lock_wait_started_at = time.perf_counter()
         with self._state_cache_lock:
+            lock_wait_s = time.perf_counter() - lock_wait_started_at
+            _serper_pool_timing_debug(
+                "state_cache_lock_wait",
+                elapsed_s=lock_wait_s,
+                operation=operation_name,
+            )
             if self._state_cache is None:
                 lock_path = _local_lock_path_for_state(self.state_path)
                 lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1041,6 +1173,7 @@ class SerperSearchClient:
 
     def _post_json(self, url: str, body: dict[str, Any]) -> tuple[dict[str, Any], int, dict[str, Any]]:
         api_key = self.api_key
+        request_id = _new_serper_request_id()
         pool_metadata: dict[str, Any] = {
             "key_id": "fixed-client",
             "managed_by": "fixed_env_or_relay",
@@ -1066,6 +1199,7 @@ class SerperSearchClient:
             "Accept": "application/json",
             "Content-Type": "application/json",
             "X-API-KEY": api_key,
+            "X-Request-ID": request_id,
         }
         relay_token = os.environ.get("SERPER_RELAY_TOKEN")
         if relay_token:
@@ -1079,9 +1213,23 @@ class SerperSearchClient:
         started_at = time.perf_counter()
         try:
             open_request = self._url_opener.open if self._url_opener is not None else urlopen
+            headers_started_at = time.perf_counter()
             with open_request(request, timeout=self.timeout_s) as response:
+                headers_elapsed_s = time.perf_counter() - headers_started_at
+                body_started_at = time.perf_counter()
                 response_payload = response.read().decode("utf-8")
+                body_read_elapsed_s = time.perf_counter() - body_started_at
                 status_code = response.getcode()
+            total_elapsed_s = time.perf_counter() - started_at
+            _serper_timing_debug(
+                "client_http",
+                elapsed_s=total_elapsed_s,
+                request_id=request_id,
+                url=url,
+                status_code=status_code,
+                headers_s=round(headers_elapsed_s, 3),
+                body_read_s=round(body_read_elapsed_s, 3),
+            )
             _serper_debug(
                 "request_done",
                 url=url,
@@ -1104,6 +1252,15 @@ class SerperSearchClient:
                 body=body,
                 response_preview=error_payload[:500],
             )
+            _serper_timing_debug(
+                "client_http_error",
+                elapsed_s=elapsed_s,
+                force=True,
+                request_id=request_id,
+                url=url,
+                status_code=exc.code,
+                error_type=exc.__class__.__name__,
+            )
             message = (
                 f"Serper request failed with HTTP {exc.code} for {url}. "
                 f"Request body: {json.dumps(body, ensure_ascii=False)}"
@@ -1124,6 +1281,15 @@ class SerperSearchClient:
                 reason=str(reason),
                 body=body,
                 key_pool=pool_metadata if pool_metadata else None,
+            )
+            _serper_timing_debug(
+                "client_url_error",
+                elapsed_s=elapsed_s,
+                force=True,
+                request_id=request_id,
+                url=url,
+                error_type=reason.__class__.__name__,
+                reason=str(reason),
             )
             raise RuntimeError(
                 "Serper request failed before receiving an HTTP response "

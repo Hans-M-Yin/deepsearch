@@ -716,6 +716,9 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
     @DistProfiler.annotate(color="red")
     def update_actor(self, data: DataProto):
         assert self._is_actor
+        if os.environ.get("RLLM_MM_TITO", "0") == "1":
+            from verl.utils.tito_audit import verify_actor_input
+            verify_actor_input(data, "update_actor")
         if self._is_offload_param:
             load_megatron_model_to_gpu(self.actor_module)
             log_gpu_memory_usage("After load actor params and grad during update_actor", logger=logger)
@@ -832,6 +835,9 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
     @DistProfiler.annotate(color="blue")
     def compute_log_prob(self, data: DataProto):
         assert self._is_actor
+        if os.environ.get("RLLM_MM_TITO", "0") == "1":
+            from verl.utils.tito_audit import verify_actor_input
+            verify_actor_input(data, "compute_log_prob")
         if self._is_offload_param:
             load_megatron_model_to_gpu(self.actor_module, load_grad=False)
             log_gpu_memory_usage("After load actor params and grad during compute_log_prob", logger=logger)
@@ -851,6 +857,17 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             data=data, calculate_entropy=calculate_entropy
         )
         tensors = {"old_log_probs": output}
+        # Compare raw vLLM logprobs to raw trainer logprobs, never to the
+        # temperature-scaled PPO anchor. Unknown/processed modes are not raw.
+        vllm_kwargs = self.config.rollout.get("engine_kwargs", {}).get("vllm", {}) or {}
+        if (
+            self.config.rollout.name == "vllm"
+            and self.config.rollout.calculate_log_probs
+            and "diagnostic_rollout_log_probs" in data.batch
+            and (vllm_kwargs.get("logprobs_mode") or "raw_logprobs") == "raw_logprobs"
+        ):
+            from verl.utils.consistency_debug import raw_monitor_logprobs
+            tensors["diagnostic_actor_raw_log_probs"] = raw_monitor_logprobs(self.actor, data, output)
         if calculate_entropy:
             tensors["entropys"] = entropys
         output = DataProto.from_dict(

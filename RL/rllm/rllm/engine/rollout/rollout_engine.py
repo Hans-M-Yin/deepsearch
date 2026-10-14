@@ -16,6 +16,8 @@ class ModelOutput:
     prompt_length: int = 0
     completion_length: int = 0
     finish_reason: str | None = None
+    cumulative_loss_mask: list[int] | None = None
+    cumulative_initial_prompt_length: int | None = None
 
     def to_dict(self):
         return {
@@ -30,6 +32,8 @@ class ModelOutput:
             "prompt_length": self.prompt_length,
             "completion_length": self.completion_length,
             "finish_reason": self.finish_reason,
+            "cumulative_loss_mask": self.cumulative_loss_mask,
+            "cumulative_initial_prompt_length": self.cumulative_initial_prompt_length,
         }
 
     @classmethod
@@ -46,6 +50,8 @@ class ModelOutput:
             prompt_length=data.get("prompt_length", 0),
             completion_length=data.get("completion_length", 0),
             finish_reason=data.get("finish_reason"),
+            cumulative_loss_mask=data.get("cumulative_loss_mask"),
+            cumulative_initial_prompt_length=data.get("cumulative_initial_prompt_length"),
         )
 
 

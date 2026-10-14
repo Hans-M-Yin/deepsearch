@@ -52,10 +52,13 @@ def _adaptive_qpm_enabled() -> bool:
     }
 
 
-def _debug_env_enabled(name: str) -> bool:
+def _debug_env_enabled(name: str, *, default: bool = False) -> bool:
     """Return whether one of the opt-in, potentially verbose worker logs is enabled."""
 
-    return str(os.environ.get(name) or "").strip().lower() in {"1", "true", "yes", "on"}
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _redact_base64_images_for_debug(value: Any, *, image_context: bool = False) -> Any:
@@ -536,6 +539,8 @@ class OpenAIModelWorkerClient:
             api_key=self.api_key,
             base_url=base_url,
             timeout=timeout_s,
+            # ModelWorker owns retries; do not multiply them inside the SDK.
+            max_retries=0,
             default_headers=default_headers,
         )
 
@@ -698,6 +703,7 @@ class AzureOpenAIModelWorkerClient:
             api_version=self.api_version,
             azure_endpoint=self.azure_endpoint,
             timeout=self.timeout_s,
+            max_retries=0,
             default_headers=self._build_headers(),
         )
 
@@ -1490,6 +1496,7 @@ class ModelRouterWorkerClient:
         total_tokens = _usage_int(usage.get("total_tokens"))
         reasoning_tokens = _usage_int(
             _get_usage_value({"usage": usage}, "usage", "reasoning_tokens")
+            or _get_usage_value({"usage": usage}, "usage", "completion_tokens_details", "reasoning_tokens")
             or _get_usage_value({"usage": usage}, "usage", "output_tokens_details", "reasoning_tokens")
         )
         cached_tokens = _usage_int(
@@ -1521,30 +1528,30 @@ class ModelRouterWorkerClient:
             totals["cached_tokens"] += cached_tokens
             totals["elapsed_s"] += worker_elapsed_s
             snapshot = dict(totals)
-        if _debug_env_enabled(_USAGE_LOG_ENV):
-            print(
-                "[llm-usage]"
-                f" alias={alias}"
-                f" served_model={response.metadata.get('served_model') or response.model}"
-                f" current_qpm={response.metadata.get('dispatch_qpm', self._current_qpm(alias=alias))}"
-                f" qpm_limit={response.metadata.get('qpm')}"
-                f" adaptive_qpm_limit={response.metadata.get('adaptive_qpm_limit', self._effective_qpm_limit(alias=alias, config=self._configs.get(alias) or {}))}"
-                f" call_prompt_tokens={prompt_tokens}"
-                f" call_completion_tokens={completion_tokens}"
-                f" call_total_tokens={total_tokens}"
-                f" call_reasoning_tokens={reasoning_tokens}"
-                f" call_cached_tokens={cached_tokens}"
-                f" cumulative_calls={snapshot['calls']}"
-                f" cumulative_prompt_tokens={snapshot['prompt_tokens']}"
-                f" cumulative_completion_tokens={snapshot['completion_tokens']}"
-                f" cumulative_total_tokens={snapshot['total_tokens']}"
-                f" cumulative_reasoning_tokens={snapshot['reasoning_tokens']}"
-                f" cumulative_cached_tokens={snapshot['cached_tokens']}"
-                f" call_elapsed_s={worker_elapsed_s:.3f}"
-                f" cumulative_elapsed_s={float(snapshot.get('elapsed_s', 0.0)):.3f}",
-                file=sys.stderr,
-                flush=True,
-            )
+        # if _debug_env_enabled(_USAGE_LOG_ENV, default=True):
+        #     print(
+        #         "[llm-usage]"
+        #         f" alias={alias}"
+        #         f" served_model={response.metadata.get('served_model') or response.model}"
+        #         f" current_qpm={response.metadata.get('dispatch_qpm', self._current_qpm(alias=alias))}"
+        #         f" qpm_limit={response.metadata.get('qpm')}"
+        #         f" adaptive_qpm_limit={response.metadata.get('adaptive_qpm_limit', self._effective_qpm_limit(alias=alias, config=self._configs.get(alias) or {}))}"
+        #         f" call_prompt_tokens={prompt_tokens}"
+        #         f" call_completion_tokens={completion_tokens}"
+        #         f" call_total_tokens={total_tokens}"
+        #         f" call_reasoning_tokens={reasoning_tokens}"
+        #         f" call_cached_tokens={cached_tokens}"
+        #         f" cumulative_calls={snapshot['calls']}"
+        #         f" cumulative_prompt_tokens={snapshot['prompt_tokens']}"
+        #         f" cumulative_completion_tokens={snapshot['completion_tokens']}"
+        #         f" cumulative_total_tokens={snapshot['total_tokens']}"
+        #         f" cumulative_reasoning_tokens={snapshot['reasoning_tokens']}"
+        #         f" cumulative_cached_tokens={snapshot['cached_tokens']}"
+        #         f" call_elapsed_s={worker_elapsed_s:.3f}"
+        #         f" cumulative_elapsed_s={float(snapshot.get('elapsed_s', 0.0)):.3f}",
+        #         file=sys.stderr,
+        #         flush=True,
+        #     )
         if _debug_env_enabled(_RAW_OUTPUT_ENV):
             print(
                 f"[llm-raw-output] alias={alias} model={response.model or ''}\n"

@@ -70,4 +70,4 @@ if [[ "${BACKEND}" == "api" ]]; then
 fi
 
 echo "Launching: ${CMD[*]}"
-exec "${CMD[@]}"
+exec "${CMD[@]}" "$@"

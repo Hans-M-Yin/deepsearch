@@ -1,7 +1,31 @@
 import json
+from unittest.mock import patch
 from pathlib import Path
 
 from synthesis.sft.merge_sharegpt_datasets import merge_datasets
+
+
+def test_reference_three_sources_and_fallback(tmp_path: Path) -> None:
+    sources = [_write_dataset(tmp_path, f"part{i}", row_id=str(i), image_name="same.jpg") for i in range(3)]
+    template = sources[1] / "dataset_info.json"
+    # First source references an external image by absolute path.
+    rows_path = sources[0] / "trajectories_sharegpt.json"
+    rows = json.loads(rows_path.read_text())
+    rows[0]["images"] = [str((sources[0] / "images/same.jpg").resolve()), str((sources[1] / "images/same.jpg").resolve())]
+    rows_path.write_text(json.dumps(rows))
+    (sources[0] / "dataset_info.json").unlink()
+    before = [ (s / "trajectories_sharegpt.json").read_bytes() for s in sources ]
+    output = tmp_path / "merged"
+    with patch("synthesis.sft.merge_sharegpt_datasets._copy_one", side_effect=AssertionError("must not copy")):
+        summary = merge_datasets(sources, output, image_mode="reference", dataset_info_from=template)
+    merged = json.loads((output / "trajectories_sharegpt.json").read_text())
+    assert len(merged) == 3
+    assert summary["copied_image_files"] == 0
+    assert not (output / "images").exists()
+    assert merged[0]["images"] == rows[0]["images"]
+    assert merged[1]["images"] == [str((sources[1] / "images/same.jpg").resolve())]
+    assert all(Path(p).is_file() for r in merged for p in r["images"])
+    assert before == [(s / "trajectories_sharegpt.json").read_bytes() for s in sources]
 
 
 def _write_dataset(root: Path, name: str, *, row_id: str, image_name: str) -> Path:

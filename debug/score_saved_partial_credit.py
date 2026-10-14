@@ -277,6 +277,7 @@ async def _score(
             task=task,
             steps=steps,
             config=config,
+            is_correct=bool(rollout.get("is_correct")),
         )
         results.append(
             {
@@ -318,6 +319,7 @@ async def _score_statement_pairs(
             task=_task_with_single_statement(task, statement),
             steps=steps,
             config=config,
+            is_correct=bool(rollout.get("is_correct")),
         )
         results.append(
             {

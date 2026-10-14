@@ -19,6 +19,11 @@ Example::
 The input order is preserved.  Records are never deduplicated: if two input
 datasets contain different trajectories for the same question, both remain
 in the merged dataset.  The output directory must not already exist.
+
+Use --image-mode reference to avoid copying images. All output image references
+then point to absolute original file paths; those source files must remain in
+place. No images directory or symlinks are created. Use --dataset-info-from to
+provide a fallback metadata template for inputs lacking dataset_info.json.
 """
 
 from __future__ import annotations
@@ -140,6 +145,8 @@ def merge_datasets(
     output_dir: str | Path,
     *,
     workers: int = 4,
+    image_mode: str = "copy",
+    dataset_info_from: str | Path | None = None,
 ) -> dict[str, Any]:
     """Merge converted ShareGPT dataset directories into a new directory."""
 
@@ -147,6 +154,11 @@ def merge_datasets(
         raise ValueError("at least one input dataset directory is required")
     if workers <= 0:
         raise ValueError("workers must be positive")
+    if image_mode not in {"copy", "reference"}:
+        raise ValueError("image_mode must be copy or reference")
+    fallback_info = _read_json(Path(dataset_info_from)) if dataset_info_from else None
+    if dataset_info_from and not isinstance(fallback_info, dict):
+        raise ValueError("dataset-info-from must contain a JSON object")
 
     sources = [Path(value).expanduser().resolve() for value in input_dirs]
     destination = Path(output_dir).expanduser().resolve()
@@ -156,6 +168,8 @@ def merge_datasets(
         if not source.is_dir():
             raise FileNotFoundError(f"input dataset directory does not exist: {source}")
         for required in (ROWS_FILE, DATASET_INFO_FILE):
+            if required == DATASET_INFO_FILE and fallback_info is not None:
+                continue
             if not (source / required).is_file():
                 raise FileNotFoundError(f"missing {required} in input dataset: {source}")
 
@@ -177,7 +191,7 @@ def merge_datasets(
         if not isinstance(rows_value, list) or any(not isinstance(row, dict) for row in rows_value):
             raise ValueError(f"{source / ROWS_FILE} must contain a JSON array of objects")
 
-        info_value = _read_json(source / DATASET_INFO_FILE)
+        info_value = _read_json(source / DATASET_INFO_FILE) if (source / DATASET_INFO_FILE).is_file() else deepcopy(fallback_info)
         if not isinstance(info_value, dict):
             raise ValueError(f"{source / DATASET_INFO_FILE} must contain a JSON object")
         if dataset_info is None:
@@ -209,6 +223,11 @@ def merge_datasets(
             rewritten_images: list[str] = []
             for image_ref in image_refs:
                 source_image, relative_image = _relative_image_source(source, image_ref)
+                if image_mode == "reference":
+                    rewritten_images.append(str(source_image))
+                    source_image_count += 1
+                    source_unique_images.add(str(source_image))
+                    continue
                 cache_key = (source_index, str(source_image))
                 destination_relative = image_mapping.get(cache_key)
                 if destination_relative is None:
@@ -276,6 +295,8 @@ def merge_datasets(
             "duplicate_ids_preserved": len(duplicate_ids),
             "dataset_info_mismatches": dataset_info_mismatches,
             "workers": workers,
+            "image_mode": image_mode,
+            "dataset_info_from": str(Path(dataset_info_from).resolve()) if dataset_info_from else None,
         }
         _write_json(metadata / "summary.json", summary)
         _write_json(
@@ -287,7 +308,8 @@ def merge_datasets(
                 "image_namespace_mapping": {
                     str(index): f"dataset{index:02d}_{_safe_component(source.name)}"
                     for index, source in enumerate(sources)
-                },
+                } if image_mode == "copy" else {},
+                "image_mode": image_mode,
             },
         )
 
@@ -309,6 +331,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Converted ShareGPT dataset directories, merged in the given order.",
     )
     parser.add_argument("--output-dir", required=True, help="New output dataset directory.")
+    parser.add_argument("--image-mode", choices=("copy", "reference"), default="copy",
+                        help="copy: copy images; reference: retain absolute source paths without copying")
+    parser.add_argument("--dataset-info-from", help="Fallback dataset_info.json for input directories missing it")
     parser.add_argument(
         "--workers",
         type=int,
@@ -321,7 +346,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
     try:
-        summary = merge_datasets(args.input_dir, args.output_dir, workers=args.workers)
+        summary = merge_datasets(args.input_dir, args.output_dir, workers=args.workers,
+                                 image_mode=args.image_mode, dataset_info_from=args.dataset_info_from)
     except (FileNotFoundError, OSError, ValueError) as exc:
         raise SystemExit(f"merge failed: {exc}") from exc
 

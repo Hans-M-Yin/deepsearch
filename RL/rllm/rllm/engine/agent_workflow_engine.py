@@ -1,5 +1,7 @@
 import asyncio
+import json
 import logging
+import os
 import sys
 import time
 import uuid
@@ -13,6 +15,9 @@ from tqdm import tqdm
 
 from rllm.agents.agent import Episode
 from rllm.engine.rollout import ModelOutput, RolloutEngine
+from rllm.utils.partial_credit_shaping import build_credit_turn_token_mask
+from rllm.utils.rollout_consistency import align_rollout_logprobs
+from rllm.utils.model_format import fatal_requires_protection
 from rllm.utils.multimodal_debug import (
     abort_on_missing_payload,
     count_token,
@@ -1303,11 +1308,15 @@ class AgentWorkflowEngine:
         metrics = []
         multi_modal_inputs_list = []
         is_fatal_flags = []
+        is_model_failure_flags = []
         fatal_step_indices = []
+        partial_credit_turns = []
+        partial_credit_expected_turn_counts = []
         # One task_id identifies one RLOO/GRPO group.  Keep the task id for
         # every constructed training row so a malformed multimodal row can
         # be removed together with all of its sibling rollouts.
         row_task_ids = []
+        rollout_token_records = []
         episode_task_ids = []
 
         multimodal_mode = sequence_mode()
@@ -1349,7 +1358,24 @@ class AgentWorkflowEngine:
 
             ep_info = episode.info or {}
             ep_is_fatal = ep_info.get("is_fatal", False)
+            ep_is_model_failure = ep_info.get("is_model_failure", False)
+            ep_protect_fatal = fatal_requires_protection(ep_is_fatal, ep_is_model_failure)
             ep_fatal_step_idx = ep_info.get("fatal_step_index")
+            raw_credit_turns = ep_info.get("partial_credit_credit_turns", ())
+            try:
+                episode_credit_turns = tuple(
+                    sorted(
+                        {
+                            int(turn)
+                            for turn in raw_credit_turns
+                            if int(turn) > 0
+                        }
+                    )
+                )
+            except (TypeError, ValueError):
+                # The trainer treats an invalid mapping as unshapable.  Keep
+                # a sentinel here so it cannot be mistaken for no credit.
+                episode_credit_turns = None
 
             for trajectory in episode.trajectories:
                 name = trajectory.name
@@ -1384,7 +1410,7 @@ class AgentWorkflowEngine:
                                 )
                             )
                             multimodal_inputs = {}
-                        if ep_is_fatal and ep_fatal_step_idx is not None:
+                        if ep_protect_fatal and ep_fatal_step_idx is not None:
                             mask = _apply_fatal_step_mask(mask, ep_fatal_step_idx)
                         prompts.append(prompt)
                         responses.append(response)
@@ -1401,7 +1427,7 @@ class AgentWorkflowEngine:
                             trajectory.steps[0].chat_completions,
                             model_output=trajectory.steps[0].model_output,
                         )
-                        if ep_is_fatal and ep_fatal_step_idx == 0:
+                        if ep_protect_fatal and ep_fatal_step_idx == 0:
                             mask = torch.zeros_like(mask)
                         prompts.append(prompt)
                         responses.append(response)
@@ -1422,7 +1448,7 @@ class AgentWorkflowEngine:
                         responses.append(response_ids)
 
                         mask = torch.ones_like(response_ids, dtype=torch.long)
-                        if ep_is_fatal and ep_fatal_step_idx == 0:
+                        if ep_protect_fatal and ep_fatal_step_idx == 0:
                             mask = torch.zeros_like(response_ids, dtype=torch.long)
                         traj_mask.append(mask)
                         multi_modal_inputs_list.append(
@@ -1436,7 +1462,7 @@ class AgentWorkflowEngine:
                                 chat_completions
                             )
                         )
-                        if ep_is_fatal and ep_fatal_step_idx == 0:
+                        if ep_protect_fatal and ep_fatal_step_idx == 0:
                             mask = torch.zeros_like(mask)
                         prompts.append(prompt)
                         responses.append(response)
@@ -1445,12 +1471,16 @@ class AgentWorkflowEngine:
 
                     step_rewards.append(trajectory.reward)
                     step_ids.append(trajectory_id)
+                    partial_credit_turns.append(episode_credit_turns)
+                    partial_credit_expected_turn_counts.append(
+                        len(trajectory.steps)
+                    )
                     n_steps = 1
 
                 else:
                     for step_idx, step in enumerate(trajectory.steps):
                         _mask_this_step = (
-                            ep_is_fatal
+                            ep_protect_fatal
                             and ep_fatal_step_idx is not None
                             and step_idx >= ep_fatal_step_idx
                         )
@@ -1492,15 +1522,28 @@ class AgentWorkflowEngine:
                         step_ids.append(
                             f"{trajectory_id}_step{step_idx}"
                         )  # unique step identifier e.g., 1234567890_solver_step0
+                        # Stepwise rows each contain exactly their own action
+                        # block.  Convert the trajectory-global judge turn to
+                        # a local turn-1 marker for the common mapper.
+                        partial_credit_turns.append(
+                            (1,)
+                            if episode_credit_turns is not None
+                            and step_idx + 1 in episode_credit_turns
+                            else (() if episode_credit_turns is not None else None)
+                        )
+                        partial_credit_expected_turn_counts.append(1)
 
                     n_steps = len(trajectory.steps)
 
+                records = [step.info.get("rollout_token_record", {}) for step in trajectory.steps]
+                rollout_token_records.extend([[record] for record in records] if stepwise_enabled else [records])
                 trajectory_ids.extend([trajectory_id] * n_steps)
                 step_nums.extend([n_steps] * n_steps)
                 traj_rewards.extend([trajectory.reward] * n_steps)
                 is_last_step.extend([False] * n_steps)
                 is_last_step[-1] = True
                 is_fatal_flags.extend([ep_is_fatal] * n_steps)
+                is_model_failure_flags.extend([ep_is_model_failure] * n_steps)
                 fatal_step_indices.extend(
                     [ep_fatal_step_idx if ep_fatal_step_idx is not None else -1]
                     * n_steps
@@ -1533,6 +1576,14 @@ class AgentWorkflowEngine:
 
         max_prompt_length = self.config.data.max_prompt_length
         max_response_length = self.config.data.max_response_length
+        if getattr(self.rollout_engine, "continuous_tito", False) and prompts:
+            from rllm.utils.continuous_tokens import batch_widths
+            model_limit = self.config.actor_rollout_ref.rollout.get("max_model_len") or (
+                max_prompt_length + max_response_length
+            )
+            max_prompt_length, max_response_length = batch_widths(
+                prompts, responses, int(model_limit), max_response_length
+            )
 
         def build_sequence_batches(prompt_rows, response_rows):
             prompt_batch = torch.nn.utils.rnn.pad_sequence(
@@ -1671,7 +1722,12 @@ class AgentWorkflowEngine:
 
             prompts = filter_rows(prompts)
             responses = filter_rows(responses)
+            rollout_token_records = filter_rows(rollout_token_records)
             traj_mask = filter_rows(traj_mask)
+            partial_credit_turns = filter_rows(partial_credit_turns)
+            partial_credit_expected_turn_counts = filter_rows(
+                partial_credit_expected_turn_counts
+            )
             multi_modal_inputs_list = filter_rows(multi_modal_inputs_list)
             step_rewards = filter_rows(step_rewards)
             step_ids = filter_rows(step_ids)
@@ -1680,6 +1736,7 @@ class AgentWorkflowEngine:
             traj_rewards = filter_rows(traj_rewards)
             is_last_step = filter_rows(is_last_step)
             is_fatal_flags = filter_rows(is_fatal_flags)
+            is_model_failure_flags = filter_rows(is_model_failure_flags)
             fatal_step_indices = filter_rows(fatal_step_indices)
             episode_ids = filter_rows(episode_ids)
             is_correct = filter_rows(is_correct)
@@ -1724,6 +1781,12 @@ class AgentWorkflowEngine:
                     "is_last_step": np.array([], dtype=bool),
                     "is_pad_step": np.array([], dtype=bool),
                     "is_fatal": np.array([], dtype=bool),
+                    "is_model_failure": np.array([], dtype=bool),
+                    "partial_credit_turns": np.array([], dtype=object),
+                    "partial_credit_expected_turn_counts": np.array(
+                        [], dtype=np.int64
+                    ),
+                    "partial_credit_turn_alignment": np.array([], dtype=bool),
                 }
                 return DataProto.from_dict(
                     tensors={
@@ -1799,6 +1862,57 @@ class AgentWorkflowEngine:
             traj_mask, max_response_length, 0, left_pad=False
         )
         traj_mask = traj_mask[:, :max_response_length]  # truncate if necessary
+        # Deliberately use a diagnostic-only key, not rollout_log_probs: these
+        # partially covered values must never enter importance-weight correction.
+        diagnostic_logprobs = torch.zeros_like(response_batch, dtype=torch.float32)
+        diagnostic_mask = torch.zeros_like(response_batch, dtype=torch.bool)
+        diagnostic_prompt_equal = torch.full_like(response_batch, -1, dtype=torch.int8)
+        alignment_counts = defaultdict(int)
+        for row, records in enumerate(rollout_token_records):
+            if getattr(self.rollout_engine, "continuous_tito", False):
+                from rllm.utils.rollout_consistency import verify_tito_training_row
+                verify_tito_training_row(
+                    input_ids[row], attention_mask[row], response_batch[row], traj_mask[row], records
+                )
+                diagnostic_prompt_equal[row][traj_mask[row].bool()] = 1
+            alignment = {}
+            values, valid = align_rollout_logprobs(
+                response_batch[row], traj_mask[row], records,
+                allow_tail_prefix=True, diagnostics=alignment,
+            )
+            for reason, count in alignment.get("counts", {}).items():
+                alignment_counts[reason] += count
+            diagnostic_logprobs[row] = values
+            diagnostic_mask[row] = valid
+
+        if alignment_counts:
+            logger.warning("Rollout logprob alignment exceptions: %s", dict(alignment_counts))
+
+        # Reconstruct the judge-selected action turns from the exact final
+        # response mask.  A mismatch (typically a truncation or tokenizer
+        # boundary mismatch) is fail-closed: no token is marked for shaping.
+        partial_credit_turn_alignment: list[bool] = []
+        normalized_partial_credit_turns: list[tuple[int, ...]] = []
+        for row_mask, row_turns, expected_turn_count in zip(
+            traj_mask,
+            partial_credit_turns,
+            partial_credit_expected_turn_counts,
+            strict=True,
+        ):
+            _, aligned = build_credit_turn_token_mask(
+                row_mask,
+                row_turns,
+                expected_turn_count,
+            )
+            partial_credit_turn_alignment.append(bool(aligned))
+            if isinstance(row_turns, tuple):
+                normalized_partial_credit_turns.append(row_turns)
+            elif isinstance(row_turns, list):
+                normalized_partial_credit_turns.append(tuple(row_turns))
+            else:
+                # Preserve malformed values as an empty marker only after the
+                # alignment result has recorded the fail-closed condition.
+                normalized_partial_credit_turns.append(())
 
         # Place all rewards to last response token of the last_step response
         traj_rewards_batch = torch.zeros_like(response_batch, dtype=torch.float32)
@@ -1851,17 +1965,22 @@ class AgentWorkflowEngine:
                         False  # set flag to filter out the episode later (after advantages are computed)
                     )
 
-        # Override: keep fatal trajectories that have a recoverable prefix.
-        # Their response_mask already zeros post-fatal tokens; the trainer
-        # will apply advantage clamping.
+        # Model failures must survive UNKNOWN filtering even if the first
+        # generated turn is invalid. Infrastructure failures keep only a
+        # recoverable prefix, with the historical mask/clamp protection.
         for i in range(len(is_valid)):
             if (
                 not is_valid[i]
                 and i < len(is_fatal_flags)
                 and is_fatal_flags[i]
-                and fatal_step_indices[i] > 0
+                and (is_model_failure_flags[i] or fatal_step_indices[i] > 0)
             ):
                 is_valid[i] = True
+
+        partial_credit_turns_array = np.empty(
+            len(normalized_partial_credit_turns), dtype=object
+        )
+        partial_credit_turns_array[:] = normalized_partial_credit_turns
 
         non_tensors = {
             "episode_ids": np.array(episode_ids),  # unique identifier for each rollout
@@ -1883,8 +2002,24 @@ class AgentWorkflowEngine:
             "is_last_step": np.array(is_last_step),
             "is_pad_step": np.array([False] * len(episode_ids)),
             "is_fatal": np.array(is_fatal_flags) if is_fatal_flags else np.array([False] * len(episode_ids)),
+            "is_model_failure": np.array(is_model_failure_flags, dtype=bool),
+            # This is deliberately a rank-1 object vector.  A direct
+            # ``np.array(list_of_tuples, dtype=object)`` expands to rank 2
+            # when every rollout happens to have the same number of turns.
+            "partial_credit_turns": partial_credit_turns_array,
+            "partial_credit_expected_turn_counts": np.asarray(
+                partial_credit_expected_turn_counts, dtype=np.int64
+            ),
+            "partial_credit_turn_alignment": np.array(
+                partial_credit_turn_alignment, dtype=bool
+            ),
         }
 
+        if getattr(self.rollout_engine, "continuous_tito", False):
+            from verl.utils.tito_audit import sequence_fingerprints
+            non_tensors["tito_sequence_fingerprint"] = np.array(
+                sequence_fingerprints(input_ids, attention_mask), dtype=object
+            )
         if any(mm_inputs is not None for mm_inputs in multi_modal_inputs_list):
             non_tensors["multi_modal_inputs"] = np.array(
                 multi_modal_inputs_list, dtype=object
@@ -1909,6 +2044,9 @@ class AgentWorkflowEngine:
                 "prompts": prompts_batch,
                 "responses": response_batch,
                 "response_mask": traj_mask,
+                "diagnostic_rollout_log_probs": diagnostic_logprobs,
+                "diagnostic_rollout_log_probs_mask": diagnostic_mask,
+                "diagnostic_prompt_equal": diagnostic_prompt_equal,
                 "traj_rewards": traj_rewards_batch,
                 "step_rewards": step_rewards_batch,
             },

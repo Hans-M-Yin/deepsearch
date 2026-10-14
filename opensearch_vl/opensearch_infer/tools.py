@@ -27,10 +27,24 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
-def get_tools_definition() -> str:
+def get_tools_definition(disabled_tools=()) -> str:
     """Return the public OpenAI-style ``tools`` array as a JSON string."""
+    definitions = sft_tools.get_tool_definitions()
+    if "t2i_search" in disabled_tools:
+        for tool in definitions:
+            function = tool.get("function", {})
+            if function.get("name") == "read_url":
+                function["description"] = (
+                    "Read webpage or PDF text and optionally extract evidence relevant to the tool goal. "
+                    "Image downloading is disabled; do not request image resources or image URLs. "
+                    "Prefer page resource_id from a prior search result; direct webpage/PDF URLs are supported."
+                )
+                function["parameters"]["properties"]["resource_id"]["description"] = (
+                    "Compact page_id returned by a prior search result. Image resources are not allowed."
+                )
     return json.dumps(
-        sft_tools.get_tool_definitions(),
+        [tool for tool in definitions
+         if tool.get("function", {}).get("name") not in disabled_tools],
         indent=2,
         ensure_ascii=False,
     )
@@ -105,7 +119,46 @@ def _normalize_search_aliases(name: str, params: dict) -> dict:
     return sft_tools.normalize_tool_arguments(name, params)
 
 
-def extract_tool_call(text: str) -> Optional[str]:
+def _parse_tool_payload(raw: str) -> tuple[dict, list[str]]:
+    """Repair known punctuation mistakes without evaluating model output."""
+    repairs: list[str] = []
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        # Restrict replacements to the leading name/arguments fields so query
+        # strings containing JSON-like text are preserved verbatim.
+        fixed = re.sub(r'^(\s*\{\s*"name")\s*,\s*(?=")', r'\1: ', raw)
+        if fixed != raw:
+            repairs.append("name_comma_to_colon")
+        fixed, count = re.subn(
+            r'^(\s*\{\s*"name"\s*:\s*"(?:[^"\\]|\\.)*"\s*,\s*)"(arguments|parameters)\s*:',
+            r'\1"\2":', fixed,
+        )
+        if count:
+            repairs.append("close_arguments_key_quote")
+        payload, end = json.JSONDecoder().raw_decode(fixed.lstrip())
+        trailing = fixed.lstrip()[end:].strip()
+        if trailing:
+            if not re.fullmatch(r'}+', trailing):
+                raise ValueError("Unexpected text after tool JSON")
+            repairs.append("remove_extra_closing_braces")
+    if not isinstance(payload, dict):
+        raise ValueError("Tool call must be an object")
+    name = payload.get("name")
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError("Tool name must be a nonempty string")
+    params = payload.get("arguments", payload.get("parameters", {}))
+    if isinstance(params, str) and name in {
+        "t2t_search", "t2i_search", "text_search", "web_search",
+    }:
+        params = {"query": params}
+        repairs.append("search_string_to_query")
+    if not isinstance(params, dict):
+        raise ValueError("Tool arguments must be an object")
+    return {"name": name, "parameters": params}, repairs
+
+
+def extract_tool_call(text: str, diagnostics: Optional[dict] = None) -> Optional[str]:
     """Pull the next tool invocation out of an agent message.
 
     Returns a JSON string ``{"name": str, "parameters": {...}}`` on success
@@ -115,16 +168,21 @@ def extract_tool_call(text: str) -> Optional[str]:
     match = _TOOL_CALL_RE.search(text)
     if match:
         try:
-            payload = json.loads(match.group(1).strip())
-            name = payload.get("name", "")
-            params = payload.get("arguments", payload.get("parameters", {})) or {}
-            params = _normalize_search_aliases(name, dict(params))
-            if name:
-                return json.dumps(
-                    {"name": name, "parameters": params}, ensure_ascii=False
-                )
-        except Exception:
-            pass
+            payload, repairs = _parse_tool_payload(match.group(1).strip())
+            name = payload["name"]
+            params = _normalize_search_aliases(name, payload["parameters"])
+            if diagnostics is not None and repairs:
+                diagnostics["repairs"] = repairs
+            return json.dumps({"name": name, "parameters": params}, ensure_ascii=False)
+        except (ValueError, TypeError) as exc:
+            if diagnostics is not None:
+                diagnostics["error"] = str(exc)
+            return None
+
+    if "<tool_call>" in text:
+        if diagnostics is not None:
+            diagnostics["error"] = "Expected a complete <tool_call> JSON object </tool_call>"
+        return None
 
     for pattern, canonical in _FALLBACK_TAGS.values():
         m = pattern.search(text)
@@ -521,6 +579,7 @@ def execute_tool(
     filename_prefix: str = "fvqa_train",
     visual_lookup: Optional[Callable[..., object]] = None,
     url_registry: Optional[dict[str, sft_tools.UrlResource]] = None,
+    disabled_tools=(),
 ) -> ToolResult:
     """Dispatch a parsed tool call. Returns ``(message, new_images)``."""
 
@@ -534,6 +593,8 @@ def execute_tool(
         return f"Tool execution error:\nInvalid tool call payload: {exc}", {}
 
     name = call.get("name", "")
+    if name in disabled_tools:
+        return f"Tool execution error:\nTool '{name}' is disabled for this ablation.", {}
     params = call.get("parameters", {}) or {}
     resource_registry = url_registry if url_registry is not None else {}
 
@@ -645,10 +706,13 @@ def execute_tool(
             url=url,
             goal=str(params.get("goal") or "").strip(),
             resource=resource or _resolve_registered_resource(resource_registry, url),
+            **({"allow_images": False} if "t2i_search" in disabled_tools else {}),
         )
         if not result.get("ok", False):
             return f"Tool execution error:\n{result.get('error', 'Unknown read_url error')}", {}
         if result.get("local_path"):
+            if "t2i_search" in disabled_tools:
+                return "Tool execution error:\nImage downloading is disabled for this ablation.", {}
             local_path = result.get("local_path", "")
             if not local_path:
                 return "Tool execution error:\nread_url returned an image without a local path.", {}

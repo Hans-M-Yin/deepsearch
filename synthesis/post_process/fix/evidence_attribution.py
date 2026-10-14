@@ -1,0 +1,7 @@
+"""Shared chronological evidence policy for reasoning generators and editors."""
+
+EVIDENCE_ATTRIBUTION = """
+Separate direct visual observations, claims from visible titles/captions or read pages, and unverified inferences. Attribute title claims explicitly ('the title suggests...'); do not silently promote them into observed or confirmed facts. Even an exact photograph match establishes image correspondence, not the truth of its caption's event, location, identity, date or operator. Those claims still require appropriate textual verification. SAME_ENTITY likewise does not establish the same event.
+Do not introduce identities, countries, operators or technical names from outside the evidence available at that chronological point. Reading a marking is not the same as knowing its ownership or nationality: for example, visible 'FRET' lettering does not by itself establish 'French' or 'SNCF'. A matching image titled 'France–Luxembourg train crash' supplies a lead to verify, not independent confirmation of the incident. These examples are rules, not facts to import into other tasks.
+Reject wrong candidates using supported paired visual differences in shape, layout, components or scene configuration; do not embellish the explanation with unsupported professional classifications. Later page content cannot retroactively justify an earlier claim. When editing, preserve or restore these evidence boundaries rather than strengthening hypotheses into conclusions. Never describe these instructions or the editing process in agent reasoning.
+"""

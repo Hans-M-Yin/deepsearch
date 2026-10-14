@@ -198,19 +198,81 @@ class EpisodeLogger:
         """
         # Keep rollout logs compact and safe: retain the model-visible text
         # conversation, but never serialize image bytes or ModelOutput tensors.
+        info = episode.info or {}
+        # Explicit allowlist: do not persist the entire task/info (images,
+        # token tensors, private search traces, or service configuration).
+        reward_metadata = info.get("reward_metadata") or {}
+        reward_metadata = reward_metadata if isinstance(reward_metadata, dict) else {}
+        metrics = getattr(episode, "metrics", None) or {}
+        task = episode.task if isinstance(episode.task, dict) else {}
+        extra = task.get("extra_info") or {}
+        extra = extra if isinstance(extra, dict) else {}
+        # Dataset.to_verl_dataset wraps the original entry in extra_info;
+        # the workflow receives that entry as its task (id is not episode.id).
+        data_id = task.get("id")
+        if data_id is None:
+            data_id = extra.get("id")
+        reward_components = {
+            name: metrics.get(key)
+            for name, key in {
+                "total": "reward/total",
+                "accuracy": "reward/accuracy",
+                "format": "reward/format",
+                "redundancy_penalty": "reward/search_redundancy_penalty",
+                "redundancy_raw_penalty": "reward/search_redundancy_raw_penalty",
+                "partial_reward": "reward/statement_partial_credit_applied_bonus",
+                "partial_raw_bonus": "reward/statement_partial_credit_raw_bonus",
+                "masked": "masked",
+                "termination_penalty": "reward/termination_penalty",
+            }.items()
+        }
+        # Fatal first-step rollouts have their entire reward hard-masked,
+        # even though their diagnostic penalty metric may still be nonzero.
+        if metrics.get("masked") == 1:
+            reward_components["redundancy_penalty"] = 0.0
+        for name, key in (("partial_mode", "statement_partial_credit"),
+                          ("redundancy_mode", "search_redundancy")):
+            record = info.get(key)
+            reward_components[name] = record.get("mode") if isinstance(record, dict) else None
         episode_data = {
             "training_step": step,
             "epoch": epoch,
             "mode": mode,
             "episode_id": episode.id,
+            "data_id": data_id,
+            "data_provenance": {
+                key: extra.get(key, task.get(key))
+                for key in ("source_question_id", "source_sample_id", "source_path_id",
+                            "source_run_dir", "source_index")
+                if key in extra or key in task
+            },
+            # accuracy/format are unweighted scores; penalties are positive
+            # deductions. Missing metrics are null, never invented zeroes.
+            "reward_components": reward_components,
             "task_hash": self.compute_task_hash(episode.task),
             "is_correct": bool(episode.is_correct),
+            "prediction": info.get("prediction"),
+            "answer": info.get("answer"),
+            "reward_metadata": {
+                key: reward_metadata[key]
+                for key in (
+                    "extracted_answer", "normalized_prediction", "normalized_refs",
+                    "judge_used", "judge_decided", "judge_attempts", "judgment",
+                    "exact_match", "fallback_reason", "judge_execution_mode",
+                )
+                if key in reward_metadata
+            },
             "termination_reason": (
                 episode.termination_reason.value
                 if episode.termination_reason
                 else None
             ),
             "raw_termination": (episode.info or {}).get("raw_termination"),
+            "is_fatal": bool(info.get("is_fatal", False)),
+            "is_model_failure": bool(info.get("is_model_failure", False)),
+            "fatal_step_index": info.get("fatal_step_index"),
+            "fatal_reason": info.get("fatal_reason"),
+            "format_error_rounds": info.get("format_error_rounds", []),
             "rollout_markers": (episode.info or {}).get(
                 "rollout_markers", []
             ),
@@ -231,6 +293,14 @@ class EpisodeLogger:
                     if isinstance(step.model_response, str)
                     else str(step.model_response)
                     for step in traj.steps
+                ],
+                "step_errors": [
+                    {
+                        "round": index + 1,
+                        "step_error": bool(step.info.get("step_error", False)),
+                        "error_type": step.info.get("error_type", ""),
+                    }
+                    for index, step in enumerate(traj.steps)
                 ],
             }
             episode_data["trajectories"].append(traj_data)

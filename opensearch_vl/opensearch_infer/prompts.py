@@ -67,7 +67,7 @@ The answer is ...
 """
 
 
-def build_system_prompt(tools_schema: str) -> str:
+def build_system_prompt(tools_schema: str, disabled_tools=()) -> str:
     """Return the system prompt with SFT's Qwen tool-schema formatting."""
 
     try:
@@ -77,7 +77,38 @@ def build_system_prompt(tools_schema: str) -> str:
         # Keep a readable fallback for callers that provide a preformatted
         # schema string rather than the normal JSON array.
         tools_block = f"\n\n# Tools\n\n<tools>\n{tools_schema}\n</tools>"
-    return _SYSTEM_PROMPT_BODY.rstrip() + "\n" + tools_block
+    body = _SYSTEM_PROMPT_BODY
+    if disabled_tools:
+        body = "\n".join(
+            line for line in body.split("\n")
+            if not any(line.startswith(f"* `{name}`:") for name in disabled_tools)
+        ).replace("Rules for the four tools:", "Rules for the available tools:")
+    if "i2i_search" in disabled_tools:
+        start = body.index("Example tool call:")
+        end = body.index("Example final response:", start)
+        body = body[:start] + '''Example tool call:
+
+<thinking>
+I should search for textual evidence relevant to the question.
+</thinking>
+<tool_call>
+{"name":"t2t_search","arguments":{"query":"relevant question keywords"}}
+</tool_call>
+
+''' + body[end:]
+    if "t2i_search" in disabled_tools:
+        body = body.replace(
+            "Use to read a webpage, PDF, or image URL returned by the search tools.",
+            "Use to read webpage or PDF text returned by the search tools. Image downloading is disabled.",
+        )
+        body += (
+            "\n\nImage-download restriction: You cannot download or view new external images. "
+            "Do not use read_url to fetch image IDs, direct image URLs, or image files. "
+            "You may still analyze images supplied with the original question and read textual "
+            "webpage/PDF evidence, including captions. Do not claim to have viewed an external "
+            "image based only on its caption or description.\n"
+        )
+    return body.rstrip() + "\n" + tools_block
 
 
 SYSTEM_PROMPT = _SYSTEM_PROMPT_BODY

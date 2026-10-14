@@ -1,0 +1,20 @@
+{
+  "seed": 42,
+  "replay_top_k": 20,
+  "result_count": 5,
+  "visual_check_workers": 16,
+  "record_workers": 16,
+  "global_visual_workers": 128,
+  "gpt_reasoning_effort": "xhigh",
+  "context_patch_retries": 1,
+  "progress_audit_retries": 1,
+  "composition_retries": 1,
+  "max_windows_per_record": 1,
+  "require_distinct_judge": false,
+  "blind_visual_review": false,
+  "model": "gemini38flash_internal_azure",
+  "verifier_model": "gemini38flash_internal_azure",
+  "judge_model": "gemini38flash_internal_azure",
+  "max_tokens": 6000,
+  "llm_retries": 2
+}

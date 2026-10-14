@@ -31,6 +31,7 @@ logger = logging.getLogger(__file__)
 
 
 class TokenOutput(BaseModel):
+    prompt_ids: Optional[list[int]] = None
     token_ids: list[int]
     """response token ids"""
     log_probs: Optional[list[float]] = None

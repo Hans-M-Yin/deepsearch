@@ -29,6 +29,11 @@ export LOSS_AGG_MODE="token-mean"
 export PARTIAL_CREDIT_MODE="${PARTIAL_CREDIT_MODE:-shadow}"
 export PARTIAL_CREDIT_JUDGE_MODEL="${PARTIAL_CREDIT_JUDGE_MODEL:-multimodal_process_global_2}"
 export PARTIAL_CREDIT_TRACE_CHUNK_STEPS="${PARTIAL_CREDIT_TRACE_CHUNK_STEPS:-15}"
+# Explicitly off by default: when enabled, judge-validated action tokens get
+# local advantage shaping (negative -> 0, positive -> 2x). Outcome-incorrect
+# positive-advantage rows also mask assistant tokens after their last verified
+# credit turn, preventing a wrong suffix from being reinforced.
+export PARTIAL_CREDIT_ADVANTAGE_SHAPING="${PARTIAL_CREDIT_ADVANTAGE_SHAPING:-0}"
 # Compute policy entropy for W&B monitoring without adding it to PPO loss.
 export LOG_ENTROPY="${LOG_ENTROPY:-True}"
 export RL_LOCAL_IO="${RL_LOCAL_IO:-1}"

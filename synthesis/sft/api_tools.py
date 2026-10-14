@@ -2488,6 +2488,8 @@ def _execute_tool_call(
             output = tools.i2i_search(
                 image_url=uploaded_url,
                 visual_lookup=context.visual_lookup,
+                **({"private_result_limit": context.metadata["i2i_private_result_limit"]}
+                   if "i2i_private_result_limit" in context.metadata else {}),
                 top_k=int(params.get("top_k", tools.DEFAULT_SEARCH_TOP_K)),
                 timings=search_timing,
                 debug_context=_i2i_empty_debug_context(
@@ -2526,6 +2528,8 @@ def _execute_tool_call(
         output = tools.i2i_search(
             image_url=remote_url or "",
             visual_lookup=context.visual_lookup,
+            **({"private_result_limit": context.metadata["i2i_private_result_limit"]}
+               if "i2i_private_result_limit" in context.metadata else {}),
             top_k=int(params.get("top_k", tools.DEFAULT_SEARCH_TOP_K)),
             timings=search_timing,
             debug_context=_i2i_empty_debug_context(

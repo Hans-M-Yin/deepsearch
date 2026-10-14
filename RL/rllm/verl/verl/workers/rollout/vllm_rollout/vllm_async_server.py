@@ -59,6 +59,15 @@ logger = logging.getLogger(__file__)
 logger.setLevel(logging.INFO)
 
 
+def _debug_check_logprobs_mode(vllm_config, *, replica_rank, node_rank, temperature):
+    """Inspect the resolved engine config before creating GPU engine processes."""
+    mode = getattr(vllm_config.model_config, "logprobs_mode", None)
+    if os.environ.get("RLLM_MM_TIS", "0") == "1" and mode != "processed_logprobs":
+        raise RuntimeError("[TOKEN_TIS] Resolved vLLM logprobs_mode must be processed_logprobs.")
+    # Raw logprobs are valid. The trainer now uses a separate T=1 forward
+    # for raw-to-raw monitoring, leaving the PPO anchor unchanged.
+
+
 class ExternalZeroMQDistributedExecutor(Executor):
     """An executor that engines are launched by external ray actors."""
 
@@ -344,6 +353,10 @@ class vLLMHttpServerBase:
         engine_args = AsyncEngineArgs.from_cli_args(args)
         usage_context = UsageContext.OPENAI_API_SERVER
         vllm_config = engine_args.create_engine_config(usage_context=usage_context)
+        _debug_check_logprobs_mode(
+            vllm_config, replica_rank=self.replica_rank,
+            node_rank=self.node_rank, temperature=self.config.temperature,
+        )
         vllm_config.parallel_config.data_parallel_master_port = self._dp_master_port
 
         engine_client = AsyncLLM.from_vllm_config(
@@ -369,6 +382,10 @@ class vLLMHttpServerBase:
         engine_args = vllm.AsyncEngineArgs.from_cli_args(args)
         usage_context = UsageContext.OPENAI_API_SERVER
         vllm_config = engine_args.create_engine_config(usage_context=usage_context, headless=True)
+        _debug_check_logprobs_mode(
+            vllm_config, replica_rank=self.replica_rank,
+            node_rank=self.node_rank, temperature=self.config.temperature,
+        )
 
         parallel_config = vllm_config.parallel_config
         local_engine_count = parallel_config.data_parallel_size_local
@@ -442,7 +459,10 @@ class vLLMHttpServerBase:
         log_probs = None
         if sampling_params.logprobs is not None:
             log_probs = [logprobs[token_ids[i]].logprob for i, logprobs in enumerate(final_res.outputs[0].logprobs)]
-        return TokenOutput(token_ids=token_ids, log_probs=log_probs)
+        return TokenOutput(
+            token_ids=token_ids, log_probs=log_probs,
+            prompt_ids=list(final_res.prompt_token_ids) if os.environ.get("RLLM_MM_TITO", "0") == "1" and final_res.prompt_token_ids is not None else None,
+        )
 
     async def abort_request(self, rid: str = "", abort_all: bool = False):
         """Abort an in-flight vLLM request before timeout or sleep.

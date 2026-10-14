@@ -84,7 +84,7 @@ def build_sft_react_system_prompt() -> str:
 
 Before every action, write a concise analysis inside <thinking>...</thinking>.
 Use exactly one tool call per turn and wait for its observation:
-<tool_call>{{"name":"tool_name","arguments":{{...}}}}</tool_call>
+<tool_call>{"name":"t2t_search","arguments":{"query":"a concrete search query"}}</tool_call>
 
 Tool rules:
 1. t2t_search searches text/web pages. Use its returned source_page_id with read_url.
@@ -95,8 +95,9 @@ Tool rules:
 
 When enough evidence has been collected, you should follow the format:
 <thinking>...</thinking><answer>wrap your final answer here</answer>
-Before that, you should follow the format:
-<thinking></thinking><tool_call>tool use here</tool_call>.
+Before that, use a complete JSON object inside one tool-call block, for example:
+<thinking>I will search for evidence about the requested location.</thinking><tool_call>{"name":"t2t_search","arguments":{"query":"Van Gogh birthplace"}}</tool_call>
+Replace the example reasoning and query with your actual next action. Keep the JSON opening and closing braces; do not use XML attributes or nest tool-call blocks.
 """ + "\n\n" + qwen_tool_prompt
 
 

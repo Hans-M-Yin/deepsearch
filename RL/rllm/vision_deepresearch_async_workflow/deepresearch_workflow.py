@@ -14,11 +14,18 @@ from vision_deepresearch_async_workflow.search_redundancy_reward import (
 )
 from vision_deepresearch_async_workflow.partial_credit_reward import (
     PartialCreditConfig,
+    collect_credit_turns,
     partial_credit_metrics,
     score_statement_partial_credit,
 )
 from rllm.agents.agent import Action, Episode, Step, Trajectory
 from rllm.engine.rollout import ModelOutput, RolloutEngine
+from rllm.utils.model_format import (
+    MODEL_ERROR_TYPES,
+    MODEL_FAILURE_REWARD,
+    step_error_type,
+    validate_response,
+)
 from rllm.rewards.reward_fn import RewardFunction
 from rllm.workflows.workflow import TerminationReason, Workflow
 
@@ -104,18 +111,11 @@ def _extract_action_from_response(response: str) -> Action:
 
 
 def _is_valid_format(content: str) -> bool:
-    if not isinstance(content, str) or not content:
-        return False
-    pattern = (
-        r"^<thinking>.*?</thinking>\s*(<tool_call>.*?</tool_call>|<answer>.*?</answer>)\s*$"
-    )
-    return re.match(pattern, content, re.DOTALL) is not None
+    return validate_response(content).valid
 
 
 def _format_reward_for_step(step: Step) -> float:
-    if step.info.get("step_error"):
-        return 0.0
-    if _has_tool_error_observation(step.observation):
+    if step_error_type(step) in MODEL_ERROR_TYPES:
         return 0.0
     content = step.model_response if isinstance(step.model_response, str) else ""
     return 1.0 if _is_valid_format(content) else 0.0
@@ -139,9 +139,9 @@ def _has_tool_error_observation(observation: Any) -> bool:
 
 
 def _is_step_error(step: Step) -> bool:
-    if step.info.get("step_error"):
-        return True
-    return _has_tool_error_observation(step.observation)
+    if "error_type" in step.info:
+        return bool(step_error_type(step))
+    return bool(step_error_type(step)) or _has_tool_error_observation(step.observation)
 
 
 # ---------------------------------------------------------------------------
@@ -483,18 +483,24 @@ def _find_fatal_step_index(
 
         if consecutive_errors >= _CONSECUTIVE_ERROR_THRESHOLD:
             fatal_start = idx - _CONSECUTIVE_ERROR_THRESHOLD + 1
-            return fatal_start, "consecutive_errors"
+            # Mixed cascades retain infrastructure protection. Only a wholly
+            # model-caused cascade is safe to train as a policy failure.
+            model_caused = all(
+                step_error_type(error_step) in MODEL_ERROR_TYPES
+                for error_step in steps[fatal_start:idx + 1]
+            )
+            return fatal_start, "model_errors" if model_caused else "consecutive_errors"
 
     if termination in {"answer", "answer_tool_fallback"}:
         return None, ""
 
-    # Exhausting the turn budget is an agent-policy failure, not a corrupted
-    # rollout.  Keep the complete trajectory learnable so its terminal -0.1
-    # reward produces a negative group-relative advantage.  Treating it as
-    # fatal would trigger the trainer's one-sided A >= 0 clamp and silently
-    # remove precisely the anti-looping signal this reward was added for.
+    # Exhausting the turn budget is a policy outcome, not a corrupted rollout.
+    # Preserve the existing max-turn reward configuration and trainable tokens.
     if _is_max_turns_termination(termination):
         return None, ""
+
+    if termination == "repetition_detected":
+        return len(steps) - 1, "model_errors"
 
     # Abnormal termination without error cascade — all existing steps are
     # usable but the trajectory is incomplete.  Mark fatal *after* the last
@@ -687,6 +693,7 @@ class DeepResearchWorkflow(Workflow):
                 statement_partial_credit = await score_statement_partial_credit(
                     task=task,
                     steps=all_steps,
+                    is_correct=bool(episode.is_correct),
                 )
             except Exception as err:  # noqa: BLE001 - reward shaping is optional.
                 print(f"Statement partial-credit scorer failed open: {err}")
@@ -703,6 +710,12 @@ class DeepResearchWorkflow(Workflow):
             )
             raw_statement_partial_bonus = float(
                 statement_partial_credit.get("raw_bonus", 0.0)
+            )
+            # Preserve only the judge-validated, one-based action turns for
+            # optional update-time advantage shaping.  Do not retain judge
+            # prompts, page text, or full event payloads in the Episode.
+            episode.info["partial_credit_credit_turns"] = collect_credit_turns(
+                statement_partial_credit.get("events", []), len(all_steps)
             )
             episode.info["statement_partial_credit"] = {
                 # Keep only scalar/structural audit information; never retain
@@ -756,22 +769,44 @@ class DeepResearchWorkflow(Workflow):
                             reward_out.reward
                         )
 
-            # --- Step-level fatal-after detection ---
-            # Replaces the old trajectory-level hard mask.  Instead of
-            # discarding entire anomalous episodes, we detect the first
-            # "fatal" point (consecutive-error cascade) and only mask
-            # tokens *after* that point.  The prefix is kept for learning
-            # with a one-sided advantage clamp (see trainer).
+            # Model-caused failures remain trainable, including their invalid
+            # assistant outputs. Infrastructure failures retain prefix masking
+            # and one-sided advantage protection.
             fatal_step_index, fatal_reason = _find_fatal_step_index(
                 all_steps, result.get("termination", "")
             )
             is_fatal = fatal_step_index is not None
+            is_model_failure = bool(is_fatal and fatal_reason == "model_errors")
+            episode.info["is_model_failure"] = is_model_failure
+            error_types = [step_error_type(step) for step in all_steps]
+            episode.info["step_error_types"] = error_types
+            error_metrics = {
+                f"errors/{kind}_rounds": float(error_types.count(kind))
+                for kind in (*sorted(MODEL_ERROR_TYPES), "external_tool_error")
+            }
+            error_metrics["errors/model_failure"] = float(is_model_failure)
+            if is_model_failure:
+                # Error sentinel text is not a final answer, even if an
+                # auxiliary judge happened to mark it correct.
+                episode.is_correct = False
 
             num_turns = sum(
                 len(t.steps) for t in episode.trajectories
             )
 
-            if is_fatal and fatal_step_index == 0:
+            format_scores = [_format_reward_for_step(s) for s in all_steps]
+            format_error_rounds = [
+                index + 1
+                for index, score in enumerate(format_scores)
+                if score == 0.0
+            ]
+            if format_scores:
+                r_format = 0.0 if format_error_rounds else 1.0
+            else:
+                r_format = 0.0
+            episode.info["format_error_rounds"] = format_error_rounds
+
+            if is_fatal and fatal_step_index == 0 and not is_model_failure:
                 # Nothing salvageable — degenerate to hard mask.
                 episode.termination_reason = TerminationReason.UNKNOWN
                 episode.info["fatal_step_index"] = 0
@@ -780,9 +815,10 @@ class DeepResearchWorkflow(Workflow):
                 for trajectory in episode.trajectories:
                     trajectory.reward = 0.0
                 episode.metrics = {
+                    **error_metrics,
                     "reward/accuracy": 0.0,
                     "reward/query_utility": 0.0,
-                    "reward/format": 0.0,
+                    "reward/format": r_format,
                     "reward/search_redundancy_raw_penalty": raw_redundancy_penalty,
                     "reward/search_redundancy_penalty": redundancy_penalty,
                     "reward/search_redundancy_events": float(
@@ -803,27 +839,9 @@ class DeepResearchWorkflow(Workflow):
                 }
                 episode.info["mask_reason"] = fatal_reason
             else:
-                # Compute full reward for group advantage statistics.
-                # Query utility remains scoped to the learnable prefix below,
-                # but format is a trajectory-level hard constraint: one
-                # malformed/error step makes the whole format component zero.
+                # One model format/argument error invalidates the format
+                # component. External service failures do not affect it.
                 r_accuracy = 1.0 if episode.is_correct else 0.0
-
-                # Keep checking every generated round, including the part
-                # after a fatal boundary.  The policy may mask that suffix
-                # during the update, but a format error anywhere in the
-                # trajectory must still invalidate the format reward.
-                format_scores = [_format_reward_for_step(s) for s in all_steps]
-                format_error_rounds = [
-                    index + 1
-                    for index, score in enumerate(format_scores)
-                    if score == 0.0
-                ]
-                if format_scores:
-                    r_format = 0.0 if format_error_rounds else 1.0
-                else:
-                    r_format = 0.0
-                episode.info["format_error_rounds"] = format_error_rounds
 
                 # Query-utility/quality reward is intentionally disabled for
                 # the current experiment.  Keep the metric field at 0.0 for
@@ -832,12 +850,17 @@ class DeepResearchWorkflow(Workflow):
                 r_query = 0.0
                 # Correctness is the principal objective, with a smaller
                 # independent trajectory-format reward.
-                base_reward = _base_outcome_reward(r_accuracy, r_format)
+                base_reward = (
+                    MODEL_FAILURE_REWARD
+                    if is_model_failure
+                    else _base_outcome_reward(r_accuracy, r_format)
+                )
                 max_turns_terminated = _is_max_turns_termination(
                     result.get("termination", "")
                 )
                 termination_penalty = (
-                    _MAX_TURNS_TERMINAL_REWARD if max_turns_terminated else 0.0
+                    MODEL_FAILURE_REWARD if is_model_failure
+                    else (_MAX_TURNS_TERMINAL_REWARD if max_turns_terminated else 0.0)
                 )
                 # Positive process credit remains unavailable for fatal error
                 # cascades, but MAX_TURNS itself no longer changes reward.
@@ -848,7 +871,7 @@ class DeepResearchWorkflow(Workflow):
                 partial_credit_suppressed_max_turns = False
                 applied_statement_partial_bonus = (
                     0.0
-                    if partial_credit_suppressed_fatal
+                    if partial_credit_suppressed_fatal or episode.is_correct
                     else statement_partial_bonus
                 )
                 total_reward = base_reward
@@ -866,6 +889,7 @@ class DeepResearchWorkflow(Workflow):
                     episode.info["fatal_reason"] = fatal_reason
 
                 episode.metrics = {
+                    **error_metrics,
                     "reward/accuracy": r_accuracy,
                     "reward/query_utility": r_query,
                     "reward/format": r_format,
@@ -982,9 +1006,15 @@ class DeepResearchWorkflow(Workflow):
                     else None
                 )
                 assistant_output_index += 1
+                token_records = result.get("rollout_token_records", [])
+                if assistant_output_index <= len(token_records):
+                    step.info["rollout_token_record"] = token_records[assistant_output_index - 1]
+                for key in ("error_type", "error_detail"):
+                    if key in msg:
+                        step.info[key] = msg[key]
                 if msg.get("step_error"):
                     step.info["step_error"] = True
-                if _has_tool_error_observation(observation):
+                if "error_type" not in msg and _has_tool_error_observation(observation):
                     step.info["step_error"] = True
                 steps.append(step)
             i += 1

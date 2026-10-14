@@ -5,6 +5,7 @@ Example:
     python scripts/build_benchmark_dataset.py --benchmark mmsearch
     python scripts/build_benchmark_dataset.py --benchmark mmsearch_plus --split train
     python scripts/build_benchmark_dataset.py --benchmark vdr_bench_testmini --output data/benchmarks/vdr/testmini.parquet
+    python scripts/build_benchmark_dataset.py --benchmark vision_deepresearch_livevqa --output ../data/benchmarks/livevqa/test.parquet
 
 MMSearch-Plus is encrypted on Hugging Face.  The converter performs the
 official XOR decryption in-process by default; pass
@@ -32,6 +33,7 @@ from urllib.parse import quote
 
 BROWSECOMP_V3_DEFAULT_KEY = "A_Visual_Vertical_Verifiable_Benchmark_for_Multimodal_Browsing_Agents"
 BROWSECOMP_V3_KEY = BROWSECOMP_V3_DEFAULT_KEY
+VISION_DEEPRESEARCH_LIVEVQA_FILENAME = "data/livevqa_webwatcher_subset_300.parquet"
 
 
 def _normalize_image_reference(image_url: str) -> str:
@@ -268,11 +270,14 @@ def _write_preview_svg(
 def _stringify_answer(value: Any) -> str:
     if value is None:
         return ""
+    np = _optional_numpy()
+    if np is not None and isinstance(value, np.ndarray):
+        value = value.tolist()
     if isinstance(value, str):
         return value.strip()
     if isinstance(value, (int, float, bool)):
         return str(value)
-    if isinstance(value, list):
+    if isinstance(value, (list, tuple)):
         parts = [str(item).strip() for item in value if str(item).strip()]
         return ", ".join(parts)
     return str(value).strip()
@@ -322,6 +327,11 @@ def _json_safe(value: Any) -> Any:
         return value
     if isinstance(value, bytes):
         return f"<bytes:{len(value)}>"
+    np = _optional_numpy()
+    if np is not None and isinstance(value, np.ndarray):
+        return _json_safe(value.tolist())
+    if np is not None and isinstance(value, np.generic):
+        return _json_safe(value.item())
     if isinstance(value, list):
         if len(value) > 1000 and all(isinstance(item, int) and 0 <= item <= 255 for item in value[:1000]):
             return f"<byte-list:{len(value)} items>"
@@ -338,6 +348,35 @@ def _json_safe(value: Any) -> Any:
         return {"_type": "PIL.Image", "size": size, "mode": mode}
 
     return str(value)
+
+
+def _as_list_or_empty(value: Any) -> list[Any]:
+    """Normalize dataset list columns without evaluating array truthiness.
+
+    Pandas materializes nested Parquet columns as ``numpy.ndarray`` values.
+    Expressions such as ``value or []`` are therefore invalid for those
+    columns, because NumPy deliberately does not define a truth value for a
+    multi-element array.  LiveVQA uses this representation for both options
+    and ground-truth answers.
+    """
+
+    if value is None:
+        return []
+
+    np = _optional_numpy()
+    if np is not None and isinstance(value, np.ndarray):
+        value = value.tolist()
+
+    if isinstance(value, list):
+        return value
+    if isinstance(value, tuple):
+        return list(value)
+    if isinstance(value, str):
+        parsed = _maybe_parse_json_string(value)
+        if parsed is not value:
+            return _as_list_or_empty(parsed)
+        return [value] if value.strip() else []
+    return [value]
 
 
 def _maybe_parse_json_string(value: Any) -> Any:
@@ -638,8 +677,10 @@ def _build_livevqa_row(record: dict[str, Any], adapter: BenchmarkAdapter) -> dic
     row["sample_id"] = sample_id
     row["category"] = str(record.get("topic") or record.get("source") or row.get("category") or "unknown")
     row["level"] = record.get("level")
-    row["options"] = record.get("options") or []
-    row["ground_truth_list"] = record.get("Ground_Truth_List") or []
+    # Nested LiveVQA columns arrive from pandas as NumPy arrays, so do not use
+    # ``record.get(...) or []`` here (NumPy arrays have no scalar truth value).
+    row["options"] = _as_list_or_empty(record.get("options"))
+    row["ground_truth_list"] = _as_list_or_empty(record.get("Ground_Truth_List"))
     image_path = str(record.get("img_path") or "").strip()
     if image_path:
         row["image_path"] = image_path
@@ -649,6 +690,99 @@ def _build_livevqa_row(record: dict[str, Any], adapter: BenchmarkAdapter) -> dic
             }
         ]
     return row
+
+
+def _build_vision_deepresearch_livevqa_rows(
+    records: list[dict[str, Any]],
+    *,
+    adapter: BenchmarkAdapter,
+    image_output_dir: Path,
+    limit: int = 0,
+) -> list[dict[str, object]]:
+    """Normalize Vision-DeepResearch's packed LiveVQA evaluation subset.
+
+    The released 300-case subset stores image payloads as base64 inside the
+    ``image_packed`` column.  Extracting them alongside the normalized parquet
+    makes the result usable by the OpenSearch-VL API runner without relying on
+    transient Hugging Face URLs or the upstream evaluator's unpack script.
+    """
+
+    image_output_dir.mkdir(parents=True, exist_ok=True)
+    rows: list[dict[str, object]] = []
+    for index, record in enumerate(records):
+        if limit > 0 and index >= limit:
+            break
+
+        raw_id = str(record.get("id") or "").strip() or f"livevqa_vdr_{index:06d}"
+        question = str(record.get("question") or "").strip()
+        answer = _stringify_answer(record.get("answer"))
+        packed = _maybe_parse_json_string(record.get("image_packed"))
+        if not isinstance(packed, list) or not packed:
+            raise ValueError(
+                f"Vision-DeepResearch LiveVQA record {raw_id!r} has no image_packed payload"
+            )
+
+        images: list[dict[str, str]] = []
+        source_images: list[str] = []
+        for image_index, item in enumerate(packed):
+            if not isinstance(item, dict):
+                raise ValueError(
+                    f"Vision-DeepResearch LiveVQA record {raw_id!r} has an invalid packed image"
+                )
+            filename = str(item.get("filename") or f"image_{image_index}.bin")
+            basename = Path(filename).name
+            payload = item.get("data")
+            if not isinstance(payload, str) or not payload.strip():
+                raise ValueError(
+                    f"Vision-DeepResearch LiveVQA record {raw_id!r} is missing image bytes"
+                )
+            try:
+                image_bytes = base64.b64decode(payload, validate=True)
+            except (binascii.Error, ValueError) as error:
+                raise ValueError(
+                    f"Vision-DeepResearch LiveVQA record {raw_id!r} has invalid base64 image data"
+                ) from error
+
+            image_path = image_output_dir / f"{index:04d}_{image_index}_{basename}"
+            if not image_path.exists():
+                image_path.write_bytes(image_bytes)
+            resolved_path = image_path.resolve()
+            # Match Vision-DeepResearch's own unpacker, which replaces the
+            # filename embedded in the question with its local image path.
+            question = question.replace(filename, str(resolved_path))
+            images.append({"url": resolved_path.as_uri()})
+            source_images.append(filename)
+
+        if not question:
+            raise ValueError(
+                f"Missing question text for benchmark={adapter.benchmark} record index={index}"
+            )
+        if not answer:
+            raise ValueError(
+                f"Missing answer text for benchmark={adapter.benchmark} record index={index}"
+            )
+        metadata = {
+            "source_repo": adapter.default_dataset,
+            "source_file": VISION_DEEPRESEARCH_LIVEVQA_FILENAME,
+            "source_id": raw_id,
+            "source_images": source_images,
+            "image_caption": record.get("image_caption"),
+        }
+        rows.append(
+            {
+                "data_id": raw_id,
+                "question_id": raw_id,
+                "sample_id": raw_id,
+                "category": "webwatcher_subset",
+                "data_source": adapter.data_source,
+                "question": question,
+                "prompt": [{"content": question}],
+                "images": images,
+                "answer": answer,
+                "source_metadata": json.dumps(_json_safe(metadata), ensure_ascii=False),
+            }
+        )
+    return rows
 
 
 def _build_fvqa_row(record: dict[str, Any], adapter: BenchmarkAdapter) -> dict[str, object]:
@@ -828,6 +962,18 @@ ADAPTERS: dict[str, BenchmarkAdapter] = {
         image_keys=("img_path", "image", "images"),
         row_builder=_build_livevqa_row,
     ),
+    "vision_deepresearch_livevqa": BenchmarkAdapter(
+        benchmark="vision_deepresearch_livevqa",
+        default_dataset="Osilly/Vision-DeepResearch-Eval",
+        default_split="test",
+        data_source="LiveVQA-Vision-DeepResearch",
+        question_keys=("question",),
+        answer_keys=("answer",),
+        id_keys=("id",),
+        sample_id_keys=("id",),
+        category_keys=(),
+        image_keys=(),
+    ),
     "fvqa": BenchmarkAdapter(
         benchmark="fvqa",
         default_dataset="lmms-lab/FVQA",
@@ -880,6 +1026,23 @@ def _load_dataset_records(
 ) -> list[dict[str, Any]]:
     from datasets import load_dataset
 
+    if benchmark == "vision_deepresearch_livevqa":
+        return _load_vision_deepresearch_livevqa_records(
+            dataset_name,
+            cache_dir=cache_dir,
+        )
+
+    # LiveVQA-new stores its train split as top-level Xet/LFS Parquet shards
+    # rather than a datasets-compatible ``data/`` layout.  As of 2026-09 the
+    # Hugging Face dataset viewer itself fails with "Parquet magic bytes not
+    # found" for this repository, and ``load_dataset`` follows the same
+    # broken viewer/parquet path.  Downloading the declared shards through the
+    # Hub client (which resolves Xet/LFS) and reading them directly is the
+    # stable source path.  It downloads metadata/QAs only, not the 5GB image
+    # ZIP archives.
+    if benchmark == "livevqa":
+        return _load_livevqa_parquet_shards(dataset_name, cache_dir=cache_dir)
+
     decrypt_script = (
         Path(mmsearch_plus_decrypt_script).expanduser().resolve()
         if mmsearch_plus_decrypt_script
@@ -915,6 +1078,106 @@ def _load_dataset_records(
         )
 
     return [dict(item) for item in dataset]
+
+
+def _load_vision_deepresearch_livevqa_records(
+    dataset_name: str,
+    *,
+    cache_dir: Optional[str],
+) -> list[dict[str, Any]]:
+    """Load the fixed 300-case LiveVQA evaluation subset released by VDR."""
+
+    source_path = Path(dataset_name).expanduser()
+    if source_path.is_file():
+        parquet_path = source_path
+    elif source_path.is_dir():
+        candidates = (
+            source_path / VISION_DEEPRESEARCH_LIVEVQA_FILENAME,
+            source_path / Path(VISION_DEEPRESEARCH_LIVEVQA_FILENAME).name,
+        )
+        parquet_path = next((path for path in candidates if path.is_file()), None)
+        if parquet_path is None:
+            raise FileNotFoundError(
+                "Could not find "
+                f"{VISION_DEEPRESEARCH_LIVEVQA_FILENAME!r} under {source_path}"
+            )
+    else:
+        try:
+            from huggingface_hub import snapshot_download
+        except ImportError as error:  # pragma: no cover - environment-specific
+            raise RuntimeError(
+                "Vision-DeepResearch LiveVQA evaluation data requires huggingface_hub"
+            ) from error
+        snapshot = Path(
+            snapshot_download(
+                repo_id=dataset_name,
+                repo_type="dataset",
+                allow_patterns=[VISION_DEEPRESEARCH_LIVEVQA_FILENAME],
+                cache_dir=cache_dir,
+            )
+        )
+        parquet_path = snapshot / VISION_DEEPRESEARCH_LIVEVQA_FILENAME
+        if not parquet_path.is_file():
+            raise FileNotFoundError(
+                f"Hugging Face snapshot did not contain {VISION_DEEPRESEARCH_LIVEVQA_FILENAME!r}"
+            )
+
+    try:
+        import pandas as pd
+    except ImportError as error:  # pragma: no cover - environment-specific
+        raise RuntimeError(
+            "Reading Vision-DeepResearch LiveVQA evaluation data requires pandas and pyarrow"
+        ) from error
+    return pd.read_parquet(parquet_path).to_dict(orient="records")
+
+
+def _load_livevqa_parquet_shards(
+    dataset_name: str,
+    *,
+    cache_dir: Optional[str],
+) -> list[dict[str, Any]]:
+    """Read LiveVQA's top-level Xet/LFS parquet shards without ``datasets``.
+
+    ``cache_dir`` may point at coordinator-local ``/tmp``.  The caller can
+    therefore keep Hub downloads off HDFS while still writing the small,
+    normalized random sample to a shared output path afterward.
+    """
+
+    source_path = Path(dataset_name).expanduser()
+    if source_path.is_dir():
+        shard_paths = sorted(source_path.glob("Dataset_part_*.parquet"))
+    else:
+        try:
+            from huggingface_hub import snapshot_download
+        except ImportError as error:  # pragma: no cover - environment-specific
+            raise RuntimeError("LiveVQA parquet shards require huggingface_hub") from error
+        snapshot = snapshot_download(
+            repo_id=dataset_name,
+            repo_type="dataset",
+            allow_patterns=["Dataset_part_*.parquet"],
+            cache_dir=cache_dir,
+        )
+        shard_paths = sorted(Path(snapshot).glob("Dataset_part_*.parquet"))
+    if not shard_paths:
+        raise FileNotFoundError(
+            f"No Dataset_part_*.parquet shards found for LiveVQA source {dataset_name!r}"
+        )
+    try:
+        import pandas as pd
+    except ImportError as error:  # pragma: no cover - environment-specific
+        raise RuntimeError("Reading LiveVQA parquet shards requires pandas and pyarrow") from error
+
+    records: list[dict[str, Any]] = []
+    for shard_path in shard_paths:
+        try:
+            frame = pd.read_parquet(shard_path)
+        except Exception as error:
+            raise RuntimeError(
+                f"LiveVQA shard is not readable as Parquet after Hub download: {shard_path}. "
+                "Ensure hf_xet is installed and use a fresh local --cache-dir."
+            ) from error
+        records.extend(frame.to_dict(orient="records"))
+    return records
 
 
 def _decrypt_mmsearch_plus_dataset(
@@ -977,6 +1240,30 @@ def _build_rows(
     return rows
 
 
+def _random_sample_records(
+    records: list[dict[str, Any]],
+    *,
+    sample_size: int,
+    seed: int,
+) -> list[dict[str, Any]]:
+    """Select a reproducible uniform subset without changing source order.
+
+    Dataset adapters can attach source-relative image paths and metadata, so
+    sampling raw records before conversion keeps every selected row intact.
+    Sorting sampled indices gives a stable Parquet row order while the choice
+    itself remains uniformly random for the supplied seed.
+    """
+
+    if sample_size < 1:
+        raise ValueError("random sample size must be positive")
+    if sample_size > len(records):
+        raise ValueError(f"random sample size {sample_size} exceeds loaded record count {len(records)}")
+    if sample_size == len(records):
+        return records
+    indices = sorted(random.Random(seed).sample(range(len(records)), sample_size))
+    return [records[index] for index in indices]
+
+
 def _default_output_path(
     benchmark: str,
     split: str,
@@ -1027,9 +1314,29 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Optionally convert only the first N records.",
     )
     parser.add_argument(
+        "--random-sample-size",
+        type=int,
+        default=0,
+        help="Convert a reproducible uniform random subset of N records; mutually exclusive with --limit.",
+    )
+    parser.add_argument(
+        "--random-sample-seed",
+        type=int,
+        default=20260919,
+        help="Seed used by --random-sample-size.",
+    )
+    parser.add_argument(
         "--cache-dir",
         default=None,
-        help="Optional Hugging Face datasets cache dir.",
+        help="Optional Hugging Face cache dir; use a local /tmp path for LiveVQA Xet/LFS shards.",
+    )
+    parser.add_argument(
+        "--image-output-dir",
+        default=None,
+        help=(
+            "Directory for unpacked images from vision_deepresearch_livevqa. "
+            "Defaults next to --output as <output-stem>_images/."
+        ),
     )
     parser.add_argument(
         "--mmsearch-plus-decrypt-script",
@@ -1079,6 +1386,12 @@ def main() -> None:
         if args.output
         else _default_output_path(args.benchmark, split, args.format)
     )
+    if args.limit < 0:
+        raise ValueError("--limit must be nonnegative")
+    if args.random_sample_size < 0:
+        raise ValueError("--random-sample-size must be nonnegative")
+    if args.limit and args.random_sample_size:
+        raise ValueError("--limit and --random-sample-size are mutually exclusive")
 
     records = _load_dataset_records(
         dataset_name=dataset_name,
@@ -1088,7 +1401,26 @@ def main() -> None:
         mmsearch_plus_decrypt_script=args.mmsearch_plus_decrypt_script,
         mmsearch_plus_canary=args.mmsearch_plus_canary,
     )
-    rows = _build_rows(records, adapter, limit=args.limit)
+    if args.random_sample_size:
+        records = _random_sample_records(
+            records,
+            sample_size=args.random_sample_size,
+            seed=args.random_sample_seed,
+        )
+    if args.benchmark == "vision_deepresearch_livevqa":
+        image_output_dir = (
+            Path(args.image_output_dir).expanduser()
+            if args.image_output_dir
+            else output_path.parent / f"{output_path.stem}_images"
+        )
+        rows = _build_vision_deepresearch_livevqa_rows(
+            records,
+            adapter=adapter,
+            image_output_dir=image_output_dir,
+            limit=args.limit,
+        )
+    else:
+        rows = _build_rows(records, adapter, limit=args.limit)
 
     if args.format == "json":
         _write_json(rows, output_path)
@@ -1105,6 +1437,8 @@ def main() -> None:
         f"Wrote {len(rows)} rows to {output_path} "
         f"(benchmark={args.benchmark}, dataset={dataset_name}, split={split})"
     )
+    if args.random_sample_size:
+        print(f"Random sample: size={args.random_sample_size}, seed={args.random_sample_seed}")
     if preview_path is not None:
         print(f"Preview SVG: {preview_path}")
 

@@ -6,6 +6,7 @@ import io
 import json
 import logging
 import os
+import re
 import time
 from datetime import datetime
 from typing import Any, Callable, Dict, Iterable, List, Optional
@@ -191,6 +192,8 @@ def _save_failure_trajectory(
     failure_reason: str,
     failed_turn: int,
     tool_call_count: int,
+    max_turns: Optional[int] = None,
+    max_tool_calls: Optional[int] = None,
 ) -> str:
     """Persist an incomplete trajectory for post-mortem inspection.
 
@@ -204,8 +207,8 @@ def _save_failure_trajectory(
     trajectory["failure_reason"] = failure_reason
     trajectory["failed_turn"] = failed_turn
     trajectory["tool_call_count"] = tool_call_count
-    trajectory["max_turns"] = config.MAX_TURNS
-    trajectory["max_tool_calls"] = config.MAX_TOOL_CALLS
+    trajectory["max_turns"] = config.MAX_TURNS if max_turns is None else max_turns
+    trajectory["max_tool_calls"] = config.MAX_TOOL_CALLS if max_tool_calls is None else max_tool_calls
     trajectory["final_response_text"] = "\n\n".join(
         turn.get("response_text", "")
         for turn in trajectory.get("turns", [])
@@ -517,6 +520,21 @@ def _prompt_from_row(row: Dict[str, Any]) -> tuple[List[Dict[str, Any]], str]:
 # ---------------------------------------------------------------------------
 
 
+def _format_error_answer_text(text: str) -> str:
+    """Normalize public final text only; never turn unfinished thinking into an answer."""
+    # A final answer may have only an opening tag. Earlier turns must not be
+    # included here: their unclosed tags could capture subsequent tool history.
+    text = re.sub(
+        r'<?(?:thinking|think|thought)\s*>.*?(?:</(?:thinking|think|thought)\s*>|\Z)',
+        '', text, flags=re.DOTALL | re.IGNORECASE,
+    ).strip()
+    if re.search(r'<tool_call\b', text, re.IGNORECASE):
+        return ''
+    match = re.search(r'<answer\s*>(.*?)(?:</answer\s*>|\Z)', text,
+                      flags=re.DOTALL | re.IGNORECASE)
+    return (match.group(1) if match else text).strip()
+
+
 def process_single_case(
     row: Any,
     runner: BaseRunner,
@@ -528,8 +546,10 @@ def process_single_case(
     inference_cfg: Optional[InferenceConfig] = None,
     timing: Optional[InferenceTiming] = None,
     dynamic_resolution: bool = False,
+    disabled_tools: tuple[str, ...] = (),
+    retain_format_errors: bool = False,
 ) -> Dict[str, Any]:
-    """Drive one benchmark example through the agent."""
+    """Drive one example; strict by default, optionally retain format-only errors."""
 
     filename_prefix = "fvqa_test" if dataset_type == "test" else "fvqa_train"
     row_dict = _row_to_dict(row)
@@ -566,8 +586,8 @@ def process_single_case(
     )
     url_registry: dict[str, Any] = {}
 
-    tools_schema = tools.get_tools_definition()
-    system_prompt = build_system_prompt(tools_schema)
+    tools_schema = tools.get_tools_definition(disabled_tools=disabled_tools)
+    system_prompt = build_system_prompt(tools_schema, disabled_tools=disabled_tools)
     initial_image_count = sum(1 for part in initial_parts if "image_url" in part or "inline_data" in part)
     prompt_text = add_sft_image_placeholders(prompt_text, initial_image_count)
     # Keep the logical message in the same form as SFT data: question text
@@ -589,11 +609,15 @@ def process_single_case(
         "turns": [],
         "timestamp": datetime.now().isoformat(),
     }
+    if disabled_tools:
+        trajectory["disabled_tools"] = list(disabled_tools)
+        trajectory["image_download_disabled"] = "t2i_search" in disabled_tools
 
     intermediate_dir = os.path.join(output_dir, "intermediate")
     cfg = inference_cfg or InferenceConfig()
     completed = False
     tool_call_count = 0
+    terminal_format_error: Optional[Dict[str, Any]] = None
 
     def persist_failure(kind: str, reason: str, failed_turn: int) -> None:
         try:
@@ -698,13 +722,50 @@ def process_single_case(
             completed = True
             break
 
-        tool_call_json = tools.extract_tool_call(response_text)
+        format_diagnostics: dict = {}
+        tool_call_json = tools.extract_tool_call(response_text, diagnostics=format_diagnostics)
+        if format_diagnostics:
+            turn_record["tool_call_format"] = format_diagnostics
         if not tool_call_json:
+            if "error" in format_diagnostics:
+                observation_text = (
+                    '<tool_response>\nError format\n</tool_response>\n'
+                    'Correct tool call format:\n'
+                    '<tool_call>{"name": "t2t_search", "arguments": '
+                    '{"query": "your search query"}}</tool_call>\n'
+                    'Use a tool name and arguments from the available tool schema. '
+                    'The payload must be valid JSON: keys need double quotes, '
+                    'use a colon between each key and value, and arguments must '
+                    'be an object. No tool was executed. Correct your tool call '
+                    'or provide a complete <answer>...</answer>.'
+                )
+                if turn_num >= config.MAX_TURNS - 2:
+                    observation_text += "\n" + _MAX_TURNS_FINALIZATION_PROMPT
+                turn_record["tool_output"] = observation_text
+                turn_record["tool_output_type"] = "error_format"
+                gemini_contents.append(
+                    {"role": "user", "parts": [{"text": observation_text}]}
+                )
+                logger.warning(
+                    "Tool format error: case_id=%s turn=%d details=%s",
+                    case_id, turn_num, format_diagnostics["error"],
+                )
+                continue
+            reason = f"Inference ended on turn {turn_num} without a complete <answer> response."
+            if retain_format_errors:
+                terminal_format_error = {
+                    "kind": "invalid_response", "turn": turn_num, "reason": reason,
+                }
+                logger.warning("[react-format-retained] case_id=%s turn=%d: %s",
+                               case_id, turn_num, reason)
+                completed = True
+                break
             persist_failure(
                 "invalid_response",
-                f"Inference ended on turn {turn_num} without a complete <answer> response.",
+                reason,
                 turn_num,
             )
+            print(response_text)
             raise RuntimeError(
                 f"Inference ended on turn {turn_num} without a complete <answer> response."
             )
@@ -773,6 +834,7 @@ def process_single_case(
                 filename_prefix=filename_prefix,
                 visual_lookup=visual_lookup,
                 url_registry=url_registry,
+                disabled_tools=disabled_tools,
             )
             tool_status = (
                 "error_result"
@@ -875,8 +937,16 @@ def process_single_case(
             f"Inference reached the {config.MAX_TURNS}-turn limit "
             "without a complete <answer> response."
         )
-        persist_failure("max_turns", reason, config.MAX_TURNS - 1)
-        raise RuntimeError(reason)
+        if (retain_format_errors and trajectory["turns"]
+                and trajectory["turns"][-1].get("tool_output_type") == "error_format"):
+            terminal_format_error = {
+                "kind": "invalid_tool_call", "turn": config.MAX_TURNS - 1,
+                "reason": reason,
+            }
+            logger.warning("[react-format-retained] case_id=%s: %s", case_id, reason)
+        else:
+            persist_failure("max_turns", reason, config.MAX_TURNS - 1)
+            raise RuntimeError(reason)
 
     trajectory["status"] = "completed"
     trajectory["tool_call_count"] = tool_call_count
@@ -885,6 +955,20 @@ def process_single_case(
         for turn in trajectory["turns"]
         if turn.get("response_text")
     )
+    if retain_format_errors:
+        trajectory["format_error_policy"] = "retain_for_evaluation"
+        trajectory["final_response_text_scope"] = "final_turn_only"
+        final_text = trajectory["turns"][-1].get("response_text", "")
+        if terminal_format_error:
+            answer = _format_error_answer_text(final_text)
+            trajectory["format_valid"] = False
+            trajectory["format_error"] = terminal_format_error
+            trajectory["answer_missing"] = not bool(answer)
+            # Empty answer tags keep this attempted sample in evaluation/resume
+            # without letting the evaluator fall back to previous search text.
+            trajectory["final_response_text"] = f"<answer>{answer}</answer>"
+        else:
+            trajectory["final_response_text"] = final_text
     trajectory["url_resources"] = _serialise_url_resources(url_registry)
 
     image_urls = {

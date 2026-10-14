@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import math
 import os
 import sys
@@ -22,6 +23,11 @@ from synthesis.sft.qwen3_vl_template import (
 # rLLM imports
 from rllm.engine.rollout import RolloutEngine
 from rllm.utils.multimodal_debug import sequence_mode
+from rllm.utils.model_format import (
+    classify_tool_failure,
+    format_feedback,
+    validate_response,
+)
 
 from vision_deepresearch_async_workflow.deepresearch_tools_async_executor import (
     SFTToolAdapter,
@@ -29,6 +35,8 @@ from vision_deepresearch_async_workflow.deepresearch_tools_async_executor import
 )
 
 # Constants from original DeepResearch
+logger = logging.getLogger(__name__)
+
 OBS_START = "<tool_response>"
 OBS_END = "\n</tool_response>"
 MAX_LLM_CALL_PER_RUN = 50
@@ -463,6 +471,7 @@ class MultiTurnReactAgent:
         # not retain these large tensors in the default/legacy path.
         self._sequence_mode = sequence_mode()
         self.model_outputs_by_round: list[Any] = []
+        self.rollout_token_records: list[dict] = []
         self.last_model_output: Any | None = None
         self._trajectory_id = ""
         self._current_round = 0
@@ -585,6 +594,10 @@ class MultiTurnReactAgent:
 
             kwargs.pop("max_new_tokens", None)
             kwargs["max_tokens"] = int(self.max_response_tokens)
+            if getattr(self.rollout_engine, "continuous_tito", False):
+                if not hasattr(self, "_continuous_token_state"):
+                    self._continuous_token_state = {}
+                kwargs["continuous_token_state"] = self._continuous_token_state
             response = await self.rollout_engine.get_model_response(
                 messages=messages, **kwargs
             )
@@ -888,6 +901,7 @@ class MultiTurnReactAgent:
             "search_trace": list(self._search_trace),
         }
         result["latency"] = self._build_latency_stats(result["time_taken"])
+        result["rollout_token_records"] = self.rollout_token_records
         if self._sequence_mode == "stepwise":
             # ModelOutput contains the processor-expanded prompt ids and the
             # corresponding pixel_values/image_grid_thw.  It is consumed by
@@ -897,6 +911,9 @@ class MultiTurnReactAgent:
             # Stage 2 only needs the final call's already-processed context;
             # keeping every round would duplicate large visual tensors.
             result["last_model_output"] = self.last_model_output
+        # Release cached PIL images after rollout; the final ModelOutput already
+        # owns the feature tensors and immutable sequence/mask needed by training.
+        self._continuous_token_state = {}
         return result
 
     async def _run(
@@ -955,7 +972,9 @@ class MultiTurnReactAgent:
         }
         self._tool_call_counts = {}
         self.model_outputs_by_round = []
+        self.rollout_token_records = []
         self.last_model_output = None
+        self._continuous_token_state = {}
         self._current_round = 0
         # Read this at run time as well as construction time so a workflow
         # object reused by a test/worker observes the current exported mode.
@@ -1005,6 +1024,19 @@ class MultiTurnReactAgent:
             user_message,
         ]
 
+        tool_schemas = {}
+        for name, tool in self.tools.items():
+            definition = getattr(tool, "json", {})
+            if callable(definition):
+                definition = definition()
+            function = definition.get("function", definition) if isinstance(definition, dict) else {}
+            tool_schemas[name] = function.get("parameters", {})
+        if "PythonInterpreter" in self.tools:
+            tool_schemas["PythonInterpreter"] = {
+                "type": "object", "properties": {"code": {"type": "string"}},
+                "required": ["code"],
+            }
+
         num_llm_calls_available = self.max_llm_calls
         round = 0
         termination = None
@@ -1042,6 +1074,17 @@ class MultiTurnReactAgent:
 
             llm_response_received_at = time.perf_counter()
             self.record_token_usage(response)
+            # Keep only lightweight generation tokens, not per-turn image tensors.
+            self.rollout_token_records.append({
+                "token_ids": getattr(response, "completion_ids", None),
+                "log_probs": getattr(response, "logprobs", None),
+            })
+            if getattr(self.rollout_engine, "continuous_tito", False):
+                from rllm.utils.rollout_consistency import token_fingerprint
+                prompt_ids = getattr(response, "prompt_ids", None)
+                if prompt_ids is not None:
+                    self.rollout_token_records[-1]["prompt_fingerprint"] = token_fingerprint(prompt_ids)
+                    self.rollout_token_records[-1]["prompt_length"] = len(prompt_ids)
             if self._sequence_mode in {"stepwise", "cumulative"}:
                 self.last_model_output = response
             if self._sequence_mode == "stepwise":
@@ -1052,15 +1095,38 @@ class MultiTurnReactAgent:
             )
             content = raw_content
 
-            if "<tool_response>" in content:
-                pos = content.find("<tool_response>")
-                content = content[:pos]
+            format_check = validate_response(content, tool_schemas)
 
-            if "<tool_call>" in content and "</tool_call>" in content:
+            if not format_check.valid:
+                messages.append({
+                    "role": "assistant", "content": content.strip(),
+                    "step_error": True, "error_type": format_check.error_type,
+                    "error_detail": format_check.detail,
+                })
+                consecutive_bad_steps += 1
+                self._log_step_error(
+                    reason=format_check.error_type, round_number=round,
+                    consecutive_errors=consecutive_bad_steps, detail=format_check.detail,
+                )
+                messages.append({
+                    "role": "user",
+                    "content": f"<tool_response>\n{format_feedback(format_check.detail)}\n</tool_response>",
+                })
+                if analyze_repetition_ngram(content) and count_words(content) > 2500:
+                    prediction = "Repetition response"
+                    termination = "repetition_detected"
+                    break
+                if consecutive_bad_steps >= 3:
+                    prediction = "Too many consecutive step errors."
+                    termination = "consecutive_step_errors"
+                    break
+
+            elif format_check.action == "tool_call":
                 assistant_message = {
                     "role": "assistant",
                     "content": content.strip(),
                     "step_error": False,
+                    "error_type": "",
                 }
                 messages.append(assistant_message)
                 tool_error = False
@@ -1105,7 +1171,7 @@ class MultiTurnReactAgent:
                             f"raw_output={raw_output_one_line}",
                             flush=True,
                         )
-                    if not isinstance(tool_name, str) or not isinstance(tool_args, dict):
+                    if not isinstance(tool_name, str) or not tool_name.strip() or not isinstance(tool_args, dict):
                         result = "[Json Parse Error]: Tool call requires a name and an arguments object."
                         tool_error = True
                         tool_error_reason = "tool_call_schema"
@@ -1184,6 +1250,7 @@ class MultiTurnReactAgent:
                                 tool_returned_at = time.perf_counter()
                         else:
                             self._last_tool_execution_timing = {}
+                            self._last_tool_error_detail = ""
                             tool_started_at = time.perf_counter()
                             try:
                                 result = await self.custom_call_tool(
@@ -1194,6 +1261,10 @@ class MultiTurnReactAgent:
                                     tool_goal=str(tool_args.get("goal") or ""),
                                     tool_cache=tool_cache,
                                 )
+                                if self._last_tool_error_detail:
+                                    tool_error = True
+                                    tool_error_reason = "tool_result_error"
+                                    tool_error_detail = self._last_tool_error_detail
                             except Exception as exc:  # noqa: BLE001
                                 result = f"Tool execution error: {type(exc).__name__}: {exc}"
                                 tool_error = True
@@ -1215,6 +1286,16 @@ class MultiTurnReactAgent:
 
                 if tool_error:
                     assistant_message["step_error"] = True
+                    if tool_error_reason.startswith("tool_call_") or tool_error_reason == "answer_tool_fallback":
+                        assistant_message["error_type"] = "model_format_error"
+                        result = format_feedback(tool_error_detail or str(result))
+                    else:
+                        assistant_message["error_type"] = classify_tool_failure(tool_error_detail or str(result))
+                    assistant_message["error_detail"] = tool_error_detail or str(result)
+                    if assistant_message["error_type"] == "tool_argument_error":
+                        result = format_feedback(assistant_message["error_detail"])
+                    elif assistant_message["error_type"] == "external_tool_error":
+                        result = f"External tool error: {result}\nThe service failed; this is not a tool-call format error."
 
                 observation_body = str(result)
                 if self._pending_sft_images:
@@ -1240,6 +1321,24 @@ class MultiTurnReactAgent:
                         tool_name=tool_name,
                         detail=tool_error_detail or str(result),
                     )
+                    if tool_error_reason in {
+                        "tool_call_json_parse", "tool_call_not_object", "tool_call_schema"
+                    }:
+                        # Preserve response.text before tool-response truncation.
+                        # JSON escaping keeps concurrent workers' records on one line.
+                        print(
+                            "[RL_TOOL_CALL_RAW_OUTPUT] " + json.dumps(
+                                {
+                                    "task": self._trajectory_id or "unknown",
+                                    "round": round,
+                                    "reason": tool_error_reason,
+                                    "raw_output": raw_content,
+                                    "parsed_payload": tool_call_text,
+                                },
+                                ensure_ascii=False,
+                            ),
+                            flush=True,
+                        )
                 else:
                     consecutive_bad_steps = 0
 
@@ -1279,75 +1378,19 @@ class MultiTurnReactAgent:
                         start_time=start_time,
                     )
 
-            elif "<answer>" in content and "</answer>" in content:
+            elif format_check.action == "answer":
                 messages.append(
                     {
                         "role": "assistant",
                         "content": content.strip(),
                         "step_error": False,
+                        "error_type": "",
                     }
                 )
-                prediction = content.split("<answer>")[1].split("</answer>")[0].strip()
+                prediction = format_check.payload
                 termination = "answer"
                 consecutive_bad_steps = 0
                 break
-
-            else:
-                is_repetitive = analyze_repetition_ngram(content)
-                is_overlong = count_words(content) > 2500
-                if is_repetitive and is_overlong:
-                    messages.append(
-                        {
-                            "role": "assistant",
-                            "content": content.strip(),
-                            "step_error": True,
-                        }
-                    )
-                    prediction = "Repetition response"
-                    termination = "repetition_detected"
-                    return self._build_result(
-                        question=question,
-                        answer=answer,
-                        messages=messages,
-                        prediction=prediction,
-                        termination=termination,
-                        rounds=round,
-                        start_time=start_time,
-                    )
-
-                observation = "Error: Invalid content format. Content must contain <thinking> followed by <tool_call> or <answer> tags. Let's try again."
-                messages.append(
-                    {
-                        "role": "assistant",
-                        "content": content.strip(),
-                        "step_error": True,
-                    }
-                )
-                messages.append({"role": "user", "content": observation})
-                consecutive_bad_steps += 1
-                self._log_step_error(
-                    reason="invalid_content_format",
-                    round_number=round,
-                    consecutive_errors=consecutive_bad_steps,
-                    detail=(
-                        f"content_len={len(content)} "
-                        f"has_thinking={'<thinking>' in content and '</thinking>' in content} "
-                        f"has_tool_call={'<tool_call>' in content and '</tool_call>' in content} "
-                        f"has_answer={'<answer>' in content and '</answer>' in content}"
-                    ),
-                )
-                if consecutive_bad_steps >= 3:
-                    prediction = "Too many consecutive step errors."
-                    termination = "consecutive_step_errors"
-                    return self._build_result(
-                        question=question,
-                        answer=answer,
-                        messages=messages,
-                        prediction=prediction,
-                        termination=termination,
-                        rounds=round,
-                        start_time=start_time,
-                    )
 
             if num_llm_calls_available <= 0 and "<answer>" not in content:
                 prediction = f"No answer found after {self.max_llm_calls} rounds."
@@ -1362,13 +1405,9 @@ class MultiTurnReactAgent:
                     start_time=start_time,
                 )
 
-        last_message_content = (
-            messages[-1].get("content", "") if isinstance(messages[-1], dict) else ""
-        )
-        if last_message_content and "<answer>" in last_message_content:
-            prediction = last_message_content.split("<answer>")[1].split("</answer>")[0].strip()
-            termination = "answer"
-        else:
+        # Only a validated assistant answer can terminate successfully.
+        # Feedback includes examples with <answer> tags and is never a prediction.
+        if termination is None:
             prediction = "No answer found."
             termination = "answer not found"
             if num_llm_calls_available == 0:
@@ -1410,6 +1449,13 @@ class MultiTurnReactAgent:
                 raise RuntimeError(
                     "SFT ToolRuntimeContext has not been initialized for this trajectory"
                 )
+            if tool_name == "read_url":
+                resource_id = str(tool_args.get("resource_id") or "").strip()
+                direct_url = str(tool_args.get("url") or "").strip()
+                if resource_id and not direct_url and context.resolve_resource_id(resource_id) is None:
+                    self._last_tool_error_detail = f"resource_id not found: {resource_id}"
+                elif not resource_id and not direct_url:
+                    self._last_tool_error_detail = "URL is required."
 
             question_text = str(kwargs.get("question_text") or "")
             assistant_text = str(kwargs.get("assistant_text") or "")
@@ -1503,12 +1549,23 @@ class MultiTurnReactAgent:
                 )
             self._last_tool_execution_timing = timing
             if isinstance(execution.output, dict) and execution.output.get("ok") is False:
+                self._last_tool_error_detail = str(execution.output.get("error") or execution.output)
                 self._log_step_error(
                     reason="tool_result_error",
                     round_number=self._current_round,
                     tool_name=tool_name,
                     detail=execution.output.get("error") or execution.output,
                 )
+            elif (
+                tool_name == "read_url"
+                and isinstance(execution.output, dict)
+                and execution.output.get("content") == "Unable to read the requested page."
+                and not self._last_tool_error_detail
+            ):
+                # The public reader observation intentionally removes backend
+                # diagnostics and the `ok` flag. Its fixed failure content is
+                # still distinguishable without exposing private URLs.
+                self._last_tool_error_detail = "The read_url service could not read the requested page."
             self._record_read_url_stage_latency(getattr(execution, "timing", None))
             self._pending_sft_images = list((execution.new_images or {}).values())
             # Search redundancy is always measured, including observation-only
@@ -1561,8 +1618,10 @@ class MultiTurnReactAgent:
                 )
             else:
                 result = f"Tool {tool_name} is not callable"
+                self._last_tool_error_detail = str(result)
             return str(result)
         except Exception as exc:  # noqa: BLE001
+            self._last_tool_error_detail = f"{type(exc).__name__}: {exc}"
             return f"Error calling tool {tool_name}: {exc}"
 
     def _record_t2t_search_trace(

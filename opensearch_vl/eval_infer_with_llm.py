@@ -27,6 +27,7 @@ from synthesis.model_worker import LLM_WORKER, ModelMessage, ModelRequest
 JUDGE_MODEL_ALIAS = os.environ.get("JUDGE_MODEL_ALIAS", "gpt54_internal_azure")
 JUDGE_MAX_TOKENS = int(os.environ.get("JUDGE_MAX_TOKENS", "1024"))
 DEFAULT_JUDGE_PROMPT_STYLE = os.environ.get("JUDGE_PROMPT_STYLE", "official").strip().lower()
+SEARCHWEAVE_CATEGORIES = {"image-interleave", "image-start", "image-end"}
 
 
 LOCAL_JUDGE_PROMPT = (
@@ -209,6 +210,83 @@ def load_answer_map(parquet_path: str) -> dict[str, str]:
     return mapping
 
 
+def load_searchweave_category_map(parquet_path: str) -> dict[str, str]:
+    import pandas as pd
+    import pyarrow.parquet as pq
+
+    columns = pq.read_schema(parquet_path).names
+    if "category" not in columns:
+        return {}
+    id_columns = [
+        key for key in ("question_id", "sample_id", "data_id", "case_id", "id")
+        if key in columns
+    ]
+    df = pd.read_parquet(parquet_path, columns=["category", *id_columns])
+    categories = set(df["category"].dropna().astype(str).str.strip()) - {""}
+    if "searchweave" not in str(parquet_path).lower() and not (
+        categories and categories <= SEARCHWEAVE_CATEGORIES
+    ):
+        return {}
+
+    mapping: dict[str, str] = {}
+    for _, row in df.iterrows():
+        category = row["category"]
+        if pd.isna(category) or not str(category).strip():
+            continue
+        for key in id_columns:
+            value = row[key]
+            if pd.notna(value) and str(value).strip():
+                mapping[str(value).strip()] = str(category).strip()
+    return mapping
+
+
+def _add_searchweave_categories(
+    results: list[dict[str, Any]],
+    traj_files: list[Path],
+    category_map: dict[str, str],
+) -> dict[str, dict[str, Any]]:
+    """Enrich fresh/cached results, including judge failures, before aggregation."""
+    paths_by_case = {_trajectory_case_id(path): path for path in traj_files}
+    for item in results:
+        case_id = str(item.get("case_id", ""))
+        category = category_map.get(case_id, "")
+        if not category and case_id in paths_by_case:
+            try:
+                traj = load_trajectory(paths_by_case[case_id])
+            except (OSError, ValueError):
+                # A broken trajectory can already have a recorded evaluation error.
+                continue
+            original = traj.get("original_data", {})
+            for key in ("question_id", "sample_id", "data_id", "case_id", "id"):
+                value = str(original.get(key) or traj.get(key) or "").strip()
+                if value in category_map:
+                    category = category_map[value]
+                    break
+            if not category:
+                direct = str(original.get("category") or traj.get("category") or "").strip()
+                if direct in SEARCHWEAVE_CATEGORIES:
+                    category = direct
+        if category:
+            item["category"] = category
+
+    if not category_map and not any(item.get("category") in SEARCHWEAVE_CATEGORIES for item in results):
+        return {}
+
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for item in results:
+        category = str(item.get("category") or "unknown")
+        grouped.setdefault(category, []).append(item)
+    summary: dict[str, dict[str, Any]] = {}
+    for category, items in sorted(grouped.items()):
+        correct = sum(int(item.get("acc", 0)) for item in items)
+        summary[category] = {
+            "total": len(items),
+            "correct": correct,
+            "accuracy": f"{correct / len(items) * 100.0:.2f}%",
+        }
+    return summary
+
+
 def _extract_question(traj: dict[str, Any]) -> str:
     prompt_msgs = traj.get("prompt", [])
     if isinstance(prompt_msgs, list):
@@ -359,6 +437,7 @@ def run_eval(
     details_path = Path(output_path.replace(".json", "_details.jsonl"))
 
     answer_map = load_answer_map(answer_file) if answer_file else {}
+    category_map = load_searchweave_category_map(answer_file) if answer_file else {}
     if rerun:
         # Explicitly discard the old result index. This reruns judging only; trajectories
         # are read from traj_dir and no inference/model rollout is started here.
@@ -420,6 +499,7 @@ def run_eval(
         print("[resume] No pending trajectories to evaluate.")
 
     results = _order_results(traj_files, results_by_case)
+    category_accuracy = _add_searchweave_categories(results, traj_files, category_map)
 
     total = len(results)
     correct = sum(int(item.get("acc", 0)) for item in results)
@@ -438,6 +518,9 @@ def run_eval(
         "error_count": error_count,
         "label_distribution": dict(acc_counter),
     }
+
+    if category_accuracy:
+        report["category_accuracy"] = category_accuracy
 
     with open(output_path, "w", encoding="utf-8") as handle:
         json.dump(report, handle, ensure_ascii=False, indent=2)
