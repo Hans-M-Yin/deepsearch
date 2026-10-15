@@ -199,7 +199,8 @@ def _run_configuration_snapshot(
     snapshot["api_mode"] = "chat_completions"
     snapshot["react_mode"] = "no_tools" if no_tools else "text_tool_call"
     if not no_tools and not getattr(args, "responses_api", False):
-        snapshot["format_error_policy"] = "retain_for_evaluation"
+        snapshot["format_error_policy"] = ("recover_and_retain" if args.format_error_policy == "recover"
+                                            else "retain_for_evaluation")
     snapshot["inference"] = {
         key: value for key, value in snapshot["inference"].items() if value is not None
     }
@@ -429,6 +430,10 @@ def _build_arg_parser(*, responses_api: bool = False) -> argparse.ArgumentParser
             "<output-dir>/retry_errors.txt."
         ),
     )
+    parser.add_argument("--format-error-policy", choices=("recover", "retain"), default="recover",
+                        help="Recover malformed responses before retaining them; retain uses the older immediate-save behavior.")
+    parser.add_argument("--format-recovery-attempts", type=int, default=3,
+                        help="Maximum extra model turns after consecutive unparseable responses (default: 3).")
     return parser
 
 
@@ -458,7 +463,7 @@ def _row_to_case_id(row: Any, idx: int) -> str:
     return f"case_{idx}"
 
 
-def _completed_case_ids(output_dir: str) -> set[str]:
+def _completed_case_ids(output_dir: str, *, retry_missing_answers: bool = False) -> set[str]:
     """Skip successful trajectories and explicitly archived terminal failures.
 
     Root-level max-turn failure files are deliberately not evaluation inputs.
@@ -492,6 +497,8 @@ def _completed_case_ids(output_dir: str) -> set[str]:
             if not isinstance(trajectory, dict):
                 continue
             if trajectory.get("status") not in (None, "completed"):
+                continue
+            if retry_missing_answers and trajectory.get("answer_missing"):
                 continue
             turns = trajectory.get("turns") or []
             if not isinstance(turns, list) or any(
@@ -536,6 +543,8 @@ def main(
         parser.description = "OpenSearch-VL single-turn inference without tool use."
     raw_argv = list(sys.argv[1:] if argv is None else argv)
     args = parser.parse_args(raw_argv)
+    if args.format_recovery_attempts < 0:
+        parser.error("--format-recovery-attempts must be nonnegative")
     if not (args.model_alias or args.model or args.served_model_name):
         parser.error("Specify --model-alias, --model or --served-model-name for the online API.")
     if args.model_alias and (args.model or args.served_model_name):
@@ -692,7 +701,10 @@ def main(
                     inference_cfg=inference_cfg,
                     timing=timing,
                     dynamic_resolution=args.dynamic_resolution,
-                    **({"retain_format_errors": True} if not no_tools and not responses_api else {}),
+                    **({"retain_format_errors": True,
+                        "recover_format_errors": args.format_error_policy == "recover",
+                        "max_format_recovery_attempts": args.format_recovery_attempts}
+                       if not no_tools and not responses_api else {}),
                     **({"disabled_tools": tuple(args.ablation)} if args.ablation else {}),
                 )
                 status = "completed"
@@ -706,7 +718,8 @@ def main(
                     timing.emit(case_id=case_id, case_idx=idx, status=status)
 
     success, failure, skipped = 0, 0, 0
-    completed_case_ids = _completed_case_ids(args.output_dir)
+    completed_case_ids = _completed_case_ids(
+        args.output_dir, retry_missing_answers=not no_tools and args.format_error_policy == "recover")
     all_indices = list(range(start, end))
     indices = []
     for idx in all_indices:

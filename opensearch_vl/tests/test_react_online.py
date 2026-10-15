@@ -60,7 +60,8 @@ class OnlineReActTests(unittest.TestCase):
             output = Path(directory) / 'out'
             argv = ['--model', 'gemini-test', '--base-url', 'https://gateway.example/v1',
                     '--data-path', str(data), '--output-dir', str(output),
-                    '--parallel-workers', '1', '--retry-monitor-interval', '0']
+                    '--parallel-workers', '1', '--retry-monitor-interval', '0',
+                    '--format-error-policy', 'retain']
             with mock.patch.object(react_online.requests, 'post', side_effect=lambda *a, **k: next(outputs)) as post, \
                     mock.patch.object(online, '_git_output', return_value=''), \
                     mock.patch.object(pipeline.tools, 'execute_tool') as execute:

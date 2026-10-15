@@ -16,6 +16,7 @@ opensearch_vl/
 |-- run_eval_set.sh           # Env-driven evaluation-set wrapper
 |-- run_eval.sh               # Judge harness for BC-VL / HLE / VDR-Bench
 |-- eval_infer_with_llm.py    # Unified LLM judge implementation
+|-- eval_t2i_alignment.py    # Per-query and optional deduplicated-intent t2i alignment metrics
 |-- .env.example              # Environment variables consumed by everything below
 `-- opensearch_infer/
     |-- __init__.py
@@ -31,6 +32,8 @@ opensearch_vl/
     |-- runners.py            # Inference runners (Claude + dense + MoE)
     `-- pipeline.py           # Per-case multi-turn agent loop
 ```
+
+For reference-chain visual search metrics, see [t2i alignment evaluation](eval_t2i_alignment.md).
 
 ## Quick start
 

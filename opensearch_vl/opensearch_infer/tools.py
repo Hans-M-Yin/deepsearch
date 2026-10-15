@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import json
 import logging
+import math
 import os
 import re
 import urllib.parse
@@ -158,7 +159,7 @@ def _parse_tool_payload(raw: str) -> tuple[dict, list[str]]:
     return {"name": name, "parameters": params}, repairs
 
 
-def extract_tool_call(text: str, diagnostics: Optional[dict] = None) -> Optional[str]:
+def extract_tool_call(text: str, diagnostics: Optional[dict] = None, *, recover_format: bool = False) -> Optional[str]:
     """Pull the next tool invocation out of an agent message.
 
     Returns a JSON string ``{"name": str, "parameters": {...}}`` on success
@@ -180,6 +181,21 @@ def extract_tool_call(text: str, diagnostics: Optional[dict] = None) -> Optional
             return None
 
     if "<tool_call>" in text:
+        if recover_format:
+            raw = text.split("<tool_call>", 1)[1].strip()
+            # Only repair the wrapper. Require a complete JSON object and a
+            # known closing-tag typo (or EOF); never invent tools/arguments.
+            raw = re.sub(r'\s*</(?:tool_call|tool_all|toolcall)\s*>?\s*$', '', raw)
+            try:
+                payload, repairs = _parse_tool_payload(raw)
+                params = _normalize_search_aliases(payload["name"], payload["parameters"])
+                if diagnostics is not None:
+                    diagnostics["repairs"] = repairs + ["recover_tool_call_closing_tag"]
+                return json.dumps({"name": payload["name"], "parameters": params}, ensure_ascii=False)
+            except (ValueError, TypeError) as exc:
+                if diagnostics is not None:
+                    diagnostics["error"] = str(exc)
+                return None
         if diagnostics is not None:
             diagnostics["error"] = "Expected a complete <tool_call> JSON object </tool_call>"
         return None
@@ -439,43 +455,58 @@ def _apply_image_op(
     return return_engine.to_pil()
 
 
-def _normalize_region_bbox(region: object) -> Tuple[Optional[Tuple[int, int, int, int]], Optional[str]]:
-    """Return ``(x, y, width, height)`` for a region payload."""
+def _normalize_region_bbox(
+    region: object, *, image_size: Tuple[int, int]
+) -> Tuple[Optional[Tuple[int, int, int, int]], Optional[str]]:
+    """Convert public 0–1000 xyxy boxes to bounded pixel xywh boxes.
+
+    Legacy x/y/width/height dictionaries retain their pixel-coordinate meaning.
+    """
 
     if region in (None, ""):
         return None, None
 
+    normalized = False
     if isinstance(region, dict):
         if all(key in region for key in ("x", "y", "width", "height")):
             try:
-                x = int(region["x"])
-                y = int(region["y"])
-                width = int(region["width"])
-                height = int(region["height"])
-            except (TypeError, ValueError):
+                x = float(region["x"])
+                y = float(region["y"])
+                width = float(region["width"])
+                height = float(region["height"])
+            except (TypeError, ValueError, OverflowError):
                 return None, "Region dict values must be numeric."
             if width <= 0 or height <= 0:
                 return None, "Region width and height must be positive."
-            return (x, y, width, height), None
-        return None, "Region dict must contain x, y, width, and height."
-
-    if isinstance(region, (list, tuple)):
+            coords = (x, y, x + width, y + height)
+        else:
+            return None, "Region dict must contain x, y, width, and height."
+    elif isinstance(region, (list, tuple)):
         if len(region) != 4:
             return None, "Region list must contain exactly 4 numbers."
         try:
-            x1 = int(region[0])
-            y1 = int(region[1])
-            x2 = int(region[2])
-            y2 = int(region[3])
-        except (TypeError, ValueError):
+            coords = tuple(float(value) for value in region)
+        except (TypeError, ValueError, OverflowError):
             return None, "Region list values must be numeric."
-        width = x2 - x1
-        height = y2 - y1
-        if width <= 0 or height <= 0:
-            return None, "Region list must be [x1, y1, x2, y2] with x2 > x1 and y2 > y1."
-        return (x1, y1, width, height), None
+        normalized = True
+    else:
+        return None, "Region must be a 4-number list or a dict with x/y/width/height."
 
-    return None, "Region must be a 4-number list or a dict with x/y/width/height."
+    if not all(math.isfinite(value) for value in coords):
+        return None, "Region coordinates must be finite numbers."
+    x1, y1, x2, y2 = coords
+    if x2 <= x1 or y2 <= y1:
+        return None, "Region must have x2 > x1 and y2 > y1."
+
+    image_width, image_height = image_size
+    if normalized:
+        x1, x2 = (round(min(max(x, 0), 1000) / 1000 * image_width) for x in (x1, x2))
+        y1, y2 = (round(min(max(y, 0), 1000) / 1000 * image_height) for y in (y1, y2))
+    x1, x2 = (min(max(int(x), 0), image_width) for x in (x1, x2))
+    y1, y2 = (min(max(int(y), 0), image_height) for y in (y1, y2))
+    if x2 <= x1 or y2 <= y1:
+        return None, "Region is empty after conversion and clipping to image bounds."
+    return (x1, y1, x2 - x1, y2 - y1), None
 
 
 def _crop_region_for_i2i_search(
@@ -496,10 +527,7 @@ def _crop_region_for_i2i_search(
     only for the search request itself.
     """
 
-    bbox, err = _normalize_region_bbox(region)
-    if err:
-        return None, {}, err
-    if bbox is None:
+    if region in (None, ""):
         return None, {}, None
 
     if not image_ref:
@@ -518,9 +546,12 @@ def _crop_region_for_i2i_search(
     if image_data is None:
         return None, {}, f"Failed to load image {image_ref!r} for region crop."
 
-    x, y, width, height = bbox
     engine = ImageToolEngine()
     engine.load_image(image_data)
+    bbox, err = _normalize_region_bbox(region, image_size=engine.current_image.size)
+    if err:
+        return None, {}, err
+    x, y, width, height = bbox
     cropped = engine.crop(x, y, width, height)
     new_id, local_path = _persist_new_image(
         cropped,

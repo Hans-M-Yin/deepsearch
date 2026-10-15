@@ -535,6 +535,28 @@ def _format_error_answer_text(text: str) -> str:
     return (match.group(1) if match else text).strip()
 
 
+def _recover_online_answer(text: str) -> str:
+    """Accept explicit answer text or plaintext; never promote unfinished thinking."""
+    if re.search(r'</?(?:tool_?(?:call|all)|action)\b', text, re.IGNORECASE):
+        return ''
+    if any(pattern.search(text) for pattern, _ in tools._FALLBACK_TAGS.values()):
+        return ''
+    return _format_error_answer_text(text)
+
+
+def _online_format_feedback(reason: str) -> str:
+    return (
+        '<tool_response>\nError format: ' + reason + '\n</tool_response>\n'
+        'Your response was not a usable final answer or tool call. No tool was executed. '
+        'Continue from the evidence already collected. Do not output image bytes/base64. '
+        'If you need a tool, use exactly '
+        '<tool_call>{"name":"t2t_search","arguments":{"query":"your query"}}</tool_call> '
+        'with valid JSON and an available tool name. Otherwise output only '
+        '<answer>Your best final answer</answer>. Close every tag, including </thinking> '
+        'if you use a thinking block. Do not repeat the entire reasoning history.'
+    )
+
+
 def process_single_case(
     row: Any,
     runner: BaseRunner,
@@ -548,6 +570,8 @@ def process_single_case(
     dynamic_resolution: bool = False,
     disabled_tools: tuple[str, ...] = (),
     retain_format_errors: bool = False,
+    recover_format_errors: bool = False,
+    max_format_recovery_attempts: int = 3,
 ) -> Dict[str, Any]:
     """Drive one example; strict by default, optionally retain format-only errors."""
 
@@ -618,6 +642,12 @@ def process_single_case(
     completed = False
     tool_call_count = 0
     terminal_format_error: Optional[Dict[str, Any]] = None
+    format_recovery_attempts = 0
+    normalized_final_answer: Optional[str] = None
+    if recover_format_errors:
+        if not retain_format_errors or max_format_recovery_attempts < 0:
+            raise ValueError("Format recovery requires retain_format_errors and a nonnegative retry budget")
+        trajectory["format_recovery_events"] = []
 
     def persist_failure(kind: str, reason: str, failed_turn: int) -> None:
         try:
@@ -718,15 +748,52 @@ def process_single_case(
                 }
             )
 
-        if tools.has_response_tag(response_text):
+        if tools.has_response_tag(response_text) and (
+                not recover_format_errors or _recover_online_answer(response_text)):
             completed = True
             break
 
+        if recover_format_errors:
+            truncated = any(str(c.get("finishReason", "")).lower() in {"length", "max_tokens"}
+                            for c in candidates)
+            answer = '' if truncated else _recover_online_answer(response_text)
+            if answer:
+                normalized_final_answer = f"<answer>{answer}</answer>"
+                trajectory["format_recovery_events"].append({"turn": turn_num, "kind": "normalize_final_answer"})
+                completed = True
+                break
+
         format_diagnostics: dict = {}
-        tool_call_json = tools.extract_tool_call(response_text, diagnostics=format_diagnostics)
+        tool_call_json = tools.extract_tool_call(response_text, diagnostics=format_diagnostics,
+                                                recover_format=recover_format_errors)
         if format_diagnostics:
             turn_record["tool_call_format"] = format_diagnostics
         if not tool_call_json:
+            if recover_format_errors:
+                reason = format_diagnostics.get("error") or "Missing a usable final answer or tool call"
+                format_recovery_attempts += 1
+                trajectory["format_recovery_events"].append({
+                    "turn": turn_num, "kind": "request_correction", "reason": reason,
+                    "consecutive_attempt": format_recovery_attempts,
+                })
+                logger.warning("[react-format-recovery] case_id=%s turn=%d attempt=%d: %s",
+                               case_id, turn_num, format_recovery_attempts, reason)
+                if format_recovery_attempts > max_format_recovery_attempts:
+                    terminal_format_error = {"kind": "format_recovery_exhausted", "turn": turn_num, "reason": reason}
+                    completed = True
+                    break
+                # Keep the raw response in the trace, but avoid replaying huge
+                # malformed/base64 outputs until they exhaust the context.
+                if candidates and len(response_text) > 4000:
+                    gemini_contents[-1]["parts"] = [{"text": response_text[:4000] +
+                                                    '\n[Malformed response truncated for correction.]'}]
+                observation_text = _online_format_feedback(reason)
+                if turn_num >= config.MAX_TURNS - 2 or format_recovery_attempts == max_format_recovery_attempts:
+                    observation_text += "\n" + _MAX_TURNS_FINALIZATION_PROMPT
+                turn_record["tool_output"] = observation_text
+                turn_record["tool_output_type"] = "error_format"
+                gemini_contents.append({"role": "user", "parts": [{"text": observation_text}]})
+                continue
             if "error" in format_diagnostics:
                 observation_text = (
                     '<tool_response>\nError format\n</tool_response>\n'
@@ -770,6 +837,10 @@ def process_single_case(
                 f"Inference ended on turn {turn_num} without a complete <answer> response."
             )
 
+        format_recovery_attempts = 0
+        if recover_format_errors and format_diagnostics.get("repairs"):
+            trajectory["format_recovery_events"].append({"turn": turn_num, "kind": "repair_tool_call",
+                                                        "repairs": format_diagnostics["repairs"]})
         tool_call_count += 1
         turn_record["tool_call"] = tool_call_json
         turn_record["tool_call_index"] = tool_call_count
@@ -956,17 +1027,23 @@ def process_single_case(
         if turn.get("response_text")
     )
     if retain_format_errors:
-        trajectory["format_error_policy"] = "retain_for_evaluation"
+        trajectory["format_error_policy"] = "recover_and_retain" if recover_format_errors else "retain_for_evaluation"
         trajectory["final_response_text_scope"] = "final_turn_only"
         final_text = trajectory["turns"][-1].get("response_text", "")
         if terminal_format_error:
-            answer = _format_error_answer_text(final_text)
+            answer = '' if recover_format_errors else _format_error_answer_text(final_text)
             trajectory["format_valid"] = False
             trajectory["format_error"] = terminal_format_error
             trajectory["answer_missing"] = not bool(answer)
             # Empty answer tags keep this attempted sample in evaluation/resume
             # without letting the evaluator fall back to previous search text.
             trajectory["final_response_text"] = f"<answer>{answer}</answer>"
+        elif normalized_final_answer is not None:
+            trajectory["final_response_text"] = normalized_final_answer
+            trajectory["format_valid"] = True
+            trajectory["raw_format_valid"] = False
+            trajectory["format_recovered"] = True
+            trajectory["answer_missing"] = False
         else:
             trajectory["final_response_text"] = final_text
     trajectory["url_resources"] = _serialise_url_resources(url_registry)
